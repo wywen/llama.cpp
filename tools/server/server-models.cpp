@@ -790,8 +790,12 @@ void server_models::load(const std::string & name) {
     if (base_params.models_memory_max > 0) {
         std::lock_guard<std::mutex> lk(mutex);
         auto & meta = mapping[name].meta;
-        new_model_memory_mb = get_model_memory_mb(meta.preset);
-        meta.memory_mb = new_model_memory_mb;
+        if (meta.memory_mb > 0) {
+            new_model_memory_mb = meta.memory_mb;
+        } else {
+            new_model_memory_mb = get_model_memory_mb(meta.preset);
+            meta.memory_mb = new_model_memory_mb;
+        }
         if (new_model_memory_mb > 0) {
             SRV_INF("model %s memory requirements: %lu MB\n", name.c_str(),
                     (unsigned long)new_model_memory_mb);
