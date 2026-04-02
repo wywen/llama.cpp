@@ -217,7 +217,7 @@ server_models::server_models(
         LOG_WRN("using original argv[0] as fallback: %s\n", argv[0]);
     }
 
-    const uint64_t memory_margin = base_params.models_memory_margin * 1024 * 1024;
+    const uint64_t memory_margin = (uint64_t)base_params.models_memory_margin * 1024 * 1024;
 
     if (memory_margin > 0) {
         const size_t n_devs = ggml_backend_dev_count();
@@ -226,7 +226,11 @@ server_models::server_models(
             size_t free, total;
             ggml_backend_dev_memory(dev, &free, &total);
             if (total > 0) {
-                memory_per_device[dev] = (free > memory_margin) ? free - memory_margin : 0;
+                const uint64_t available = (free > memory_margin) ? free - memory_margin : 0;
+                memory_per_device[dev] = available;
+                SRV_DBG("device %s: available memory after margin=%lu MB\n",
+                    ggml_backend_dev_name(dev),
+                    (unsigned long)(available / (1024 * 1024)));
             }
         }
     }
@@ -727,7 +731,15 @@ uint64_t server_models::get_memory_exceeded(const model_memory_map& new_model_me
     uint64_t memory_exceeded = 0;
 
     for (const auto& [key, limit] : memory_per_device) {
-        if (get(new_model_memory_per_device, key) + get(total_memory_per_device, key) > limit) {
+        const uint64_t total_memory = get(total_memory_per_device, key);
+        const uint64_t new_memory = get(new_model_memory_per_device, key);
+        SRV_DBG("device %s: total=%lu MB, new=%lu MB, limit=%lu MB\n",
+            ggml_backend_dev_name(key),
+            (unsigned long)(total_memory / (1024 * 1024)),
+            (unsigned long)(new_memory / (1024 * 1024)),
+            (unsigned long)(limit / (1024 * 1024)));
+
+        if (total_memory + new_memory > limit) {
             memory_exceeded++;
         }
     }
