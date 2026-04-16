@@ -54,7 +54,7 @@ static std::string server_model_status_to_string(server_model_status status) {
     }
 }
 
-using model_memory_map = std::map<ggml_backend_dev_t, uint64_t>;
+using device_memory_map = std::map<ggml_backend_dev_t, size_t>;
 
 struct server_model_meta {
     common_preset preset;
@@ -64,7 +64,7 @@ struct server_model_meta {
     int port = 0;
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
     int64_t last_used = 0; // for LRU unloading
-    model_memory_map memory_usage_per_device; // bytes used per device
+    device_memory_map dmm_req; // bytes required per device
     std::vector<std::string> args; // args passed to the model instance, will be populated by render_args()
     json loaded_info; // info to be reflected via /v1/models endpoint
     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
@@ -118,18 +118,20 @@ private:
     common_preset base_preset; // base preset from llama-server CLI args
 
     // available memory per device
-    model_memory_map available_memory_per_device;
+    device_memory_map dmm_available;
 
     void update_meta(const std::string & name, const server_model_meta & meta);
 
     // unload least recently used models if the limit is reached
-    void unload_lru(const model_memory_map & new_model_memory_per_device);
+    void unload_lru(const device_memory_map & dmm_req);
 
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);
 
+    // return number of devices where the memory limit would be exceeded
+    // return 0 if the new model would fit on all devices
     // not thread-safe, caller must hold mutex
-    uint64_t get_memory_exceeded(const model_memory_map & new_model_memory_per_device) const;
+    int can_fit(const device_memory_map & dmm_req) const;
 
 public:
     server_models(const common_params & params, int argc, char ** argv);
