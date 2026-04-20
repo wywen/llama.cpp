@@ -511,6 +511,7 @@ struct common_params {
     int32_t control_vector_layer_end   = -1; // layer range for control vector
     bool    offline                    = false;
     bool    skip_download              = false; // skip model file downloading
+    bool    download_only              = false; // only download the model if required, don't start the server
 
     int32_t ppl_stride      = 0;     // stride for perplexity calculations. If left at 0, the pre-existing approach will be used.
     int32_t ppl_output_type = 0;     // = 0 -> ppl output is as usual, = 1 -> ppl output is num_tokens, ppl, one per line

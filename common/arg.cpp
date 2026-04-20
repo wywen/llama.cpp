@@ -3380,6 +3380,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_OFFLINE"));
     add_opt(common_arg(
+        {"--download-only"},
+        "Download the model file(s) and exit",
+        [](common_params & params) {
+            params.download_only = true;
+        }
+    ));
+    add_opt(common_arg(
         {"-lv", "--verbosity", "--log-verbosity"}, "N",
         string_format("Set the verbosity threshold. Messages with a higher verbosity will be ignored. Values:\n"
             " - 0: generic output\n"

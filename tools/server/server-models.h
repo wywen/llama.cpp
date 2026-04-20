@@ -14,6 +14,9 @@
 /**
  * state diagram:
  *
+ *
+ *  ┌► DOWNLOADING ─┐
+ *  │               ▼
  * UNLOADED ──► LOADING ──► LOADED ◄──── SLEEPING
  *  ▲            │            │               ▲
  *  └───failed───┘            │               │
@@ -21,8 +24,8 @@
  *  └────────unloaded─────────┘
  */
 enum server_model_status {
-    // TODO: also add downloading state when the logic is added
     SERVER_MODEL_STATUS_UNLOADED,
+    SERVER_MODEL_STATUS_DOWNLOADING,
     SERVER_MODEL_STATUS_LOADING,
     SERVER_MODEL_STATUS_LOADED,
     SERVER_MODEL_STATUS_SLEEPING
@@ -31,6 +34,9 @@ enum server_model_status {
 static server_model_status server_model_status_from_string(const std::string & status_str) {
     if (status_str == "unloaded") {
         return SERVER_MODEL_STATUS_UNLOADED;
+    }
+    if (status_str == "downloading") {
+        return SERVER_MODEL_STATUS_DOWNLOADING;
     }
     if (status_str == "loading") {
         return SERVER_MODEL_STATUS_LOADING;
@@ -46,11 +52,12 @@ static server_model_status server_model_status_from_string(const std::string & s
 
 static std::string server_model_status_to_string(server_model_status status) {
     switch (status) {
-        case SERVER_MODEL_STATUS_UNLOADED: return "unloaded";
-        case SERVER_MODEL_STATUS_LOADING:  return "loading";
-        case SERVER_MODEL_STATUS_LOADED:   return "loaded";
-        case SERVER_MODEL_STATUS_SLEEPING: return "sleeping";
-        default:                           return "unknown";
+        case SERVER_MODEL_STATUS_UNLOADED:     return "unloaded";
+        case SERVER_MODEL_STATUS_DOWNLOADING:  return "downloading";
+        case SERVER_MODEL_STATUS_LOADING:      return "loading";
+        case SERVER_MODEL_STATUS_LOADED:       return "loaded";
+        case SERVER_MODEL_STATUS_SLEEPING:     return "sleeping";
+        default:                               return "unknown";
     }
 }
 
@@ -132,6 +139,12 @@ private:
     // return 0 if the new model would fit on all devices
     // not thread-safe, caller must hold mutex
     int can_fit(const device_memory_map & dmm_req) const;
+
+    // download model files, blocking call (caller must NOT hold mutex)
+    bool download_model(const std::string & name);
+
+    // Internal helper for model loading
+    void _load(const std::string & name, const device_memory_map & dmm_req);
 
 public:
     server_models(const common_params & params, int argc, char ** argv);
