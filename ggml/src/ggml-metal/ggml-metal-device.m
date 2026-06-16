@@ -1509,6 +1509,29 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
     return res;
 }
 
+// [rrl] Metadata-only mapped buffer: tracks the host range for bookkeeping
+// (get_base / tensor->data assignment / region-register) but creates NO MTLBuffer
+// over it (n_buffers=0). Used for the zero-copy per-expert region: the GPU never
+// reads the parent — it reads each routed expert through its own per-expert
+// sub-buffer (rrl_metal_expert_subbuffers). A full newBufferWithBytesNoCopy here
+// would map the entire expert region into GPU VA a SECOND time (on top of the
+// sub-buffers), inflating currentAllocatedSize by the whole region (~9.6 GiB @20L,
+// ~14.4 GiB @30L) and tripping the Metal command-buffer residency ceiling
+// (-3 OOM / garbage). get_buffer_id returns {nil,0} for tensors here (only used in
+// the stock-mode fallback, which the zero-copy ptr-mode path never takes).
+ggml_metal_buffer_t ggml_metal_buffer_map_metadata_only(ggml_metal_device_t dev, void * ptr, size_t size) {
+    ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
+    res->dev       = dev;
+    res->all_data  = ptr;
+    res->all_size  = size;
+    res->is_shared = true;
+    res->owned     = false;
+    res->n_buffers = 0;     // no MTLBuffer — no GPU-VA mapping of the parent
+    res->use_residency_sets = false;
+    res->rset      = nil;
+    return res;
+}
+
 ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size, bool use_residency) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
 

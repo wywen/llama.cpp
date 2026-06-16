@@ -13,6 +13,12 @@
 #include <limits>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>      // [rrl] getenv (RRL_MOE_METAL_EVICT)
+#include <cstdint>      // [rrl] uint64_t (eviction counters)
+#include <atomic>       // [rrl] eviction counters
+#include <chrono>       // [rrl] evict-time profiling counter
+#include <vector>       // [rrl] Increment 1: per-op wired-expert id list
+#include <sys/mman.h>   // [rrl] madvise (page-in), msync, MS_INVALIDATE (eviction)
 
 // [rrl] Per-expert Metal decode hook — dispatch-table pattern.
 //
@@ -25,23 +31,190 @@
 //
 // Hook signature matches rrl_metal_expert_subbuffers in mmap_metal_experts.mm:
 //   int fn(void *host_base, size_t base_offs, int32_t n_expert, uint64_t stride,
-//          void **out_argbuf, void ***out_mtl_bufs)
+//          void **out_argbuf, void ***out_mtl_bufs,
+//          _Atomic uint8_t **out_state, _Atomic uint32_t **out_refcount)
+//
+// [rrl] PR#121 piggyback: out_state carries the per-expert NORMAL/EVICTING
+// state array.  [rrl] Increment 1: out_refcount carries the per-expert refcount
+// array (atomic uint32_t, calloc'd to 0).  Both are nullable (pass &ptr or
+// nullptr); the .mm side guards with `if (out_state)` / `if (out_refcount)`.
 
 typedef int (*rrl_expert_subbuffers_fn)(
-    void *    host_base,
-    size_t    base_offs,
-    int32_t   n_expert,
-    uint64_t  stride,
-    void **   out_argbuf,
-    void ***  out_mtl_bufs);
+    void *                   host_base,
+    size_t                   base_offs,
+    int32_t                  n_expert,
+    uint64_t                 stride,
+    void **                  out_argbuf,
+    void ***                 out_mtl_bufs,
+    std::atomic<uint8_t> **  out_state,
+    std::atomic<uint32_t> ** out_refcount);
+
+// [rrl] PR#121: _Atomic uint8_t (C) and std::atomic<uint8_t> (C++) are
+// layout- and lock-free-compatible on Apple (both are 1-byte, always lock-free).
+// [rrl] Increment 1: same guarantee for _Atomic uint32_t / std::atomic<uint32_t>.
+static_assert(sizeof(std::atomic<uint8_t>) == 1 &&
+              std::atomic<uint8_t>::is_always_lock_free,
+              "std::atomic<uint8_t> must be 1-byte and always lock-free");
+static_assert(sizeof(std::atomic<uint32_t>) == 4 &&
+              std::atomic<uint32_t>::is_always_lock_free,
+              "std::atomic<uint32_t> must be 4-byte and always lock-free");
 
 static rrl_expert_subbuffers_fn g_rrl_expert_subbuffers = nullptr;
 
 // Called once by the Rust crate shim (mmap_metal_experts.mm startup) to wire
 // in the ObjC++ implementation.  Idempotent: safe to call multiple times with
-// the same pointer (which happens on re-init).
+// the same pointer (which happens on re-init). (Exported for the crate; the
+// forward decl satisfies -Wmissing-prototypes — there is no shared header.)
+extern "C" void rrl_install_expert_subbuffers_hook(rrl_expert_subbuffers_fn fn);
 extern "C" void rrl_install_expert_subbuffers_hook(rrl_expert_subbuffers_fn fn) {
     g_rrl_expert_subbuffers = fn;
+}
+
+// [rrl] Region-membership detection for per-expert mmap-metal weights.
+//
+// We CANNOT identify an expert tensor by its buffer's buft name: the shim's
+// buft_alloc_buffer delegates to ggml_backend_metal_buffer_from_ptr_no_residency,
+// so the tensor's buffer->buft is Metal's own *_mapped buft ("mmap-metal" never
+// matches). Instead the shim registers its mmap region [base, base+size) and we
+// test whether src0->data falls inside it — the robust signal (matches how the KV
+// residency path identifies its buffers). Dispatch-table hook (NOUNDEFS dylib
+// can't reference the crate directly); installed by the shim at device open.
+typedef int (*rrl_addr_in_region_fn)(const void *addr);
+static rrl_addr_in_region_fn g_rrl_addr_in_region = nullptr;
+
+extern "C" void rrl_install_addr_in_region_hook(rrl_addr_in_region_fn fn);
+extern "C" void rrl_install_addr_in_region_hook(rrl_addr_in_region_fn fn) {
+    g_rrl_addr_in_region = fn;
+}
+
+// True iff t is a per-expert mmap-metal weight tensor (its data lives in a
+// registered mmap-metal region). Replaces the broken buft-name check.
+static inline bool rrl_is_expert_mmap_metal(const ggml_tensor *t) {
+    return t != nullptr && t->data != nullptr &&
+           g_rrl_addr_in_region != nullptr && g_rrl_addr_in_region(t->data) != 0;
+}
+
+// [rrl] Expert-eviction counters. Incremented in ggml_metal_op_mul_mat_id when
+// the rolling evict-previous runs (RRL_MOE_METAL_EVICT). Exported so a test can
+// confirm the mechanism processed the expected working-set volume (proof that
+// peak residency is bounded by construction — only ~1 op's experts are live
+// between evictions). bytes is cumulative across re-faults (≈ working set ×
+// n_forward_passes).
+static std::atomic<uint64_t> g_rrl_evict_calls{0};
+static std::atomic<uint64_t> g_rrl_evict_bytes{0};
+// [rrl] Cumulative wall-time (ns) spent in the eviction block (the deferred
+// per-expert/whole-tensor madvise work). Profiling counter to localize the LFU
+// path's decode overhead: compare against the cb-tick ns (moe_eval_cb.cpp).
+static std::atomic<uint64_t> g_rrl_evict_ns{0};
+// Counts mul_mat_id ops that actually ran in per-expert ptr-mode (use_expert_ptrs
+// = 1), to confirm the ptr-mode kernel engaged rather than silently falling back
+// to the stock path. >0 proves region detection + the sub-buffer hook fired.
+static std::atomic<uint64_t> g_rrl_ptrmode_calls{0};
+
+// [rrl] PR#121 piggyback: per-expert NORMAL/EVICTING state array for the PREVIOUS
+// mul_mat_id op (the one whose expert pages are being evicted in the next op's
+// rolling-evict slot).  Set by the encoder block (after the hook fires) and read
+// by the eviction block on the following op.  Null when no hook fired (first op,
+// or a non-ptr-mode layer) — the evictor falls back to bare madvise in that case.
+// File-scope so both the eviction block and the encoder block in the same function
+// can reach it without static-inside-braces scoping issues.
+static std::atomic<uint8_t> * s_rrl_prev_state = nullptr;
+
+// [rrl] Increment 1: per-expert refcount array for the PREVIOUS mul_mat_id op.
+// Set together with s_rrl_prev_state in the encoder block; read by the deferred
+// evictor to decrement each wired expert's refcount (acq_rel) before evicting.
+// Null when no hook fired; the evictor skips the decrement in that case.
+static std::atomic<uint32_t> * s_rrl_prev_refcount = nullptr;
+
+// [rrl] Increment 1: wired-expert lists.  s_rrl_wired_cur accumulates the UNIQUE
+// routed expert ids claimed by the CURRENT op's encoder (cleared at start of each
+// op's claim loop).  After the claim loop, it is moved into s_rrl_prev_wired so
+// the NEXT op's deferred evictor sees which experts were routed last op.
+// Only unique eids are stored (one ++ per unique eid per op).
+static std::vector<int32_t> s_rrl_wired_cur;
+static std::vector<int32_t> s_rrl_prev_wired;
+
+// [rrl] Eviction enable flag. Set by the crate (rrl_metal_set_evict) when it
+// installs the node-by-node MetalResident eval-cb — the precondition that makes
+// rolling evict-previous SAFE (the prior op has computed+synced before the next
+// op encodes). Eviction is MANDATORY for the per-expert path; this flag is not a
+// user toggle but the safety interlock — it stays 0 until the crate confirms the
+// node-by-node cb is installed, so the backend never evicts without that guarantee.
+static std::atomic<int> g_rrl_evict_on{0};
+extern "C" void rrl_metal_set_evict(int on);
+extern "C" void rrl_metal_set_evict(int on) {
+    g_rrl_evict_on.store(on ? 1 : 0, std::memory_order_relaxed);
+}
+
+// [rrl] Expert reclaim primitive (zero-copy expert path). Experts are mapped
+// read-only from the GGUF mmap, so the reclaim hint must be RO-capable:
+// MADV_FREE_REUSABLE returns EPERM (a silent no-op) on a PROT_READ mapping
+// (verified via /tmp/reclaim_probe), which would leave cold experts resident and
+// thrash the 14.4 GiB region into swap. msync(MS_INVALIDATE) drops the clean RO
+// pages immediately (resident→0) — the tightest bound, and cheap because there is
+// no dirty writeback. Validated on the full 30L run: hot set ~3 GiB, swap stayed
+// at 0, bit-exact logits. (The old copy-mode FREE_REUSABLE branch and the
+// RRL_MOE_RECLAIM tuning knob were removed with copy mode.)
+static inline void rrl_expert_reclaim(void *addr, size_t len) {
+    msync(addr, len, MS_INVALIDATE);
+}
+
+extern "C" void rrl_metal_evict_stats(uint64_t *calls, uint64_t *bytes,
+                                      uint64_t *ptrmode_calls);
+extern "C" void rrl_metal_evict_stats(uint64_t *calls, uint64_t *bytes,
+                                      uint64_t *ptrmode_calls) {
+    if (calls)         { *calls         = g_rrl_evict_calls.load(std::memory_order_relaxed); }
+    if (bytes)         { *bytes         = g_rrl_evict_bytes.load(std::memory_order_relaxed); }
+    if (ptrmode_calls) { *ptrmode_calls = g_rrl_ptrmode_calls.load(std::memory_order_relaxed); }
+}
+
+extern "C" void rrl_metal_evict_reset(void);
+extern "C" void rrl_metal_evict_reset(void) {
+    g_rrl_evict_calls.store(0, std::memory_order_relaxed);
+    g_rrl_evict_bytes.store(0, std::memory_order_relaxed);
+    g_rrl_ptrmode_calls.store(0, std::memory_order_relaxed);
+    g_rrl_evict_ns.store(0, std::memory_order_relaxed);
+    // [rrl] PR#121: clear the cross-op state pointer on reset so a fresh
+    // decode sequence starts with no stale state from a prior run.
+    s_rrl_prev_state = nullptr;
+    // [rrl] Increment 1: clear refcount pointer and wired lists on reset.
+    s_rrl_prev_refcount = nullptr;
+    s_rrl_wired_cur.clear();
+    s_rrl_prev_wired.clear();
+}
+
+// [rrl] Read the cumulative eviction-block wall-time (ns) since the last reset.
+extern "C" uint64_t rrl_metal_evict_ns(void);
+extern "C" uint64_t rrl_metal_evict_ns(void) {
+    return g_rrl_evict_ns.load(std::memory_order_relaxed);
+}
+
+// [rrl] LFU keep-mask handoff (Approach D). The crate installs a per-(layer,expert)
+// byte mask before each forward pass via rrl_metal_set_keep_mask; each byte is 1
+// (HOT — keep resident) or 0 (COLD — evict on the deferred rolling-evict slot).
+// When the mask is absent (null pointer or dimension mismatch), the whole-tensor
+// fallback runs instead. The mask is written by moe_metal_lfu_eval_cb at ask=true
+// (BEFORE the kernel), so it reflects the LFU policy decision for the current token.
+// The actual eviction still happens in the NEXT op's rolling-evict slot (deferred
+// by one) — by then the current op has synced, so the GPU is done with those pages.
+static const uint8_t * g_rrl_keep_mask    = nullptr;
+static uint32_t        g_rrl_keep_n_layer  = 0;
+static uint32_t        g_rrl_keep_n_expert = 0;
+
+extern "C" void rrl_metal_set_keep_mask(const uint8_t * mask, uint32_t n_layer,
+                                        uint32_t n_expert);
+extern "C" void rrl_metal_set_keep_mask(const uint8_t * mask, uint32_t n_layer,
+                                        uint32_t n_expert) {
+    g_rrl_keep_mask    = mask;
+    g_rrl_keep_n_layer  = n_layer;
+    g_rrl_keep_n_expert = n_expert;
+}
+
+extern "C" void rrl_metal_clear_keep_mask(void);
+extern "C" void rrl_metal_clear_keep_mask(void) {
+    g_rrl_keep_mask    = nullptr;
+    g_rrl_keep_n_layer  = 0;
+    g_rrl_keep_n_expert = 0;
 }
 
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
@@ -2332,6 +2505,189 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_src2 = ggml_metal_get_buffer_id(op->src[2]);
     ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
 
+    // [rrl] Expert EVICTION (#3): rolling evict-previous-on-next. When src0 is a
+    // per-expert mmap-metal weight tensor, drop the PREVIOUS per-expert
+    // mul_mat_id's resident pages. Under the MetalResident node-by-node callback
+    // (which the per-expert path requires), the previous op's chunk has already
+    // computed+synced before this op encodes, so its expert pages are safe to
+    // reclaim. Experts are mapped read-only from the GGUF, so rrl_expert_reclaim
+    // uses msync(MS_INVALIDATE): MADV_FREE_REUSABLE EPERMs on a read-only mapping
+    // (silent no-op → cold experts never reclaim → 14.4 GiB accumulates → swap
+    // thrash), whereas the clean PROT_READ pages invalidate as a cheap drop with no
+    // writeback and no stall (verified: /tmp/reclaim_probe).
+    // Pages re-fault from the backing file on next access — the paged-expert design
+    // (GPU re-fault verified safe; zero-copy re-fault via the page-in WILLNEED+touch
+    // block below).
+    // This bounds resident expert bytes to ~the current op instead of accumulating
+    // the whole model across a forward pass. Eviction is MANDATORY for the
+    // per-expert path; g_rrl_evict_on is the safety interlock the crate sets when
+    // it installs the MetalResident node-by-node cb (not a user toggle). UNSAFE
+    // without node-by-node (would reclaim pages the GPU is still reading) —
+    // coupling eviction to that cb install is what keeps it safe by construction.
+    //
+    // [rrl] LFU keep-mask (Approach D): when g_rrl_keep_mask is installed, only
+    // COLD experts (mask byte == 0) are evicted; HOT experts (mask byte == 1) are
+    // skipped so their pages stay resident across tokens. The mask is written by
+    // moe_metal_lfu_eval_cb at ask=true (before the kernel), so it reflects the
+    // LFU decision for the current token. Because eviction is DEFERRED by one op
+    // (we evict the PREVIOUS op's range here, not the current), the GPU has already
+    // synced the previous op before any page is released — safety unchanged.
+    // When the mask is absent or the previous-op dimensions don't match, fall back
+    // to the original whole-tensor eviction path.
+    {
+        const bool rrl_evict = (g_rrl_evict_on.load(std::memory_order_relaxed) != 0);
+        static void *     s_prev_addr   = nullptr;
+        static size_t     s_prev_len    = 0;
+        static int        s_prev_layer  = -1;
+        static uint64_t   s_prev_stride = 0;
+        static int64_t    s_prev_nexp   = 0;
+        // [rrl] PR#121: s_prev_state is file-scope (s_rrl_prev_state) so the
+        // encoder block below can write it after the hook fires.
+        const ggml_tensor * s0 = op->src[0];
+        if (rrl_evict && rrl_is_expert_mmap_metal(s0)) {
+            const auto rrl_ev_t0 = std::chrono::steady_clock::now();
+            if (s_prev_addr != nullptr) {
+                // [rrl] Selective per-expert eviction when a keep-mask is installed.
+                // HOT experts (mask==1) are skipped; only COLD experts (mask==0) get
+                // madvise(MADV_FREE_REUSABLE) on their individual per-expert stride.
+                const uint8_t * mask    = g_rrl_keep_mask;
+                const uint32_t  n_layer = g_rrl_keep_n_layer;
+                const uint32_t  n_exp   = g_rrl_keep_n_expert;
+                // [rrl] Increment 1: the residency-aware path iterates the prev op's
+                // WIRED (routed) experts. A non-empty wired list means the prev op
+                // was mv_id ptr-mode. An mm_id (prefill) op has NO per-expert wired
+                // set (whole-buffer resident) → wired is empty → fall through to the
+                // whole-tensor fallback so its resident experts are still evicted
+                // (gating on use_mask alone would iterate an empty list = no evict =
+                // leak for >32-token prefills).
+                const bool use_mask = (mask != nullptr &&
+                                       s_prev_layer >= 0 &&
+                                       (uint32_t)s_prev_layer < n_layer &&
+                                       s_prev_nexp <= (int64_t)n_exp &&
+                                       s_prev_stride > 0 &&
+                                       !s_rrl_prev_wired.empty());
+                if (use_mask) {
+                    // [rrl] Increment 1: RESIDENCY-AWARE EVICTOR.
+                    // Iterate only over the PREVIOUS op's wired (routed) experts
+                    // (s_rrl_prev_wired), not over all s_prev_nexp experts.
+                    // For each wired expert:
+                    //   1. Decrement its refcount (acq_rel) — the deferred-by-one
+                    //      slot guarantees the previous op has synced, so refcount
+                    //      drops to 0 here in the synchronous path.
+                    //   2. Check if it is COLD (mask byte == 0).  HOT experts (mask
+                    //      byte == 1) are kept resident; only their refcount is
+                    //      decremented, no madvise.
+                    //   3. For COLD experts: full try_evict with the validated
+                    //      handshake ordering (c3a97bc metal_probe_evict_handshake):
+                    //        CAS NORMAL→EVICTING (seq_cst) → seq_cst fence →
+                    //        recheck refcount==0 (acquire) → madvise → store NORMAL (release).
+                    //      Abort if CAS fails (another evictor won) or refcount != 0
+                    //      (encoder raced in — impossible in the sync path but correct
+                    //      in the later async cut).
+                    //      When s_rrl_prev_state==nullptr: bare madvise (no CAS guard).
+                    // This evicts ONLY routed-and-cold experts (≈ n_expert_used minus
+                    // hot), not all 128 — far fewer madvise calls, and re-faulted cold
+                    // experts re-evict next time they are routed (no leak).
+                    constexpr uint8_t kNormal   = 0;
+                    constexpr uint8_t kEvicting = 1;
+                    std::atomic<uint8_t>  * st  = s_rrl_prev_state;
+                    std::atomic<uint32_t> * rc  = s_rrl_prev_refcount;
+                    for (int32_t eid : s_rrl_prev_wired) {
+                        // Bounds guard (defensive; wired list is built from valid eids).
+                        if (eid < 0 || eid >= (int32_t) s_prev_nexp) { continue; }
+                        // Step 1: decrement refcount (acq_rel) — op has synced.
+                        if (rc != nullptr) {
+                            rc[eid].fetch_sub(1u, std::memory_order_acq_rel);
+                        }
+                        // Step 2: skip HOT experts (keep resident).
+                        const bool cold =
+                            (mask[(std::size_t)s_prev_layer * n_exp + (std::size_t)eid] == 0);
+                        if (!cold) { continue; }
+                        // Step 3: try_evict this cold expert.
+                        char * expert_addr =
+                            static_cast<char *>(s_prev_addr) +
+                            (std::size_t)eid * (std::size_t)s_prev_stride;
+                        if (st != nullptr) {
+                            // Full try_evict: validated handshake ordering.
+                            // CAS NORMAL→EVICTING (seq_cst).
+                            uint8_t expect = kNormal;
+                            if (!st[eid].compare_exchange_strong(
+                                    expect, kEvicting,
+                                    std::memory_order_seq_cst,
+                                    std::memory_order_relaxed)) {
+                                continue; // another evictor won the CAS
+                            }
+                            // seq_cst fence: ensures refcount store (from encoder)
+                            // is visible before we recheck.
+                            std::atomic_thread_fence(std::memory_order_seq_cst);
+                            // Recheck refcount: abort if encoder raced in.
+                            const uint32_t live = (rc != nullptr)
+                                ? rc[eid].load(std::memory_order_acquire)
+                                : 0u;
+                            if (live == 0u) {
+                                rrl_expert_reclaim(expert_addr, (std::size_t)s_prev_stride);
+                                g_rrl_evict_calls.fetch_add(1, std::memory_order_relaxed);
+                                g_rrl_evict_bytes.fetch_add(
+                                    s_prev_stride, std::memory_order_relaxed);
+                            }
+                            // Restore to NORMAL (release).
+                            st[eid].store(kNormal, std::memory_order_release);
+                        } else {
+                            // No state ptr (no hook last op): bare reclaim.
+                            rrl_expert_reclaim(expert_addr, (std::size_t)s_prev_stride);
+                            g_rrl_evict_calls.fetch_add(1, std::memory_order_relaxed);
+                            g_rrl_evict_bytes.fetch_add(
+                                s_prev_stride, std::memory_order_relaxed);
+                        }
+                    }
+                } else {
+                    // Fallback: no mask or dimension mismatch — evict whole tensor.
+                    // NOT state-guarded: this is the degenerate path (msync over
+                    // the full tensor in one call, not per-expert); no per-expert
+                    // CAS is applied here.
+                    rrl_expert_reclaim(s_prev_addr, s_prev_len);
+                    g_rrl_evict_calls.fetch_add(1, std::memory_order_relaxed);
+                    g_rrl_evict_bytes.fetch_add((uint64_t)s_prev_len,
+                                                std::memory_order_relaxed);
+                }
+            }
+            g_rrl_evict_ns.fetch_add(
+                (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - rrl_ev_t0).count(),
+                std::memory_order_relaxed);
+            // Record this op's geometry for the NEXT iteration's eviction slot.
+            // src0->data is page-aligned (mmap-metal buft) and ggml_nbytes is a
+            // whole number of (padded) per-expert strides → page-multiple.
+            // Parse the layer index from s0->name ("blk.<L>.ffn_...").
+            {
+                int layer = -1;
+                const char *p = s0->name;
+                if (p[0]=='b' && p[1]=='l' && p[2]=='k' && p[3]=='.') {
+                    p += 4;
+                    int val = 0;
+                    bool ok = false;
+                    while (*p >= '0' && *p <= '9') { val = val*10 + (*p-'0'); ++p; ok=true; }
+                    if (ok && *p == '.') { layer = val; }
+                }
+                s_prev_layer  = layer;
+            }
+            s_prev_addr   = s0->data;
+            s_prev_len    = ggml_nbytes(s0);
+            s_prev_stride = (uint64_t)s0->nb[2];
+            s_prev_nexp   = s0->ne[2];
+            // [rrl] PR#121: reset s_rrl_prev_state to nullptr so that if the
+            // encoder block below doesn't fire the hook (e.g. hook returned an
+            // error or ids_base==null), the next iteration's evictor sees null
+            // and falls back to bare madvise.  The encoder block overwrites it
+            // with expert_state after a successful hook call.
+            // [rrl] Increment 1: reset refcount ptr and wired lists for the same
+            // reason — the encoder block overwrites them on a successful hook call.
+            s_rrl_prev_state    = nullptr;
+            s_rrl_prev_refcount = nullptr;
+            s_rrl_prev_wired.clear();
+        }
+    }
+
     const uint32_t r2 = 1;
     const uint32_t r3 = 1;
 
@@ -2451,12 +2807,18 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         int32_t use_expert_ptrs = 0;
         void *  argbuf_mtl    = nullptr; // id<MTLBuffer> for the gpuAddress array
         void ** expert_mtl_bufs = nullptr; // per-expert id<MTLBuffer> for useResource
+        // [rrl] PR#121 piggyback: per-expert NORMAL/EVICTING state array from the
+        // cache entry.  Null until the hook fires; saved into s_rrl_prev_state below so
+        // the NEXT op's evictor can CAS-guard its per-expert madvise calls.
+        std::atomic<uint8_t> * expert_state = nullptr;
+        // [rrl] Increment 1: per-expert refcount array from the cache entry.
+        // Null until the hook fires; saved into s_rrl_prev_refcount below so the
+        // NEXT op's deferred evictor can decrement each wired expert's refcount.
+        std::atomic<uint32_t> * expert_refcount = nullptr;
 
         const ggml_tensor * src0 = op->src[0];
         if (g_rrl_expert_subbuffers != nullptr &&
-            src0->buffer != nullptr &&
-            src0->buffer->buft != nullptr &&
-            strcmp(ggml_backend_buft_name(src0->buffer->buft), "mmap-metal") == 0 &&
+            rrl_is_expert_mmap_metal(src0) &&
             ne02 >= 1) {
             // Get the host base of the parent buffer and the tensor's offset within it.
             ggml_metal_buffer_t metal_buf = (ggml_metal_buffer_t) src0->buffer->context;
@@ -2466,30 +2828,139 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             // nb02 is the padded per-expert stride (set by the loader to LLAMA_METAL_EXPERT_ALIGN).
             const uint64_t stride = (uint64_t) nb02;
 
+            // [rrl] PR#121: pass &expert_state; Increment 1: pass &expert_refcount.
             int hook_rc = g_rrl_expert_subbuffers(
                 host_base, base_offs, (int32_t) ne02, stride,
-                &argbuf_mtl, &expert_mtl_bufs);
+                &argbuf_mtl, &expert_mtl_bufs, &expert_state, &expert_refcount);
 
             if (hook_rc == 0 && argbuf_mtl != nullptr && expert_mtl_bufs != nullptr) {
                 // Read the routed expert ids from src[2] (the ids tensor, host-visible).
                 // Valid here because cb_eval runs node-by-node: the router node that
                 // wrote src[2] has already been executed on UMA before this node encodes.
-                const int32_t * ids_host = (const int32_t *) op->src[2]->data;
-                const int32_t   n_ids    = ne20 * ne21; // nei0 * nei1
+                //
+                // CRITICAL: the ids tensor is ROW-STRIDED. src[2] is the top_k VIEW
+                // over the argsort output, so each token's row is nb21 bytes wide
+                // (the FULL n_expert argsort row), and only the first ne20 (=
+                // n_expert_used) entries per row are the selected experts. The kernel
+                // reads id[i02] = ((int32*)(ids + iid1*nbi1))[idx] with nbi1 = nb21,
+                // i.e. it strides by nb21 per token. We MUST read with the same stride
+                // — a flat ids_host[0..ne20*ne21) read would, for tokens >0, pick up
+                // the unselected tail of token 0's row instead of that token's experts,
+                // useResource the wrong subset, and the kernel would then dereference a
+                // non-resident expert (garbage). (Only manifests for ne21>1: a single
+                // decode token is one row so flat==strided. Batched eval ne21>1, e.g.
+                // a multi-token prompt under the mv_id threshold, exposes it.)
+                const char *  ids_base = (const char *) op->src[2]->data;
 
-                if (ids_host != nullptr) {
-                    // useResource only the routed expert sub-buffers.
-                    for (int32_t i = 0; i < n_ids; ++i) {
-                        int32_t eid = ids_host[i];
-                        if (eid >= 0 && eid < (int32_t) ne02 && expert_mtl_bufs[eid] != nullptr) {
-                            // MTLResourceUsageRead = 1
-                            ggml_metal_encoder_use_resource_raw(enc, expert_mtl_bufs[eid], /*MTLResourceUsageRead=*/1u);
+                if (ids_base != nullptr) {
+                    {
+                        // useResource only the routed expert sub-buffers. Read each
+                        // token's row at ids_base + i1*nb21 (matching the kernel's
+                        // nbi1=nb21 stride); the selected experts are the first ne20
+                        // (contiguous, nb20=4) entries of each row.
+                        //
+                        // [rrl] PR#121 ENCODER CLAIM: before useResource each
+                        // routed expert, spin-wait while it is EVICTING.  Inert in
+                        // the synchronous path (state always NORMAL when observed
+                        // here); load-bearing once a background evictor exists.
+                        //
+                        // [rrl] Increment 1: dedup per unique eid (seen[]) so each
+                        // expert gets exactly one refcount++ and one wired-list entry,
+                        // regardless of how many tokens route to it.  useResource is
+                        // also called only once per unique expert (idempotent on Metal,
+                        // but dedup avoids redundant calls and keeps the refcount balanced).
+                        // [rrl] Increment 1: clear wired list and seen bitmap at start.
+                        s_rrl_wired_cur.clear();
+                        std::vector<uint8_t> seen((size_t)ne02, 0);
+
+                        // [rrl] Zero-copy page-in: experts are mapped read-only from
+                        // the GGUF and never CPU-touched at load (zero-copy = no
+                        // memcpy), so their pages are cold. useResource on a
+                        // no-residency buffer does NOT fault cold mmap pages in, so the
+                        // GPU would read non-resident pages → garbage logits. For each
+                        // unique routed expert (already confirmed in a registered
+                        // mmap-metal region) we synchronously fault its pages in BEFORE
+                        // dispatch: madvise(WILLNEED) as a readahead hint, then a
+                        // volatile one-byte-per-page touch (the volatile defeats
+                        // dead-read elimination; madvise alone is async and may not land
+                        // before the GPU dispatch). No mlock — a Metal probe showed a
+                        // reclaimed+refaulted RO page stays GPU-visible, and wiring just
+                        // starves the GPU working set.
+                        // macOS arm64 always uses 16 KiB pages.
+                        static constexpr size_t kRrlPageSize = (size_t)16384;
+
+                        for (int32_t i1 = 0; i1 < (int32_t) ne21; ++i1) {
+                            const int32_t * row =
+                                (const int32_t *) (ids_base + (size_t) i1 * nb21);
+                            for (int32_t i0 = 0; i0 < (int32_t) ne20; ++i0) {
+                                int32_t eid = row[i0];
+                                if (eid >= 0 && eid < (int32_t) ne02 &&
+                                    expert_mtl_bufs[eid] != nullptr) {
+                                    if (!seen[(size_t)eid]) {
+                                        seen[(size_t)eid] = 1;
+
+                                        // [rrl] Zero-copy page-in: fault in this
+                                        // routed expert's pages before useResource so
+                                        // the GPU sees resident data, not garbage.
+                                        {
+                                            volatile const char * ep =
+                                                (volatile const char *) src0->data +
+                                                (size_t) eid * (size_t) stride;
+                                            madvise((void *) ep, (size_t) stride,
+                                                    MADV_WILLNEED);
+                                            // Synchronous touch: one byte per page.
+                                            for (size_t pg = 0;
+                                                 pg < (size_t) stride;
+                                                 pg += kRrlPageSize) {
+                                                (void) ep[pg];
+                                            }
+                                        }
+
+                                        // [rrl] Increment 1: ENCODER PUBLISH.
+                                        // refcount++ (relaxed) then seq_cst fence,
+                                        // BEFORE the spin-while-EVICTING check.
+                                        // Ordering: relaxed fetch_add → seq_cst fence →
+                                        // spin-acquire.  Matches the validated handshake
+                                        // (c3a97bc metal_probe_evict_handshake).
+                                        if (expert_refcount != nullptr) {
+                                            expert_refcount[eid].fetch_add(
+                                                1u, std::memory_order_relaxed);
+                                            std::atomic_thread_fence(
+                                                std::memory_order_seq_cst);
+                                        }
+                                        // [rrl] PR#121: spin while EVICTING (RRL_EXP_EVICTING=1).
+                                        if (expert_state != nullptr) {
+                                            while (expert_state[eid].load(
+                                                       std::memory_order_acquire) == 1u) {
+                                                __builtin_arm_yield();
+                                            }
+                                        }
+                                        // useResource the routed expert's sub-buffer
+                                        // (MTLResourceUsageRead = 1).
+                                        ggml_metal_encoder_use_resource_raw(
+                                            enc, expert_mtl_bufs[eid],
+                                            /*usage=*/1u);
+                                        // [rrl] Increment 1: record in wired list.
+                                        s_rrl_wired_cur.push_back(eid);
+                                    }
+                                }
+                            }
                         }
                     }
                     use_expert_ptrs = 1;
+                    g_rrl_ptrmode_calls.fetch_add(1, std::memory_order_relaxed);
                 }
             }
         }
+        // [rrl] PR#121: save this op's state pointer so the NEXT op's evictor
+        // (deferred rolling-evict slot) can CAS-guard its per-expert madvise.
+        // s_rrl_prev_state is file-scope (alongside g_rrl_evict_calls etc.) so
+        // both this encoder block and the eviction block above can reach it.
+        // [rrl] Increment 1: save refcount ptr + move wired list for the evictor.
+        s_rrl_prev_state    = expert_state;
+        s_rrl_prev_refcount = expert_refcount;
+        s_rrl_prev_wired    = std::move(s_rrl_wired_cur);
+        s_rrl_wired_cur.clear(); // leave cur empty after move
 
         ggml_metal_kargs_mul_mv_id args = {
             /*.nei0            =*/ ne20,

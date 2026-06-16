@@ -62,6 +62,12 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 // msync(MS_INVALIDATE) to reclaim pages while the buffer is live (KV eviction).
 GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_metal_buffer_from_ptr_no_residency(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size);
 
+// [rrl] Zero-copy per-expert region: metadata-only mapped buffer — tracks the host
+// range but creates NO MTLBuffer (no GPU-VA mapping). The GPU reaches each routed
+// expert via its own per-expert sub-buffer, so mapping the whole region here too
+// would double-count it in currentAllocatedSize and trip the residency ceiling.
+GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_metal_buffer_from_ptr_metadata_only(ggml_backend_dev_t dev, void * ptr, size_t size);
+
 #ifdef __cplusplus
 }
 #endif

@@ -89,6 +89,11 @@ struct llama_model_loader {
     bool no_alloc;
 
     bool per_expert_moe = false;  // true when moe.layout == "per_expert" in this GGUF
+    // Set to use_mmap for a per_expert model: skip the assembly memcpy and point the
+    // fused tensor's data directly into the GGUF mmap (requires the page-aligned
+    // trailing-expert layout). False on the CPU managed-expert path (use_mmap=false),
+    // which keeps the memcpy assembly via the `use_mmap && per_expert_zerocopy` gate.
+    bool per_expert_zerocopy = false;
     // Names of fused expert tensors synthesised from per-expert slices (need assembly at load time).
     std::unordered_set<std::string> per_expert_assembled;
 

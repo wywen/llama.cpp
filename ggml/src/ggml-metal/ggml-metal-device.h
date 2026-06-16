@@ -280,6 +280,7 @@ typedef struct ggml_metal_buffer * ggml_metal_buffer_t;
 
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared);
 ggml_metal_buffer_t ggml_metal_buffer_map (ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size, bool use_residency);
+ggml_metal_buffer_t ggml_metal_buffer_map_metadata_only(ggml_metal_device_t dev, void * ptr, size_t size); // [rrl] zero-copy: no MTLBuffer, ptr-mode reads via sub-buffers
 
 void   ggml_metal_buffer_free     (ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_base (ggml_metal_buffer_t buf);

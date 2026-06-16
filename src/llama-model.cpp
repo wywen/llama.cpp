@@ -1455,6 +1455,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
+        // [rrl] NOTE: forcing the real-Metal default-buft to the COPY path under
+        // zero-copy (to avoid the whole-file resident mmap buffer) SEGFAULTS — the
+        // experts' fused tensor lives in this same default context with
+        // cur->buffer = the mmap buffer and cur->data pointing into it, so copying
+        // the buffer out-of-bounds the experts. Experts + non-expert share the
+        // default mmap buffer; they can't be separated here. (See memory.)
         std::vector<ggml_backend_buffer_ptr> bufs;
         if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
@@ -1476,6 +1482,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 }
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
+            }
+            // [zero-copy per-expert] If no mmap range was found for any file (e.g. a
+            // context that contains only sub-page assembled tensors whose offs=0
+            // placeholder was excluded from get_mapping_range), fall through to the
+            // bump-alloc path so those tensors get a proper backend buffer.
+            if (bufs.empty()) {
+                ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+                if (buf == nullptr) {
+                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                }
+                bufs.emplace_back(buf);
+                for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                    buf_map.emplace(idx, buf);
+                }
             }
         } else {
             ggml_backend_buffer_t buf;
