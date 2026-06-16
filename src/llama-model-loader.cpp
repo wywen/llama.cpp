@@ -2016,8 +2016,23 @@ bool llama_model_loader::load_all_data(
                     }
                     continue; // skip copy loop, skip reclaim, skip tensor_set
                 }
-                // Contiguity check failed — on-disk layout is not aligned; fall through
-                // to the copy path so loading still works (just not zero-copy).
+                // Contiguity check failed — on-disk layout is not page-aligned, so the
+                // fused tensor cannot be pointed into the mmap. On the mmap-metal path
+                // cur->data is null and the tensor's backend buffer is metadata-only (no
+                // MTLBuffer); the copy fallback below would ggml_backend_tensor_set into a
+                // null tensor->data and crash (issue #138). Fail loudly instead: un-aligned
+                // per-expert GGUFs are unsupported on this path — regenerate the fixture
+                // with page-aligned expert sub-buffers (the -aligned variants). The
+                // CPU/tight path keeps cur->data pre-allocated and assembles in place below,
+                // so it is unaffected.
+                if (cur->data == nullptr) {
+                    throw std::runtime_error(format(
+                        "per-expert tensor '%s': zero-copy contiguity check failed and no "
+                        "writable backend buffer is available (un-aligned per-expert GGUF on "
+                        "the mmap-metal single-device path). Regenerate with a page-aligned "
+                        "(-aligned) per-expert GGUF.",
+                        fused_name.c_str()));
+                }
                 LLAMA_LOG_WARN("%s: zero-copy contiguity check FAILED for %s — falling back to copy path\n",
                     __func__, fused_name.c_str());
             }
