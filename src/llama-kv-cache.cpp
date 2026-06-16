@@ -98,20 +98,43 @@ llama_kv_cache::llama_kv_cache(
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
 
-    // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
-    struct ggml_backend_buft_comparator {
-        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
-            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+    // The mmap-metal device wants each transformer layer's K/V in its
+    // own ggml_backend_buffer, so the per-layer residency manager can free/recreate
+    // one layer's Metal buffer (over a stable host mmap range) without disturbing the
+    // others. This is gated strictly by buft name: every other device (CPU, default
+    // Metal, mmap-cpu) keeps the historical single-buffer-per-buft layout.
+    auto buft_per_layer = [](ggml_backend_buffer_type_t buft) -> bool {
+        return strcmp(ggml_backend_buft_name(buft), "mmap-metal") == 0;
+    };
+
+    // define a comparator for the (buft, layer) -> ctx map to ensure that the order
+    // is well-defined. layer == -1 means "one shared context for this buft" (the
+    // default); a per-layer buft instead gets one context — hence one buffer — per il.
+    struct buft_layer_key {
+        ggml_backend_buffer_type_t buft;
+        int layer;
+    };
+    struct buft_layer_comparator {
+        bool operator()(const buft_layer_key & lhs, const buft_layer_key & rhs) const {
+            const int c = strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft));
+            if (c != 0) {
+                return c < 0;
+            }
+            return lhs.layer < rhs.layer;
         }
     };
-    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    std::map<buft_layer_key, ggml_context_ptr, buft_layer_comparator> ctx_map;
 
-    // create a context for each buffer type
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        auto it = ctx_map.find(buft);
+    // create a context for each buffer type (and, for a per-layer buft, each layer)
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft, int il) -> ggml_context * {
+        const int key_layer = buft_per_layer(buft) ? il : -1;
+        const buft_layer_key key{ buft, key_layer };
+        auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
+            // A per-layer context only ever holds one layer's tensors.
+            const uint32_t n_ctx_layers = buft_per_layer(buft) ? 1u : n_layer_kv;
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer_kv*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_ctx_layers*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -121,7 +144,7 @@ llama_kv_cache::llama_kv_cache(
                 return nullptr;
             }
 
-            ctx_map.emplace(buft, ctx);
+            ctx_map.emplace(key, ctx);
 
             return ctx;
         }
@@ -199,7 +222,7 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
-        ggml_context * ctx = ctx_for_buft(buft);
+        ggml_context * ctx = ctx_for_buft(buft, (int) il);
         if (!ctx) {
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
@@ -250,8 +273,11 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    // allocate tensors and initialize the buffers to avoid NaNs in the padding
-    for (auto & [buft, ctx] : ctx_map) {
+    // allocate tensors and initialize the buffers to avoid NaNs in the padding.
+    // For a per-layer buft this map has one entry per layer, so each iteration
+    // allocates that layer's own buffer (independently freeable by the manager).
+    for (auto & [key, ctx] : ctx_map) {
+        ggml_backend_buffer_type_t buft = key.buft;
         ggml_backend_buffer_t buf;
         if (model.hparams.no_alloc) {
             buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
