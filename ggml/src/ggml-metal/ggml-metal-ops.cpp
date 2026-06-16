@@ -12,6 +12,37 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <cstring>
+
+// [rrl] Per-expert Metal decode hook — dispatch-table pattern.
+//
+// libggml-metal is a two-level-namespace NOUNDEFS dylib: it cannot reference
+// symbols from the Rust crate directly.  Instead, the crate calls
+// rrl_install_expert_subbuffers_hook (exported from this file) at startup to
+// wire its ObjC++ implementation (mmap_metal_experts.mm) into the table.
+// ggml_metal_op_mul_mat_id dispatches through the function pointer; when not
+// installed (default null) the per-expert path is simply skipped.
+//
+// Hook signature matches rrl_metal_expert_subbuffers in mmap_metal_experts.mm:
+//   int fn(void *host_base, size_t base_offs, int32_t n_expert, uint64_t stride,
+//          void **out_argbuf, void ***out_mtl_bufs)
+
+typedef int (*rrl_expert_subbuffers_fn)(
+    void *    host_base,
+    size_t    base_offs,
+    int32_t   n_expert,
+    uint64_t  stride,
+    void **   out_argbuf,
+    void ***  out_mtl_bufs);
+
+static rrl_expert_subbuffers_fn g_rrl_expert_subbuffers = nullptr;
+
+// Called once by the Rust crate shim (mmap_metal_experts.mm startup) to wire
+// in the ObjC++ implementation.  Idempotent: safe to call multiple times with
+// the same pointer (which happens on re-init).
+extern "C" void rrl_install_expert_subbuffers_hook(rrl_expert_subbuffers_fn fn) {
+    g_rrl_expert_subbuffers = fn;
+}
 
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
@@ -2406,27 +2437,82 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
         const size_t smem = pipeline.smem;
 
+        // [rrl] Per-expert decode mode: detect mmap-metal src0 and call the shim
+        // hook to get per-expert sub-buffer handles.
+        //
+        // Gate: src0 must carry the "mmap-metal" buft name AND ne02 (n_expert)
+        // must be >= 1 (the loader stamps this buft only for the per-expert GGUF
+        // with moe.layout=per_expert; stock fused models use the ordinary Metal
+        // buft and keep the stock path byte-identical).
+        //
+        // The hook is weak-linked (optional feature): if rrl_metal_expert_subbuffers
+        // is not linked in (no-residency build), the flag stays 0 and the stock
+        // nb02-stride path runs unchanged.
+        int32_t use_expert_ptrs = 0;
+        void *  argbuf_mtl    = nullptr; // id<MTLBuffer> for the gpuAddress array
+        void ** expert_mtl_bufs = nullptr; // per-expert id<MTLBuffer> for useResource
+
+        const ggml_tensor * src0 = op->src[0];
+        if (g_rrl_expert_subbuffers != nullptr &&
+            src0->buffer != nullptr &&
+            src0->buffer->buft != nullptr &&
+            strcmp(ggml_backend_buft_name(src0->buffer->buft), "mmap-metal") == 0 &&
+            ne02 >= 1) {
+            // Get the host base of the parent buffer and the tensor's offset within it.
+            ggml_metal_buffer_t metal_buf = (ggml_metal_buffer_t) src0->buffer->context;
+            void *   host_base = ggml_metal_buffer_get_base(metal_buf);
+            // tensor->data is the absolute host pointer to expert 0's start.
+            const size_t base_offs = (size_t)((const char *) src0->data - (const char *) host_base);
+            // nb02 is the padded per-expert stride (set by the loader to LLAMA_METAL_EXPERT_ALIGN).
+            const uint64_t stride = (uint64_t) nb02;
+
+            int hook_rc = g_rrl_expert_subbuffers(
+                host_base, base_offs, (int32_t) ne02, stride,
+                &argbuf_mtl, &expert_mtl_bufs);
+
+            if (hook_rc == 0 && argbuf_mtl != nullptr && expert_mtl_bufs != nullptr) {
+                // Read the routed expert ids from src[2] (the ids tensor, host-visible).
+                // Valid here because cb_eval runs node-by-node: the router node that
+                // wrote src[2] has already been executed on UMA before this node encodes.
+                const int32_t * ids_host = (const int32_t *) op->src[2]->data;
+                const int32_t   n_ids    = ne20 * ne21; // nei0 * nei1
+
+                if (ids_host != nullptr) {
+                    // useResource only the routed expert sub-buffers.
+                    for (int32_t i = 0; i < n_ids; ++i) {
+                        int32_t eid = ids_host[i];
+                        if (eid >= 0 && eid < (int32_t) ne02 && expert_mtl_bufs[eid] != nullptr) {
+                            // MTLResourceUsageRead = 1
+                            ggml_metal_encoder_use_resource_raw(enc, expert_mtl_bufs[eid], /*MTLResourceUsageRead=*/1u);
+                        }
+                    }
+                    use_expert_ptrs = 1;
+                }
+            }
+        }
+
         ggml_metal_kargs_mul_mv_id args = {
-            /*.nei0 =*/ ne20,
-            /*.nei1 =*/ ne21,
-            /*.nbi1 =*/ nb21,
-            /*.ne00 =*/ ne00,
-            /*.ne01 =*/ ne01,
-            /*.ne02 =*/ ne02,
-            /*.nb00 =*/ nb00,
-            /*.nb01 =*/ nb01,
-            /*.nb02 =*/ nb02,
-            /*.ne10 =*/ ne10,
-            /*.ne11 =*/ ne11,
-            /*.ne12 =*/ ne12,
-            /*.ne13 =*/ ne13,
-            /*.nb10 =*/ nb10,
-            /*.nb11 =*/ nb11,
-            /*.nb12 =*/ nb12,
-            /*.ne0  =*/ ne0,
-            /*.ne1  =*/ ne1,
-            /*.nb1  =*/ nb1,
-            /*.nr0  =*/ nr0,
+            /*.nei0            =*/ ne20,
+            /*.nei1            =*/ ne21,
+            /*.nbi1            =*/ nb21,
+            /*.ne00            =*/ ne00,
+            /*.ne01            =*/ ne01,
+            /*.ne02            =*/ ne02,
+            /*.nb00            =*/ nb00,
+            /*.nb01            =*/ nb01,
+            /*.nb02            =*/ nb02,
+            /*.ne10            =*/ ne10,
+            /*.ne11            =*/ ne11,
+            /*.ne12            =*/ ne12,
+            /*.ne13            =*/ ne13,
+            /*.nb10            =*/ nb10,
+            /*.nb11            =*/ nb11,
+            /*.nb12            =*/ nb12,
+            /*.ne0             =*/ ne0,
+            /*.ne1             =*/ ne1,
+            /*.nb1             =*/ nb1,
+            /*.nr0             =*/ nr0,
+            /*.use_expert_ptrs =*/ use_expert_ptrs,
         };
 
         if (ggml_is_quantized(op->src[0]->type)) {
@@ -2439,6 +2525,20 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, bid_src1, 2);
         ggml_metal_encoder_set_buffer(enc, bid_dst,  3);
         ggml_metal_encoder_set_buffer(enc, bid_src2, 4);
+
+        // [rrl] When per-expert ptr-mode is active, bind the gpuAddress argbuf
+        // at buffer(5).  In stock mode (use_expert_ptrs == 0) we must still bind
+        // SOMETHING at buffer(5) because the Metal shader declares the argument
+        // unconditionally; reuse bid_src0 (an already-resident buffer) so Metal
+        // validation sees a valid binding even though the shader will not
+        // dereference expert_ptrs when use_expert_ptrs == 0.
+        if (use_expert_ptrs && argbuf_mtl != nullptr) {
+            struct ggml_metal_buffer_id bid_argbuf = { argbuf_mtl, 0 };
+            ggml_metal_encoder_set_buffer(enc, bid_argbuf, 5);
+        } else {
+            // Dummy binding: shader ignores expert_ptrs when use_expert_ptrs==0.
+            ggml_metal_encoder_set_buffer(enc, bid_src0, 5);
+        }
 
         const int64_t _ne1 = 1;
         const int64_t ne123 = ne20*ne21;

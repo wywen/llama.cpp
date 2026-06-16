@@ -10315,6 +10315,7 @@ kernel void kernel_mul_mv_id(
         device       char * dst,
         device const char * ids,
         threadgroup  char * shmem [[threadgroup(0)]],
+        device const uint64_t * expert_ptrs [[buffer(5)]], // [rrl] per-expert gpuAddress array; ignored when use_expert_ptrs==0
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
@@ -10332,7 +10333,13 @@ kernel void kernel_mul_mv_id(
     const int64_t i1 = idx;
     const int64_t i2 = i12;
 
-    device const char * src0_cur = src0s + i02*args.nb02;
+    // [rrl] per-expert ptr-mode: when use_expert_ptrs != 0, src0_cur is taken
+    // from the expert_ptrs gpuAddress array (indexed by routed expert id i02)
+    // instead of the fused src0s + i02*nb02 stride.  Cold experts are never
+    // dereferenced because only the routed i02 values appear in a decode step.
+    device const char * src0_cur = (args.use_expert_ptrs != 0)
+        ? (device const char *) expert_ptrs[i02]
+        : src0s + i02*args.nb02;
     device const char * src1_cur = src1  + i11*args.nb11 + i12*args.nb12;
 
     device char * dst_cur = dst + (i1*args.ne0 + i2*args.ne1*args.ne0)*sizeof(float);

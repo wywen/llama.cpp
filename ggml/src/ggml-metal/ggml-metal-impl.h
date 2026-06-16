@@ -544,6 +544,7 @@ typedef struct {
     int32_t  ne1;
     uint64_t nb1;
     int32_t  nr0;
+    int32_t  use_expert_ptrs; // [rrl] 0 = stock nb02 stride; 1 = per-expert gpuAddress array
 } ggml_metal_kargs_mul_mv_id;
 
 // NORM

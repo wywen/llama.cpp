@@ -517,6 +517,20 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
     [encoder->obj endEncoding];
 }
 
+// [rrl] Per-expert Metal decode: useResource on a raw id<MTLBuffer> (passed as
+// void* to avoid ObjC headers in the C++ ops layer).  Called from
+// ggml_metal_op_mul_mat_id when use_expert_ptrs is set; makes only the routed
+// expert sub-buffers resident for this command encoder.
+void ggml_metal_encoder_use_resource_raw(ggml_metal_encoder_t encoder,
+                                         void * mtl_buffer_raw,
+                                         unsigned int usage) {
+    if (!encoder || !mtl_buffer_raw) {
+        return;
+    }
+    id<MTLBuffer> buf = (__bridge id<MTLBuffer>) mtl_buffer_raw;
+    [encoder->obj useResource:buf usage:(MTLResourceUsage)usage];
+}
+
 struct ggml_metal_device {
     id<MTLDevice> mtl_device;
 

@@ -91,6 +91,12 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 
+// [rrl] Call useResource on a raw id<MTLBuffer> (passed as void* to keep the
+// C++ ops layer free of ObjC headers).  `usage` maps directly to MTLResourceUsage.
+void ggml_metal_encoder_use_resource_raw(ggml_metal_encoder_t encoder,
+                                         void * mtl_buffer_raw,
+                                         unsigned int usage);
+
 //
 // MTLLibrary wrapper
 //
