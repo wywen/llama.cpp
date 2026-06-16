@@ -2885,10 +2885,10 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 /*.r2               =*/ r2,
                 /*.r3               =*/ r3,
                 /*.use_expert_ptrs  =*/ use_expert_ptrs_mm,
+                /*.base_expert      =*/ 0, // [rrl] #135 Stage 1: overridden per-iter in ptr-mode loop below
             };
 
             ggml_metal_encoder_set_pipeline(enc, pipeline);
-            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
             ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
             ggml_metal_encoder_set_buffer  (enc, bid_tpe,  3);
             ggml_metal_encoder_set_buffer  (enc, bid_ids,  4);
@@ -2915,7 +2915,27 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
+            // [rrl] #135 Stage 1: sparse per-expert dispatch in ptr-mode.
+            // The routed expert ids for this op were collected in s_rrl_wired_cur during
+            // the useResource loop (~2790-2844) and then moved into s_rrl_prev_wired at
+            // ~2864 (before this block). Iterate s_rrl_prev_wired: dispatch Z=1 per
+            // routed expert, setting base_expert=eid so the kernel computes
+            // im = tgpig.z + args.base_expert = 0 + eid = eid. The per-token early-out
+            // (r1 >= neh1) handles tokens not routed to eid — only routed experts produce
+            // output, so this is correct and is the sparse win.
+            // Buffer bindings (1..6) are set once above and do not change per expert.
+            // In stock mode (use_expert_ptrs_mm==0) the original single Z=ne02 dispatch
+            // with base_expert=0 is used — byte-identical to the pre-Stage-1 behavior.
+            if (use_expert_ptrs_mm) {
+                for (int32_t eid : s_rrl_prev_wired) {
+                    args.base_expert = eid;
+                    ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+                    ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, 1, 128, 1, 1);
+                }
+            } else {
+                ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+                ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
+            }
         }
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);

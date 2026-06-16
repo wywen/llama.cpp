@@ -9801,7 +9801,10 @@ kernel void kernel_mul_mm_id(
     constexpr int NL0 = NK/16;
     constexpr int NL1 = NK/8;
 
-    const int im = tgpig.z; // expert
+    // [rrl] #135 Stage 1: in ptr-mode (use_expert_ptrs==1) caller dispatches Z=1 per
+    // routed expert and sets base_expert to the expert id.  In stock mode base_expert==0
+    // and Z=ne02, so im == tgpig.z exactly as before — byte-identical.
+    const int im = tgpig.z + args.base_expert; // expert
     const int r0 = tgpig.y*NR0;
     const int r1 = tgpig.x*NR1;
 
