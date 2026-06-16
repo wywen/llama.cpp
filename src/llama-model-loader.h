@@ -232,6 +232,13 @@ struct llama_model_loader {
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
 
+    // [rrl #125] Register an expert mmap range with the crate's zero-copy region
+    // hook so the mmap-metal shim can distinguish EXPERT buffers (→ metadata-only)
+    // from GENERAL weight buffers (→ real-mapped) during the buffer phase, which is
+    // required when KV is routed onto the same mmap-metal device as the experts.
+    // No-op when the hook is not installed (non-Apple / crate not linked).
+    void rrl_register_expert_region(const void * base, size_t size) const;
+
     // for backwards compatibility, does not support ggml-backend
     void load_data_for(struct ggml_tensor * cur) const;
 

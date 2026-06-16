@@ -34,7 +34,39 @@ extern "C" void rrl_install_zcopy_region_hook(rrl_zcopy_region_hook_fn fn);
 extern "C" void rrl_install_zcopy_region_hook(rrl_zcopy_region_hook_fn fn) {
     g_rrl_zcopy_region_hook = fn;
 }
+
+// [rrl #125] DEDICATED expert-buffer hook — kept SEPARATE from the zcopy/ptr-mode
+// region hook above. The zcopy hook registers the WHOLE GGUF file range (for
+// ptr-mode src0 recognition at decode); reusing it for the buffer-phase
+// expert/general-weight discriminator would pollute that registry with general
+// weights and make the discriminator depend on phase ordering. This hook feeds a
+// dedicated registry in the shim that holds ONLY per-expert buffer ranges, so the
+// discriminator is correct by construction regardless of when other ranges are
+// registered.
+typedef void (*rrl_expert_buffer_hook_fn)(const void *base, size_t size);
+static rrl_expert_buffer_hook_fn g_rrl_expert_buffer_hook = nullptr;
+
+extern "C" void rrl_install_expert_buffer_hook(rrl_expert_buffer_hook_fn fn);
+extern "C" void rrl_install_expert_buffer_hook(rrl_expert_buffer_hook_fn fn) {
+    g_rrl_expert_buffer_hook = fn;
+}
 #endif
+
+// [rrl #125] Invoke the dedicated expert-buffer hook for an expert mmap range.
+// Called from the buffer phase (llama-model.cpp) BEFORE creating each expert
+// buffer so the mmap-metal shim can tell experts (→ metadata-only) from general
+// weights (→ real-mapped) when KV shares the expert device. Defined here so the
+// static g_rrl_expert_buffer_hook stays internal to this translation unit.
+void llama_model_loader::rrl_register_expert_region(const void * base, size_t size) const {
+#if defined(__APPLE__)
+    if (g_rrl_expert_buffer_hook != nullptr && base != nullptr && size > 0) {
+        g_rrl_expert_buffer_hook(base, size);
+    }
+#else
+    (void) base;
+    (void) size;
+#endif
+}
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;

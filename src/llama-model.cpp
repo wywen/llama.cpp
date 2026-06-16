@@ -1475,6 +1475,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (first >= last) {
                     continue;
                 }
+                // [rrl #125] If this is an expert context (per-expert fused FFN
+                // tensors), register its mmap range BEFORE creating the buffer so the
+                // mmap-metal shim's dev_buffer_from_host_ptr treats it as an expert
+                // (metadata-only) while leaving GENERAL weights real-mapped. Required
+                // when KV is routed onto the same mmap-metal device as the experts
+                // (issue #125): otherwise general weights take the expert
+                // metadata-only path and the GPU reads garbage. Detected by the
+                // "_exps" tensor-name suffix; each expert fused tensor has its own ctx.
+                {
+                    const ggml_tensor * t0 = ggml_get_first_tensor(ctx);
+                    if (t0 != nullptr && std::strstr(ggml_get_name(t0), "_exps") != nullptr) {
+                        ml.rrl_register_expert_region((const char *) addr + first, last - first);
+                    }
+                }
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
                 if (buf == nullptr) {
