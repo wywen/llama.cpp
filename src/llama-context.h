@@ -361,6 +361,9 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
+    // env: RRL_KV_SEGMENT (layer-split barrier stride; 0 = disabled)
+    int rrl_kv_segment = 0;
+
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;

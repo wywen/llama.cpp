@@ -11,6 +11,7 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "llama-barriers.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -194,6 +195,23 @@ llama_context::llama_context(
 
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
+        }
+    }
+
+    // Read the layer-barrier stride once at context creation.
+    // RRL_KV_SEGMENT=N inserts identity CPU barrier ops after every N-th l_out tensor,
+    // forcing a Metal/CPU backend split at those layer boundaries.  Barriers fire only
+    // when segment >= 1 AND segment < n_layer (checked at each call site below).
+    // TODO (Increment 3): gate on the mmap-metal device being active so non-mmap-metal
+    // contexts skip the env-read entirely.
+    {
+        const char * rrl_seg_env = getenv("RRL_KV_SEGMENT");
+        if (rrl_seg_env && rrl_seg_env[0] != '\0') {
+            rrl_kv_segment = atoi(rrl_seg_env);
+            if (rrl_kv_segment >= 1) {
+                LLAMA_LOG_INFO("%s: RRL_KV_SEGMENT=%d — layer-split barriers enabled\n",
+                               __func__, rrl_kv_segment);
+            }
         }
     }
 
@@ -1276,6 +1294,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // Insert identity CPU barrier ops at layer boundaries before the graph is
+        // allocated by the backend scheduler.  No-op when rrl_kv_segment == 0 or
+        // segment >= n_layer.
+        if (rrl_kv_segment >= 1 &&
+            rrl_kv_segment < static_cast<int>(model.hparams.n_layer)) {
+            rrl_insert_layer_barriers(gf, res->get_ctx(),
+                                      static_cast<int>(model.hparams.n_layer),
+                                      rrl_kv_segment);
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2248,6 +2276,17 @@ ggml_cgraph * llama_context::graph_reserve(
     res->reset();
 
     auto * gf = model.build_graph(gparams);
+
+    // Mirror the same barrier rewrite applied in process_ubatch so the reserved graph
+    // and the executed graph have the same topology.  Alloc sizing and split count must
+    // match; a mismatch causes a scheduler assert at decode time.  Same gate as
+    // process_ubatch: fires only when segment >= 1 AND < n_layer.
+    if (gf && rrl_kv_segment >= 1 &&
+        rrl_kv_segment < static_cast<int>(model.hparams.n_layer)) {
+        rrl_insert_layer_barriers(gf, res->get_ctx(),
+                                  static_cast<int>(model.hparams.n_layer),
+                                  rrl_kv_segment);
+    }
 
     this->n_outputs = save_n_outputs;
 
