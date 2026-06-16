@@ -94,6 +94,13 @@ static inline bool rrl_is_expert_mmap_metal(const ggml_tensor *t) {
            g_rrl_addr_in_region != nullptr && g_rrl_addr_in_region(t->data) != 0;
 }
 
+// [rrl] #135 Stage 2: C-callable wrapper for rrl_is_expert_mmap_metal so the
+// ObjC context.m window planner can use the same gate without duplicating it.
+// (Prototype declared in ggml-metal-ops.h, included above.)
+extern "C" int rrl_is_expert_mmap_metal_c(const struct ggml_tensor *t) {
+    return rrl_is_expert_mmap_metal(t) ? 1 : 0;
+}
+
 // [rrl] Expert-eviction counters. Incremented in ggml_metal_op_mul_mat_id when
 // the rolling evict-previous runs (RRL_MOE_METAL_EVICT). Exported so a test can
 // confirm the mechanism processed the expected working-set volume (proof that
@@ -2859,6 +2866,14 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         // Prefill→decode handoff: the last mm_id op populates s_rrl_prev_wired here;
         // the first mv_id decode op evicts it via the standard rolling-evict slot —
         // no special casing needed.
+        //
+        // [rrl] #135 Stage 2 robustness: capture a local copy of s_rrl_wired_cur
+        // BEFORE the std::move hands it off to the evictor slot.  The dispatch loop
+        // below iterates this local copy so it is decoupled from the evictor's
+        // hand-off variable (s_rrl_prev_wired) — functionally identical today, but
+        // safe if an async evictor ever clears s_rrl_prev_wired between the move and
+        // the dispatch loop.
+        std::vector<int32_t> dispatch_eids = s_rrl_wired_cur; // copy before move
         s_rrl_prev_state    = expert_state_mm;
         s_rrl_prev_refcount = expert_refcount_mm;
         s_rrl_prev_wired    = std::move(s_rrl_wired_cur);
@@ -2927,7 +2942,10 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             // In stock mode (use_expert_ptrs_mm==0) the original single Z=ne02 dispatch
             // with base_expert=0 is used — byte-identical to the pre-Stage-1 behavior.
             if (use_expert_ptrs_mm) {
-                for (int32_t eid : s_rrl_prev_wired) {
+                // [rrl] #135 Stage 2: iterate dispatch_eids (local copy of wired set
+                // captured before the std::move to s_rrl_prev_wired), so this loop is
+                // decoupled from the evictor's hand-off variable.
+                for (int32_t eid : dispatch_eids) {
                     args.base_expert = eid;
                     ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
                     ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, 1, 128, 1, 1);

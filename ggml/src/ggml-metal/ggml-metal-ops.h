@@ -8,6 +8,12 @@ extern "C" {
 
 typedef struct ggml_metal_op * ggml_metal_op_t;
 
+// [rrl] #135 Stage 2: returns non-zero iff tensor t is a per-expert mmap-metal
+// weight tensor (the same gate rrl_is_expert_mmap_metal uses internally).
+// Declared here so ggml-metal-context.m can drive the window planner using the
+// same detection logic without duplicating it.
+int rrl_is_expert_mmap_metal_c(const struct ggml_tensor *t);
+
 ggml_metal_op_t ggml_metal_op_init(
         ggml_metal_device_t dev,
         ggml_metal_cmd_buf_t cmd_buf,

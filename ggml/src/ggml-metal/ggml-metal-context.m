@@ -506,6 +506,179 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // short-hand
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
 
+        // [rrl] #135 Stage 2: windowed-sequential compute mode.
+        // When RRL_METAL_CB_WINDOW is set (and not in capture mode), walk gf->nodes
+        // to build per-layer window ranges [start, end), commit one command buffer per
+        // window, and drain each window (waitUntilCompleted) before starting the next.
+        // This releases the GPU useResource residency for each layer's experts as soon
+        // as that layer's CB completes, bounding peak to ~1-2 layers (~480 MiB-1 GiB).
+        // The existing rolling msync evictor (installed via cb_eval) handles the CPU
+        // page side; this change handles the GPU useResource side.
+        // When unset (or in capture mode), falls through to the parallel dispatch_apply
+        // path unchanged.
+        const bool use_cb_window = (getenv("RRL_METAL_CB_WINDOW") != NULL) && !use_capture;
+        if (use_cb_window) {
+            // -- Window planner -------------------------------------------------
+            // Walk gf->nodes to build a list of window boundaries.  A new window
+            // starts at each node that is:
+            //   1. a MUL_MAT_ID op, AND
+            //   2. src[0] is a per-expert mmap-metal tensor
+            //      (rrl_is_expert_mmap_metal — same gate the encoder uses), AND
+            //   3. the layer id parsed from src[0]->name ("blk.<L>.ffn_...") is
+            //      different from the layer id of the previous expert node seen.
+            // This cuts one window per MoE layer.  Non-expert nodes before the
+            // first expert node go into window 0 (the prefix window).  Non-expert
+            // nodes after the last expert node (or between layers) go into the
+            // current window's trailing range — they are emitted in the window that
+            // opens at the first expert node of that layer.
+            //
+            // Implementation: collect the start indices of each new window; the end
+            // of window[i] is start of window[i+1] (or gf->n_nodes for the last).
+
+            struct rrl_window { int start; };
+            NSMutableArray * windows_arr = [NSMutableArray array];
+
+            {
+                int prev_layer = -2; // -2 = no layer seen yet
+                for (int i = 0; i < gf->n_nodes; ++i) {
+                    struct ggml_tensor * node = gf->nodes[i];
+                    if (node->op != GGML_OP_MUL_MAT_ID) { continue; }
+                    struct ggml_tensor * s0 = node->src[0];
+                    // Use the same gate as the encoder: only per-expert mmap-metal
+                    // tensors trigger windowing (via the C-callable wrapper so we
+                    // don't duplicate the detection logic in this .m file).
+                    if (!rrl_is_expert_mmap_metal_c(s0)) { continue; }
+
+                    // Parse layer id from src[0]->name ("blk.<L>.ffn_...").
+                    int layer = -1;
+                    const char * p = s0->name;
+                    if (p[0]=='b' && p[1]=='l' && p[2]=='k' && p[3]=='.') {
+                        p += 4;
+                        int val = 0; bool ok = false;
+                        while (*p >= '0' && *p <= '9') { val = val*10 + (*p-'0'); ++p; ok=true; }
+                        if (ok && *p == '.') { layer = val; }
+                    }
+
+                    if (layer != prev_layer) {
+                        // Cut a new window at this node.
+                        struct rrl_window w = { .start = i };
+                        [windows_arr addObject:[NSValue valueWithBytes:&w objCType:@encode(struct rrl_window)]];
+                        prev_layer = layer;
+                    }
+                }
+            }
+
+            // Build the flat start[] array.  Window 0 always starts at 0 (prefix).
+            // If the planner found no expert nodes, there is one implicit window
+            // covering the whole graph.
+            int n_win = (int) windows_arr.count + 1; // +1 for the prefix window
+            int * win_starts = (int *) alloca((size_t)(n_win + 1) * sizeof(int));
+            win_starts[0] = 0; // prefix window
+            for (int wi = 0; wi < (int) windows_arr.count; ++wi) {
+                struct rrl_window w;
+                [[windows_arr objectAtIndex:wi] getValue:&w];
+                win_starts[wi + 1] = w.start;
+            }
+            win_starts[n_win] = gf->n_nodes; // sentinel (end of last window)
+
+            // -- Sequential commit loop -----------------------------------------
+            // For each window [start, end):
+            //   create CB → enqueue → build op → encode → free (ends encoding) →
+            //   commit → waitUntilCompleted → check status
+            // waitUntilCompleted after each CB releases that window's useResource
+            // residency before the next window faults its experts.
+            //
+            // Memory management: commandBufferWithUnretainedReferences + explicit
+            // [retain] gives us a retain count of 1.  We transfer that retain to
+            // cmd_bufs_ext (for the last window) so synchronize() can hold a live
+            // reference via cmd_buf_last.  Intermediate window CBs are released
+            // immediately after drain (they have already completed).
+            id<MTLCommandBuffer> last_win_cmd_buf = nil;
+
+            for (int wi = 0; wi < n_win; ++wi) {
+                const int w_start = win_starts[wi];
+                const int w_end   = win_starts[wi + 1];
+
+                if (w_start >= w_end) { continue; } // skip empty windows
+
+                id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+                [cmd_buf retain];
+                [cmd_buf enqueue];
+
+                ggml_metal_op_t ctx_op = ggml_metal_op_init(
+                    ctx->dev,
+                    (ggml_metal_cmd_buf_t) cmd_buf,
+                    gf,
+                    w_start,
+                    w_end,
+                    ctx->use_fusion,
+                    ctx->use_concurrency,
+                    /*use_capture=*/false,
+                    ctx->debug_graph,
+                    ctx->debug_fusion);
+
+                for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+                    const int res = ggml_metal_op_encode(ctx_op, idx);
+                    if (res == 0) { break; }
+                    idx += res - 1;
+                }
+
+                // ends encoding and frees the encoder
+                ggml_metal_op_free(ctx_op);
+
+                [cmd_buf commit];
+
+                // Drain: waitUntilCompleted releases this window's useResource
+                // residency before the next window faults its experts.
+                [cmd_buf waitUntilCompleted];
+
+                MTLCommandBufferStatus status = [cmd_buf status];
+                if (status != MTLCommandBufferStatusCompleted) {
+                    GGML_LOG_INFO("%s: [rrl] windowed CB %d failed with status %lu\n",
+                                  __func__, wi, (unsigned long) status);
+                    if (status == MTLCommandBufferStatusError) {
+                        GGML_LOG_INFO("error: %s\n",
+                                      [[cmd_buf error].localizedDescription UTF8String]);
+                    }
+                    ctx->has_error = true;
+                    // Release the failed CB's retain (it is not stored in cmd_bufs_ext).
+                    [cmd_buf release];
+                    // Release any prior window CB we were holding in last_win_cmd_buf
+                    // (it succeeded but we haven't added it to cmd_bufs_ext yet).
+                    if (last_win_cmd_buf != nil) {
+                        [last_win_cmd_buf release];
+                        last_win_cmd_buf = nil;
+                    }
+                    return GGML_STATUS_FAILED;
+                }
+
+                // Release the previous last-window CB (it has completed and we are
+                // about to replace last_win_cmd_buf).
+                if (last_win_cmd_buf != nil) {
+                    [last_win_cmd_buf release];
+                }
+                last_win_cmd_buf = cmd_buf; // transfer our retain to last_win_cmd_buf
+            }
+
+            // Track the last window's CB in cmd_bufs_ext so synchronize() can
+            // wait on it via cmd_buf_last.  Retain count accounting:
+            //   commandBufferWithUnretainedReferences starts at 0.
+            //   Our [retain] (at top of loop)   → count 1
+            //   addObject (array retains)        → count 2
+            //   synchronize [release]            → count 1
+            //   synchronize removeAllObjects     → count 0 → dealloc ✓
+            // Do NOT call an extra [release] here — we need count=2 entering
+            // synchronize so both its explicit [release] and removeAllObjects
+            // balance correctly.
+            if (last_win_cmd_buf != nil) {
+                [ctx->cmd_bufs_ext addObject:last_win_cmd_buf];
+                ctx->cmd_buf_last = last_win_cmd_buf;
+                // Our explicit [retain] is still live; addObject added the second
+                // retain.  Leave both — synchronize consumes them.
+            }
+        } else {
+        // -- Original parallel dispatch_apply path (unchanged) ------------------
+
         // the main thread commits the first few commands immediately
         // cmd_buf[n_cb]
         {
@@ -551,6 +724,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
+
+        } // end else (original parallel path)
 
         // enter here only when capturing in order to wait for all computation to finish
         // otherwise, we leave the graph to compute asynchronously
