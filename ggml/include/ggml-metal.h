@@ -56,6 +56,12 @@ GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t bac
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
+// Zero-copy Metal buffer from a host pointer, with the residency set opt-out.
+// Identical to the buffer returned by ggml_backend_dev_buffer_from_host_ptr on a
+// GPU device, but the buffer is NOT added to any MTLResidencySet.  This allows
+// msync(MS_INVALIDATE) to reclaim pages while the buffer is live (KV eviction).
+GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_metal_buffer_from_ptr_no_residency(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size);
+
 #ifdef __cplusplus
 }
 #endif

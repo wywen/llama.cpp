@@ -717,14 +717,26 @@ static ggml_backend_buffer_type_t ggml_backend_metal_device_get_buffer_type(ggml
     return props_dev->use_shared_buffers ? ggml_backend_metal_buffer_type_shared(props_dev->device) : ggml_backend_metal_buffer_type_private(props_dev->device);
 }
 
-static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
+// Shared body for the two mapped (zero-copy from-host-ptr) buffer constructors.
+// The only difference is whether the buffer joins the device's MTLResidencySet:
+// weights want it (kept wired for the GPU); evictable KV must opt out so
+// msync(MS_INVALIDATE) can reclaim its pages.
+static ggml_backend_buffer_t ggml_backend_metal_buffer_from_ptr_impl(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size, bool use_residency) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
-    ggml_metal_buffer_t res = ggml_metal_buffer_map(ctx_dev, ptr, size, max_tensor_size);
+    ggml_metal_buffer_t res = ggml_metal_buffer_map(ctx_dev, ptr, size, max_tensor_size, use_residency);
 
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
 
     return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_mapped(props_dev->device), ggml_backend_metal_buffer_shared_i, res, size);
+}
+
+static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
+    return ggml_backend_metal_buffer_from_ptr_impl(dev, ptr, size, max_tensor_size, /*use_residency=*/true);
+}
+
+ggml_backend_buffer_t ggml_backend_metal_buffer_from_ptr_no_residency(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
+    return ggml_backend_metal_buffer_from_ptr_impl(dev, ptr, size, max_tensor_size, /*use_residency=*/false);
 }
 
 static bool ggml_backend_metal_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
