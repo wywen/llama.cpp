@@ -14,6 +14,7 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
@@ -47,6 +48,13 @@ struct llama_model_loader {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
+
+        // Synthetic constructor for per-expert assembled tensors.
+        // Skips GGUF validation; offs=0 and idx=0 are placeholders (never used
+        // for data access — load_all_data detects per_expert_assembled entries
+        // and assembles them from per-expert slices instead).
+        llama_tensor_weight(uint16_t idx_, size_t offs_, ggml_tensor * tensor_)
+            : idx(idx_), offs(offs_), tensor(tensor_) {}
     };
 
     // custom comparator to sort weights more nicely by layer
@@ -80,6 +88,19 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
 
+    bool per_expert_moe = false;  // true when moe.layout == "per_expert" in this GGUF
+    // Names of fused expert tensors synthesised from per-expert slices (need assembly at load time).
+    std::unordered_set<std::string> per_expert_assembled;
+
+    // [keep-separate Metal, step 1] Monotonic counter that gives every fused
+    // expert tensor routed to the mmap-metal buft its OWN ggml_context — hence
+    // its own MTLBuffer whose base is 16 KiB-aligned. Without this, multiple
+    // expert tensors share one per-layer buffer and only the first lands on a
+    // page boundary (Metal's mapped-buffer alignment is 32, not 16 KiB), so
+    // experts of the 2nd+ tensor would be misaligned. Encoded into buft_layer_key
+    // so each is a distinct map entry.
+    int metal_expert_ctx_seq = 0;
+
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;
@@ -103,14 +124,26 @@ struct llama_model_loader {
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
-    // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
-    struct ggml_backend_buft_comparator {
-        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
-            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+    // Key for the buft -> ctx map.  For buffer types that want per-layer contexts
+    // (currently "mmap-metal"), layer holds the transformer block index so each layer
+    // gets its own ggml_context — hence its own MTLBuffer — instead of one monolithic
+    // allocation.  For all other bufts layer == -1 (shared context, historical behaviour).
+    // Mirrors the buft_layer_key / buft_layer_comparator in llama-kv-cache.cpp.
+    struct buft_layer_key {
+        ggml_backend_buffer_type_t buft;
+        int                        layer; // -1 = shared context (non-per-layer buft)
+    };
+    struct buft_layer_comparator {
+        bool operator()(const buft_layer_key & lhs, const buft_layer_key & rhs) const {
+            const int c = strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft));
+            if (c != 0) {
+                return c < 0;
+            }
+            return lhs.layer < rhs.layer;
         }
     };
 
-    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    std::map<buft_layer_key, ggml_context_ptr, buft_layer_comparator> ctx_map;
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
@@ -185,6 +218,10 @@ struct llama_model_loader {
     struct ggml_tensor * create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required = true);
 
     void done_getting_tensors(bool partial = false) const;
+
+    // Returns true if `name` is a per-expert source tensor (e.g. blk.N.ffn_XXX_exps.E.suffix).
+    // These are never loaded directly; they are assembled into fused tensors at load time.
+    bool is_per_expert_source(const std::string & name) const;
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 
