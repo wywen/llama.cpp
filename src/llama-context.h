@@ -361,8 +361,11 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
-    // env: RRL_KV_SEGMENT (layer-split barrier stride; 0 = disabled)
-    int rrl_kv_segment = 0;
+    // True when the KV device's residency manager is armed (typed KvEviction set
+    // at device open) — i.e. the layer-split barrier machinery is on, with barrier
+    // positions chosen by the manager's plan (fixed stride or SWA-weighted budget).
+    // Computed once after memory creation; see llama_context::llama_context.
+    bool rrl_kv_active = false;
 
     // perf
     mutable int64_t t_start_us  = 0;

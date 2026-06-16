@@ -108,7 +108,10 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
-    ~llama_kv_cache() = default;
+    // [Step 4] Not defaulted: unregisters this cache's per-layer KV buffers from
+    // the mmap-metal residency manager (which outlives the cache on a reused
+    // device) before ctxs_bufs frees them. See llama-kv-cache.cpp.
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -272,6 +275,11 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    // [Step 4] The mmap-metal KV device, captured during per-layer registration
+    // (null for every other layout). ~llama_kv_cache() unregisters it from the
+    // residency manager so a reused device never holds slots into freed buffers.
+    ggml_backend_dev_t rrl_kv_dev = nullptr;
 
     size_t total_size() const;
 

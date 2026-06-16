@@ -13,6 +13,11 @@
 #include <map>
 #include <stdexcept>
 
+// [Step 4 Increment 3a] rrl_residency_register is declared in
+// llama-barriers.h (included via llama-kv-cache.h → ... → llama.h).
+// We include it directly here.
+#include "llama-barriers.h"
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -276,6 +281,30 @@ llama_kv_cache::llama_kv_cache(
     // allocate tensors and initialize the buffers to avoid NaNs in the padding.
     // For a per-layer buft this map has one entry per layer, so each iteration
     // allocates that layer's own buffer (independently freeable by the manager).
+    // Reserve so emplace_back never reallocates: the residency manager stores raw
+    // pointers INTO these slots (&ctxs_bufs[i].second) and a realloc would dangle them.
+    ctxs_bufs.reserve(ctx_map.size());
+
+    // [Step 4] If this ctor throws AFTER registering some per-layer KV buffers
+    // (e.g. a later layer's KV allocation fails under memory pressure — exactly
+    // this feature's operating regime), the dtor never runs on the partially-
+    // constructed object, so the device-lifetime residency manager would keep
+    // entries whose `slot` points into the half-built ctxs_bufs that is about to
+    // be freed. This guard unregisters them on the throw path; it is dismissed
+    // once construction completes, after which the dtor owns teardown. It only
+    // dereferences a device handle + calls a free function, so it needs no access
+    // to llama_kv_cache internals.
+    struct rrl_reg_guard {
+        ggml_backend_dev_t * dev_slot;
+        const void *         owner;
+        bool                 armed = true;
+        ~rrl_reg_guard() {
+            if (armed && *dev_slot) {
+                rrl_residency_unregister(*dev_slot, owner);
+            }
+        }
+    } rrl_guard{ &rrl_kv_dev, this };
+
     for (auto & [key, ctx] : ctx_map) {
         ggml_backend_buffer_type_t buft = key.buft;
         ggml_backend_buffer_t buf;
@@ -295,6 +324,60 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+
+        // [Step 4 Increment 3a/3b] Register per-layer KV buffers with the
+        // residency manager.  Gate strictly on "mmap-metal" name — every other
+        // device (CPU, standard Metal, mmap-cpu) keeps the old layout unchanged.
+        // Register AFTER emplace so we can hand the manager a pointer to llama's
+        // OWNING handle (the raw ggml_backend_buffer_t inside the ctxs_bufs
+        // unique_ptr): the manager frees/recreates through that slot, keeping
+        // llama the single owner (no double-free at teardown). The unique_ptr has
+        // a stateless deleter so it is layout-compatible with the raw handle.
+        if (buft_per_layer(buft)) {
+            static_assert(sizeof(ggml_backend_buffer_ptr) == sizeof(ggml_backend_buffer_t),
+                          "ctxs_bufs slot must be layout-compatible with a raw buffer handle");
+            const int il = key.layer;
+            ggml_backend_dev_t kv_dev = ggml_backend_buft_get_device(buft);
+            // Capture the KV device so ~llama_kv_cache can unregister it (RAII).
+            rrl_kv_dev = kv_dev;
+
+            // Find the K and V tensors for this layer from the layers vector.
+            // map_layer_ids[il] maps model layer id → KV cache layer index.
+            ggml_tensor * k_tensor = nullptr;
+            ggml_tensor * v_tensor = nullptr;
+            auto it = map_layer_ids.find(il);
+            if (it != map_layer_ids.end()) {
+                const auto & lkv = layers[static_cast<size_t>(it->second)];
+                k_tensor = lkv.k;
+                v_tensor = lkv.v;
+            }
+
+            // Reader range for sharing-aware eviction. Under KV-cache reuse
+            // (layer_reuse_cb), several model layers map to ONE buffer:
+            // map_layer_ids[il'] == map_layer_ids[il]. first/last_reader are the
+            // min/max such model-layer index. The residency manager frees this
+            // buffer only after a barrier past last_reader, so a buffer a later
+            // layer still reads is never reclaimed mid-pass (the gemma-3n fix).
+            // Non-shared layers collapse to first == last == il.
+            int first_reader = il;
+            int last_reader  = il;
+            if (it != map_layer_ids.end()) {
+                for (const auto & m : map_layer_ids) {
+                    if (m.second == it->second) {
+                        const int mi = static_cast<int>(m.first);
+                        if (mi < first_reader) { first_reader = mi; }
+                        if (mi > last_reader)  { last_reader  = mi; }
+                    }
+                }
+            }
+
+            ggml_backend_buffer_t * slot =
+                reinterpret_cast<ggml_backend_buffer_t *>(&ctxs_bufs.back().second);
+            // `this` is the owner token: unregistration (teardown or ctor-throw)
+            // drops exactly the entries this cache made, never a live sibling's.
+            rrl_residency_register(kv_dev, il, slot, k_tensor, v_tensor,
+                                   first_reader, last_reader, this);
+        }
     }
 
     {
@@ -351,6 +434,22 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    // [Step 4] Construction completed — hand teardown to the dtor.
+    rrl_guard.armed = false;
+}
+
+// [Step 4] RAII teardown: unregister this cache's per-layer KV buffers from the
+// residency manager BEFORE the ctxs_bufs unique_ptrs free them. The mmap-metal
+// MmapMetalDevice (and its manager) outlives the cache across the scheduler's
+// spill/restore cycle, so without this the manager would keep LayerKv entries
+// whose `slot` points into freed buffers — a use-after-free on the next decode,
+// plus double-counted budget bytes. No-op for every non-mmap-metal layout
+// (rrl_kv_dev stays null) and when the residency hooks were never installed.
+llama_kv_cache::~llama_kv_cache() {
+    if (rrl_kv_dev) {
+        rrl_residency_unregister(rrl_kv_dev, this);
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
