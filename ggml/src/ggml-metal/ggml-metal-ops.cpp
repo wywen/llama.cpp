@@ -141,6 +141,25 @@ static std::atomic<uint32_t> * s_rrl_prev_refcount = nullptr;
 static std::vector<int32_t> s_rrl_wired_cur;
 static std::vector<int32_t> s_rrl_prev_wired;
 
+// [rrl] PR2-A.2: return the async in-flight depth D, or 0 if async is disabled.
+// Reads RRL_METAL_CB_ASYNC once and caches the result (function-static).
+// Returns 0 when RRL_METAL_CB_ASYNC is not set (sync path unchanged).
+// Also requires RRL_METAL_CB_WINDOW to be set (checked by context.m; this fn only
+// returns the depth).
+extern "C" int rrl_metal_cb_async_depth(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * v = getenv("RRL_METAL_CB_ASYNC");
+        if (v == nullptr) {
+            cached = 0; // unset — sync path
+        } else {
+            const int d = atoi(v);
+            cached = (d > 0) ? d : 2; // 0/""/non-numeric → default 2
+        }
+    }
+    return cached;
+}
+
 // [rrl] Eviction enable flag. Set by the crate (rrl_metal_set_evict) when it
 // installs the node-by-node MetalResident eval-cb — the precondition that makes
 // rolling evict-previous SAFE (the prior op has computed+synced before the next
@@ -188,6 +207,10 @@ extern "C" void rrl_metal_evict_reset(void) {
     s_rrl_prev_refcount = nullptr;
     s_rrl_wired_cur.clear();
     s_rrl_prev_wired.clear();
+    // [rrl] PR2-A.2: s_rrl_async_records is NOT cleared here — it is declared after
+    // the rrl_evict_window POD (a forward-reference from this earlier reset fn) and
+    // is drained every window by rrl_async_window_take_records, so it never carries
+    // stale records across a reset.  See rrl_async_window_take_records below.
 }
 
 // [rrl] Read the cumulative eviction-block wall-time (ns) since the last reset.
@@ -321,6 +344,38 @@ static void rrl_evict_window_reclaim(const rrl_evict_window & w) {
         g_rrl_evict_calls.fetch_add(1, std::memory_order_relaxed);
         g_rrl_evict_bytes.fetch_add((uint64_t)w.len, std::memory_order_relaxed);
     }
+}
+
+// [rrl] PR2-A.2: async-records accumulator.  In async CB mode (RRL_METAL_CB_ASYNC
+// set), each mul_mat_id encoder appends an rrl_evict_window for THIS op's own
+// experts to this vector (bypassing the sync rolling-evict-previous slot).
+// context.m drains this vector into a heap allocation via rrl_async_window_take_records
+// and attaches it to the window's MTL completion handler, which then calls
+// rrl_async_window_reclaim_and_free.  Single-threaded sequential encode → safe.
+static std::vector<rrl_evict_window> s_rrl_async_records;
+
+// [rrl] PR2-A.2: move s_rrl_async_records to a heap-allocated vector and return
+// an opaque void* handle (or NULL if the vector was empty).  Clears the static.
+// Called from context.m (ObjC side) immediately after the encode loop for a window.
+extern "C" void * rrl_async_window_take_records(void) {
+    if (s_rrl_async_records.empty()) {
+        return nullptr;
+    }
+    auto * vec = new std::vector<rrl_evict_window>(std::move(s_rrl_async_records));
+    s_rrl_async_records.clear(); // belt-and-suspenders after move
+    return static_cast<void *>(vec);
+}
+
+// [rrl] PR2-A.2: run rrl_evict_window_reclaim on each record in the handle and
+// free it.  Safe to call with a null handle (no-op).  Called from the MTL
+// completion handler block in context.m — executes on the Metal driver thread.
+extern "C" void rrl_async_window_reclaim_and_free(void * handle) {
+    if (handle == nullptr) { return; }
+    auto * vec = static_cast<std::vector<rrl_evict_window> *>(handle);
+    for (const rrl_evict_window & w : *vec) {
+        rrl_evict_window_reclaim(w);
+    }
+    delete vec;
 }
 
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
@@ -2640,7 +2695,11 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     // synced the previous op before any page is released — safety unchanged.
     // When the mask is absent or the previous-op dimensions don't match, fall back
     // to the original whole-tensor eviction path.
-    {
+    //
+    // [rrl] PR2-A.2: in async CB mode the completion handler is the SOLE evictor.
+    // Running the sync rolling-evict-previous here too would double-evict (race).
+    // Gate the entire block on !async so the sync path is unchanged.
+    if (!rrl_metal_cb_async_depth()) {
         const bool rrl_evict = (g_rrl_evict_on.load(std::memory_order_relaxed) != 0);
         static void *     s_prev_addr   = nullptr;
         static size_t     s_prev_len    = 0;
@@ -2892,6 +2951,46 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         s_rrl_prev_wired    = std::move(s_rrl_wired_cur);
         s_rrl_wired_cur.clear();
 
+        // [rrl] PR2-A.2: in async CB mode, push a window record for THIS op so
+        // the MTL completion handler can run the reclaim after the CB finishes.
+        // We capture from the CURRENT op directly (base_addr=src0_mm->data) rather
+        // than the deferred s_prev_* slot — the handler fires after this window's
+        // CB completes, so the GPU is done with this op's experts at that point.
+        // The encoder refcount++ (done above in the useResource loop) is kept:
+        // a LATER window's encoder bumps refcount for a shared eid BEFORE this
+        // window's handler fires, so the handler's recheck (refcount==0) aborts
+        // the reclaim for any expert a later in-flight window still needs.
+        if (rrl_metal_cb_async_depth() > 0 &&
+                g_rrl_evict_on.load(std::memory_order_relaxed) != 0 &&
+                rrl_is_expert_mmap_metal(src0_mm) &&
+                !dispatch_eids.empty()) {
+            rrl_evict_window w;
+            w.base_addr    = src0_mm->data;
+            w.len          = ggml_nbytes(src0_mm);
+            w.stride       = (uint64_t) src0_mm->nb[2];
+            w.nexp         = src0_mm->ne[2];
+            // Parse layer from src0_mm->name ("blk.<L>.ffn_...").
+            {
+                int layer = -1;
+                const char * p = src0_mm->name;
+                if (p[0]=='b' && p[1]=='l' && p[2]=='k' && p[3]=='.') {
+                    p += 4;
+                    int val = 0;
+                    bool ok = false;
+                    while (*p >= '0' && *p <= '9') { val = val*10 + (*p-'0'); ++p; ok=true; }
+                    if (ok && *p == '.') { layer = val; }
+                }
+                w.layer = layer;
+            }
+            w.wired        = dispatch_eids;         // copy of this op's routed set
+            w.state        = expert_state_mm;       // per-expert NORMAL/EVICTING array
+            w.refcount     = expert_refcount_mm;    // per-expert refcount array
+            w.keep_mask    = g_rrl_keep_mask;
+            w.keep_n_layer = g_rrl_keep_n_layer;
+            w.keep_n_exp   = g_rrl_keep_n_expert;
+            s_rrl_async_records.push_back(std::move(w));
+        }
+
         {
             auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op);
 
@@ -3141,10 +3240,53 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         // s_rrl_prev_state is file-scope (alongside g_rrl_evict_calls etc.) so
         // both this encoder block and the eviction block above can reach it.
         // [rrl] Increment 1: save refcount ptr + move wired list for the evictor.
+        // [rrl] PR2-A.2: capture local copy of wired set BEFORE std::move so the
+        // async accumulation block below (and the dispatch loop after it) can
+        // iterate this op's experts independently of the evictor slot.
+        std::vector<int32_t> dispatch_eids_mv = s_rrl_wired_cur; // copy before move
         s_rrl_prev_state    = expert_state;
         s_rrl_prev_refcount = expert_refcount;
         s_rrl_prev_wired    = std::move(s_rrl_wired_cur);
         s_rrl_wired_cur.clear(); // leave cur empty after move
+
+        // [rrl] PR2-A.2: in async CB mode, push a window record for THIS op so
+        // the MTL completion handler can run the reclaim after the CB finishes.
+        // Mirrors the mm_id accumulation block (~:2957-2995): capture from THIS op
+        // (base_addr=src0->data) using dispatch_eids_mv (local copy before move).
+        // The encoder refcount++ in the page-in loop above is kept: a later window's
+        // encoder bumps refcount for a shared eid BEFORE this window's handler fires,
+        // so the handler's recheck (refcount==0) aborts reclaim for any expert a
+        // later in-flight window still needs.
+        if (rrl_metal_cb_async_depth() > 0 &&
+                g_rrl_evict_on.load(std::memory_order_relaxed) != 0 &&
+                rrl_is_expert_mmap_metal(src0) &&
+                !dispatch_eids_mv.empty()) {
+            rrl_evict_window w;
+            w.base_addr    = src0->data;
+            w.len          = ggml_nbytes(src0);
+            w.stride       = (uint64_t) src0->nb[2];
+            w.nexp         = src0->ne[2];
+            // Parse layer from src0->name ("blk.<L>.ffn_...").
+            {
+                int layer = -1;
+                const char * p = src0->name;
+                if (p[0]=='b' && p[1]=='l' && p[2]=='k' && p[3]=='.') {
+                    p += 4;
+                    int val = 0;
+                    bool ok = false;
+                    while (*p >= '0' && *p <= '9') { val = val*10 + (*p-'0'); ++p; ok=true; }
+                    if (ok && *p == '.') { layer = val; }
+                }
+                w.layer = layer;
+            }
+            w.wired        = dispatch_eids_mv;   // copy of this op's routed set
+            w.state        = expert_state;        // per-expert NORMAL/EVICTING array
+            w.refcount     = expert_refcount;     // per-expert refcount array
+            w.keep_mask    = g_rrl_keep_mask;
+            w.keep_n_layer = g_rrl_keep_n_layer;
+            w.keep_n_exp   = g_rrl_keep_n_expert;
+            s_rrl_async_records.push_back(std::move(w));
+        }
 
         ggml_metal_kargs_mul_mv_id args = {
             /*.nei0            =*/ ne20,

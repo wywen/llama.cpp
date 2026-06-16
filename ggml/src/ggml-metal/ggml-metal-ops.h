@@ -14,6 +14,23 @@ typedef struct ggml_metal_op * ggml_metal_op_t;
 // same detection logic without duplicating it.
 int rrl_is_expert_mmap_metal_c(const struct ggml_tensor *t);
 
+// [rrl] PR2-A.2: async completion-handler evictor interface (C-callable from context.m).
+//
+// rrl_metal_cb_async_depth: returns the async in-flight depth D (from
+//   RRL_METAL_CB_ASYNC env var), or 0 if async mode is disabled (var unset).
+//   Default D=2 when the var is set to 0/empty/non-numeric.
+//
+// rrl_async_window_take_records: move the accumulated async-records vector to a
+//   heap allocation and return an opaque handle (NULL if nothing was accumulated).
+//   Call once per window after the encode loop, before committing.
+//
+// rrl_async_window_reclaim_and_free: run rrl_evict_window_reclaim on each record
+//   in the handle and free it.  Safe to call with NULL.  Call from the MTL
+//   completion handler — the handler is the SOLE evictor in async mode.
+int   rrl_metal_cb_async_depth(void);
+void *rrl_async_window_take_records(void);
+void  rrl_async_window_reclaim_and_free(void *handle);
+
 ggml_metal_op_t ggml_metal_op_init(
         ggml_metal_device_t dev,
         ggml_metal_cmd_buf_t cmd_buf,

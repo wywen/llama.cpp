@@ -582,100 +582,206 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             win_starts[n_win] = gf->n_nodes; // sentinel (end of last window)
 
             // -- Sequential commit loop -----------------------------------------
-            // For each window [start, end):
-            //   create CB → enqueue → build op → encode → free (ends encoding) →
-            //   commit → waitUntilCompleted → check status
-            // waitUntilCompleted after each CB releases that window's useResource
-            // residency before the next window faults its experts.
+            // Two sub-paths:
             //
-            // Memory management: commandBufferWithUnretainedReferences + explicit
-            // [retain] gives us a retain count of 1.  We transfer that retain to
-            // cmd_bufs_ext (for the last window) so synchronize() can hold a live
-            // reference via cmd_buf_last.  Intermediate window CBs are released
-            // immediately after drain (they have already completed).
-            id<MTLCommandBuffer> last_win_cmd_buf = nil;
+            //   Sync  (RRL_METAL_CB_ASYNC unset): per-window waitUntilCompleted
+            //     before the next window starts; sync rolling-evict runs inside
+            //     the encoder (ops.cpp).  Retain accounting: retain→count 1; last
+            //     CB goes into cmd_bufs_ext→count 2; synchronize releases both.
+            //
+            //   Async (RRL_METAL_CB_ASYNC=D): counting semaphore of depth D limits
+            //     in-flight CBs.  Each window's addCompletedHandler runs the reclaim
+            //     (rrl_async_window_reclaim_and_free) and releases the CB.  After all
+            //     windows are committed, drain the semaphore D times to ensure every
+            //     handler has fired before graph_compute returns.  The handler is the
+            //     SOLE evictor; the sync rolling-evict block in ops.cpp is bypassed.
+            //     cmd_buf_last is set to nil (all work done; synchronize is a no-op).
 
-            for (int wi = 0; wi < n_win; ++wi) {
-                const int w_start = win_starts[wi];
-                const int w_end   = win_starts[wi + 1];
+            const int rrl_async_d = rrl_metal_cb_async_depth();
 
-                if (w_start >= w_end) { continue; } // skip empty windows
+            if (rrl_async_d > 0) {
+                // -- Async path (RRL_METAL_CB_ASYNC=D) ----------------------------
+                // Semaphore starts at D: the main thread takes one slot before
+                // creating each CB; the completion handler signals one slot back.
+                dispatch_semaphore_t sem = dispatch_semaphore_create(rrl_async_d);
 
-                id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
-                [cmd_buf retain];
-                [cmd_buf enqueue];
+                for (int wi = 0; wi < n_win; ++wi) {
+                    const int w_start = win_starts[wi];
+                    const int w_end   = win_starts[wi + 1];
 
-                ggml_metal_op_t ctx_op = ggml_metal_op_init(
-                    ctx->dev,
-                    (ggml_metal_cmd_buf_t) cmd_buf,
-                    gf,
-                    w_start,
-                    w_end,
-                    ctx->use_fusion,
-                    ctx->use_concurrency,
-                    /*use_capture=*/false,
-                    ctx->debug_graph,
-                    ctx->debug_fusion);
+                    if (w_start >= w_end) { continue; } // skip empty windows
 
-                for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
-                    const int res = ggml_metal_op_encode(ctx_op, idx);
-                    if (res == 0) { break; }
-                    idx += res - 1;
+                    // Throttle: block until a slot is available (<D in-flight CBs).
+                    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+
+                    id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+                    [cmd_buf retain]; // our explicit retain → count 1
+                    [cmd_buf enqueue];
+
+                    ggml_metal_op_t ctx_op = ggml_metal_op_init(
+                        ctx->dev,
+                        (ggml_metal_cmd_buf_t) cmd_buf,
+                        gf,
+                        w_start,
+                        w_end,
+                        ctx->use_fusion,
+                        ctx->use_concurrency,
+                        /*use_capture=*/false,
+                        ctx->debug_graph,
+                        ctx->debug_fusion);
+
+                    for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+                        const int res = ggml_metal_op_encode(ctx_op, idx);
+                        if (res == 0) { break; }
+                        idx += res - 1;
+                    }
+
+                    // ends encoding and frees the encoder
+                    ggml_metal_op_free(ctx_op);
+
+                    // Drain the async-records accumulated by this window's encoder
+                    // calls into a heap allocation.  The completion handler owns it.
+                    void * rrl_handle = rrl_async_window_take_records();
+
+                    // Completion handler: sole evictor + release + signal.
+                    // h is captured by value (opaque void* — no C++ copy needed).
+                    // The handler executes on the Metal driver thread after the CB
+                    // finishes; by that time all GPU reads of this window's experts
+                    // are complete, so it is safe to msync-evict them.
+                    void * h = rrl_handle; // explicit local for Block capture (C)
+                    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                        if (cb.status != MTLCommandBufferStatusCompleted) {
+                            ctx->has_error = true;
+                        }
+                        rrl_async_window_reclaim_and_free(h); // sole evictor; safe if NULL
+                        [cb release];                          // balance our [retain] above
+                        dispatch_semaphore_signal(sem);
+                    }];
+
+                    [cmd_buf commit]; // NO waitUntilCompleted
+                    // DO NOT add to cmd_bufs_ext — the handler owns the release.
                 }
 
-                // ends encoding and frees the encoder
-                ggml_metal_op_free(ctx_op);
+                // Drain: acquire all D permits so every in-flight completion handler
+                // has fired.  Each committed CB's handler signals exactly once, so the
+                // initial D permits plus those signals make these D waits always
+                // complete regardless of how many windows committed (no deadlock).
+                for (int i = 0; i < rrl_async_d; ++i) {
+                    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+                }
+                // Restore the count to its creation value BEFORE releasing: libdispatch
+                // traps (EXC_BREAKPOINT in _dispatch_semaphore_dispose) if a semaphore is
+                // deallocated while its value is below the value it was created with.
+                for (int i = 0; i < rrl_async_d; ++i) {
+                    dispatch_semaphore_signal(sem);
+                }
+                dispatch_release(sem);
 
-                [cmd_buf commit];
+                // All window CBs are done and released.  Set cmd_buf_last to nil so
+                // synchronize() skips its waitUntilCompleted (no live reference left).
+                ctx->cmd_buf_last = nil;
 
-                // Drain: waitUntilCompleted releases this window's useResource
-                // residency before the next window faults its experts.
-                [cmd_buf waitUntilCompleted];
-
-                MTLCommandBufferStatus status = [cmd_buf status];
-                if (status != MTLCommandBufferStatusCompleted) {
-                    GGML_LOG_INFO("%s: [rrl] windowed CB %d failed with status %lu\n",
-                                  __func__, wi, (unsigned long) status);
-                    if (status == MTLCommandBufferStatusError) {
-                        GGML_LOG_INFO("error: %s\n",
-                                      [[cmd_buf error].localizedDescription UTF8String]);
-                    }
-                    ctx->has_error = true;
-                    // Release the failed CB's retain (it is not stored in cmd_bufs_ext).
-                    [cmd_buf release];
-                    // Release any prior window CB we were holding in last_win_cmd_buf
-                    // (it succeeded but we haven't added it to cmd_bufs_ext yet).
-                    if (last_win_cmd_buf != nil) {
-                        [last_win_cmd_buf release];
-                        last_win_cmd_buf = nil;
-                    }
+                if (ctx->has_error) {
                     return GGML_STATUS_FAILED;
                 }
 
-                // Release the previous last-window CB (it has completed and we are
-                // about to replace last_win_cmd_buf).
-                if (last_win_cmd_buf != nil) {
-                    [last_win_cmd_buf release];
-                }
-                last_win_cmd_buf = cmd_buf; // transfer our retain to last_win_cmd_buf
-            }
+            } else {
+                // -- Sync path (RRL_METAL_CB_ASYNC unset) -------------------------
+                // For each window [start, end):
+                //   create CB → enqueue → build op → encode → free (ends encoding)
+                //   → commit → waitUntilCompleted → check status
+                // waitUntilCompleted after each CB releases that window's useResource
+                // residency before the next window faults its experts.
+                //
+                // Memory management: commandBufferWithUnretainedReferences + explicit
+                // [retain] gives us a retain count of 1.  We transfer that retain to
+                // cmd_bufs_ext (for the last window) so synchronize() can hold a live
+                // reference via cmd_buf_last.  Intermediate window CBs are released
+                // immediately after drain (they have already completed).
+                id<MTLCommandBuffer> last_win_cmd_buf = nil;
 
-            // Track the last window's CB in cmd_bufs_ext so synchronize() can
-            // wait on it via cmd_buf_last.  Retain count accounting:
-            //   commandBufferWithUnretainedReferences starts at 0.
-            //   Our [retain] (at top of loop)   → count 1
-            //   addObject (array retains)        → count 2
-            //   synchronize [release]            → count 1
-            //   synchronize removeAllObjects     → count 0 → dealloc ✓
-            // Do NOT call an extra [release] here — we need count=2 entering
-            // synchronize so both its explicit [release] and removeAllObjects
-            // balance correctly.
-            if (last_win_cmd_buf != nil) {
-                [ctx->cmd_bufs_ext addObject:last_win_cmd_buf];
-                ctx->cmd_buf_last = last_win_cmd_buf;
-                // Our explicit [retain] is still live; addObject added the second
-                // retain.  Leave both — synchronize consumes them.
-            }
+                for (int wi = 0; wi < n_win; ++wi) {
+                    const int w_start = win_starts[wi];
+                    const int w_end   = win_starts[wi + 1];
+
+                    if (w_start >= w_end) { continue; } // skip empty windows
+
+                    id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+                    [cmd_buf retain];
+                    [cmd_buf enqueue];
+
+                    ggml_metal_op_t ctx_op = ggml_metal_op_init(
+                        ctx->dev,
+                        (ggml_metal_cmd_buf_t) cmd_buf,
+                        gf,
+                        w_start,
+                        w_end,
+                        ctx->use_fusion,
+                        ctx->use_concurrency,
+                        /*use_capture=*/false,
+                        ctx->debug_graph,
+                        ctx->debug_fusion);
+
+                    for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+                        const int res = ggml_metal_op_encode(ctx_op, idx);
+                        if (res == 0) { break; }
+                        idx += res - 1;
+                    }
+
+                    // ends encoding and frees the encoder
+                    ggml_metal_op_free(ctx_op);
+
+                    [cmd_buf commit];
+
+                    // Drain: waitUntilCompleted releases this window's useResource
+                    // residency before the next window faults its experts.
+                    [cmd_buf waitUntilCompleted];
+
+                    MTLCommandBufferStatus status = [cmd_buf status];
+                    if (status != MTLCommandBufferStatusCompleted) {
+                        GGML_LOG_INFO("%s: [rrl] windowed CB %d failed with status %lu\n",
+                                      __func__, wi, (unsigned long) status);
+                        if (status == MTLCommandBufferStatusError) {
+                            GGML_LOG_INFO("error: %s\n",
+                                          [[cmd_buf error].localizedDescription UTF8String]);
+                        }
+                        ctx->has_error = true;
+                        // Release the failed CB's retain (it is not stored in cmd_bufs_ext).
+                        [cmd_buf release];
+                        // Release any prior window CB we were holding in last_win_cmd_buf
+                        // (it succeeded but we haven't added it to cmd_bufs_ext yet).
+                        if (last_win_cmd_buf != nil) {
+                            [last_win_cmd_buf release];
+                            last_win_cmd_buf = nil;
+                        }
+                        return GGML_STATUS_FAILED;
+                    }
+
+                    // Release the previous last-window CB (it has completed and we are
+                    // about to replace last_win_cmd_buf).
+                    if (last_win_cmd_buf != nil) {
+                        [last_win_cmd_buf release];
+                    }
+                    last_win_cmd_buf = cmd_buf; // transfer our retain to last_win_cmd_buf
+                }
+
+                // Track the last window's CB in cmd_bufs_ext so synchronize() can
+                // wait on it via cmd_buf_last.  Retain count accounting:
+                //   commandBufferWithUnretainedReferences starts at 0.
+                //   Our [retain] (at top of loop)   → count 1
+                //   addObject (array retains)        → count 2
+                //   synchronize [release]            → count 1
+                //   synchronize removeAllObjects     → count 0 → dealloc ✓
+                // Do NOT call an extra [release] here — we need count=2 entering
+                // synchronize so both its explicit [release] and removeAllObjects
+                // balance correctly.
+                if (last_win_cmd_buf != nil) {
+                    [ctx->cmd_bufs_ext addObject:last_win_cmd_buf];
+                    ctx->cmd_buf_last = last_win_cmd_buf;
+                    // Our explicit [retain] is still live; addObject added the second
+                    // retain.  Leave both — synchronize consumes them.
+                }
+            } // end sync/async branch
         } else {
         // -- Original parallel dispatch_apply path (unchanged) ------------------
 
