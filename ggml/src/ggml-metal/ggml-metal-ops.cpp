@@ -224,6 +224,105 @@ extern "C" void rrl_metal_clear_keep_mask(void) {
     g_rrl_keep_n_expert = 0;
 }
 
+// [rrl] PR2-A.1: POD capturing all fields needed to perform one rolling-evict
+// reclaim (previously held in file-scope statics + globals).  Populated from the
+// current s_prev_* / s_rrl_prev_* state at the call site, then passed to
+// rrl_evict_window_reclaim.  The async completion handler (PR2-A.2) will capture
+// this by value so it can run the same reclaim off the hot path.
+struct rrl_evict_window {
+    void *                  base_addr;     // s_prev_addr
+    size_t                  len;           // s_prev_len (whole-tensor fallback size)
+    uint64_t                stride;        // s_prev_stride (per-expert)
+    int64_t                 nexp;          // s_prev_nexp
+    int                     layer;         // s_prev_layer
+    std::vector<int32_t>    wired;         // routed eids (s_rrl_prev_wired)
+    std::atomic<uint8_t> *  state;         // s_rrl_prev_state
+    std::atomic<uint32_t> * refcount;      // s_rrl_prev_refcount
+    const uint8_t *         keep_mask;     // g_rrl_keep_mask snapshot
+    uint32_t                keep_n_layer;  // mask dims
+    uint32_t                keep_n_exp;
+};
+
+// [rrl] PR2-A.1: Extracted reclaim function.  Performs the full rolling-evict
+// reclaim for a single window (previously the inline block at ~ops.cpp:2598-2658).
+// Reads all fields from the POD; does NOT touch any file-scope statics or globals.
+// Per-expert path: the full CAS/refcount handshake ordering is preserved verbatim —
+//   refcount fetch_sub (acq_rel) → keep-mask COLD check → CAS NORMAL→EVICTING
+//   (seq_cst) → seq_cst fence → recheck refcount==0 (acquire) → rrl_expert_reclaim
+//   → store NORMAL (release); bare reclaim when state==null.
+// Whole-tensor fallback: when keep_mask==null or dims mismatch.
+// Counter increments (g_rrl_evict_calls / g_rrl_evict_bytes) are preserved.
+static void rrl_evict_window_reclaim(const rrl_evict_window & w) {
+    constexpr uint8_t kNormal   = 0;
+    constexpr uint8_t kEvicting = 1;
+    const uint8_t * mask    = w.keep_mask;
+    const uint32_t  n_layer = w.keep_n_layer;
+    const uint32_t  n_exp   = w.keep_n_exp;
+    const bool use_mask = (mask != nullptr &&
+                           w.layer >= 0 &&
+                           (uint32_t)w.layer < n_layer &&
+                           w.nexp <= (int64_t)n_exp &&
+                           w.stride > 0 &&
+                           !w.wired.empty());
+    if (use_mask) {
+        // [rrl] Residency-aware per-expert evictor (see full comment at original site).
+        std::atomic<uint8_t>  * st = w.state;
+        std::atomic<uint32_t> * rc = w.refcount;
+        for (int32_t eid : w.wired) {
+            if (eid < 0 || eid >= (int32_t) w.nexp) { continue; }
+            // Step 1: decrement refcount (acq_rel) — op has synced.
+            if (rc != nullptr) {
+                rc[eid].fetch_sub(1u, std::memory_order_acq_rel);
+            }
+            // Step 2: skip HOT experts (keep resident).
+            const bool cold =
+                (mask[(std::size_t)w.layer * n_exp + (std::size_t)eid] == 0);
+            if (!cold) { continue; }
+            // Step 3: try_evict this cold expert.
+            char * expert_addr =
+                static_cast<char *>(w.base_addr) +
+                (std::size_t)eid * (std::size_t)w.stride;
+            if (st != nullptr) {
+                // Full try_evict: validated handshake ordering.
+                // CAS NORMAL→EVICTING (seq_cst).
+                uint8_t expect = kNormal;
+                if (!st[eid].compare_exchange_strong(
+                        expect, kEvicting,
+                        std::memory_order_seq_cst,
+                        std::memory_order_relaxed)) {
+                    continue; // another evictor won the CAS
+                }
+                // seq_cst fence: ensures refcount store (from encoder)
+                // is visible before we recheck.
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                // Recheck refcount: abort if encoder raced in.
+                const uint32_t live = (rc != nullptr)
+                    ? rc[eid].load(std::memory_order_acquire)
+                    : 0u;
+                if (live == 0u) {
+                    rrl_expert_reclaim(expert_addr, (std::size_t)w.stride);
+                    g_rrl_evict_calls.fetch_add(1, std::memory_order_relaxed);
+                    g_rrl_evict_bytes.fetch_add(
+                        w.stride, std::memory_order_relaxed);
+                }
+                // Restore to NORMAL (release).
+                st[eid].store(kNormal, std::memory_order_release);
+            } else {
+                // No state ptr (no hook last op): bare reclaim.
+                rrl_expert_reclaim(expert_addr, (std::size_t)w.stride);
+                g_rrl_evict_calls.fetch_add(1, std::memory_order_relaxed);
+                g_rrl_evict_bytes.fetch_add(
+                    w.stride, std::memory_order_relaxed);
+            }
+        }
+    } else {
+        // Fallback: no mask or dimension mismatch — evict whole tensor.
+        rrl_expert_reclaim(w.base_addr, w.len);
+        g_rrl_evict_calls.fetch_add(1, std::memory_order_relaxed);
+        g_rrl_evict_bytes.fetch_add((uint64_t)w.len, std::memory_order_relaxed);
+    }
+}
+
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
         return { nullptr, 0 };
@@ -2554,109 +2653,23 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         if (rrl_evict && rrl_is_expert_mmap_metal(s0)) {
             const auto rrl_ev_t0 = std::chrono::steady_clock::now();
             if (s_prev_addr != nullptr) {
-                // [rrl] Selective per-expert eviction when a keep-mask is installed.
-                // HOT experts (mask==1) are skipped; only COLD experts (mask==0) get
-                // madvise(MADV_FREE_REUSABLE) on their individual per-expert stride.
-                const uint8_t * mask    = g_rrl_keep_mask;
-                const uint32_t  n_layer = g_rrl_keep_n_layer;
-                const uint32_t  n_exp   = g_rrl_keep_n_expert;
-                // [rrl] Increment 1: the residency-aware path iterates the prev op's
-                // WIRED (routed) experts. A non-empty wired list means the prev op
-                // was mv_id OR mm_id ptr-mode (both populate s_rrl_prev_wired since
-                // #126). An empty wired list means the prev op ran in stock / fallback
-                // mode → fall through to the whole-tensor fallback so its resident
-                // experts are still evicted (gating on use_mask alone would iterate
-                // an empty list = no evict = leak).
-                const bool use_mask = (mask != nullptr &&
-                                       s_prev_layer >= 0 &&
-                                       (uint32_t)s_prev_layer < n_layer &&
-                                       s_prev_nexp <= (int64_t)n_exp &&
-                                       s_prev_stride > 0 &&
-                                       !s_rrl_prev_wired.empty());
-                if (use_mask) {
-                    // [rrl] Increment 1: RESIDENCY-AWARE EVICTOR.
-                    // Iterate only over the PREVIOUS op's wired (routed) experts
-                    // (s_rrl_prev_wired), not over all s_prev_nexp experts.
-                    // For each wired expert:
-                    //   1. Decrement its refcount (acq_rel) — the deferred-by-one
-                    //      slot guarantees the previous op has synced, so refcount
-                    //      drops to 0 here in the synchronous path.
-                    //   2. Check if it is COLD (mask byte == 0).  HOT experts (mask
-                    //      byte == 1) are kept resident; only their refcount is
-                    //      decremented, no madvise.
-                    //   3. For COLD experts: full try_evict with the validated
-                    //      handshake ordering (c3a97bc metal_probe_evict_handshake):
-                    //        CAS NORMAL→EVICTING (seq_cst) → seq_cst fence →
-                    //        recheck refcount==0 (acquire) → madvise → store NORMAL (release).
-                    //      Abort if CAS fails (another evictor won) or refcount != 0
-                    //      (encoder raced in — impossible in the sync path but correct
-                    //      in the later async cut).
-                    //      When s_rrl_prev_state==nullptr: bare madvise (no CAS guard).
-                    // This evicts ONLY routed-and-cold experts (≈ n_expert_used minus
-                    // hot), not all 128 — far fewer madvise calls, and re-faulted cold
-                    // experts re-evict next time they are routed (no leak).
-                    constexpr uint8_t kNormal   = 0;
-                    constexpr uint8_t kEvicting = 1;
-                    std::atomic<uint8_t>  * st  = s_rrl_prev_state;
-                    std::atomic<uint32_t> * rc  = s_rrl_prev_refcount;
-                    for (int32_t eid : s_rrl_prev_wired) {
-                        // Bounds guard (defensive; wired list is built from valid eids).
-                        if (eid < 0 || eid >= (int32_t) s_prev_nexp) { continue; }
-                        // Step 1: decrement refcount (acq_rel) — op has synced.
-                        if (rc != nullptr) {
-                            rc[eid].fetch_sub(1u, std::memory_order_acq_rel);
-                        }
-                        // Step 2: skip HOT experts (keep resident).
-                        const bool cold =
-                            (mask[(std::size_t)s_prev_layer * n_exp + (std::size_t)eid] == 0);
-                        if (!cold) { continue; }
-                        // Step 3: try_evict this cold expert.
-                        char * expert_addr =
-                            static_cast<char *>(s_prev_addr) +
-                            (std::size_t)eid * (std::size_t)s_prev_stride;
-                        if (st != nullptr) {
-                            // Full try_evict: validated handshake ordering.
-                            // CAS NORMAL→EVICTING (seq_cst).
-                            uint8_t expect = kNormal;
-                            if (!st[eid].compare_exchange_strong(
-                                    expect, kEvicting,
-                                    std::memory_order_seq_cst,
-                                    std::memory_order_relaxed)) {
-                                continue; // another evictor won the CAS
-                            }
-                            // seq_cst fence: ensures refcount store (from encoder)
-                            // is visible before we recheck.
-                            std::atomic_thread_fence(std::memory_order_seq_cst);
-                            // Recheck refcount: abort if encoder raced in.
-                            const uint32_t live = (rc != nullptr)
-                                ? rc[eid].load(std::memory_order_acquire)
-                                : 0u;
-                            if (live == 0u) {
-                                rrl_expert_reclaim(expert_addr, (std::size_t)s_prev_stride);
-                                g_rrl_evict_calls.fetch_add(1, std::memory_order_relaxed);
-                                g_rrl_evict_bytes.fetch_add(
-                                    s_prev_stride, std::memory_order_relaxed);
-                            }
-                            // Restore to NORMAL (release).
-                            st[eid].store(kNormal, std::memory_order_release);
-                        } else {
-                            // No state ptr (no hook last op): bare reclaim.
-                            rrl_expert_reclaim(expert_addr, (std::size_t)s_prev_stride);
-                            g_rrl_evict_calls.fetch_add(1, std::memory_order_relaxed);
-                            g_rrl_evict_bytes.fetch_add(
-                                s_prev_stride, std::memory_order_relaxed);
-                        }
-                    }
-                } else {
-                    // Fallback: no mask or dimension mismatch — evict whole tensor.
-                    // NOT state-guarded: this is the degenerate path (msync over
-                    // the full tensor in one call, not per-expert); no per-expert
-                    // CAS is applied here.
-                    rrl_expert_reclaim(s_prev_addr, s_prev_len);
-                    g_rrl_evict_calls.fetch_add(1, std::memory_order_relaxed);
-                    g_rrl_evict_bytes.fetch_add((uint64_t)s_prev_len,
-                                                std::memory_order_relaxed);
-                }
+                // [rrl] PR2-A.1: build the window POD from the current s_prev_* /
+                // s_rrl_prev_* statics + the keep-mask globals, then delegate to the
+                // extracted rrl_evict_window_reclaim.  Behavior is byte-identical to
+                // the inlined block that was here before — same paths, same ordering.
+                rrl_evict_window w;
+                w.base_addr    = s_prev_addr;
+                w.len          = s_prev_len;
+                w.stride       = s_prev_stride;
+                w.nexp         = s_prev_nexp;
+                w.layer        = s_prev_layer;
+                w.wired        = s_rrl_prev_wired;   // copy (statics cleared below)
+                w.state        = s_rrl_prev_state;
+                w.refcount     = s_rrl_prev_refcount;
+                w.keep_mask    = g_rrl_keep_mask;
+                w.keep_n_layer = g_rrl_keep_n_layer;
+                w.keep_n_exp   = g_rrl_keep_n_expert;
+                rrl_evict_window_reclaim(w);
             }
             g_rrl_evict_ns.fetch_add(
                 (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
