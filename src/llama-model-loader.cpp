@@ -13,6 +13,7 @@
 #include <future>
 #include <regex>
 #if defined(__APPLE__)
+#  include <fcntl.h>
 #  include <sys/mman.h>
 #  include <unistd.h>
 #endif
@@ -1624,6 +1625,27 @@ bool llama_model_loader::load_all_data(
         return true;
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
+
+#if defined(__APPLE__)
+    // [keep-separate Metal] On the per-expert layout the source weights are read
+    // exactly once (use_mmap is disabled on this path) and never needed again —
+    // each expert is assembled into the mmap-metal region and its destination
+    // pages are reclaimed per fused tensor (msync + MADV_FREE_REUSABLE). Mark every
+    // source fd F_NOCACHE so those ~14 GiB of one-time reads do NOT populate the
+    // unified buffer cache; otherwise the leftover source page-cache (on top of the
+    // destination temp file) drives the watchdog's free% metric below threshold
+    // during the first context build, killing the run before decode. F_NOCACHE
+    // (unlike O_DIRECT / F_DIRECT) imposes no read-alignment requirement and only
+    // affects this fd's caching. Best-effort: ignore fcntl failures.
+    if (per_expert_moe) {
+        for (const auto & file : files) {
+            const int fd = file->file_id();
+            if (fd >= 0) {
+                fcntl(fd, F_NOCACHE, 1);
+            }
+        }
+    }
+#endif
 
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
