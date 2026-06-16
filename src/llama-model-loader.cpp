@@ -1448,8 +1448,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const int    ndims = ggml_n_dims(tensor);
         const int    last  = ndims - 1;
         const int64_t n_exp = tensor->ne[last];
-        if (n_exp >= 1 && last >= 0) {
-            const size_t raw_stride = tensor->nb[last]; // contiguous per-expert bytes
+        const size_t raw_stride = (last >= 0) ? tensor->nb[last] : 0; // contiguous per-expert bytes
+        // Only pad LARGE per-expert tensors — the quantized weight matrices that
+        // actually get per-expert sub-buffer residency in the decode kernel (their
+        // per-expert stride is >> a page). Sub-page per-expert tensors (the gemma
+        // expert SCALES like up_exps_s — a few bytes per expert — and any biases)
+        // MUST stay tightly packed (contiguous): build_moe_ffn reshapes them
+        // (ggml_reshape_3d asserts ggml_is_contiguous), and they're tiny so they
+        // stay fully resident regardless — page-alignment buys them nothing. Padding
+        // them would both break the reshape and balloon them to a page each.
+        if (n_exp >= 1 && last >= 0 && raw_stride >= LLAMA_METAL_EXPERT_ALIGN) {
             const size_t padded     = (raw_stride + (LLAMA_METAL_EXPERT_ALIGN - 1)) &
                                       ~(static_cast<size_t>(LLAMA_METAL_EXPERT_ALIGN) - 1);
             tensor->nb[last] = padded;
