@@ -1,22 +1,23 @@
 #pragma once
 
-// Graph-rewrite: identity CPU barrier ops at layer boundaries.
+// Barrier hook API: CPU split barriers at layer boundaries.
 //
-// rrl_insert_layer_barriers inserts a GGML_OP_CUSTOM identity op after every
-// `segment`-th l_out-<il> tensor in the just-built (not-yet-allocated) graph `gf`.
-// This forces the backend scheduler to split Metal/CPU execution at those points,
-// enabling per-segment residency management in later increments.
+// The barrier custom-op and the graph rewrite that inserts it now live in the
+// rust-recipes-llama crate (compiled into its own DSO with the ResidencyManager).
+// This header declares the libllama-side hook tables the crate installs into, plus
+// the thin forwarders the patched call-sites still call by name.
 //
-// The rewrite is numerically transparent: the custom callback is a plain memcpy that
-// produces a byte-identical copy of its input.  Graph reuse (can_reuse) works normally
-// because the barrier ops are inserted into gf before alloc, so the reserved graph and
-// the executed graph have the same topology.
-//
-// [Step 4 Increment 3a] The function now accepts an optional residency manager
-// callback pair (void* mgr, void (*on_barrier)(void*, int)).  When both are non-null
-// each barrier custom-op invokes on_barrier(mgr, il) after the identity memcpy.
-// When either is null the behaviour is identical to Increment 2 (pure passthrough).
-// This keeps the barriers TU model-agnostic: it never knows the residency manager.
+// rrl_insert_layer_barriers forwards to the crate's rewrite (s_rewrite_hook). That
+// rewrite splices, after every planned `l_out-<il>` tensor, a [1-element view, CPU
+// custom-op] pair: the CPU op forces a Metal/CPU backend split (enabling per-segment
+// residency management) and fires the residency callback. It is numerically
+// transparent — l_out and its consumers are untouched, so the values flowing through
+// the graph are unchanged; the op only taps a 1-element VIEW of l_out (not the whole
+// residual) and its output is unused. That keeps the scheduler's cross-backend copy
+// to a single element with no CPU→Metal copy-back, instead of the two full-residual
+// copies a whole-l_out barrier with consumer redirect would pay. Graph reuse
+// (can_reuse) is unaffected: the barrier nodes are inserted before alloc, so the
+// reserved and executed graphs have the same topology.
 
 #include "ggml-backend.h" // ggml_backend_dev_t, ggml_backend_buffer_t, ggml_tensor
 
@@ -27,13 +28,18 @@ extern "C" {
 struct ggml_cgraph;
 struct ggml_context;
 
-/// Inserts identity CPU custom ops after every `segment`-th layer's `l_out-{il}` tensor,
-/// forcing a Metal/CPU backend split there.  Returns the number of barriers inserted
-/// (0 = no-op).  `gf` is the just-built, not-yet-allocated graph; `ctx` is the graph's
-/// compute context (res->get_ctx()); `n_layer` is the model layer count.
+/// Forwards to the crate's graph rewrite (installed via rrl_install_barrier_hooks),
+/// which splices CPU barrier ops after every planned `l_out-{il}` tensor and returns
+/// the number inserted (0 = no-op / hook not installed).  `gf` is the just-built,
+/// not-yet-allocated graph; `ctx` is the graph's compute context (res->get_ctx());
+/// `n_layer` is the model layer count.
 ///
-/// `mgr` and `on_barrier` are the residency manager callback pair (Step 4 Inc 3a).
-/// Pass both as NULL for the Increment-2 pure-passthrough behaviour.
+/// `mgr` and `on_barrier` are the residency manager callback pair.  Passing both as
+/// NULL selects the bare fixed-stride passthrough, but note the rewrite is now
+/// crate-resident: it (the bare path included) returns 0 until an mmap-metal device
+/// has been opened, which is what installs the hooks (see rrl_install_barrier_hooks).
+/// In practice the patched call-sites always pass segment=0 + a manager, so the bare
+/// fixed-stride branch is reachable only from a direct unit-test call.
 ///
 /// Contract: call AFTER build_graph() and BEFORE ggml_backend_sched_alloc_graph() /
 /// ggml_backend_sched_reserve().
@@ -44,7 +50,7 @@ int rrl_insert_layer_barriers(struct ggml_cgraph * gf,
                               void (*on_barrier)(void *, int));
 
 /// Test introspection: total barriers inserted by the most recent rewrite.
-/// Thread-safe (atomic); only meaningful in serialized test contexts.
+/// Forwards to the crate's counter; only meaningful in serialized test contexts.
 int rrl_last_barrier_count(void);
 
 // [Step 4 Increment 3a] Residency-manager hook table.
@@ -68,6 +74,15 @@ typedef int   (*rrl_plan_barriers_fn)(void * mgr, int * out, int max_out);
 typedef int   (*rrl_armed_fn)(void * mgr);
 typedef void  (*rrl_unregister_fn)(ggml_backend_dev_t dev, const void * owner);
 
+// The graph-rewrite hook + the barrier-count getter (the crate-resident op and
+// rewrite). rrl_rewrite_fn matches rrl_insert_layer_barriers's signature so the
+// libllama forwarder is a verbatim pass-through.
+typedef int   (*rrl_rewrite_fn)(struct ggml_cgraph * gf,
+                                struct ggml_context * ctx,
+                                int n_layer, int segment, void * mgr,
+                                void (*on_barrier)(void *, int));
+typedef int   (*rrl_last_count_fn)(void);
+
 /// Install real residency-manager function pointers.  Called once from the
 /// Rust crate after mmap_metal_open succeeds.  Thread-hostile; call before
 /// any llama_context using the mmap-metal device is constructed.
@@ -78,6 +93,11 @@ void rrl_install_residency_hooks(rrl_get_mgr_fn   get_mgr,
                                  rrl_plan_barriers_fn plan_barriers,
                                  rrl_armed_fn armed,
                                  rrl_unregister_fn unregister);
+
+/// Install the crate's barrier-rewrite + barrier-count function pointers.
+/// Called once from the crate alongside rrl_install_residency_hooks.
+void rrl_install_barrier_hooks(rrl_rewrite_fn rewrite,
+                               rrl_last_count_fn last_count);
 
 /// Return the residency manager pointer for dev (dispatches through hook).
 void * rrl_residency_manager_ptr(ggml_backend_dev_t dev);
