@@ -2555,11 +2555,11 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 const uint32_t  n_exp   = g_rrl_keep_n_expert;
                 // [rrl] Increment 1: the residency-aware path iterates the prev op's
                 // WIRED (routed) experts. A non-empty wired list means the prev op
-                // was mv_id ptr-mode. An mm_id (prefill) op has NO per-expert wired
-                // set (whole-buffer resident) → wired is empty → fall through to the
-                // whole-tensor fallback so its resident experts are still evicted
-                // (gating on use_mask alone would iterate an empty list = no evict =
-                // leak for >32-token prefills).
+                // was mv_id OR mm_id ptr-mode (both populate s_rrl_prev_wired since
+                // #126). An empty wired list means the prev op ran in stock / fallback
+                // mode → fall through to the whole-tensor fallback so its resident
+                // experts are still evicted (gating on use_mask alone would iterate
+                // an empty list = no evict = leak).
                 const bool use_mask = (mask != nullptr &&
                                        s_prev_layer >= 0 &&
                                        (uint32_t)s_prev_layer < n_layer &&
@@ -2748,35 +2748,168 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         // this barrier is always needed because the next kernel has to wait for the id maps to be computed
         ggml_metal_op_concurrency_reset(ctx);
 
+        // [rrl] #126: per-expert ptr-mode for the prefill (mul_mm_id) path. Mirrors
+        // the decode (mul_mv_id) path: call the subbuffer hook, page in routed experts,
+        // wire via useResource, and bind the tiny argbuf at buffer(1) + buffer(6) so
+        // the fused 14.4 GiB layer buffer is NOT made resident. Gate is identical to
+        // the decode path: hook installed AND src0 in a registered mmap-metal region
+        // AND ne02 >= 1. Stock fused models (no hook or wrong buft) keep the existing
+        // whole-tensor mm_id path byte-identical.
+        int32_t use_expert_ptrs_mm = 0;
+        void *  argbuf_mtl_mm      = nullptr; // id<MTLBuffer> for the gpuAddress array
+        void ** expert_mtl_bufs_mm = nullptr; // per-expert id<MTLBuffer> for useResource
+        std::atomic<uint8_t>  * expert_state_mm    = nullptr;
+        std::atomic<uint32_t> * expert_refcount_mm = nullptr;
+
+        const ggml_tensor * src0_mm = op->src[0];
+        if (g_rrl_expert_subbuffers != nullptr &&
+            rrl_is_expert_mmap_metal(src0_mm) &&
+            ne02 >= 1) {
+            ggml_metal_buffer_t metal_buf_mm = (ggml_metal_buffer_t) src0_mm->buffer->context;
+            void *   host_base_mm  = ggml_metal_buffer_get_base(metal_buf_mm);
+            const size_t base_offs_mm = (size_t)((const char *) src0_mm->data - (const char *) host_base_mm);
+            const uint64_t stride_mm  = (uint64_t) nb02;
+
+            int hook_rc_mm = g_rrl_expert_subbuffers(
+                host_base_mm, base_offs_mm, (int32_t) ne02, stride_mm,
+                &argbuf_mtl_mm, &expert_mtl_bufs_mm,
+                &expert_state_mm, &expert_refcount_mm);
+
+            if (hook_rc_mm == 0 && argbuf_mtl_mm != nullptr && expert_mtl_bufs_mm != nullptr) {
+                // Read routed expert ids from src[2].
+                // CRITICAL — id-stride: prefill has ne21 >= 32 tokens so EVERY token's
+                // row matters. Read each row at ids_base + i1*nb21 (the kernel's nbi1=nb21
+                // stride); a flat read would pick up the unselected tail of token 0's row
+                // for tokens > 0, useResource the wrong experts, and the kernel dereferences
+                // non-resident data. This is the exact bug class fixed for mv_id (see the
+                // nb21-stride comment in the decode block ~2899).
+                const char * ids_base_mm = (const char *) op->src[2]->data;
+                if (ids_base_mm != nullptr) {
+                    static constexpr size_t kRrlPageSizeMm = (size_t)16384;
+
+                    s_rrl_wired_cur.clear();
+                    std::vector<uint8_t> seen_mm((size_t)ne02, 0);
+
+                    for (int32_t i1 = 0; i1 < (int32_t) ne21; ++i1) {
+                        const int32_t * row_mm =
+                            (const int32_t *) (ids_base_mm + (size_t) i1 * nb21);
+                        for (int32_t i0 = 0; i0 < (int32_t) ne20; ++i0) {
+                            int32_t eid = row_mm[i0];
+                            if (eid >= 0 && eid < (int32_t) ne02 &&
+                                expert_mtl_bufs_mm[eid] != nullptr) {
+                                if (!seen_mm[(size_t)eid]) {
+                                    seen_mm[(size_t)eid] = 1;
+
+                                    // [rrl] Zero-copy page-in: fault in this expert's
+                                    // pages before useResource so the GPU sees resident
+                                    // data, not garbage. Zero-copy is the only expert
+                                    // path, so this is unconditional (no env gate).
+                                    {
+                                        volatile const char * ep_mm =
+                                            (volatile const char *) src0_mm->data +
+                                            (size_t) eid * (size_t) stride_mm;
+                                        madvise((void *) ep_mm, (size_t) stride_mm,
+                                                MADV_WILLNEED);
+                                        for (size_t pg = 0;
+                                             pg < (size_t) stride_mm;
+                                             pg += kRrlPageSizeMm) {
+                                            (void) ep_mm[pg];
+                                        }
+                                    }
+
+                                    // [rrl] ENCODER PUBLISH: refcount++ (relaxed) then
+                                    // seq_cst fence, BEFORE the spin-while-EVICTING check.
+                                    // Mirrors the validated handshake (c3a97bc).
+                                    if (expert_refcount_mm != nullptr) {
+                                        expert_refcount_mm[eid].fetch_add(
+                                            1u, std::memory_order_relaxed);
+                                        std::atomic_thread_fence(
+                                            std::memory_order_seq_cst);
+                                    }
+                                    // Spin while EVICTING (inert in the sync path but
+                                    // correct for the future async cut).
+                                    if (expert_state_mm != nullptr) {
+                                        while (expert_state_mm[eid].load(
+                                                   std::memory_order_acquire) == 1u) {
+                                            __builtin_arm_yield();
+                                        }
+                                    }
+                                    // MTLResourceUsageRead = 1
+                                    ggml_metal_encoder_use_resource_raw(
+                                        enc, expert_mtl_bufs_mm[eid], /*usage=*/1u);
+                                    s_rrl_wired_cur.push_back(eid);
+                                }
+                            }
+                        }
+                    }
+                    use_expert_ptrs_mm = 1;
+                    g_rrl_ptrmode_calls.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        // [rrl] #126: save evictor state so the NEXT op's deferred evictor sees this
+        // op's wired set. Mirrors the mv_id save at ~3213. The deferred-one-op slot
+        // means: when the NEXT call enters, the eviction block at ~2594 reads
+        // s_rrl_prev_wired (set here) to decide which experts to evict. The static
+        // geometry statics (s_prev_addr/len/layer/stride/nexp) are already updated
+        // from op->src[0] at ~2730 in the eviction block above (it runs BEFORE this
+        // code), so they already reflect the current mm_id op's tensor — no further
+        // update needed for geometry. We only need to set the file-scope ptrs.
+        //
+        // Prefill→decode handoff: the last mm_id op populates s_rrl_prev_wired here;
+        // the first mv_id decode op evicts it via the standard rolling-evict slot —
+        // no special casing needed.
+        s_rrl_prev_state    = expert_state_mm;
+        s_rrl_prev_refcount = expert_refcount_mm;
+        s_rrl_prev_wired    = std::move(s_rrl_wired_cur);
+        s_rrl_wired_cur.clear();
+
         {
             auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op);
 
             ggml_metal_kargs_mul_mm_id args = {
-                /*.ne00  =*/ ne00,
-                /*.ne02  =*/ ne02,
-                /*.nb01  =*/ nb01,
-                /*.nb02  =*/ nb02,
-                /*.nb03  =*/ nb03,
-                /*.ne11  =*/ ne11, // n_expert_used (bcast)
-                /*.nb10  =*/ nb10,
-                /*.nb11  =*/ nb11,
-                /*.nb12  =*/ nb12,
-                /*.nb13  =*/ nb13,
-                /*.ne20  =*/ ne20, // n_expert_used
-                /*.ne21  =*/ ne21, // n_tokens
-                /*.ne0   =*/ ne0,
-                /*.ne1   =*/ ne1,
-                /*.r2    =*/ r2,
-                /*.r3    =*/ r3,
+                /*.ne00             =*/ ne00,
+                /*.ne02             =*/ ne02,
+                /*.nb01             =*/ nb01,
+                /*.nb02             =*/ nb02,
+                /*.nb03             =*/ nb03,
+                /*.ne11             =*/ ne11, // n_expert_used (bcast)
+                /*.nb10             =*/ nb10,
+                /*.nb11             =*/ nb11,
+                /*.nb12             =*/ nb12,
+                /*.nb13             =*/ nb13,
+                /*.ne20             =*/ ne20, // n_expert_used
+                /*.ne21             =*/ ne21, // n_tokens
+                /*.ne0              =*/ ne0,
+                /*.ne1              =*/ ne1,
+                /*.r2               =*/ r2,
+                /*.r3               =*/ r3,
+                /*.use_expert_ptrs  =*/ use_expert_ptrs_mm,
             };
 
             ggml_metal_encoder_set_pipeline(enc, pipeline);
             ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-            ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
             ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
             ggml_metal_encoder_set_buffer  (enc, bid_tpe,  3);
             ggml_metal_encoder_set_buffer  (enc, bid_ids,  4);
             ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
+
+            // [rrl] #126: buffer binding mirrors the decode path (~3167).
+            // In ptr-mode: bind the tiny argbuf at buffer(1) (satisfies the src0 arg
+            // without making the whole 14.4 GiB layer resident) and at buffer(6) (the
+            // gpuAddress array the kernel reads). Only the per-expert sub-buffers made
+            // resident by the useResource loop above get pinned.
+            // In stock mode: bind the real fused buffer at buffer(1); buffer(6) still
+            // needs a valid binding (the kernel param is declared unconditionally) but
+            // is never dereferenced when use_expert_ptrs==0.
+            if (use_expert_ptrs_mm && argbuf_mtl_mm != nullptr) {
+                struct ggml_metal_buffer_id bid_argbuf_mm = { argbuf_mtl_mm, 0 };
+                ggml_metal_encoder_set_buffer(enc, bid_argbuf_mm, 1); // tiny; fused tensor not pinned
+                ggml_metal_encoder_set_buffer(enc, bid_argbuf_mm, 6); // the gpuAddress array
+            } else {
+                ggml_metal_encoder_set_buffer(enc, bid_src0, 1);   // stock: real fused buffer
+                ggml_metal_encoder_set_buffer(enc, bid_src0, 6);   // dummy; ignored when off
+            }
 
             const size_t smem = pipeline.smem;
 

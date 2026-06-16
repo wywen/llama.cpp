@@ -9779,7 +9779,14 @@ kernel void kernel_mul_mm_id(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        // [rrl] #126: per-expert gpuAddress array (buffer(6)).
+        // In ptr-mode (use_expert_ptrs==1) expert_ptrs[im] is the GPU base of expert im's
+        // sub-buffer; caller makes only the routed experts resident via useResource.
+        // The early-out (r1 >= neh1) ensures zero-token experts return before any dereference.
+        // In stock mode (use_expert_ptrs==0) this buffer is bound to a dummy argbuf and
+        // is never dereferenced.
+        device const uint64_t * expert_ptrs [[buffer(6)]]) {
     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
     threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
 
@@ -9807,6 +9814,18 @@ kernel void kernel_mul_mm_id(
         return;
     }
 
+    // [rrl] #126: ptr-mode branch. In ptr-mode the sub-buffer for expert im starts
+    // at expert_ptrs[im] (a GPU virtual address), which already points to that
+    // expert's weight data. The im*nb02 term in offset0 is NOT added because the
+    // sub-buffer base IS the expert im offset. In stock mode src0_cur == src0 and
+    // offset0 includes im*nb02 as before.
+    // CRITICAL: this dereference must come AFTER the early-out (r1 >= neh1) above
+    // so that threadgroups for zero-token experts return without touching a pointer
+    // for a potentially non-resident sub-buffer.
+    device const char * src0_cur = args.use_expert_ptrs
+        ? (device const char *) expert_ptrs[im]
+        : src0;
+
     // if this block is of 64x32 shape or smaller
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
     const short nr1 = (    neh1 - r1 < NR1) ? (    neh1 - r1) : NR1;
@@ -9825,10 +9844,12 @@ kernel void kernel_mul_mm_id(
     const short i12 = (id / args.ne20);
     const short i13 = 0;
 
-    const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
+    // [rrl] #126: in ptr-mode, src0_cur already points at expert im's base so
+    // offset0 does not include im*nb02. In stock mode, offset0 = im*nb02 + i13*nb03.
+    const uint64_t offset0 = (args.use_expert_ptrs ? 0u : (uint64_t)im*args.nb02) + i13*args.nb03;
     const short    offset1 = il0/nl;
 
-    device const block_q * x = (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
+    device const block_q * x = (device const block_q *)(src0_cur + args.nb01*(r0 + lr0) + offset0) + offset1;
 
     const short iy = 8*(tiitg % NL1);
 

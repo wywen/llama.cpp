@@ -521,6 +521,7 @@ typedef struct {
     int32_t  ne1;
     int16_t  r2;
     int16_t  r3;
+    int32_t  use_expert_ptrs; // [rrl] #126: 0 = stock nb02 stride; 1 = per-expert gpuAddress array (mm_id prefill path)
 } ggml_metal_kargs_mul_mm_id;
 
 typedef struct {
