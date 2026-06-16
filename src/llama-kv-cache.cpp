@@ -322,7 +322,19 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
-        ggml_backend_buffer_clear(buf, 0);
+        // [Step 4] Per-layer mmap-metal KV buffers sit over a freshly
+        // fallocated (all-zero) backing file, so this clear is redundant on
+        // first use — and actively harmful: memsetting every layer faults in
+        // and dirties the entire KV region (sized to exceed RAM by design),
+        // so context creation wedges in the pager before the residency
+        // window ever runs. Skip it for per-layer managed buffers. A REUSED
+        // region (scheduler spill/restore) re-allocates over stale KV bytes;
+        // those cells are masked before use, but if a needs-clear contract
+        // is ever required there it must be scoped to the reused range via
+        // the device — never this whole-region clear.
+        if (!buft_per_layer(buft)) {
+            ggml_backend_buffer_clear(buf, 0);
+        }
         ctxs_bufs.emplace_back(std::move(ctx), buf);
 
         // [Step 4 Increment 3a/3b] Register per-layer KV buffers with the
@@ -460,7 +472,16 @@ void llama_kv_cache::clear(bool data) {
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
-            ggml_backend_buffer_clear(buf.get(), 0);
+            // [Step 4] With eviction armed, a per-layer KV slot is null whenever
+            // its layer sits in the freed dead state — free-on-register at
+            // creation, or between decode steps. clear(true) fires from the
+            // session-state restore paths, and ggml_backend_buffer_clear opens
+            // with GGML_ASSERT(buffer), so skip freed slots: a skipped slot
+            // re-faults zero from its fresh-fallocated backing file (or is masked
+            // before use). A genuine scoped clear must go through the device.
+            if (buf) {
+                ggml_backend_buffer_clear(buf.get(), 0);
+            }
         }
     }
 }
