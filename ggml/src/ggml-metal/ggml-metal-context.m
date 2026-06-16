@@ -519,21 +519,31 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         const bool use_cb_window = (getenv("RRL_METAL_CB_WINDOW") != NULL) && !use_capture;
         if (use_cb_window) {
             // -- Window planner -------------------------------------------------
-            // Walk gf->nodes to build a list of window boundaries.  A new window
-            // starts at each node that is:
-            //   1. a MUL_MAT_ID op, AND
-            //   2. src[0] is a per-expert mmap-metal tensor
-            //      (rrl_is_expert_mmap_metal — same gate the encoder uses), AND
-            //   3. the layer id parsed from src[0]->name ("blk.<L>.ffn_...") is
-            //      different from the layer id of the previous expert node seen.
-            // This cuts one window per MoE layer.  Non-expert nodes before the
-            // first expert node go into window 0 (the prefix window).  Non-expert
-            // nodes after the last expert node (or between layers) go into the
-            // current window's trailing range — they are emitted in the window that
-            // opens at the first expert node of that layer.
+            // Two planner modes depending on whether RRL_METAL_CB_WEXP is set:
             //
-            // Implementation: collect the start indices of each new window; the end
+            // W=0 (PR2-A per-layer mode): Cut one window per MoE layer.  A new
+            //   window starts at the first expert node whose layer id differs from
+            //   the previous expert layer seen.  Non-expert nodes trailing a layer
+            //   share that layer's window.
+            //
+            // W>0 (PR2-B per-expert sub-window mode, requires RRL_METAL_CB_ASYNC):
+            //   Cut a window at EACH expert mul_mat_id node AND immediately after
+            //   it, isolating every expert node as a singleton window.  Non-expert
+            //   nodes between expert nodes get their own windows.  The async loop
+            //   then calls rrl_encode_expert_node_windows for each singleton expert
+            //   window (which creates W-expert sub-CBs internally); non-expert
+            //   windows use the existing single-CB async path.
+            //
+            // Implementation: collect the start indices of each boundary; the end
             // of window[i] is start of window[i+1] (or gf->n_nodes for the last).
+
+            const int rrl_wexp = rrl_metal_cb_wexp();
+            const int rrl_async_d = rrl_metal_cb_async_depth();
+
+            // rrl_is_wexp_mode: W-expert sub-windowing is active when W>0 AND we
+            // are in async mode (rrl_async_d>0).  If W>0 but no async, fall back to
+            // per-layer windowing (the W-expert entry needs async semaphore).
+            const bool rrl_is_wexp_mode = (rrl_wexp > 0) && (rrl_async_d > 0);
 
             struct rrl_window { int start; };
             NSMutableArray * windows_arr = [NSMutableArray array];
@@ -549,21 +559,42 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                     // don't duplicate the detection logic in this .m file).
                     if (!rrl_is_expert_mmap_metal_c(s0)) { continue; }
 
-                    // Parse layer id from src[0]->name ("blk.<L>.ffn_...").
-                    int layer = -1;
-                    const char * p = s0->name;
-                    if (p[0]=='b' && p[1]=='l' && p[2]=='k' && p[3]=='.') {
-                        p += 4;
-                        int val = 0; bool ok = false;
-                        while (*p >= '0' && *p <= '9') { val = val*10 + (*p-'0'); ++p; ok=true; }
-                        if (ok && *p == '.') { layer = val; }
-                    }
+                    if (rrl_is_wexp_mode) {
+                        // W-expert mode: isolate each expert node as a singleton
+                        // window.  Emit a boundary at node i (start of expert
+                        // singleton) and at i+1 (start of the following non-expert
+                        // run), but only if they don't duplicate an existing entry.
+                        // Since we walk in order and emit monotonically increasing
+                        // indices, duplication can only happen if two expert nodes
+                        // are adjacent (i+1 == next expert node); that is handled
+                        // naturally because the next iteration emits i+1 again
+                        // (which the loop below deduplicates by skipping empty windows).
 
-                    if (layer != prev_layer) {
-                        // Cut a new window at this node.
-                        struct rrl_window w = { .start = i };
-                        [windows_arr addObject:[NSValue valueWithBytes:&w objCType:@encode(struct rrl_window)]];
-                        prev_layer = layer;
+                        // boundary at node i (start of this expert singleton)
+                        struct rrl_window wi = { .start = i };
+                        [windows_arr addObject:[NSValue valueWithBytes:&wi objCType:@encode(struct rrl_window)]];
+                        // boundary at node i+1 (start of trailing non-expert run,
+                        // or next expert node) — only add if within range
+                        if (i + 1 < gf->n_nodes) {
+                            struct rrl_window wi1 = { .start = i + 1 };
+                            [windows_arr addObject:[NSValue valueWithBytes:&wi1 objCType:@encode(struct rrl_window)]];
+                        }
+                    } else {
+                        // Per-layer mode (PR2-A): cut at each new layer.
+                        int layer = -1;
+                        const char * p = s0->name;
+                        if (p[0]=='b' && p[1]=='l' && p[2]=='k' && p[3]=='.') {
+                            p += 4;
+                            int val = 0; bool ok = false;
+                            while (*p >= '0' && *p <= '9') { val = val*10 + (*p-'0'); ++p; ok=true; }
+                            if (ok && *p == '.') { layer = val; }
+                        }
+
+                        if (layer != prev_layer) {
+                            struct rrl_window w = { .start = i };
+                            [windows_arr addObject:[NSValue valueWithBytes:&w objCType:@encode(struct rrl_window)]];
+                            prev_layer = layer;
+                        }
                     }
                 }
             }
@@ -571,6 +602,10 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             // Build the flat start[] array.  Window 0 always starts at 0 (prefix).
             // If the planner found no expert nodes, there is one implicit window
             // covering the whole graph.
+            // In W-expert mode, duplicate start indices can appear when two expert
+            // nodes are adjacent (both emit i and i+1, and the next emits i+1 and
+            // i+2 — so i+1 appears twice).  The commit loop skips empty windows
+            // (w_start >= w_end) which covers duplicates naturally.
             int n_win = (int) windows_arr.count + 1; // +1 for the prefix window
             int * win_starts = (int *) alloca((size_t)(n_win + 1) * sizeof(int));
             win_starts[0] = 0; // prefix window
@@ -597,12 +632,22 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             //     SOLE evictor; the sync rolling-evict block in ops.cpp is bypassed.
             //     cmd_buf_last is set to nil (all work done; synchronize is a no-op).
 
-            const int rrl_async_d = rrl_metal_cb_async_depth();
-
+            // rrl_async_d and rrl_wexp are declared above in the planner section.
             if (rrl_async_d > 0) {
                 // -- Async path (RRL_METAL_CB_ASYNC=D) ----------------------------
                 // Semaphore starts at D: the main thread takes one slot before
                 // creating each CB; the completion handler signals one slot back.
+                //
+                // W-expert sub-window mode (rrl_is_wexp_mode):
+                //   Expert-node singleton windows are routed to
+                //   rrl_encode_expert_node_windows which creates ceil(N/W) sub-CBs
+                //   internally, each acquiring sem once and signaling once in its
+                //   handler.  The outer loop does NOT call dispatch_semaphore_wait
+                //   for these windows; the entry does its own waits.
+                //   Non-expert windows use the existing one-CB-per-window path.
+                //   The drain at the end is still D waits: semaphore starts at D,
+                //   each committed CB's handler signals exactly once, so after all
+                //   handlers fire the semaphore = D again; D drain-waits = 0.
                 dispatch_semaphore_t sem = dispatch_semaphore_create(rrl_async_d);
 
                 for (int wi = 0; wi < n_win; ++wi) {
@@ -611,6 +656,38 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
                     if (w_start >= w_end) { continue; } // skip empty windows
 
+                    // [rrl] PR2-B: detect singleton expert-node windows and route to
+                    // rrl_encode_expert_node_windows when W-expert mode is active.
+                    // A singleton expert window has w_end == w_start + 1 AND the
+                    // single node is a per-expert mmap-metal MUL_MAT_ID.
+                    if (rrl_is_wexp_mode &&
+                        w_end == w_start + 1 &&
+                        rrl_is_expert_mmap_metal_c(gf->nodes[w_start]->src[0]) &&
+                        gf->nodes[w_start]->op == GGML_OP_MUL_MAT_ID) {
+
+                        // Delegate entirely: the entry creates and commits sub-CBs,
+                        // each acquiring sem before creation and signaling in its
+                        // completion handler.  Returns 0 on fallback (not ptr-mode);
+                        // in that case fall through to the normal single-CB path.
+                        int n_sub = rrl_encode_expert_node_windows(
+                            ctx->dev, gf, w_start,
+                            (__bridge void *) queue,
+                            (void *) sem,
+                            rrl_async_d, rrl_wexp,
+                            &ctx->has_error);
+                        if (n_sub > 0) {
+                            // sub-CBs were committed; move to next window.
+                            // error detection: rrl_encode_expert_node_windows sets
+                            // ctx->has_error via the handler's has_error_ptr (which
+                            // we passed as nil — see note in ops.cpp).  We check
+                            // ctx->has_error after the loop.
+                            continue;
+                        }
+                        // fallthrough: rrl_encode_expert_node_windows returned 0
+                        // (hook not installed, ids null, etc.) — encode normally.
+                    }
+
+                    // -- Normal single-CB path (non-expert window OR wexp fallback) --
                     // Throttle: block until a slot is available (<D in-flight CBs).
                     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
 

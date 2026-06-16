@@ -531,6 +531,53 @@ void ggml_metal_encoder_use_resource_raw(ggml_metal_encoder_t encoder,
     [encoder->obj useResource:buf usage:(MTLResourceUsage)usage];
 }
 
+// [rrl] PR2-B: C wrappers for MTLCommandBuffer operations used by the C++ side.
+
+ggml_metal_cmd_buf_t rrl_cmd_buf_create_unretained(void * queue_raw) {
+    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>) queue_raw;
+    return (__bridge void *) [queue commandBufferWithUnretainedReferences];
+}
+
+void rrl_cmd_buf_retain(ggml_metal_cmd_buf_t cb) {
+    id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>) cb;
+    [buf retain];
+}
+
+void rrl_cmd_buf_release(ggml_metal_cmd_buf_t cb) {
+    id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>) cb;
+    [buf release];
+}
+
+void rrl_cmd_buf_enqueue(ggml_metal_cmd_buf_t cb) {
+    id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>) cb;
+    [buf enqueue];
+}
+
+void rrl_cmd_buf_commit(ggml_metal_cmd_buf_t cb) {
+    id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>) cb;
+    [buf commit];
+}
+
+typedef struct {
+    rrl_cb_handler_fn fn;
+    void *            userdata;
+} rrl_cb_handler_ctx;
+
+void rrl_cmd_buf_add_handler(ggml_metal_cmd_buf_t cb,
+                              rrl_cb_handler_fn fn,
+                              void * userdata) {
+    id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>) cb;
+    rrl_cb_handler_ctx * ctx = (rrl_cb_handler_ctx *) malloc(sizeof(rrl_cb_handler_ctx));
+    ctx->fn       = fn;
+    ctx->userdata = userdata;
+    // The block captures ctx by pointer; the block is released when the CB is
+    // released, but we free ctx inside the handler (exactly once).
+    [buf addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        ctx->fn(ctx->userdata, (int) b.status);
+        free(ctx);
+    }];
+}
+
 struct ggml_metal_device {
     id<MTLDevice> mtl_device;
 

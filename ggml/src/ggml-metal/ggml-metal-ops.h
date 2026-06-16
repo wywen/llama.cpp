@@ -31,6 +31,30 @@ int   rrl_metal_cb_async_depth(void);
 void *rrl_async_window_take_records(void);
 void  rrl_async_window_reclaim_and_free(void *handle);
 
+// [rrl] PR2-B: W-expert sub-window entry point (C-callable from context.m).
+//
+// rrl_metal_cb_wexp: returns W from RRL_METAL_CB_WEXP env var, or 0 if unset.
+//   Requires RRL_METAL_CB_ASYNC to also be set; context.m checks that condition.
+//
+// rrl_encode_expert_node_windows: encode one expert mul_mat_id node (node_idx in
+//   gf) as ceil(N_routed/W) sub-CBs, each covering a W-expert group.  Called from
+//   the async path in graph_compute when RRL_METAL_CB_WEXP is set and the current
+//   singleton window is an expert node.  The entry owns all sem.wait() calls for
+//   its sub-CBs; the caller must NOT acquire sem before calling.  Each sub-CB's
+//   completion handler runs rrl_async_window_reclaim_and_free, releases the CB,
+//   and signals sem.  Returns the number of sub-CBs committed (0 on fallback to the
+//   single-CB path).
+int rrl_metal_cb_wexp(void);
+int rrl_encode_expert_node_windows(
+        ggml_metal_device_t   dev,
+        struct ggml_cgraph  * gf,
+        int                   node_idx,
+        void                * queue,          // id<MTLCommandQueue>, passed as void* (ObjC)
+        void                * sem,            // dispatch_semaphore_t, passed as void*
+        int                   D,
+        int                   W,
+        bool                * has_error_out); // set to true on CB error; may be NULL
+
 ggml_metal_op_t ggml_metal_op_init(
         ggml_metal_device_t dev,
         ggml_metal_cmd_buf_t cmd_buf,

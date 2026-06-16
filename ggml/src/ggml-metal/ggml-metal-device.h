@@ -66,6 +66,22 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
 
 typedef void * ggml_metal_cmd_buf_t;
 
+// [rrl] PR2-B: thin C wrappers for MTLCommandBuffer operations needed by the
+// C++ rrl_encode_expert_node_windows entry point in ggml-metal-ops.cpp.
+// `queue_raw` is void* (id<MTLCommandQueue>); `cb` is void* (id<MTLCommandBuffer>).
+ggml_metal_cmd_buf_t rrl_cmd_buf_create_unretained(void * queue_raw);
+void rrl_cmd_buf_retain  (ggml_metal_cmd_buf_t cb);
+void rrl_cmd_buf_release (ggml_metal_cmd_buf_t cb);
+void rrl_cmd_buf_enqueue (ggml_metal_cmd_buf_t cb);
+void rrl_cmd_buf_commit  (ggml_metal_cmd_buf_t cb);
+
+// Completion-handler bridge: fn(userdata, MTLCommandBufferStatus) is called from
+// the Metal driver thread after the CB finishes.
+typedef void (*rrl_cb_handler_fn)(void * userdata, int status);
+void rrl_cmd_buf_add_handler(ggml_metal_cmd_buf_t cb,
+                              rrl_cb_handler_fn fn,
+                              void * userdata);
+
 //
 // MTLComputeCommandEncoder wrapper
 //

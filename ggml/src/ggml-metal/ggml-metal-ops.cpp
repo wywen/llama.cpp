@@ -19,6 +19,7 @@
 #include <chrono>       // [rrl] evict-time profiling counter
 #include <vector>       // [rrl] Increment 1: per-op wired-expert id list
 #include <sys/mman.h>   // [rrl] madvise (page-in), msync, MS_INVALIDATE (eviction)
+#include <dispatch/dispatch.h> // [rrl] PR2-B: dispatch_semaphore_t for rrl_encode_expert_node_windows
 
 // [rrl] Per-expert Metal decode hook — dispatch-table pattern.
 //
@@ -376,6 +377,365 @@ extern "C" void rrl_async_window_reclaim_and_free(void * handle) {
         rrl_evict_window_reclaim(w);
     }
     delete vec;
+}
+
+// [rrl] PR2-B: returns W from RRL_METAL_CB_WEXP, or 0 if unset.
+// Cached on first call (function-static).  W=0 means W-expert sub-windowing is
+// disabled; the per-layer PR2-A async path remains unchanged.
+extern "C" int rrl_metal_cb_wexp(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * v = getenv("RRL_METAL_CB_WEXP");
+        if (v == nullptr) {
+            cached = 0;
+        } else {
+            const int w = atoi(v);
+            cached = (w > 0) ? w : 0; // 0/empty/non-positive → disabled
+        }
+    }
+    return cached;
+}
+
+// [rrl] PR2-B: completion-handler userdata for one W-expert sub-CB.
+// Allocated on the heap by rrl_encode_expert_node_windows; freed inside the handler.
+struct rrl_wexp_handler_ctx {
+    void *               handle;  // opaque rrl_evict_window* vector from take_records
+    ggml_metal_cmd_buf_t cb;      // the CB to release (our explicit retain)
+    void *               sem;     // dispatch_semaphore_t to signal after release
+    bool *               has_error_ptr; // pointer into the ggml_metal context (may be null)
+};
+
+// Called from the Metal driver thread when a W-expert sub-CB completes.
+static void rrl_wexp_completion_handler(void * userdata, int status) {
+    rrl_wexp_handler_ctx * ctx = static_cast<rrl_wexp_handler_ctx *>(userdata);
+    // MTLCommandBufferStatus: 0=NotEnqueued, 1=Enqueued, 2=Committed,
+    //   3=Scheduled, 4=Completed, 5=Error.
+    if (status != 4 /* MTLCommandBufferStatusCompleted */ && ctx->has_error_ptr) {
+        *ctx->has_error_ptr = true;
+    }
+    rrl_async_window_reclaim_and_free(ctx->handle);
+    rrl_cmd_buf_release(ctx->cb);
+    dispatch_semaphore_signal(static_cast<dispatch_semaphore_t>(ctx->sem));
+    delete ctx;
+}
+
+// [rrl] PR2-B: encode one mm_id expert mul_mat_id node as W-expert sub-CBs.
+//
+// Only handles the mm_id path (ne21 >= 32 and has_simdgroup_mm and ne00 >= 64).
+// Returns 0 immediately for mv_id nodes (ne21 < 32), which the caller (context.m)
+// detects via the ne21 >= 32 gate BEFORE calling here — so mv_id nodes never reach
+// this function in practice.  The early return is a belt-and-suspenders guard.
+//
+// For mm_id: splits the routed expert set into ceil(N_routed/W) groups and creates
+// one sub-CB per group.  Sub-CB 0 includes the map0 kernel (tpe + ids remapping
+// required by the mm_id kernel); subsequent sub-CBs dispatch the kernel directly.
+// Metal executes CBs on a single queue in commit order, so sub-CBs 1..N see
+// sub-CB 0's map0 output in GPU memory (tpe/ids are GPU-side buffers).
+//
+// Returns the number of sub-CBs committed, or 0 if the node is not in ptr-mode
+// (fallback to the normal single-CB path by the caller).
+//
+// Ownership: for each committed sub-CB, the completion handler releases our explicit
+// retain ([retain] = +1, handler release = -1 → count goes to 0 → dealloc).
+// The caller must NOT call dispatch_semaphore_wait(sem) before this call for the
+// expert-node "window" — the entry owns all waits internally.
+extern "C" int rrl_encode_expert_node_windows(
+        ggml_metal_device_t   dev,
+        struct ggml_cgraph  * gf,
+        int                   node_idx,
+        void                * queue,          // id<MTLCommandQueue>, void* to avoid ObjC
+        void                * sem,            // dispatch_semaphore_t, void*
+        int                   D,
+        int                   W,
+        bool                * has_error_out)  // set to true on CB error; may be NULL
+{
+    (void) D; // depth D is only needed for the outer loop's drain; we use sem directly
+
+    struct ggml_tensor * op = gf->nodes[node_idx];
+    if (!op || op->op != GGML_OP_MUL_MAT_ID || !rrl_is_expert_mmap_metal(op->src[0])) {
+        return 0; // not an expert node; caller should use normal path
+    }
+
+    if (!g_rrl_expert_subbuffers) {
+        return 0; // hook not installed; fallback
+    }
+
+    ggml_metal_library_t lib = ggml_metal_device_get_library(dev);
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne2, op->src[2], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb2, op->src[2], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+
+    // buffer ids
+    auto buf_id = [](const ggml_tensor * t) -> ggml_metal_buffer_id {
+        if (!t) { return { nullptr, 0 }; }
+        ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;
+        return ggml_metal_buffer_get_id((ggml_metal_buffer_t) buffer->context, t);
+    };
+    // bid_src0 is not needed: in ptr-mode we always bind bid_argbuf at slot 1.
+    ggml_metal_buffer_id bid_src1 = buf_id(op->src[1]);
+    ggml_metal_buffer_id bid_src2 = buf_id(op->src[2]);
+    ggml_metal_buffer_id bid_dst  = buf_id(op);
+
+    // call the subbuffer hook to get expert handles
+    ggml_metal_buffer_t metal_buf = (ggml_metal_buffer_t) op->src[0]->buffer->context;
+    void *         host_base      = ggml_metal_buffer_get_base(metal_buf);
+    const size_t   base_offs      = (size_t)((const char *) op->src[0]->data - (const char *) host_base);
+    const uint64_t stride         = (uint64_t) nb02;
+
+    void *                  argbuf_mtl    = nullptr;
+    void **                 expert_mtl_bufs = nullptr;
+    std::atomic<uint8_t> *  expert_state    = nullptr;
+    std::atomic<uint32_t> * expert_refcount = nullptr;
+
+    int hook_rc = g_rrl_expert_subbuffers(
+        host_base, base_offs, (int32_t) ne02, stride,
+        &argbuf_mtl, &expert_mtl_bufs, &expert_state, &expert_refcount);
+
+    if (hook_rc != 0 || argbuf_mtl == nullptr || expert_mtl_bufs == nullptr) {
+        return 0; // hook failed; fallback to normal single-CB path
+    }
+
+    const char * ids_base = (const char *) op->src[2]->data;
+    if (!ids_base) { return 0; }
+
+    // --- Determine kernel path (mirrors ggml_metal_op_mul_mat_id's branch) ----------
+    const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(dev);
+    const int ne21_mm_id_min = 32;
+    const bool use_mm_id = props_dev->has_simdgroup_mm && ne00 >= 64 && (ne21 >= ne21_mm_id_min);
+
+    // Belt-and-suspenders: context.m gates on ne21 >= 32 before calling here,
+    // but return 0 for any mv_id node that slips through so it falls back to the
+    // PR2-A per-layer path and the mv_id kernel surface is not touched.
+    if (!use_mm_id) { return 0; }
+
+    // --- Collect all routed expert ids (union across all tokens) ---------------------
+    // [rrl] id-stride: read each token's row at ids_base + i1*nb21, selecting
+    // only the first ne20 entries (the routed experts).  Exactly as the standard
+    // ptr-mode encode does (see the nb21-stride comment at ops.cpp:3123).
+    static constexpr size_t kPageSize = (size_t) 16384;
+
+    std::vector<int32_t> all_eids;
+    all_eids.reserve((size_t) ne20);
+    std::vector<uint8_t> seen_all((size_t) ne02, 0);
+
+    for (int32_t i1 = 0; i1 < (int32_t) ne21; ++i1) {
+        const int32_t * row = (const int32_t *)(ids_base + (size_t) i1 * nb21);
+        for (int32_t i0 = 0; i0 < (int32_t) ne20; ++i0) {
+            int32_t eid = row[i0];
+            if (eid >= 0 && eid < (int32_t) ne02 && expert_mtl_bufs[eid] != nullptr) {
+                if (!seen_all[(size_t) eid]) {
+                    seen_all[(size_t) eid] = 1;
+                    all_eids.push_back(eid);
+                }
+            }
+        }
+    }
+
+    if (all_eids.empty()) { return 0; }
+
+    // mm_id path only: ceil(N_routed/W) groups, one sub-CB per group.
+    const int n_groups = ((int) all_eids.size() + W - 1) / W;
+
+    // Keep-mask snapshot for eviction records (consistent across all groups).
+    const uint8_t * keep_mask    = g_rrl_keep_mask;
+    const uint32_t  keep_n_layer = g_rrl_keep_n_layer;
+    const uint32_t  keep_n_exp   = g_rrl_keep_n_expert;
+    const bool      do_evict     = g_rrl_evict_on.load(std::memory_order_relaxed) != 0;
+
+    // Parse layer from src[0]->name for eviction records.
+    int node_layer = -1;
+    {
+        const char * p = op->src[0]->name;
+        if (p[0]=='b' && p[1]=='l' && p[2]=='k' && p[3]=='.') {
+            p += 4;
+            int val = 0; bool ok = false;
+            while (*p >= '0' && *p <= '9') { val = val*10 + (*p-'0'); ++p; ok=true; }
+            if (ok && *p == '.') { node_layer = val; }
+        }
+    }
+
+    // --- Extra buffer ids for the mm_id map0 + kernel ----------------------------
+    // use_mm_id is always true here (mv_id returned 0 early above).
+    ggml_metal_buffer_id bid_tpe     = bid_dst;
+    bid_tpe.offs                    += ggml_nbytes(op);
+    ggml_metal_buffer_id bid_ids_buf = bid_tpe;
+    bid_ids_buf.offs                += ggml_metal_op_mul_mat_id_extra_tpe(op);
+
+    // --- Commit one sub-CB per W-expert group ----------------------------------------
+    const uint32_t r2 = 1;
+    const uint32_t r3 = 1;
+    int n_committed = 0;
+
+    for (int gi = 0; gi < n_groups; ++gi) {
+        const int g_start = gi * W;
+        const int g_end   = std::min(g_start + W, (int) all_eids.size());
+
+        // sub-group expert ids
+        std::vector<int32_t> group_eids(all_eids.begin() + g_start,
+                                        all_eids.begin() + g_end);
+
+        // --- Page-in, refcount++, spin-while-EVICTING, useResource -----------------
+        // Done BEFORE creating the CB so pages are resident when the encoder runs.
+        // We page-in here; useResource is done on the encoder after CB creation.
+        for (int32_t eid : group_eids) {
+            volatile const char * ep =
+                (volatile const char *) op->src[0]->data + (size_t) eid * (size_t) stride;
+            madvise((void *) ep, (size_t) stride, MADV_WILLNEED);
+            for (size_t pg = 0; pg < (size_t) stride; pg += kPageSize) {
+                (void) ep[pg];
+            }
+            // ENCODER PUBLISH: refcount++ (relaxed) → seq_cst fence → spin-EVICTING.
+            if (expert_refcount != nullptr) {
+                expert_refcount[eid].fetch_add(1u, std::memory_order_relaxed);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+            }
+            if (expert_state != nullptr) {
+                while (expert_state[eid].load(std::memory_order_acquire) == 1u) {
+                    __builtin_arm_yield();
+                }
+            }
+        }
+
+        // --- Build eviction record for this group -----------------------------------
+        if (do_evict) {
+            rrl_evict_window w;
+            w.base_addr    = op->src[0]->data;
+            w.len          = ggml_nbytes(op->src[0]);
+            w.stride       = stride;
+            w.nexp         = op->src[0]->ne[2];
+            w.layer        = node_layer;
+            w.wired        = group_eids;         // only this group's experts
+            w.state        = expert_state;
+            w.refcount     = expert_refcount;
+            w.keep_mask    = keep_mask;
+            w.keep_n_layer = keep_n_layer;
+            w.keep_n_exp   = keep_n_exp;
+            s_rrl_async_records.push_back(std::move(w));
+        }
+        void * handle = rrl_async_window_take_records(); // may be null if !do_evict
+
+        // --- Throttle via semaphore -------------------------------------------------
+        dispatch_semaphore_wait(static_cast<dispatch_semaphore_t>(sem),
+                                DISPATCH_TIME_FOREVER);
+
+        // --- Create CB + encoder ---------------------------------------------------
+        ggml_metal_cmd_buf_t cmd_buf = rrl_cmd_buf_create_unretained(queue);
+        rrl_cmd_buf_retain(cmd_buf);
+        rrl_cmd_buf_enqueue(cmd_buf);
+
+        // use_concurrency=false for the expert dispatch (no mem-range tracking needed)
+        ggml_metal_encoder_t enc = ggml_metal_encoder_init(cmd_buf, /*concurrent=*/false);
+
+        // useResource for this group's experts (binding residency to this CB).
+        struct ggml_metal_buffer_id bid_argbuf = { argbuf_mtl, 0 };
+        for (int32_t eid : group_eids) {
+            // usage = 1u = MTLResourceUsageRead
+            ggml_metal_encoder_use_resource_raw(enc, expert_mtl_bufs[eid], /*usage=*/1u);
+        }
+
+        {
+            // mm_id path (use_mm_id guaranteed true; mv_id returned 0 early above).
+            // Sub-CB 0 includes the map0 kernel; subsequent sub-CBs skip it.
+            // map0 output (bid_tpe, bid_ids_buf) lives in GPU memory: Metal queues
+            // CBs in commit order on one queue, so sub-CB 1 sees sub-CB 0's writes.
+            if (gi == 0) {
+                ggml_metal_kargs_mul_mm_id_map0 map0_args = {
+                    ne02,
+                    ne10,
+                    ne11, // n_expert_used (bcast)
+                    nb11,
+                    nb12,
+                    ne21, // n_tokens
+                    ne20, // n_expert_used
+                    nb21,
+                };
+                auto pl_map0 = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20);
+                ggml_metal_encoder_set_pipeline(enc, pl_map0);
+                ggml_metal_encoder_set_bytes   (enc, &map0_args, sizeof(map0_args), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_src2,   1);
+                ggml_metal_encoder_set_buffer  (enc, bid_tpe,    2);
+                ggml_metal_encoder_set_buffer  (enc, bid_ids_buf, 3);
+                ggml_metal_encoder_set_threadgroup_memory_size(enc, pl_map0.smem, 0);
+                GGML_ASSERT(ne02 <= ggml_metal_pipeline_max_theads_per_threadgroup(pl_map0));
+                ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ne02, 1, 1);
+                // barrier: mm_id kernel must see map0's tpe/ids output
+                ggml_metal_encoder_memory_barrier(enc);
+            }
+
+            // mm_id kernel: one Z=1 dispatch per expert in this group.
+            auto pl_mm = ggml_metal_library_get_pipeline_mul_mm_id(lib, op);
+            ggml_metal_kargs_mul_mm_id mm_args = {
+                /*.ne00            =*/ ne00,
+                /*.ne02            =*/ ne02,
+                /*.nb01            =*/ nb01,
+                /*.nb02            =*/ nb02,
+                /*.nb03            =*/ nb03,
+                /*.ne11            =*/ ne11,
+                /*.nb10            =*/ nb10,
+                /*.nb11            =*/ nb11,
+                /*.nb12            =*/ nb12,
+                /*.nb13            =*/ nb13,
+                /*.ne20            =*/ ne20,
+                /*.ne21            =*/ ne21,
+                /*.ne0             =*/ ne0,
+                /*.ne1             =*/ ne1,
+                /*.r2              =*/ r2,
+                /*.r3              =*/ r3,
+                /*.use_expert_ptrs =*/ 1,
+                /*.base_expert     =*/ 0, // overridden per expert below
+            };
+
+            ggml_metal_encoder_set_pipeline(enc, pl_mm);
+            ggml_metal_encoder_set_buffer  (enc, bid_argbuf,  1); // tiny; no fused pin
+            ggml_metal_encoder_set_buffer  (enc, bid_src1,    2);
+            ggml_metal_encoder_set_buffer  (enc, bid_tpe,     3);
+            ggml_metal_encoder_set_buffer  (enc, bid_ids_buf, 4);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst,     5);
+            ggml_metal_encoder_set_buffer  (enc, bid_argbuf,  6); // gpuAddress array
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, pl_mm.smem, 0);
+
+            for (int32_t eid : group_eids) {
+                mm_args.base_expert = eid;
+                ggml_metal_encoder_set_bytes(enc, &mm_args, sizeof(mm_args), 0);
+                ggml_metal_encoder_dispatch_threadgroups(
+                    enc, (ne21 + 31)/32, (ne01 + 63)/64, 1, 128, 1, 1);
+            }
+        }
+
+        // end encoder (frees the encoder wrapper)
+        ggml_metal_encoder_end_encoding(enc);
+        ggml_metal_encoder_free(enc);
+
+        // --- Attach completion handler and commit ------------------------------------
+        rrl_wexp_handler_ctx * hctx = new rrl_wexp_handler_ctx;
+        hctx->handle        = handle;
+        hctx->cb            = cmd_buf;
+        hctx->sem           = sem;
+        hctx->has_error_ptr = has_error_out; // propagate to caller's flag
+        rrl_cmd_buf_add_handler(cmd_buf, rrl_wexp_completion_handler, hctx);
+
+        rrl_cmd_buf_commit(cmd_buf);
+        ++n_committed;
+    }
+
+    // Update s_rrl_prev_state / s_rrl_prev_refcount / s_rrl_prev_wired so the NEXT
+    // expert node's rolling-evict slot (if PR2-A ever falls back to sync) sees the
+    // current node's wired set.  In async mode these are not read by the eviction
+    // block (it is gated on !async), but we maintain them for symmetry with the
+    // standard ggml_metal_op_mul_mat_id path.
+    s_rrl_prev_state    = expert_state;
+    s_rrl_prev_refcount = expert_refcount;
+    s_rrl_prev_wired    = all_eids;
+    s_rrl_wired_cur.clear();
+    g_rrl_ptrmode_calls.fetch_add(1, std::memory_order_relaxed);
+
+    return n_committed;
 }
 
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
