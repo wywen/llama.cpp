@@ -12,6 +12,10 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#if defined(__APPLE__)
+#  include <sys/mman.h>
+#  include <unistd.h>
+#endif
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1815,6 +1819,35 @@ bool llama_model_loader::load_all_data(
                     file->read_raw(dst, expert_nbytes);
                 }
             }
+
+#if defined(__APPLE__)
+            // Stream-reclaim the just-assembled fused tensor's destination pages so
+            // assembling ~14.4 GiB of experts doesn't accumulate a fatal resident
+            // peak on a memory-tight box. The mmap-metal destination is a file-backed
+            // MAP_SHARED region whose dirty pages would otherwise stay resident until
+            // the OS hits pressure (and the run watchdog kills first). Flush them to
+            // the backing file (msync MS_SYNC) then mark reusable (MADV_FREE_REUSABLE
+            // — the documented Darwin reclaim for MAP_SHARED file-backed pages;
+            // MADV_DONTNEED is a near-no-op there). Pages fault back in from the file
+            // on first decode — the paged-expert design. msync guarantees the data is
+            // persisted before reclaim, so nothing is lost.
+            //
+            // Gated on page alignment: the mmap-metal path pads each expert stride to
+            // 16 KiB, so dst_base and fused_nbytes are page-aligned; the CPU/tight
+            // path (32-byte aligned) is skipped (msync would EINVAL and the CPU path
+            // is not the memory-constrained target here).
+            if (cur->data != nullptr) {
+                const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
+                if (pg != 0 &&
+                    ((uintptr_t) dst_base % pg) == 0 &&
+                    (fused_nbytes % pg) == 0) {
+                    if (msync(dst_base, fused_nbytes, MS_SYNC) == 0) {
+                        // Best-effort reclaim; failure just means pages stay resident.
+                        madvise(dst_base, fused_nbytes, MADV_FREE_REUSABLE);
+                    }
+                }
+            }
+#endif
 
             if (cur->data == nullptr) {
                 // Write assembled data into the backend buffer (GPU or other backend).
