@@ -1441,9 +1441,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // buffer is then page-rounded by buft_alloc_buffer, so the MTLBuffer stays a
     // whole number of pages. STRICTLY gated on the mmap-metal buft: the CPU
     // per-expert path keeps the contiguous (tightly packed) stride byte-for-byte.
-    // NOTE: this padded stride is intentionally WRONG for mul_mat_id compute —
-    // step 1 is load-only (no decode). The kernel surgery that consumes the
-    // page-aligned experts is step 2.
+    //
+    // The padded stride is COMPUTE-CORRECT for mul_mat_id: the assembly writes
+    // each expert at `dst_base + e*padded_stride`, and both mul_mm_id and
+    // mul_mv_id index expert `im` by the same `nb02` (= this padded stride), so
+    // they read each expert at its true location and never touch the inter-expert
+    // padding gaps. The padding exists purely to page-align each expert so the
+    // decode path can carve an independent no-residency MTLBuffer per expert and
+    // useResource only the routed ones (per-expert Metal residency). Confirmed by
+    // static review of ggml-metal.metal (mm_id ~9828 / mv_id ~10335) on
+    // 2026-06-14; an earlier comment here claiming it was "wrong for compute" was
+    // mistaken.
     if (per_expert_moe && per_expert_assembled.count(ggml_get_name(cur)) &&
         strcmp(ggml_backend_buft_name(buft), "mmap-metal") == 0) {
         const int    ndims = ggml_n_dims(tensor);

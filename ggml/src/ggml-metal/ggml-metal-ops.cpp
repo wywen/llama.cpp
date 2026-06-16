@@ -2521,23 +2521,32 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
-        ggml_metal_encoder_set_buffer(enc, bid_src0, 1);
         ggml_metal_encoder_set_buffer(enc, bid_src1, 2);
         ggml_metal_encoder_set_buffer(enc, bid_dst,  3);
         ggml_metal_encoder_set_buffer(enc, bid_src2, 4);
 
-        // [rrl] When per-expert ptr-mode is active, bind the gpuAddress argbuf
-        // at buffer(5).  In stock mode (use_expert_ptrs == 0) we must still bind
-        // SOMETHING at buffer(5) because the Metal shader declares the argument
-        // unconditionally; reuse bid_src0 (an already-resident buffer) so Metal
-        // validation sees a valid binding even though the shader will not
-        // dereference expert_ptrs when use_expert_ptrs == 0.
+        // [rrl] Buffer(1) = src0s, buffer(5) = expert_ptrs.
+        //
+        // CRITICAL for per-expert residency: in ptr-mode the kernel reads each
+        // expert's weights via expert_ptrs[i02] (made resident individually by the
+        // useResource calls above) and NEVER dereferences src0s. Binding the whole
+        // per-layer bid_src0 here would force Metal to make ALL 128 experts of the
+        // layer resident (bound buffers are made resident for the encoder),
+        // defeating the per-expert useResource of just the routed experts. So in
+        // ptr-mode bind the tiny argbuf at buffer(1) too — it satisfies the shader
+        // arg without pinning the layer. Only the routed per-expert sub-buffers
+        // (useResource'd) end up resident.
+        //
+        // In stock mode (use_expert_ptrs == 0) the kernel DOES read src0s, so bind
+        // the real fused buffer at 1; buffer(5) still needs SOME valid binding (the
+        // shader declares expert_ptrs unconditionally) but is never dereferenced.
         if (use_expert_ptrs && argbuf_mtl != nullptr) {
             struct ggml_metal_buffer_id bid_argbuf = { argbuf_mtl, 0 };
-            ggml_metal_encoder_set_buffer(enc, bid_argbuf, 5);
+            ggml_metal_encoder_set_buffer(enc, bid_argbuf, 1); // tiny; src0s unused in ptr-mode
+            ggml_metal_encoder_set_buffer(enc, bid_argbuf, 5); // the gpuAddress array
         } else {
-            // Dummy binding: shader ignores expert_ptrs when use_expert_ptrs==0.
-            ggml_metal_encoder_set_buffer(enc, bid_src0, 5);
+            ggml_metal_encoder_set_buffer(enc, bid_src0, 1);   // stock: real fused buffer
+            ggml_metal_encoder_set_buffer(enc, bid_src0, 5);   // dummy; ignored when off
         }
 
         const int64_t _ne1 = 1;
