@@ -507,16 +507,35 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
 
         // [rrl] #135 Stage 2: windowed-sequential compute mode.
-        // When RRL_METAL_CB_WINDOW is set (and not in capture mode), walk gf->nodes
-        // to build per-layer window ranges [start, end), commit one command buffer per
-        // window, and drain each window (waitUntilCompleted) before starting the next.
+        // Walk gf->nodes to build per-layer window ranges [start, end), commit one
+        // command buffer per window, and reclaim each window's experts on completion.
         // This releases the GPU useResource residency for each layer's experts as soon
         // as that layer's CB completes, bounding peak to ~1-2 layers (~480 MiB-1 GiB).
         // The existing rolling msync evictor (installed via cb_eval) handles the CPU
-        // page side; this change handles the GPU useResource side.
-        // When unset (or in capture mode), falls through to the parallel dispatch_apply
-        // path unchanged.
-        const bool use_cb_window = (getenv("RRL_METAL_CB_WINDOW") != NULL) && !use_capture;
+        // page side; this handles the GPU useResource side.
+        //
+        // [rrl] #128 Phase 1: windowing is default-ON for the per-expert MoE path.
+        // It auto-enables when the graph contains per-expert mmap-metal expert nodes
+        // (the path whose useResource residency must be bounded); RRL_METAL_CB_WINDOW=0
+        // forces it off, and an explicit non-zero value forces it on even without
+        // detected expert nodes (back-compat / testing).  Capture mode and graphs with
+        // no per-expert experts fall through to the stock parallel dispatch_apply path
+        // unchanged, so this default is inert for dense / non-expert models.
+        const char * rrl_cb_window_env = getenv("RRL_METAL_CB_WINDOW");
+        const bool rrl_window_forced_off = (rrl_cb_window_env != NULL && rrl_cb_window_env[0] == '0');
+        const bool rrl_window_forced_on  = (rrl_cb_window_env != NULL && rrl_cb_window_env[0] != '0');
+        bool rrl_has_expert_nodes = false;
+        if (!rrl_window_forced_off && !rrl_window_forced_on) {
+            for (int i = 0; i < gf->n_nodes; ++i) {
+                struct ggml_tensor * n = gf->nodes[i];
+                if (n->op == GGML_OP_MUL_MAT_ID && rrl_is_expert_mmap_metal_c(n->src[0])) {
+                    rrl_has_expert_nodes = true;
+                    break;
+                }
+            }
+        }
+        const bool use_cb_window = !use_capture && !rrl_window_forced_off &&
+                                   (rrl_window_forced_on || rrl_has_expert_nodes);
         if (use_cb_window) {
             // -- Window planner -------------------------------------------------
             // Two planner modes depending on whether RRL_METAL_CB_WEXP is set:
@@ -539,6 +558,18 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
             const int rrl_wexp = rrl_metal_cb_wexp();
             const int rrl_async_d = rrl_metal_cb_async_depth();
+
+            // [rrl] #128 Phase 1: log windowed-compute engagement once per process so
+            // the default-on path is observable (silent under the default noop logger;
+            // surfaces with RRL_LLAMA_LOG=1).  async_d=0 means the synchronous drain.
+            static bool rrl_window_logged = false;
+            if (!rrl_window_logged) {
+                rrl_window_logged = true;
+                GGML_LOG_INFO("%s: [rrl] #128 windowed compute active: async_d=%d wexp=%d "
+                              "(forced_on=%d auto_experts=%d)\n",
+                              __func__, rrl_async_d, rrl_wexp,
+                              (int) rrl_window_forced_on, (int) rrl_has_expert_nodes);
+            }
 
             // rrl_is_wexp_mode: W-expert sub-windowing is active when W>0 AND we
             // are in async mode (rrl_async_d>0).  If W>0 but no async, fall back to

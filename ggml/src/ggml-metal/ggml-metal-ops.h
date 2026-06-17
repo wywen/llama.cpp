@@ -16,9 +16,9 @@ int rrl_is_expert_mmap_metal_c(const struct ggml_tensor *t);
 
 // [rrl] PR2-A.2: async completion-handler evictor interface (C-callable from context.m).
 //
-// rrl_metal_cb_async_depth: returns the async in-flight depth D (from
-//   RRL_METAL_CB_ASYNC env var), or 0 if async mode is disabled (var unset).
-//   Default D=2 when the var is set to 0/empty/non-numeric.
+// rrl_metal_cb_async_depth: returns the async in-flight depth D.  Default-ON:
+//   D=2 when RRL_METAL_CB_ASYNC is UNSET; explicit =0 selects the synchronous
+//   per-window waitUntilCompleted drain; a positive value selects that depth.
 //
 // rrl_async_window_take_records: move the accumulated async-records vector to a
 //   heap allocation and return an opaque handle (NULL if nothing was accumulated).

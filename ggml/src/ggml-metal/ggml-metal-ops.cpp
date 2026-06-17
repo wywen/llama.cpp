@@ -142,20 +142,23 @@ static std::atomic<uint32_t> * s_rrl_prev_refcount = nullptr;
 static std::vector<int32_t> s_rrl_wired_cur;
 static std::vector<int32_t> s_rrl_prev_wired;
 
-// [rrl] PR2-A.2: return the async in-flight depth D, or 0 if async is disabled.
+// [rrl] PR2-A.2 / #128 Phase 1: return the async in-flight depth D.
 // Reads RRL_METAL_CB_ASYNC once and caches the result (function-static).
-// Returns 0 when RRL_METAL_CB_ASYNC is not set (sync path unchanged).
-// Also requires RRL_METAL_CB_WINDOW to be set (checked by context.m; this fn only
-// returns the depth).
+// Default-ON: returns D=2 when the var is UNSET (the async completion-handler
+// evictor is the default reclaim path for the windowed per-expert MoE path).
+// Explicit RRL_METAL_CB_ASYNC=0 selects the synchronous per-window
+// waitUntilCompleted drain (the PR2-A A/B baseline); a positive value selects that
+// depth.  Only consulted when windowing is active (context.m), so this default is
+// inert for non-expert graphs.
 extern "C" int rrl_metal_cb_async_depth(void) {
     static int cached = -1;
     if (cached < 0) {
         const char * v = getenv("RRL_METAL_CB_ASYNC");
         if (v == nullptr) {
-            cached = 0; // unset — sync path
+            cached = 2; // unset — async evict default-ON, depth D=2
         } else {
             const int d = atoi(v);
-            cached = (d > 0) ? d : 2; // 0/""/non-numeric → default 2
+            cached = (d > 0) ? d : 0; // explicit 0 → sync drain; >0 → that depth
         }
     }
     return cached;
