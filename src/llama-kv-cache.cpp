@@ -756,6 +756,19 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, buf] : ctxs_bufs) {
+        // On the bounded rolling-KV eviction path (KvEviction::Segment/Budget)
+        // the residency manager frees a per-layer KV buffer and nulls its
+        // ctxs_bufs slot until the next pre-decode reset recreates it. A freed
+        // buffer holds no host/GPU bytes, so it contributes nothing to the
+        // breakdown — skip it. Without this guard ggml_backend_buffer_get_type
+        // dereferences the null buffer (GGML_ASSERT(buffer)) and aborts the
+        // whole process, making any footprint probe unusable on exactly the
+        // rolling-KV path it most needs to measure (issue #143). The
+        // non-evicting CPU/standard paths never null a slot, so they are
+        // unaffected.
+        if (!buf) {
+            continue;
+        }
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
 
         if (hparams.no_alloc) {
