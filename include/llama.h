@@ -361,6 +361,11 @@ extern "C" {
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
+        // Pre-compute-only variant of cb_eval: fires before each node, no post-compute
+        // read, no per-split sync.  Set at most one of cb_eval / cb_eval_pre.
+        ggml_backend_sched_eval_pre_callback cb_eval_pre;
+        void * cb_eval_pre_user_data;
+
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
