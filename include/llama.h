@@ -885,9 +885,10 @@ extern "C" {
 // serialize/restore only the cell metadata (positions, seq-ids), never the KV
 // tensor bytes. For a session whose KV lives in a persistent backing region
 // (mmap-metal): the tensor data stays in the region across a spill, so only the
-// host-side bookkeeping needs saving. Requires the occupied cells form a single
-// contiguous range from 0 (chat sessions under capacity); state_write throws
-// otherwise so the caller can fall back rather than restore to wrong offsets.
+// host-side bookkeeping needs saving. Position-preserving — each cell carries
+// its physical index, so restore places it back at the exact slot its bytes
+// occupy. Works for a rotated SWA window or a fragmented single-sequence cache,
+// not just a contiguous run from 0. Single destination sequence only.
 #define LLAMA_STATE_SEQ_FLAGS_META_ONLY 4
 
     typedef uint32_t llama_state_seq_flags;

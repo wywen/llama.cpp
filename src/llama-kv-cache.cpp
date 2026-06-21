@@ -2052,16 +2052,11 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         if (meta_only) {
             // Meta-only spill (mmap-metal): the KV tensor bytes persist in the
             // backing region across the spill, so only the cell bookkeeping is
-            // serialized. This is sound only when the data already sits at the
-            // offsets restore will allocate — i.e. the occupied cells form one
-            // contiguous run from 0 (single-sequence chat under capacity). A
-            // rotated SWA window or a fragmented cache would map cells to
-            // different offsets on restore; refuse here so the caller can fall
-            // back (e.g. close the session) rather than restore wrong bytes.
-            if (cr.data.size() != 1 || cr.data[0].first != 0 || cr.data[0].second != cell_count) {
-                throw std::runtime_error("meta-only state_write requires contiguous KV from cell 0");
-            }
-            state_write_meta(io, cr, seq_id);
+            // serialized. Restore must put each cell back at the same physical
+            // slot its bytes occupy, so emit the per-cell physical index
+            // (position-preserving) — this handles a rotated SWA window or a
+            // fragmented single-sequence cache, not just a contiguous run from 0.
+            state_write_meta_pos(io, cr, seq_id);
             continue;
         }
 
@@ -2094,22 +2089,14 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
         slot_info sinfo;
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id);
         if (meta_only) {
-            // The KV tensor bytes were left in the backing region at
-            // row == physical cell index. find_slot must have re-allocated the
-            // same contiguous [0, cell_count) run, or the restored cells would
-            // point at the wrong bytes. Verify rather than trust.
-            if (res && (sinfo.n_stream() != 1 || sinfo.idxs[0].size() != cell_count)) {
-                res = false;
-            }
-            for (uint32_t i = 0; res && i < cell_count; ++i) {
-                if (sinfo.idxs[0][i] != i) {
-                    LLAMA_LOG_ERROR("%s: meta-only restore expected contiguous cells from 0\n", __func__);
-                    res = false;
-                }
-            }
+            // Position-preserving restore: place each cell back at the physical
+            // index its KV bytes occupy in the backing region (read from the
+            // buffer), instead of repacking via find_slot. No tensor bytes are
+            // read — they are already in place.
+            res = res && state_read_meta_pos(io, strm, cell_count, sinfo, seq_id);
         } else {
+            res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id);
             res = res && state_read_data(io, strm, cell_count, sinfo);
         }
 
@@ -2152,6 +2139,43 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
 
             for (const auto & seq_id : seq_ids) {
                 io.write(&seq_id, sizeof(seq_id));
+            }
+        }
+    }
+}
+
+void llama_kv_cache::state_write_meta_pos(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
+    const auto & cells = v_cells[cr.strm];
+
+    // Like state_write_meta, but each cell is prefixed with its physical index
+    // so state_read_meta_pos can restore it at the exact slot its bytes occupy.
+    for (const auto & range : cr.data) {
+        for (uint32_t i = range.first; i < range.second; ++i) {
+            std::vector<llama_seq_id> seq_ids;
+
+            for (llama_seq_id cur = 0; cur < (int) n_seq_max; ++cur) {
+                if (cur == seq_id || seq_id == -1) {
+                    if (cells.seq_has(i, cur)) {
+                        seq_ids.push_back(cur);
+                    }
+                }
+            }
+
+            const uint32_t idx      = i;
+            const llama_pos pos      = cells.pos_get(i);
+            const uint32_t n_seq_id  = seq_ids.size();
+
+            io.write(&idx,      sizeof(idx));
+            io.write(&pos,      sizeof(pos));
+            io.write(&n_seq_id, sizeof(n_seq_id));
+
+            if (hparams.n_pos_per_embd() > 1) {
+                const llama_kv_cell_ext ext = cells.ext_get(i);
+                io.write(&ext, sizeof(ext));
+            }
+
+            for (const auto & sid : seq_ids) {
+                io.write(&sid, sizeof(sid));
             }
         }
     }
@@ -2371,6 +2395,88 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         head = 0;
     }
+
+    return true;
+}
+
+bool llama_kv_cache::state_read_meta_pos(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id) {
+    auto & cells = v_cells[strm];
+    auto & head  = v_heads[strm];
+
+    // Position-preserving restore reassigns the saved cells to a single
+    // destination sequence at their original physical indices. A whole-cache
+    // (-1) restore would need to honour per-cell seq sets and is not used by the
+    // meta-only (mmap-metal) path.
+    if (dest_seq_id == -1) {
+        LLAMA_LOG_ERROR("%s: meta-only restore requires a destination sequence\n", __func__);
+        return false;
+    }
+
+    if (cell_count > cells.size()) {
+        LLAMA_LOG_ERROR("%s: cell_count %u exceeds cache size %u\n", __func__, cell_count, cells.size());
+        return false;
+    }
+
+    // Drop any cells already held by this sequence; we rebuild them below at the
+    // exact slots their KV bytes occupy in the backing region.
+    seq_rm(dest_seq_id, -1, -1);
+
+    sinfo.s0 = strm;
+    sinfo.s1 = strm;
+    sinfo.resize(1);
+    sinfo.strm[0] = strm;
+    sinfo.idxs[0].resize(cell_count);
+
+    for (uint32_t i = 0; i < cell_count; ++i) {
+        uint32_t  idx;
+        llama_pos pos;
+        uint32_t  n_seq_id;
+
+        io.read(&idx,      sizeof(idx));
+        io.read(&pos,      sizeof(pos));
+        io.read(&n_seq_id, sizeof(n_seq_id));
+
+        if (n_seq_id != 1) {
+            LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
+            return false;
+        }
+
+        if (idx >= cells.size()) {
+            LLAMA_LOG_ERROR("%s: cell index %u out of range (size %u)\n", __func__, idx, cells.size());
+            return false;
+        }
+
+        if (!cells.is_empty(idx)) {
+            LLAMA_LOG_ERROR("%s: cell index %u already occupied on restore\n", __func__, idx);
+            return false;
+        }
+
+        cells.pos_set(idx, pos);
+
+        if (hparams.n_pos_per_embd() > 1) {
+            // Unlike state_read_meta (which routes through apply_ubatch and cannot
+            // yet carry ext), this path sets cells directly, so restore M-RoPE ext
+            // like the whole-cache branch does.
+            llama_kv_cell_ext ext;
+            io.read(&ext, sizeof(ext));
+            cells.ext_set(idx, ext);
+        }
+
+        // The serialized seq id is discarded; cells are reassigned to dest_seq_id.
+        {
+            llama_seq_id sid;
+            io.read(&sid, sizeof(sid));
+        }
+
+        cells.seq_add(idx, dest_seq_id);
+
+        sinfo.idxs[0][i] = idx;
+    }
+
+    // head is only a search-start hint for find_slot (which scans the whole cache
+    // and selects cells by emptiness / SWA position-masking, never by head), so a
+    // fresh 0 is sufficient — matching the whole-cache restore branch.
+    head = 0;
 
     return true;
 }

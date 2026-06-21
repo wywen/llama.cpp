@@ -312,6 +312,15 @@ private:
 
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+
+    // META_ONLY (position-preserving) save/restore: like state_write_meta /
+    // state_read_meta but each cell also carries its physical index, so restore
+    // places it back at the exact slot its KV bytes occupy in the backing region
+    // instead of repacking to [0, cell_count) via find_slot. This lifts the
+    // contiguous-from-0 restriction, allowing a rotated SWA window or fragmented
+    // single-sequence cache to spill meta-only. Single destination sequence only.
+    void state_write_meta_pos(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const;
+    bool state_read_meta_pos (llama_io_read_i  & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
