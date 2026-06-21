@@ -2002,7 +2002,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 }
 
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    GGML_UNUSED(flags);
+    const bool meta_only = flags & LLAMA_STATE_SEQ_FLAGS_META_ONLY;
 
     io.write(&n_stream, sizeof(n_stream));
 
@@ -2049,13 +2049,29 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
             continue;
         }
 
+        if (meta_only) {
+            // Meta-only spill (mmap-metal): the KV tensor bytes persist in the
+            // backing region across the spill, so only the cell bookkeeping is
+            // serialized. This is sound only when the data already sits at the
+            // offsets restore will allocate — i.e. the occupied cells form one
+            // contiguous run from 0 (single-sequence chat under capacity). A
+            // rotated SWA window or a fragmented cache would map cells to
+            // different offsets on restore; refuse here so the caller can fall
+            // back (e.g. close the session) rather than restore wrong bytes.
+            if (cr.data.size() != 1 || cr.data[0].first != 0 || cr.data[0].second != cell_count) {
+                throw std::runtime_error("meta-only state_write requires contiguous KV from cell 0");
+            }
+            state_write_meta(io, cr, seq_id);
+            continue;
+        }
+
         state_write_meta(io, cr, seq_id);
         state_write_data(io, cr);
     }
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    GGML_UNUSED(flags);
+    const bool meta_only = flags & LLAMA_STATE_SEQ_FLAGS_META_ONLY;
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
@@ -2079,7 +2095,23 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
 
         bool res = true;
         res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id);
-        res = res && state_read_data(io, strm, cell_count, sinfo);
+        if (meta_only) {
+            // The KV tensor bytes were left in the backing region at
+            // row == physical cell index. find_slot must have re-allocated the
+            // same contiguous [0, cell_count) run, or the restored cells would
+            // point at the wrong bytes. Verify rather than trust.
+            if (res && (sinfo.n_stream() != 1 || sinfo.idxs[0].size() != cell_count)) {
+                res = false;
+            }
+            for (uint32_t i = 0; res && i < cell_count; ++i) {
+                if (sinfo.idxs[0][i] != i) {
+                    LLAMA_LOG_ERROR("%s: meta-only restore expected contiguous cells from 0\n", __func__);
+                    res = false;
+                }
+            }
+        } else {
+            res = res && state_read_data(io, strm, cell_count, sinfo);
+        }
 
         if (!res) {
             if (seq_id == -1) {
