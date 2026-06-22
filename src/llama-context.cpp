@@ -206,7 +206,7 @@ llama_context::llama_context(
     // Layer-split KV eviction is configured by TYPED config (model::KvEviction),
     // not env vars: the device seeds the residency manager via set_eviction_config
     // at open time, and the context asks the manager whether eviction is armed
-    // (rrl_residency_armed). rrl_kv_active is computed once after memory creation
+    // (rrl_residency_armed). rrl_barrier_active is computed once after memory creation
     // below, so it is a single decision shared by graph_reserve and process_ubatch
     // (identical barrier topology) and the manager is the sole authority. There is
     // no longer a bare env-driven path (the manager is always the source).
@@ -323,13 +323,13 @@ llama_context::llama_context(
         // manager was already configured via set_eviction_config at device open).
         // The manager is the single authority for "is eviction armed"; a context
         // whose KV device is not mmap-metal (no manager) is never armed. Computing
-        // rrl_kv_active once here — rather than per gate site — guarantees
+        // rrl_barrier_active once here — rather than per gate site — guarantees
         // graph_reserve (below) and process_ubatch see the same value, so the
         // reserved and executed graphs get identical barrier topology.
         {
             void * rrl_mgr = rrl_residency_manager_ptr(model.dev_layer(0));
             const bool rrl_armed = rrl_mgr && rrl_residency_armed(rrl_mgr) != 0;
-            rrl_kv_active = rrl_armed && static_cast<int>(model.hparams.n_layer) > 1;
+            rrl_barrier_active = rrl_armed && static_cast<int>(model.hparams.n_layer) > 1;
         }
     }
 
@@ -1283,7 +1283,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // rebuild branch would crash the moment can_reuse() returns true after an
     // eviction (freed buffers bound by the reused graph). No-op when nothing was
     // evicted (every layer alive → recreate_layer early-returns).
-    if (rrl_kv_active) {
+    if (rrl_barrier_active) {
         rrl_residency_pre_decode_reset(rrl_residency_manager_ptr(model.dev_layer(0)));
     }
 
@@ -1320,7 +1320,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // Insert identity CPU barrier ops at layer boundaries before the graph is
         // allocated by the backend scheduler.  No-op when eviction is disabled;
         // barrier positions come from the manager's plan (stride or budget).
-        if (rrl_kv_active) {
+        if (rrl_barrier_active) {
             // Increment 3a: pass the residency manager pointer for the KV device
             // (layer 0) + rrl_residency_on_barrier as the callback pair.  When the
             // KV buft isn't mmap-metal, rrl_residency_manager_ptr returns null →
@@ -2310,7 +2310,7 @@ ggml_cgraph * llama_context::graph_reserve(
     // and the executed graph have the same topology.  Alloc sizing and split count must
     // match; a mismatch causes a scheduler assert at decode time.  Same gate as
     // process_ubatch.
-    if (gf && rrl_kv_active) {
+    if (gf && rrl_barrier_active) {
         // Increment 3a: pass the residency manager pointer so barriers fire on_barrier(il).
         void * rrl_mgr = rrl_residency_manager_ptr(model.dev_layer(0));
         rrl_insert_layer_barriers(gf, res->get_ctx(),
