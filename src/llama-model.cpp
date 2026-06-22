@@ -1483,11 +1483,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 // (issue #125): otherwise general weights take the expert
                 // metadata-only path and the GPU reads garbage. Detected by the
                 // "_exps" tensor-name suffix; each expert fused tensor has its own ctx.
-                {
-                    const ggml_tensor * t0 = ggml_get_first_tensor(ctx);
-                    if (t0 != nullptr && std::strstr(ggml_get_name(t0), "_exps") != nullptr) {
-                        ml.rrl_register_expert_region((const char *) addr + first, last - first);
-                    }
+                const ggml_tensor * t0 = ggml_get_first_tensor(ctx);
+                const bool is_expert_ctx =
+                    t0 != nullptr && std::strstr(ggml_get_name(t0), "_exps") != nullptr;
+                if (is_expert_ctx) {
+                    ml.rrl_register_expert_region((const char *) addr + first, last - first);
                 }
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
@@ -1496,6 +1496,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 }
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
+                // [rrl #201] Register the finalized buffer for the weight roller.
+                // Skip experts (owned by the per-expert ptr-mode path). Each
+                // mmap-metal tensor has its own per-tensor context/buffer
+                // (buft_per_layer_wt), so t0 is THE tensor and buf base/size are
+                // its page-aligned range; the shim parses blk.<il>. from the name.
+                if (t0 != nullptr && !is_expert_ctx) {
+                    ml.rrl_register_weight_tensor(ggml_get_name(t0),
+                        ggml_backend_buffer_get_base(buf),
+                        ggml_backend_buffer_get_size(buf));
+                }
             }
             // [zero-copy per-expert] If no mmap range was found for any file (e.g. a
             // context that contains only sub-page assembled tensors whose offs=0

@@ -50,6 +50,22 @@ extern "C" void rrl_install_expert_buffer_hook(rrl_expert_buffer_hook_fn fn);
 extern "C" void rrl_install_expert_buffer_hook(rrl_expert_buffer_hook_fn fn) {
     g_rrl_expert_buffer_hook = fn;
 }
+
+// [rrl #201] DEDICATED weight-tensor hook — feeds the mmap-metal shim's weight
+// roller. Fires once per GENERAL (non-expert) per-layer weight buffer during the
+// buffer phase, carrying the tensor name (so the shim can parse blk.<il>. and key
+// the LayerWeight) plus the buffer base/size. Kept separate from the expert hook
+// above: experts are owned by the per-expert ptr-mode residency path and must NOT
+// be double-managed by the weight roller. Each mmap-metal tensor lands in its own
+// 16 KiB-aligned context/buffer (buft_per_layer_wt), so base/size is per-tensor.
+// Null when not wired; the call is skipped safely.
+typedef void (*rrl_weight_tensor_hook_fn)(const char *name, const void *base, size_t size);
+static rrl_weight_tensor_hook_fn g_rrl_weight_tensor_hook = nullptr;
+
+extern "C" void rrl_install_weight_tensor_hook(rrl_weight_tensor_hook_fn fn);
+extern "C" void rrl_install_weight_tensor_hook(rrl_weight_tensor_hook_fn fn) {
+    g_rrl_weight_tensor_hook = fn;
+}
 #endif
 
 // [rrl #125] Invoke the dedicated expert-buffer hook for an expert mmap range.
@@ -63,6 +79,21 @@ void llama_model_loader::rrl_register_expert_region(const void * base, size_t si
         g_rrl_expert_buffer_hook(base, size);
     }
 #else
+    (void) base;
+    (void) size;
+#endif
+}
+
+// [rrl #201] Invoke the dedicated weight-tensor hook for a general (non-expert)
+// per-layer weight buffer. Called from the buffer phase (llama-model.cpp) AFTER
+// the buffer is created so base/size reflect the finalized mmap-metal buffer.
+void llama_model_loader::rrl_register_weight_tensor(const char * name, const void * base, size_t size) const {
+#if defined(__APPLE__)
+    if (g_rrl_weight_tensor_hook != nullptr && name != nullptr && base != nullptr && size > 0) {
+        g_rrl_weight_tensor_hook(name, base, size);
+    }
+#else
+    (void) name;
     (void) base;
     (void) size;
 #endif

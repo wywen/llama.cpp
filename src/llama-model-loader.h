@@ -239,6 +239,12 @@ struct llama_model_loader {
     // No-op when the hook is not installed (non-Apple / crate not linked).
     void rrl_register_expert_region(const void * base, size_t size) const;
 
+    // [rrl #201] Register a general (non-expert) per-layer weight buffer with the
+    // crate's weight-tensor hook so the mmap-metal shim's weight roller can page it
+    // in/out at barriers. No-op when the hook is not installed (non-Apple / crate
+    // not linked / weight rolling off).
+    void rrl_register_weight_tensor(const char * name, const void * base, size_t size) const;
+
     // for backwards compatibility, does not support ggml-backend
     void load_data_for(struct ggml_tensor * cur) const;
 
