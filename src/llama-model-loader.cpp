@@ -795,7 +795,13 @@ llama_model_loader::llama_model_loader(
     {
         std::string moe_layout;
         get_key("moe.layout", moe_layout, /*required=*/false);
-        if (moe_layout == "per_expert") {
+        // "per_expert"       — type-major: gate_up{e0..eN} | down{e0..eN}.
+        // "per_expert_major" — expert-major: each (layer,expert)'s
+        //   matrices are one contiguous super-block, so a fused tensor's experts
+        //   are spaced by the super-block, not the matrix. The assembly site derives
+        //   the per-expert stride from the on-disk slice spacing, so both layouts
+        //   share one code path; the only difference is the stride magnitude.
+        if (moe_layout == "per_expert" || moe_layout == "per_expert_major") {
             per_expert_moe = true;
             // Zero-copy is the only per-expert expert path now (copy mode removed):
             // when the model is mmap'd, point each fused expert tensor's data directly
@@ -1979,21 +1985,45 @@ bool llama_model_loader::load_all_data(
                         slices_ok = false; // expert too large for stride — should not happen
                     }
                 }
-                // Contiguity check: all slices must share idx[0] and lie at
-                // offs[0] + e*per_expert_stride.
-                bool contiguous = slices_ok;
+                // [expert-major] Derive the per-expert stride from the ACTUAL on-disk slice
+                // spacing rather than assuming it equals the create_tensor matrix-padded
+                // nb. Type-major spaces experts by the padded matrix (== per_expert_stride);
+                // expert-major (moe.layout=per_expert_major) spaces them by the whole
+                // (gate_up+down) super-block. Reading the spacing from disk makes the
+                // contiguity check and the fused tensor's nb02 correct for both layouts —
+                // the matmul steps experts by nb02 and reads each matrix via nb00/nb01
+                // (bounded by ne0/ne1), so a super-block nb02 is compute-correct.
+                const size_t disk_stride =
+                    (n_exp >= 2) ? (slices[1].offs - slices[0].offs) : per_expert_stride;
+                // Contiguity check: all slices share idx[0], lie at offs[0] + e*disk_stride,
+                // and each matrix fits within its stride slot.
+                bool contiguous = slices_ok && disk_stride > 0;
                 if (contiguous && n_exp > 0) {
                     const uint16_t idx0 = slices[0].idx;
                     const size_t   off0 = slices[0].offs;
                     for (int64_t e = 0; e < n_exp; ++e) {
                         if (slices[e].idx != idx0 ||
-                            slices[e].offs != off0 + static_cast<size_t>(e) * per_expert_stride) {
+                            slices[e].offs != off0 + static_cast<size_t>(e) * disk_stride ||
+                            slices[e].nbytes > disk_stride) {
                             contiguous = false;
                             break;
                         }
                     }
                 }
                 if (contiguous && n_exp > 0) {
+                    // [expert-major] Set the fused tensor's per-expert stride (nb02) to the
+                    // ACTUAL on-disk spacing. create_tensor padded nb[last] up to the
+                    // matrix size; for expert-major the experts are spaced by the larger
+                    // super-block, so override it here from the validated disk_stride.
+                    // The matmul steps experts by nb02 and reads each matrix via nb00/nb01
+                    // (bounded by ne0/ne1), so the trailing super-block bytes are ignored.
+                    // For type-major disk_stride == the padded nb, so this is a no-op.
+                    if (n_dims >= 1) {
+                        cur->nb[n_dims - 1] = disk_stride;
+                        for (int i = n_dims; i < GGML_MAX_DIMS; ++i) {
+                            cur->nb[i] = cur->nb[i - 1] * cur->ne[i - 1];
+                        }
+                    }
                     // [Site C] Point the fused tensor's data directly into the GGUF mmap.
                     const auto & mapping = mappings.at(slices[0].idx);
                     uint8_t * mmap_ptr = static_cast<uint8_t *>(mapping->addr()) + slices[0].offs;
@@ -2036,7 +2066,13 @@ bool llama_model_loader::load_all_data(
                     {
                         auto & mu = mmaps_used[slices[0].idx];
                         mu.first  = std::min(mu.first,  slices[0].offs);
-                        mu.second = std::max(mu.second, slices[0].offs + fused_nbytes);
+                        // [expert-major] Use the actual last-slice end, not slices[0]+fused_nbytes:
+                        // fused_nbytes is the tightly-packed matrix total, which understates
+                        // the super-block span under expert-major (experts spaced by
+                        // disk_stride > matrix). Keeps the tail-unmap from reclaiming the
+                        // last experts' pages. Exact for type-major too.
+                        const auto & last = slices[n_exp - 1];
+                        mu.second = std::max(mu.second, last.offs + last.nbytes);
                     }
                     size_done += fused_nbytes;
                     if (progress_callback) {
