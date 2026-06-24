@@ -156,7 +156,19 @@ static std::vector<int32_t> s_rrl_prev_wired;
 // waitUntilCompleted drain (the PR2-A A/B baseline); a positive value selects that
 // depth.  Only consulted when windowing is active (context.m), so this default is
 // inert for non-expert graphs.
+// [rrl] #268: crate-side override of the async depth. -1 = unset (fall through to
+// the RRL_METAL_CB_ASYNC env/default below); >= 0 = explicit from the typed session
+// field (0 = sync drain, >0 = that depth). Checked before the cached env read so a
+// setter call wins even if the env value was already cached on an earlier read.
+static std::atomic<int> g_rrl_cb_async_override{-1};
+extern "C" void rrl_metal_set_cb_async_depth(int d) {
+    g_rrl_cb_async_override.store(d, std::memory_order_relaxed);
+}
 extern "C" int rrl_metal_cb_async_depth(void) {
+    const int ov = g_rrl_cb_async_override.load(std::memory_order_relaxed);
+    if (ov >= 0) {
+        return ov;
+    }
     static int cached = -1;
     if (cached < 0) {
         const char * v = getenv("RRL_METAL_CB_ASYNC");
@@ -401,7 +413,17 @@ extern "C" void rrl_async_window_reclaim_and_free(void * handle) {
 // [rrl] PR2-B: returns W from RRL_METAL_CB_WEXP, or 0 if unset.
 // Cached on first call (function-static).  W=0 means W-expert sub-windowing is
 // disabled; the per-layer PR2-A async path remains unchanged.
+// [rrl] #268: crate-side override of W. -1 = unset (fall through to RRL_METAL_CB_WEXP
+// env/default); >= 0 = explicit from the typed session field (0 = disabled, >0 = window).
+static std::atomic<int> g_rrl_cb_wexp_override{-1};
+extern "C" void rrl_metal_set_cb_wexp(int w) {
+    g_rrl_cb_wexp_override.store(w, std::memory_order_relaxed);
+}
 extern "C" int rrl_metal_cb_wexp(void) {
+    const int ov = g_rrl_cb_wexp_override.load(std::memory_order_relaxed);
+    if (ov >= 0) {
+        return ov;
+    }
     static int cached = -1;
     if (cached < 0) {
         const char * v = getenv("RRL_METAL_CB_WEXP");
