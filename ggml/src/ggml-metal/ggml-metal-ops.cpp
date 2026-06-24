@@ -3211,6 +3211,10 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             void *   host_base_mm  = ggml_metal_buffer_get_base(metal_buf_mm);
             const size_t base_offs_mm = (size_t)((const char *) src0_mm->data - (const char *) host_base_mm);
             const uint64_t stride_mm  = (uint64_t) nb02;
+            // [expert-major] Per-expert matrix extent, decoupled from the (possibly larger,
+            // super-block) stride — see the decode-path note. Used for page-in length.
+            const size_t expert_len_mm =
+                ggml_row_size(src0_mm->type, src0_mm->ne[0]) * (size_t) src0_mm->ne[1];
 
             int hook_rc_mm = g_rrl_expert_subbuffers(
                 host_base_mm, base_offs_mm, (int32_t) ne02, stride_mm,
@@ -3250,10 +3254,10 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                                         volatile const char * ep_mm =
                                             (volatile const char *) src0_mm->data +
                                             (size_t) eid * (size_t) stride_mm;
-                                        madvise((void *) ep_mm, (size_t) stride_mm,
+                                        madvise((void *) ep_mm, expert_len_mm,
                                                 MADV_WILLNEED);
                                         for (size_t pg = 0;
-                                             pg < (size_t) stride_mm;
+                                             pg < expert_len_mm;
                                              pg += kRrlPageSizeMm) {
                                             (void) ep_mm[pg];
                                         }
@@ -3471,8 +3475,15 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             void *   host_base = ggml_metal_buffer_get_base(metal_buf);
             // tensor->data is the absolute host pointer to expert 0's start.
             const size_t base_offs = (size_t)((const char *) src0->data - (const char *) host_base);
-            // nb02 is the padded per-expert stride (set by the loader to LLAMA_METAL_EXPERT_ALIGN).
+            // nb02 is the per-expert stride: matrix-padded (type-major) or the
+            // gate_up+down super-block (expert-major). It steps BETWEEN experts.
             const uint64_t stride = (uint64_t) nb02;
+            // [expert-major] The per-expert EXTENT (matrix payload) is decoupled from the
+            // stride: a routed expert's pages span only the matrix, not the (possibly
+            // larger) super-block. Used for page-in/evict lengths so the last expert
+            // doesn't overrun the file mmap. Type-major: ~= stride minus padding.
+            const size_t expert_len =
+                ggml_row_size(src0->type, src0->ne[0]) * (size_t) src0->ne[1];
 
             // [rrl] PR#121: pass &expert_state; Increment 1: pass &expert_refcount.
             int hook_rc = g_rrl_expert_subbuffers(
@@ -3552,11 +3563,11 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                                             volatile const char * ep =
                                                 (volatile const char *) src0->data +
                                                 (size_t) eid * (size_t) stride;
-                                            madvise((void *) ep, (size_t) stride,
+                                            madvise((void *) ep, expert_len,
                                                     MADV_WILLNEED);
                                             // Synchronous touch: one byte per page.
                                             for (size_t pg = 0;
-                                                 pg < (size_t) stride;
+                                                 pg < expert_len;
                                                  pg += kRrlPageSize) {
                                                 (void) ep[pg];
                                             }
