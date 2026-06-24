@@ -40,11 +40,17 @@
 // array (atomic uint32_t, calloc'd to 0).  Both are nullable (pass &ptr or
 // nullptr); the .mm side guards with `if (out_state)` / `if (out_refcount)`.
 
+// [expert-major] sub_len is the per-expert SUB-BUFFER length (page-aligned matrix
+// size), decoupled from stride (the inter-expert step). For type-major they are
+// equal; for expert-major stride is the larger super-block, so length=stride would
+// over-claim past the registered region for the last experts (buffer creation
+// fails → garbage). sub_len bounds each MTLBuffer to its own matrix.
 typedef int (*rrl_expert_subbuffers_fn)(
     void *                   host_base,
     size_t                   base_offs,
     int32_t                  n_expert,
     uint64_t                 stride,
+    uint64_t                 sub_len,
     void **                  out_argbuf,
     void ***                 out_mtl_bufs,
     std::atomic<uint8_t> **  out_state,
@@ -496,8 +502,11 @@ extern "C" int rrl_encode_expert_node_windows(
     std::atomic<uint8_t> *  expert_state    = nullptr;
     std::atomic<uint32_t> * expert_refcount = nullptr;
 
+    const uint64_t sub_len =
+        (((uint64_t) ggml_row_size(op->src[0]->type, op->src[0]->ne[0]) *
+          (uint64_t) op->src[0]->ne[1]) + 16383ull) & ~16383ull;
     int hook_rc = g_rrl_expert_subbuffers(
-        host_base, base_offs, (int32_t) ne02, stride,
+        host_base, base_offs, (int32_t) ne02, stride, sub_len,
         &argbuf_mtl, &expert_mtl_bufs, &expert_state, &expert_refcount);
 
     if (hook_rc != 0 || argbuf_mtl == nullptr || expert_mtl_bufs == nullptr) {
@@ -3216,8 +3225,9 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             const size_t expert_len_mm =
                 ggml_row_size(src0_mm->type, src0_mm->ne[0]) * (size_t) src0_mm->ne[1];
 
+            const uint64_t sub_len_mm = ((uint64_t) expert_len_mm + 16383ull) & ~16383ull;
             int hook_rc_mm = g_rrl_expert_subbuffers(
-                host_base_mm, base_offs_mm, (int32_t) ne02, stride_mm,
+                host_base_mm, base_offs_mm, (int32_t) ne02, stride_mm, sub_len_mm,
                 &argbuf_mtl_mm, &expert_mtl_bufs_mm,
                 &expert_state_mm, &expert_refcount_mm);
 
@@ -3486,8 +3496,9 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 ggml_row_size(src0->type, src0->ne[0]) * (size_t) src0->ne[1];
 
             // [rrl] PR#121: pass &expert_state; Increment 1: pass &expert_refcount.
+            const uint64_t sub_len = ((uint64_t) expert_len + 16383ull) & ~16383ull;
             int hook_rc = g_rrl_expert_subbuffers(
-                host_base, base_offs, (int32_t) ne02, stride,
+                host_base, base_offs, (int32_t) ne02, stride, sub_len,
                 &argbuf_mtl, &expert_mtl_bufs, &expert_state, &expert_refcount);
 
             if (hook_rc == 0 && argbuf_mtl != nullptr && expert_mtl_bufs != nullptr) {

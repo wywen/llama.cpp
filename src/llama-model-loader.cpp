@@ -2021,9 +2021,6 @@ bool llama_model_loader::load_all_data(
                     }
                 }
                 if (contiguous && n_exp > 0) {
-                    LLAMA_LOG_INFO("[LEVERB-DBG] %s zero-copy: per_expert_stride=%zu disk_stride=%zu nb0=%zu nb1=%zu ne0=%lld ne1=%lld off0=%zu\n",
-                        fused_name.c_str(), per_expert_stride, disk_stride,
-                        cur->nb[0], cur->nb[1], (long long)cur->ne[0], (long long)cur->ne[1], slices[0].offs);
                     // [expert-major] Set the fused tensor's per-expert stride (nb02) to the
                     // ACTUAL on-disk spacing. create_tensor padded nb[last] up to the
                     // matrix size; for expert-major the experts are spaced by the larger
