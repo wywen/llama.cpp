@@ -265,7 +265,11 @@ extern "C" void rrl_metal_clear_keep_mask(void) {
 struct rrl_evict_window {
     void *                  base_addr;     // s_prev_addr
     size_t                  len;           // s_prev_len (whole-tensor fallback size)
-    uint64_t                stride;        // s_prev_stride (per-expert)
+    uint64_t                stride;        // s_prev_stride (per-expert STEP between experts)
+    size_t                  expert_len = 0;// [expert-major] per-expert reclaim EXTENT (matrix
+                                           // bytes); 0 => fall back to stride. Under
+                                           // expert-major stride is the super-block, so
+                                           // reclaiming `stride` would msync a neighbour.
     int64_t                 nexp;          // s_prev_nexp
     int                     layer;         // s_prev_layer
     std::vector<int32_t>    wired;         // routed eids (s_rrl_prev_wired)
@@ -286,6 +290,12 @@ struct rrl_evict_window {
 // Whole-tensor fallback: when keep_mask==null or dims mismatch.
 // Counter increments (g_rrl_evict_calls / g_rrl_evict_bytes) are preserved.
 static void rrl_evict_window_reclaim(const rrl_evict_window & w) {
+    // [expert-major] Per-expert reclaim EXTENT: the matrix bytes, not the inter-expert
+    // stride (which is the super-block under expert-major and would msync a still-
+    // resident neighbour). Falls back to stride for records that don't set it.
+    const std::size_t rlen =
+        (w.expert_len != 0 && w.expert_len <= (std::size_t) w.stride)
+            ? w.expert_len : (std::size_t) w.stride;
     constexpr uint8_t kNormal   = 0;
     constexpr uint8_t kEvicting = 1;
     const uint8_t * mask    = w.keep_mask;
@@ -333,19 +343,19 @@ static void rrl_evict_window_reclaim(const rrl_evict_window & w) {
                     ? rc[eid].load(std::memory_order_acquire)
                     : 0u;
                 if (live == 0u) {
-                    rrl_expert_reclaim(expert_addr, (std::size_t)w.stride);
+                    rrl_expert_reclaim(expert_addr, rlen);
                     g_rrl_evict_calls.fetch_add(1, std::memory_order_relaxed);
                     g_rrl_evict_bytes.fetch_add(
-                        w.stride, std::memory_order_relaxed);
+                        rlen, std::memory_order_relaxed);
                 }
                 // Restore to NORMAL (release).
                 st[eid].store(kNormal, std::memory_order_release);
             } else {
                 // No state ptr (no hook last op): bare reclaim.
-                rrl_expert_reclaim(expert_addr, (std::size_t)w.stride);
+                rrl_expert_reclaim(expert_addr, rlen);
                 g_rrl_evict_calls.fetch_add(1, std::memory_order_relaxed);
                 g_rrl_evict_bytes.fetch_add(
-                    w.stride, std::memory_order_relaxed);
+                    rlen, std::memory_order_relaxed);
             }
         }
     } else {
@@ -620,6 +630,8 @@ extern "C" int rrl_encode_expert_node_windows(
             w.base_addr    = op->src[0]->data;
             w.len          = ggml_nbytes(op->src[0]);
             w.stride       = stride;
+            w.expert_len   = ggml_row_size(op->src[0]->type, op->src[0]->ne[0]) *
+                             (size_t) op->src[0]->ne[1];
             w.nexp         = op->src[0]->ne[2];
             w.layer        = node_layer;
             w.wired        = group_eids;         // only this group's experts
@@ -3075,6 +3087,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         const bool rrl_evict = (g_rrl_evict_on.load(std::memory_order_relaxed) != 0);
         static void *     s_prev_addr   = nullptr;
         static size_t     s_prev_len    = 0;
+        static size_t     s_prev_expert_len = 0; // [expert-major] per-expert matrix extent
         static int        s_prev_layer  = -1;
         static uint64_t   s_prev_stride = 0;
         static int64_t    s_prev_nexp   = 0;
@@ -3092,6 +3105,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 w.base_addr    = s_prev_addr;
                 w.len          = s_prev_len;
                 w.stride       = s_prev_stride;
+                w.expert_len   = s_prev_expert_len;
                 w.nexp         = s_prev_nexp;
                 w.layer        = s_prev_layer;
                 w.wired        = s_rrl_prev_wired;   // copy (statics cleared below)
@@ -3125,6 +3139,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             s_prev_addr   = s0->data;
             s_prev_len    = ggml_nbytes(s0);
             s_prev_stride = (uint64_t)s0->nb[2];
+            s_prev_expert_len = ggml_row_size(s0->type, s0->ne[0]) * (size_t) s0->ne[1];
             s_prev_nexp   = s0->ne[2];
             // [rrl] PR#121: reset s_rrl_prev_state to nullptr so that if the
             // encoder block below doesn't fire the hook (e.g. hook returned an
@@ -3345,6 +3360,8 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             w.base_addr    = src0_mm->data;
             w.len          = ggml_nbytes(src0_mm);
             w.stride       = (uint64_t) src0_mm->nb[2];
+            w.expert_len   = ggml_row_size(src0_mm->type, src0_mm->ne[0]) *
+                             (size_t) src0_mm->ne[1];
             w.nexp         = src0_mm->ne[2];
             // Parse layer from src0_mm->name ("blk.<L>.ffn_...").
             {
@@ -3650,6 +3667,8 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             w.base_addr    = src0->data;
             w.len          = ggml_nbytes(src0);
             w.stride       = (uint64_t) src0->nb[2];
+            w.expert_len   = ggml_row_size(src0->type, src0->ne[0]) *
+                             (size_t) src0->ne[1];
             w.nexp         = src0->ne[2];
             // Parse layer from src0->name ("blk.<L>.ffn_...").
             {
