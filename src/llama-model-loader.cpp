@@ -1993,8 +1993,18 @@ bool llama_model_loader::load_all_data(
                 // contiguity check and the fused tensor's nb02 correct for both layouts —
                 // the matmul steps experts by nb02 and reads each matrix via nb00/nb01
                 // (bounded by ne0/ne1), so a super-block nb02 is compute-correct.
+                // Only the LARGE per-expert weight tensors are page-padded by
+                // create_tensor (raw_stride >= LLAMA_METAL_EXPERT_ALIGN) and zero-copied;
+                // the sub-page scale tensors stay tightly packed and MUST keep their
+                // contiguous nb (the gemma4 graph reshapes them — ggml_is_contiguous
+                // asserts). Derive the disk stride only for the padded weights: for the
+                // scales keep per_expert_stride, so their 16 KiB-spaced on-disk layout
+                // fails the contiguity check and they take the contiguous copy path,
+                // exactly as before this change.
                 const size_t disk_stride =
-                    (n_exp >= 2) ? (slices[1].offs - slices[0].offs) : per_expert_stride;
+                    (n_exp >= 2 && per_expert_stride >= (size_t) LLAMA_METAL_EXPERT_ALIGN)
+                        ? (slices[1].offs - slices[0].offs)
+                        : per_expert_stride;
                 // Contiguity check: all slices share idx[0], lie at offs[0] + e*disk_stride,
                 // and each matrix fits within its stride slot.
                 bool contiguous = slices_ok && disk_stride > 0;
@@ -2011,6 +2021,9 @@ bool llama_model_loader::load_all_data(
                     }
                 }
                 if (contiguous && n_exp > 0) {
+                    LLAMA_LOG_INFO("[LEVERB-DBG] %s zero-copy: per_expert_stride=%zu disk_stride=%zu nb0=%zu nb1=%zu ne0=%lld ne1=%lld off0=%zu\n",
+                        fused_name.c_str(), per_expert_stride, disk_stride,
+                        cur->nb[0], cur->nb[1], (long long)cur->ne[0], (long long)cur->ne[1], slices[0].offs);
                     // [expert-major] Set the fused tensor's per-expert stride (nb02) to the
                     // ACTUAL on-disk spacing. create_tensor padded nb[last] up to the
                     // matrix size; for expert-major the experts are spaced by the larger
