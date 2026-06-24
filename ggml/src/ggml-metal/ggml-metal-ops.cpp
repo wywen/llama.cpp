@@ -3239,6 +3239,9 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             // super-block) stride — see the decode-path note. Used for page-in length.
             const size_t expert_len_mm =
                 ggml_row_size(src0_mm->type, src0_mm->ne[0]) * (size_t) src0_mm->ne[1];
+            // [expert-major coalesce] see the decode-path note: the gate_up leader faults the
+            // whole super-block; the down follower faults only its matrix.
+            const bool em_lead_mm = (strstr(src0_mm->name, "ffn_down_exps") == nullptr);
 
             const uint64_t sub_len_mm = ((uint64_t) expert_len_mm + 16383ull) & ~16383ull;
             int hook_rc_mm = g_rrl_expert_subbuffers(
@@ -3279,10 +3282,14 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                                         volatile const char * ep_mm =
                                             (volatile const char *) src0_mm->data +
                                             (size_t) eid * (size_t) stride_mm;
-                                        madvise((void *) ep_mm, expert_len_mm,
+                                        // [expert-major coalesce] leader faults the super-block.
+                                        const size_t fl_mm =
+                                            (em_lead_mm && eid + 1 < (int32_t) ne02)
+                                                ? (size_t) stride_mm : expert_len_mm;
+                                        madvise((void *) ep_mm, fl_mm,
                                                 MADV_WILLNEED);
                                         for (size_t pg = 0;
-                                             pg < expert_len_mm;
+                                             pg < fl_mm;
                                              pg += kRrlPageSizeMm) {
                                             (void) ep_mm[pg];
                                         }
@@ -3511,6 +3518,14 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             // doesn't overrun the file mmap. Type-major: ~= stride minus padding.
             const size_t expert_len =
                 ggml_row_size(src0->type, src0->ne[0]) * (size_t) src0->ne[1];
+            // [expert-major coalesce] On the expert-major layout the input projection
+            // (gate_up) leads each expert's super-block and is computed first, so its
+            // page-in faults the whole super-block (stride) in one read — pulling the
+            // paired `down` in for free. The follower (down) only faults its own matrix
+            // (already resident). The last expert can't over-read past the region, so
+            // it falls back to expert_len. Type-major: stride ~= matrix, so this is a
+            // no-op (leader faults the padded matrix, no neighbour spillover).
+            const bool em_lead = (strstr(src0->name, "ffn_down_exps") == nullptr);
 
             // [rrl] PR#121: pass &expert_state; Increment 1: pass &expert_refcount.
             const uint64_t sub_len = ((uint64_t) expert_len + 16383ull) & ~16383ull;
@@ -3591,11 +3606,17 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                                             volatile const char * ep =
                                                 (volatile const char *) src0->data +
                                                 (size_t) eid * (size_t) stride;
-                                            madvise((void *) ep, expert_len,
-                                                    MADV_WILLNEED);
+                                            // [expert-major coalesce] leader faults the whole
+                                            // super-block (stride) except the last expert
+                                            // (would over-read the region); follower and
+                                            // type-major fault just the matrix.
+                                            const size_t fl =
+                                                (em_lead && eid + 1 < (int32_t) ne02)
+                                                    ? (size_t) stride : expert_len;
+                                            madvise((void *) ep, fl, MADV_WILLNEED);
                                             // Synchronous touch: one byte per page.
                                             for (size_t pg = 0;
-                                                 pg < expert_len;
+                                                 pg < fl;
                                                  pg += kRrlPageSize) {
                                                 (void) ep[pg];
                                             }
