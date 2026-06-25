@@ -362,6 +362,11 @@ extern "C" {
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
+        // Pre-compute-only variant of cb_eval: fires before each node, no post-compute
+        // read, no per-split sync.  Set at most one of cb_eval / cb_eval_pre.
+        ggml_backend_sched_eval_pre_callback cb_eval_pre;
+        void * cb_eval_pre_user_data;
+
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
@@ -883,6 +888,15 @@ extern "C" {
 // Keeps the tensor data on device buffers (i.e. not accessible in host memory, but faster save/load).
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
+
+// serialize/restore only the cell metadata (positions, seq-ids), never the KV
+// tensor bytes. For a session whose KV lives in a persistent backing region
+// (mmap-metal): the tensor data stays in the region across a spill, so only the
+// host-side bookkeeping needs saving. Position-preserving — each cell carries
+// its physical index, so restore places it back at the exact slot its bytes
+// occupy. Works for a rotated SWA window or a fragmented single-sequence cache,
+// not just a contiguous run from 0. Single destination sequence only.
+#define LLAMA_STATE_SEQ_FLAGS_META_ONLY 4
 
     typedef uint32_t llama_state_seq_flags;
 

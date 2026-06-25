@@ -8,6 +8,53 @@ extern "C" {
 
 typedef struct ggml_metal_op * ggml_metal_op_t;
 
+// [rrl] #135 Stage 2: returns non-zero iff tensor t is a per-expert mmap-metal
+// weight tensor (the same gate rrl_is_expert_mmap_metal uses internally).
+// Declared here so ggml-metal-context.m can drive the window planner using the
+// same detection logic without duplicating it.
+int rrl_is_expert_mmap_metal_c(const struct ggml_tensor *t);
+
+// [rrl] PR2-A.2: async completion-handler evictor interface (C-callable from context.m).
+//
+// rrl_metal_cb_async_depth: returns the async in-flight depth D.  Default-ON:
+//   D=2 when RRL_METAL_CB_ASYNC is UNSET; explicit =0 selects the synchronous
+//   per-window waitUntilCompleted drain; a positive value selects that depth.
+//
+// rrl_async_window_take_records: move the accumulated async-records vector to a
+//   heap allocation and return an opaque handle (NULL if nothing was accumulated).
+//   Call once per window after the encode loop, before committing.
+//
+// rrl_async_window_reclaim_and_free: run rrl_evict_window_reclaim on each record
+//   in the handle and free it.  Safe to call with NULL.  Call from the MTL
+//   completion handler — the handler is the SOLE evictor in async mode.
+int   rrl_metal_cb_async_depth(void);
+void *rrl_async_window_take_records(void);
+void  rrl_async_window_reclaim_and_free(void *handle);
+
+// [rrl] PR2-B: W-expert sub-window entry point (C-callable from context.m).
+//
+// rrl_metal_cb_wexp: returns W from RRL_METAL_CB_WEXP env var, or 0 if unset.
+//   Requires RRL_METAL_CB_ASYNC to also be set; context.m checks that condition.
+//
+// rrl_encode_expert_node_windows: encode one expert mul_mat_id node (node_idx in
+//   gf) as ceil(N_routed/W) sub-CBs, each covering a W-expert group.  Called from
+//   the async path in graph_compute when RRL_METAL_CB_WEXP is set and the current
+//   singleton window is an expert node.  The entry owns all sem.wait() calls for
+//   its sub-CBs; the caller must NOT acquire sem before calling.  Each sub-CB's
+//   completion handler runs rrl_async_window_reclaim_and_free, releases the CB,
+//   and signals sem.  Returns the number of sub-CBs committed (0 on fallback to the
+//   single-CB path).
+int rrl_metal_cb_wexp(void);
+int rrl_encode_expert_node_windows(
+        ggml_metal_device_t   dev,
+        struct ggml_cgraph  * gf,
+        int                   node_idx,
+        void                * queue,          // id<MTLCommandQueue>, passed as void* (ObjC)
+        void                * sem,            // dispatch_semaphore_t, passed as void*
+        int                   D,
+        int                   W,
+        bool                * has_error_out); // set to true on CB error; may be NULL
+
 ggml_metal_op_t ggml_metal_op_init(
         ggml_metal_device_t dev,
         ggml_metal_cmd_buf_t cmd_buf,

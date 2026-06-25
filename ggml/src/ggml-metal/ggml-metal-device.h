@@ -66,6 +66,22 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
 
 typedef void * ggml_metal_cmd_buf_t;
 
+// [rrl] PR2-B: thin C wrappers for MTLCommandBuffer operations needed by the
+// C++ rrl_encode_expert_node_windows entry point in ggml-metal-ops.cpp.
+// `queue_raw` is void* (id<MTLCommandQueue>); `cb` is void* (id<MTLCommandBuffer>).
+ggml_metal_cmd_buf_t rrl_cmd_buf_create_unretained(void * queue_raw);
+void rrl_cmd_buf_retain  (ggml_metal_cmd_buf_t cb);
+void rrl_cmd_buf_release (ggml_metal_cmd_buf_t cb);
+void rrl_cmd_buf_enqueue (ggml_metal_cmd_buf_t cb);
+void rrl_cmd_buf_commit  (ggml_metal_cmd_buf_t cb);
+
+// Completion-handler bridge: fn(userdata, MTLCommandBufferStatus) is called from
+// the Metal driver thread after the CB finishes.
+typedef void (*rrl_cb_handler_fn)(void * userdata, int status);
+void rrl_cmd_buf_add_handler(ggml_metal_cmd_buf_t cb,
+                              rrl_cb_handler_fn fn,
+                              void * userdata);
+
 //
 // MTLComputeCommandEncoder wrapper
 //
@@ -90,6 +106,12 @@ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
+
+// [rrl] Call useResource on a raw id<MTLBuffer> (passed as void* to keep the
+// C++ ops layer free of ObjC headers).  `usage` maps directly to MTLResourceUsage.
+void ggml_metal_encoder_use_resource_raw(ggml_metal_encoder_t encoder,
+                                         void * mtl_buffer_raw,
+                                         unsigned int usage);
 
 //
 // MTLLibrary wrapper
@@ -300,7 +322,8 @@ const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_de
 typedef struct ggml_metal_buffer * ggml_metal_buffer_t;
 
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared);
-ggml_metal_buffer_t ggml_metal_buffer_map (ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size);
+ggml_metal_buffer_t ggml_metal_buffer_map (ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size, bool use_residency);
+ggml_metal_buffer_t ggml_metal_buffer_map_metadata_only(ggml_metal_device_t dev, void * ptr, size_t size); // [rrl] zero-copy: no MTLBuffer, ptr-mode reads via sub-buffers
 
 void   ggml_metal_buffer_free     (ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_base (ggml_metal_buffer_t buf);

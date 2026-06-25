@@ -717,13 +717,43 @@ static ggml_backend_buffer_type_t ggml_backend_metal_device_get_buffer_type(ggml
     return props_dev->use_shared_buffers ? ggml_backend_metal_buffer_type_shared(props_dev->device) : ggml_backend_metal_buffer_type_private(props_dev->device);
 }
 
-static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
+// Shared body for the two mapped (zero-copy from-host-ptr) buffer constructors.
+// The only difference is whether the buffer joins the device's MTLResidencySet:
+// weights want it (kept wired for the GPU); evictable KV must opt out so
+// msync(MS_INVALIDATE) can reclaim its pages.
+static ggml_backend_buffer_t ggml_backend_metal_buffer_from_ptr_impl(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size, bool use_residency) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
-    ggml_metal_buffer_t res = ggml_metal_buffer_map(ctx_dev, ptr, size, max_tensor_size);
+    ggml_metal_buffer_t res = ggml_metal_buffer_map(ctx_dev, ptr, size, max_tensor_size, use_residency);
 
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
 
+    return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_mapped(props_dev->device), ggml_backend_metal_buffer_shared_i, res, size);
+}
+
+static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
+    // Stock behaviour. The per-expert MoE feature used to force this buffer
+    // out of the residency set (the default-buft mmap buffer once spanned the WHOLE
+    // GGUF and wiring it OOMed), but the trailing-expert GGUF layout
+    // (shard_moe_experts.py) shrank the non-expert range to [front, X) (~2.5 GiB,
+    // no expert pages), so it is safe to leave residency to the stock path. (The crate
+    // also sets GGML_METAL_NO_RESIDENCY, which disables the residency set globally, so
+    // use_residency is effectively moot here regardless.)
+    return ggml_backend_metal_buffer_from_ptr_impl(dev, ptr, size, max_tensor_size,
+                                                   /*use_residency=*/true);
+}
+
+ggml_backend_buffer_t ggml_backend_metal_buffer_from_ptr_no_residency(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
+    return ggml_backend_metal_buffer_from_ptr_impl(dev, ptr, size, max_tensor_size, /*use_residency=*/false);
+}
+
+// [rrl] Zero-copy per-expert region: metadata-only mapped buffer (no MTLBuffer).
+// See ggml_metal_buffer_map_metadata_only — avoids double-mapping the experts
+// into GPU VA on top of the per-expert sub-buffers.
+ggml_backend_buffer_t ggml_backend_metal_buffer_from_ptr_metadata_only(ggml_backend_dev_t dev, void * ptr, size_t size) {
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+    ggml_metal_buffer_t res = ggml_metal_buffer_map_metadata_only(ctx_dev, ptr, size);
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
     return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_mapped(props_dev->device), ggml_backend_metal_buffer_shared_i, res, size);
 }
 

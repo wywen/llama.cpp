@@ -374,6 +374,14 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
+    // True when the layer device's residency manager is armed (KV eviction and/or
+    // weight rolling configured at device open) — i.e. the layer-split barrier
+    // machinery is on, with barrier positions chosen by the manager's plan (fixed
+    // stride or SWA-weighted budget). Named rrl_barrier_active (not _kv_active)
+    // because weight rolling arms the same barriers even with KV eviction off.
+    // Computed once after memory creation; see llama_context::llama_context.
+    bool rrl_barrier_active = false;
+
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;

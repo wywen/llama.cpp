@@ -114,7 +114,10 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share);
 
-    ~llama_kv_cache() = default;
+    // [Step 4] Not defaulted: unregisters this cache's per-layer KV buffers from
+    // the mmap-metal residency manager (which outlives the cache on a reused
+    // device) before ctxs_bufs frees them. See llama-kv-cache.cpp.
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -284,6 +287,11 @@ private:
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
+    // [Step 4] The mmap-metal KV device, captured during per-layer registration
+    // (null for every other layout). ~llama_kv_cache() unregisters it from the
+    // residency manager so a reused device never holds slots into freed buffers.
+    ggml_backend_dev_t rrl_kv_dev = nullptr;
+
     size_t total_size() const;
 
     size_t size_k_bytes() const;
@@ -315,6 +323,15 @@ private:
 
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+
+    // META_ONLY (position-preserving) save/restore: like state_write_meta /
+    // state_read_meta but each cell also carries its physical index, so restore
+    // places it back at the exact slot its KV bytes occupy in the backing region
+    // instead of repacking to [0, cell_count) via find_slot. This lifts the
+    // contiguous-from-0 restriction, allowing a rotated SWA window or fragmented
+    // single-sequence cache to spill meta-only. Single destination sequence only.
+    void state_write_meta_pos(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const;
+    bool state_read_meta_pos (llama_io_read_i  & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id);
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {

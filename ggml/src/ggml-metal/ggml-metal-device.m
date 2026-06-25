@@ -517,6 +517,67 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
     [encoder->obj endEncoding];
 }
 
+// [rrl] Per-expert Metal decode: useResource on a raw id<MTLBuffer> (passed as
+// void* to avoid ObjC headers in the C++ ops layer).  Called from
+// ggml_metal_op_mul_mat_id when use_expert_ptrs is set; makes only the routed
+// expert sub-buffers resident for this command encoder.
+void ggml_metal_encoder_use_resource_raw(ggml_metal_encoder_t encoder,
+                                         void * mtl_buffer_raw,
+                                         unsigned int usage) {
+    if (!encoder || !mtl_buffer_raw) {
+        return;
+    }
+    id<MTLBuffer> buf = (__bridge id<MTLBuffer>) mtl_buffer_raw;
+    [encoder->obj useResource:buf usage:(MTLResourceUsage)usage];
+}
+
+// [rrl] PR2-B: C wrappers for MTLCommandBuffer operations used by the C++ side.
+
+ggml_metal_cmd_buf_t rrl_cmd_buf_create_unretained(void * queue_raw) {
+    id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>) queue_raw;
+    return (__bridge void *) [queue commandBufferWithUnretainedReferences];
+}
+
+void rrl_cmd_buf_retain(ggml_metal_cmd_buf_t cb) {
+    id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>) cb;
+    [buf retain];
+}
+
+void rrl_cmd_buf_release(ggml_metal_cmd_buf_t cb) {
+    id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>) cb;
+    [buf release];
+}
+
+void rrl_cmd_buf_enqueue(ggml_metal_cmd_buf_t cb) {
+    id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>) cb;
+    [buf enqueue];
+}
+
+void rrl_cmd_buf_commit(ggml_metal_cmd_buf_t cb) {
+    id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>) cb;
+    [buf commit];
+}
+
+typedef struct {
+    rrl_cb_handler_fn fn;
+    void *            userdata;
+} rrl_cb_handler_ctx;
+
+void rrl_cmd_buf_add_handler(ggml_metal_cmd_buf_t cb,
+                              rrl_cb_handler_fn fn,
+                              void * userdata) {
+    id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>) cb;
+    rrl_cb_handler_ctx * ctx = (rrl_cb_handler_ctx *) malloc(sizeof(rrl_cb_handler_ctx));
+    ctx->fn       = fn;
+    ctx->userdata = userdata;
+    // The block captures ctx by pointer; the block is released when the CB is
+    // released, but we free ctx inside the handler (exactly once).
+    [buf addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        ctx->fn(ctx->userdata, (int) b.status);
+        free(ctx);
+    }];
+}
+
 struct ggml_metal_device {
     id<MTLDevice> mtl_device;
 
@@ -1566,7 +1627,30 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
     return res;
 }
 
-ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size) {
+// [rrl] Metadata-only mapped buffer: tracks the host range for bookkeeping
+// (get_base / tensor->data assignment / region-register) but creates NO MTLBuffer
+// over it (n_buffers=0). Used for the zero-copy per-expert region: the GPU never
+// reads the parent — it reads each routed expert through its own per-expert
+// sub-buffer (rrl_metal_expert_subbuffers). A full newBufferWithBytesNoCopy here
+// would map the entire expert region into GPU VA a SECOND time (on top of the
+// sub-buffers), inflating currentAllocatedSize by the whole region (~9.6 GiB @20L,
+// ~14.4 GiB @30L) and tripping the Metal command-buffer residency ceiling
+// (-3 OOM / garbage). get_buffer_id returns {nil,0} for tensors here (only used in
+// the stock-mode fallback, which the zero-copy ptr-mode path never takes).
+ggml_metal_buffer_t ggml_metal_buffer_map_metadata_only(ggml_metal_device_t dev, void * ptr, size_t size) {
+    ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
+    res->dev       = dev;
+    res->all_data  = ptr;
+    res->all_size  = size;
+    res->is_shared = true;
+    res->owned     = false;
+    res->n_buffers = 0;     // no MTLBuffer — no GPU-VA mapping of the parent
+    res->use_residency_sets = false;
+    res->rset      = nil;
+    return res;
+}
+
+ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size, bool use_residency) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
 
     res->dev = dev;
@@ -1648,7 +1732,7 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
         }
     }
 
-    res->use_residency_sets = props_dev->use_residency_sets;
+    res->use_residency_sets = use_residency && props_dev->use_residency_sets;
 
     if (!ggml_metal_buffer_rset_init(res)) {
         GGML_LOG_ERROR("%s: error: failed to initialize residency set\n", __func__);

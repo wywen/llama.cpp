@@ -9854,7 +9854,14 @@ kernel void kernel_mul_mm_id(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        // [rrl] #126: per-expert gpuAddress array (buffer(6)).
+        // In ptr-mode (use_expert_ptrs==1) expert_ptrs[im] is the GPU base of expert im's
+        // sub-buffer; caller makes only the routed experts resident via useResource.
+        // The early-out (r1 >= neh1) ensures zero-token experts return before any dereference.
+        // In stock mode (use_expert_ptrs==0) this buffer is bound to a dummy argbuf and
+        // is never dereferenced.
+        device const uint64_t * expert_ptrs [[buffer(6)]]) {
     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
     threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
 
@@ -9869,7 +9876,10 @@ kernel void kernel_mul_mm_id(
     constexpr int NL0 = NK/16;
     constexpr int NL1 = NK/8;
 
-    const int im = tgpig.z; // expert
+    // [rrl] #135 Stage 1: in ptr-mode (use_expert_ptrs==1) caller dispatches Z=1 per
+    // routed expert and sets base_expert to the expert id.  In stock mode base_expert==0
+    // and Z=ne02, so im == tgpig.z exactly as before — byte-identical.
+    const int im = tgpig.z + args.base_expert; // expert
     const int r0 = tgpig.y*NR0;
     const int r1 = tgpig.x*NR1;
 
@@ -9881,6 +9891,18 @@ kernel void kernel_mul_mm_id(
     if (r1 >= neh1) {
         return;
     }
+
+    // [rrl] #126: ptr-mode branch. In ptr-mode the sub-buffer for expert im starts
+    // at expert_ptrs[im] (a GPU virtual address), which already points to that
+    // expert's weight data. The im*nb02 term in offset0 is NOT added because the
+    // sub-buffer base IS the expert im offset. In stock mode src0_cur == src0 and
+    // offset0 includes im*nb02 as before.
+    // CRITICAL: this dereference must come AFTER the early-out (r1 >= neh1) above
+    // so that threadgroups for zero-token experts return without touching a pointer
+    // for a potentially non-resident sub-buffer.
+    device const char * src0_cur = args.use_expert_ptrs
+        ? (device const char *) expert_ptrs[im]
+        : src0;
 
     // if this block is of 64x32 shape or smaller
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
@@ -9900,10 +9922,12 @@ kernel void kernel_mul_mm_id(
     const short i12 = (id / args.ne20);
     const short i13 = 0;
 
-    const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
+    // [rrl] #126: in ptr-mode, src0_cur already points at expert im's base so
+    // offset0 does not include im*nb02. In stock mode, offset0 = im*nb02 + i13*nb03.
+    const uint64_t offset0 = (args.use_expert_ptrs ? 0u : (uint64_t)im*args.nb02) + i13*args.nb03;
     const short    offset1 = il0/nl;
 
-    device const block_q * x = (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
+    device const block_q * x = (device const block_q *)(src0_cur + args.nb01*(r0 + lr0) + offset0) + offset1;
 
     const short iy = 8*(tiitg % NL1);
 
@@ -10390,6 +10414,7 @@ kernel void kernel_mul_mv_id(
         device       char * dst,
         device const char * ids,
         threadgroup  char * shmem [[threadgroup(0)]],
+        device const uint64_t * expert_ptrs [[buffer(5)]], // [rrl] per-expert gpuAddress array; ignored when use_expert_ptrs==0
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
@@ -10407,7 +10432,13 @@ kernel void kernel_mul_mv_id(
     const int64_t i1 = idx;
     const int64_t i2 = i12;
 
-    device const char * src0_cur = src0s + i02*args.nb02;
+    // [rrl] per-expert ptr-mode: when use_expert_ptrs != 0, src0_cur is taken
+    // from the expert_ptrs gpuAddress array (indexed by routed expert id i02)
+    // instead of the fused src0s + i02*nb02 stride.  Cold experts are never
+    // dereferenced because only the routed i02 values appear in a decode step.
+    device const char * src0_cur = (args.use_expert_ptrs != 0)
+        ? (device const char *) expert_ptrs[i02]
+        : src0s + i02*args.nb02;
     device const char * src1_cur = src1  + i11*args.nb11 + i12*args.nb12;
 
     device char * dst_cur = dst + (i1*args.ne0 + i2*args.ne1*args.ne0)*sizeof(float);

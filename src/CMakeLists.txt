@@ -40,6 +40,8 @@ add_library(llama
             unicode.cpp
             unicode.h
             ${LLAMA_MODELS_SOURCES}
+            llama-barriers.h
+            llama-barriers.cpp
             )
 
 set_target_properties(llama PROPERTIES
@@ -49,6 +51,8 @@ set_target_properties(llama PROPERTIES
 )
 
 target_include_directories(llama PRIVATE .)
+# needed for ggml_cgraph struct (nodes/n_nodes/size fields).
+target_include_directories(llama PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

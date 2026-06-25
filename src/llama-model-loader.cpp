@@ -9,13 +9,105 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <regex>
+#if defined(__APPLE__)
+#  include <fcntl.h>
+#  include <sys/mman.h>
+#  include <unistd.h>
+#endif
+
+// [rrl] Zero-copy expert region registration: dispatch-table pattern, matching
+// rrl_install_addr_in_region_hook in ggml-metal-ops.cpp (libggml-metal is a
+// NOUNDEFS dylib and cannot carry undefined references; the same constraint
+// applies here to libllama). The crate calls rrl_install_zcopy_region_hook to
+// wire in its implementation; the loader then calls through the function
+// pointer at the zero-copy assembly site. Null when not wired (non-Metal
+// builds or the crate not linked); the registration call is skipped safely.
+#if defined(__APPLE__)
+typedef void (*rrl_zcopy_region_hook_fn)(const void *base, size_t size);
+static rrl_zcopy_region_hook_fn g_rrl_zcopy_region_hook = nullptr;
+
+extern "C" void rrl_install_zcopy_region_hook(rrl_zcopy_region_hook_fn fn);
+extern "C" void rrl_install_zcopy_region_hook(rrl_zcopy_region_hook_fn fn) {
+    g_rrl_zcopy_region_hook = fn;
+}
+
+// [rrl #125] DEDICATED expert-buffer hook — kept SEPARATE from the zcopy/ptr-mode
+// region hook above. The zcopy hook registers the WHOLE GGUF file range (for
+// ptr-mode src0 recognition at decode); reusing it for the buffer-phase
+// expert/general-weight discriminator would pollute that registry with general
+// weights and make the discriminator depend on phase ordering. This hook feeds a
+// dedicated registry in the shim that holds ONLY per-expert buffer ranges, so the
+// discriminator is correct by construction regardless of when other ranges are
+// registered.
+typedef void (*rrl_expert_buffer_hook_fn)(const void *base, size_t size);
+static rrl_expert_buffer_hook_fn g_rrl_expert_buffer_hook = nullptr;
+
+extern "C" void rrl_install_expert_buffer_hook(rrl_expert_buffer_hook_fn fn);
+extern "C" void rrl_install_expert_buffer_hook(rrl_expert_buffer_hook_fn fn) {
+    g_rrl_expert_buffer_hook = fn;
+}
+
+// [rrl #201] DEDICATED weight-tensor hook — feeds the mmap-metal shim's weight
+// roller. Fires once per GENERAL (non-expert) per-layer weight buffer during the
+// buffer phase, carrying the tensor name (so the shim can parse blk.<il>. and key
+// the LayerWeight) plus the buffer base/size. Kept separate from the expert hook
+// above: experts are owned by the per-expert ptr-mode residency path and must NOT
+// be double-managed by the weight roller. Each mmap-metal tensor lands in its own
+// 16 KiB-aligned context/buffer (buft_per_layer_wt), so base/size is per-tensor.
+// Null when not wired; the call is skipped safely.
+typedef void (*rrl_weight_tensor_hook_fn)(const char *name, const void *base, size_t size);
+static rrl_weight_tensor_hook_fn g_rrl_weight_tensor_hook = nullptr;
+
+extern "C" void rrl_install_weight_tensor_hook(rrl_weight_tensor_hook_fn fn);
+extern "C" void rrl_install_weight_tensor_hook(rrl_weight_tensor_hook_fn fn) {
+    g_rrl_weight_tensor_hook = fn;
+}
+#endif
+
+// [rrl #125] Invoke the dedicated expert-buffer hook for an expert mmap range.
+// Called from the buffer phase (llama-model.cpp) BEFORE creating each expert
+// buffer so the mmap-metal shim can tell experts (→ metadata-only) from general
+// weights (→ real-mapped) when KV shares the expert device. Defined here so the
+// static g_rrl_expert_buffer_hook stays internal to this translation unit.
+void llama_model_loader::rrl_register_expert_region(const void * base, size_t size) const {
+#if defined(__APPLE__)
+    if (g_rrl_expert_buffer_hook != nullptr && base != nullptr && size > 0) {
+        g_rrl_expert_buffer_hook(base, size);
+    }
+#else
+    (void) base;
+    (void) size;
+#endif
+}
+
+// [rrl #201] Invoke the dedicated weight-tensor hook for a general (non-expert)
+// per-layer weight buffer. Called from the buffer phase (llama-model.cpp) AFTER
+// the buffer is created so base/size reflect the finalized mmap-metal buffer.
+void llama_model_loader::rrl_register_weight_tensor(const char * name, const void * base, size_t size) const {
+#if defined(__APPLE__)
+    if (g_rrl_weight_tensor_hook != nullptr && name != nullptr && base != nullptr && size > 0) {
+        g_rrl_weight_tensor_hook(name, base, size);
+    }
+#else
+    (void) name;
+    (void) base;
+    (void) size;
+#endif
+}
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+
+// [keep-separate Metal, step 1] Per-expert page alignment for the mmap-metal
+// per-expert loader. Matches the Apple-Silicon OS page size used by
+// mmap_metal_shim.cpp's buft_alloc_buffer (16 KiB); experts are padded to this
+// boundary so each gets a page-aligned base for an independent MTLBuffer carve.
+#define LLAMA_METAL_EXPERT_ALIGN 16384
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -701,6 +793,164 @@ llama_model_loader::llama_model_loader(
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
+    // Detect per-expert layout and synthesise fused tensor metadata entries.
+    {
+        std::string moe_layout;
+        get_key("moe.layout", moe_layout, /*required=*/false);
+        // "per_expert"       — type-major: gate_up{e0..eN} | down{e0..eN}.
+        // "per_expert_major" — expert-major: each (layer,expert)'s
+        //   matrices are one contiguous super-block, so a fused tensor's experts
+        //   are spaced by the super-block, not the matrix. The assembly site derives
+        //   the per-expert stride from the on-disk slice spacing, so both layouts
+        //   share one code path; the only difference is the stride magnitude.
+        if (moe_layout == "per_expert" || moe_layout == "per_expert_major") {
+            per_expert_moe = true;
+            // Zero-copy is the only per-expert expert path now (copy mode removed):
+            // when the model is mmap'd, point each fused expert tensor's data directly
+            // into the GGUF mmap (Site C) instead of memcpying it into an owned region.
+            // Keyed off use_mmap so the CPU managed-expert path (ManagedMmap, use_mmap
+            // = false) still takes the memcpy assembly via the `use_mmap &&
+            // per_expert_zerocopy` gate at the assembly site, and platforms without
+            // mmap fall back to the copy assembly. (use_mmap is final here: line ~986
+            // only clears it when mmap is unsupported, which precedes nothing we need.)
+            per_expert_zerocopy = use_mmap;
+            LLAMA_LOG_INFO("%s: moe.layout = per_expert — will assemble fused expert tensors at load%s\n",
+                __func__, per_expert_zerocopy ? " (zero-copy mmap path)" : " (copy path)");
+
+            // Scan weights_map for per-expert tensors whose names match the pattern:
+            //   blk.N.ffn_XXX_exps.E.suffix
+            // Group by fused name (blk.N.ffn_XXX_exps.suffix).
+            std::map<std::string, std::vector<std::pair<int, const llama_tensor_weight *>>> groups;
+            static const std::regex re_per_expert(
+                R"(^(blk\.\d+\.ffn_[a-z_]+_exps)\.(\d+)\.(.+)$)");
+            for (const auto & kv : weights_map) {
+                std::smatch m;
+                if (std::regex_match(kv.first, m, re_per_expert)) {
+                    // fused name: blk.N.ffn_XXX_exps.suffix  (e.g. blk.0.ffn_down_exps.weight)
+                    const std::string fused = m[1].str() + "." + m[3].str();
+                    const int expert_idx = std::stoi(m[2].str());
+                    groups[fused].emplace_back(expert_idx, &kv.second);
+                }
+            }
+
+            // Count how many per-expert source tensors are in the groups so we can
+            // correct n_tensors (the model creates fused entries, not the per-expert slices).
+            int n_per_expert_source_count = 0;
+
+            for (auto & [fused_name, expert_list] : groups) {
+                std::sort(expert_list.begin(), expert_list.end(),
+                          [](const auto & a, const auto & b) { return a.first < b.first; });
+                const int n_exp = static_cast<int>(expert_list.size());
+
+                // Validate expert indices are 0..n_exp-1 contiguous.
+                for (int e = 0; e < n_exp; ++e) {
+                    if (expert_list[e].first != e) {
+                        throw std::runtime_error(format(
+                            "per-expert tensor group '%s': missing expert index %d (found %d)",
+                            fused_name.c_str(), e, expert_list[e].first));
+                    }
+                }
+
+                // Use expert 0's ggml_tensor for type and per-expert shape.
+                const ggml_tensor * e0 = expert_list[0].second->tensor;
+                const int64_t ne0 = e0->ne[0];
+                const int64_t ne1 = e0->ne[1];
+                const ggml_type type = e0->type;
+
+                // Validate all experts have the same shape and type.
+                for (int e = 1; e < n_exp; ++e) {
+                    const ggml_tensor * et = expert_list[e].second->tensor;
+                    if (et->type != type || et->ne[0] != ne0 || et->ne[1] != ne1) {
+                        throw std::runtime_error(format(
+                            "per-expert tensor '%s' expert %d has shape/type mismatch vs expert 0",
+                            fused_name.c_str(), e));
+                    }
+                }
+
+                // Synthesise a fused ggml_tensor with shape matching the fused layout.
+                // Scale/bias tensors may have per-expert shape [1] (ne0=1, ne1=1), so the
+                // fused form must be 1D [n_exp]. Weight tensors have shape [ne0, ne1] with
+                // ne1 > 1 and produce [ne0, ne1, n_exp] (3D). Intermediate case: [ne0, n_exp]
+                // (2D) when ne0 > 1 but ne1 == 1. This mirrors the shapes create_tensor uses.
+                ggml_init_params synth_params = {
+                    /*.mem_size   =*/ ggml_tensor_overhead() + 64,
+                    /*.mem_buffer =*/ NULL,
+                    /*.no_alloc   =*/ true,
+                };
+                ggml_context_ptr synth_ctx { ggml_init(synth_params) };
+                if (!synth_ctx) {
+                    throw std::runtime_error(format(
+                        "failed to create synthetic context for %s", fused_name.c_str()));
+                }
+                ggml_tensor * synth;
+                if (ne0 == 1 && ne1 == 1) {
+                    // Scale/bias: each expert contributes one scalar → fused shape [n_exp].
+                    synth = ggml_new_tensor_1d(synth_ctx.get(), type, n_exp);
+                } else if (ne1 == 1) {
+                    // 1-D weight per expert → fused shape [ne0, n_exp].
+                    synth = ggml_new_tensor_2d(synth_ctx.get(), type, ne0, n_exp);
+                } else {
+                    // Standard weight matrix per expert → fused shape [ne0, ne1, n_exp].
+                    synth = ggml_new_tensor_3d(synth_ctx.get(), type, ne0, ne1, n_exp);
+                }
+                ggml_set_name(synth, fused_name.c_str());
+                // Stash the context so the tensor lives as long as the loader.
+                contexts.emplace_back(std::move(synth_ctx));
+
+                // Add to weights_map via the synthetic constructor (skips GGUF validation).
+                // [Site D] Under zero-copy, give the synth entry real (idx, offs) = expert-0's
+                // source slice so get_mapping_range includes it in the mmap buffer phase
+                // (llama-model.cpp:1459).  The buffer phase runs before load_all_data, so
+                // the real values must be present here, not patched later.
+                //
+                // Only do this for LARGE per-expert tensors whose raw size is at or above
+                // LLAMA_METAL_EXPERT_ALIGN (16 KiB) — those will pass the zero-copy
+                // contiguity check.  Sub-page tensors (e.g. scale tensors, ~4 B per expert)
+                // are NOT zero-copy capable (the mmap-metal buft pads them during
+                // create_tensor only if raw_stride >= 16 KiB, so they stay tightly packed
+                // in the fused layout but the on-disk stride is 16 KiB due to GGUF
+                // alignment).  Giving them placeholder (0, 0) causes get_mapping_range to
+                // skip them via the offs==0 sentinel, so they fall through to the bump-
+                // alloc path instead of the GGUF mmap buffer — which they can't use
+                // (read-only, non-contiguous per-stride).
+                //
+                // Under the copy path, (0, 0) are harmless placeholders for all tensors.
+                {
+                    const uint16_t e0_idx  = expert_list[0].second->idx;
+                    const size_t   e0_offs = expert_list[0].second->offs;
+                    const size_t   raw_per_expert = ggml_nbytes(expert_list[0].second->tensor);
+                    const bool zerocopy_eligible =
+                        per_expert_zerocopy && raw_per_expert >= LLAMA_METAL_EXPERT_ALIGN;
+                    const uint16_t synth_idx  = zerocopy_eligible ? e0_idx  : uint16_t(0);
+                    const size_t   synth_offs = zerocopy_eligible ? e0_offs : size_t(0);
+                    weights_map.emplace(fused_name, llama_tensor_weight(synth_idx, synth_offs, synth));
+                }
+                per_expert_assembled.insert(fused_name);
+
+                // Update element/byte accounting.
+                const size_t fused_nbytes = ggml_nbytes(synth);
+                n_elements += static_cast<uint64_t>(ne0) * ne1 * n_exp;
+                n_bytes    += fused_nbytes;
+
+                n_per_expert_source_count += n_exp;
+
+                LLAMA_LOG_INFO("%s: synthesised fused tensor %s [%" PRId64 " %" PRId64 " %d] type=%s (%zu MiB)\n",
+                    __func__, fused_name.c_str(),
+                    ne0, ne1, n_exp,
+                    ggml_type_name(type),
+                    fused_nbytes / 1024 / 1024);
+            }
+
+            // Correct n_tensors: it was set to weights_map.size() before synthesis.
+            // Now weights_map contains: per-expert source slices + non-expert tensors + fused synthetics.
+            // The model calls create_tensor for fused + non-expert tensors, never for per-expert slices.
+            // Subtract the source slice count and add the synthetic fused count so that
+            // n_created == n_tensors at done_getting_tensors() time.
+            n_tensors -= n_per_expert_source_count;
+            n_tensors += static_cast<int>(per_expert_assembled.size());
+        }
+    }
+
     fver = (enum llama_fver) gguf_get_version(metadata);
 
     LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n",
@@ -1047,15 +1297,45 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        auto it = ctx_map.find(buft);
+    // For "mmap-metal" buffer types we want one ggml_context per (buft, layer) so
+    // that each transformer block's expert weights end up in their own MTLBuffer
+    // instead of one monolithic ~13 GiB allocation.  All other buffer types keep
+    // the historical single-context-per-buft behaviour (layer == -1 in the key).
+    // This mirrors the buft_per_layer / buft_layer_key split in llama-kv-cache.cpp.
+    auto buft_per_layer_wt = [](ggml_backend_buffer_type_t buft) -> bool {
+        return strcmp(ggml_backend_buft_name(buft), "mmap-metal") == 0;
+    };
+
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft, int layer) -> ggml_context * {
+        (void)layer; // layer is used only as a key discriminator via metal_expert_ctx_seq; suppress unused-parameter warning
+        // [keep-separate Metal, step 1] For the mmap-metal buft give EACH tensor
+        // its own context (unique key id), so each fused expert tensor lands in
+        // its own MTLBuffer with a 16 KiB-aligned base. (Metal's mapped-buffer
+        // placement alignment is only 32 bytes, so packing >1 expert tensor into
+        // one buffer would misalign all but the first.) `layer` is unused as a
+        // semantic value downstream — load_tensors only reads key.buft — so a
+        // monotonic id is a safe discriminator. Other bufts keep the historical
+        // single-shared-context behaviour (key_layer == -1).
+        const int key_layer = buft_per_layer_wt(buft) ? metal_expert_ctx_seq++ : -1;
+        const buft_layer_key key{ buft, key_layer };
+        auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
-            // one ggml context per buffer type
-            int max_n_tensors = n_tensors;
-            max_n_tensors += 1;                   // duplicated output tensor
-            max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
-            if (files.empty()) {
-                max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
+            // For a per-layer context only one layer's tensors will ever be added,
+            // so reserve space for a generous-but-small constant of tensors (256 covers
+            // all expert + non-expert tensors a single MoE block can have).
+            // For shared contexts keep the historical upper-bound sizing.
+            int max_n_tensors;
+            if (buft_per_layer_wt(buft)) {
+                // One tensor per context (see metal_expert_ctx_seq); a tiny pad
+                // covers any incidental duplicate/view bookkeeping.
+                max_n_tensors = 4;
+            } else {
+                max_n_tensors = n_tensors;
+                max_n_tensors += 1;                   // duplicated output tensor
+                max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
+                if (files.empty()) {
+                    max_n_tensors += hparams.n_layer()*256;
+                }
             }
             const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
 
@@ -1070,7 +1350,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 throw std::runtime_error(format("failed to create ggml context"));
             }
 
-            ctx_map.emplace(buft, ctx);
+            ctx_map.emplace(key, ctx);
 
             return ctx;
         }
@@ -1244,7 +1524,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
         GGML_ASSERT(buft != nullptr);
-        ggml_context * ctx = ctx_for_buft(buft);
+        ggml_context * ctx = ctx_for_buft(buft, tn.bid);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
         return ret;
@@ -1255,7 +1535,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (buft == nullptr) {
         return nullptr; // return type is ggml_tensor *
     }
-    ggml_context * ctx = ctx_for_buft(buft);
+    ggml_context * ctx = ctx_for_buft(buft, tn.bid);
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
     if (flags & TENSOR_DUPLICATED) {
@@ -1276,6 +1556,52 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
     ggml_set_name(tensor, ggml_get_name(cur));
+
+    // [keep-separate Metal, step 1] When a fused per-expert tensor is routed to
+    // the mmap-metal buft, pad the per-expert stride (the last meaningful nb) up
+    // to the Metal page size (16 KiB) so each expert's bytes begin on a page
+    // boundary inside the per-layer MTLBuffer. ggml_dup_tensor just set nb
+    // contiguously, so nb[ndims-1] currently equals one expert's RAW byte size;
+    // overwriting it enlarges ggml_nbytes (= raw + (n_exp-1)*padded_stride),
+    // which in turn enlarges the buffer alloc-ctx sizes for this tensor. The
+    // buffer is then page-rounded by buft_alloc_buffer, so the MTLBuffer stays a
+    // whole number of pages. STRICTLY gated on the mmap-metal buft: the CPU
+    // per-expert path keeps the contiguous (tightly packed) stride byte-for-byte.
+    //
+    // The padded stride is COMPUTE-CORRECT for mul_mat_id: the assembly writes
+    // each expert at `dst_base + e*padded_stride`, and both mul_mm_id and
+    // mul_mv_id index expert `im` by the same `nb02` (= this padded stride), so
+    // they read each expert at its true location and never touch the inter-expert
+    // padding gaps. The padding exists purely to page-align each expert so the
+    // decode path can carve an independent no-residency MTLBuffer per expert and
+    // useResource only the routed ones (per-expert Metal residency). Confirmed by
+    // static review of ggml-metal.metal (mm_id ~9828 / mv_id ~10335) on
+    // 2026-06-14; an earlier comment here claiming it was "wrong for compute" was
+    // mistaken.
+    if (per_expert_moe && per_expert_assembled.count(ggml_get_name(cur)) &&
+        strcmp(ggml_backend_buft_name(buft), "mmap-metal") == 0) {
+        const int    ndims = ggml_n_dims(tensor);
+        const int    last  = ndims - 1;
+        const int64_t n_exp = tensor->ne[last];
+        const size_t raw_stride = (last >= 0) ? tensor->nb[last] : 0; // contiguous per-expert bytes
+        // Only pad LARGE per-expert tensors — the quantized weight matrices that
+        // actually get per-expert sub-buffer residency in the decode kernel (their
+        // per-expert stride is >> a page). Sub-page per-expert tensors (the gemma
+        // expert SCALES like up_exps_s — a few bytes per expert — and any biases)
+        // MUST stay tightly packed (contiguous): build_moe_ffn reshapes them
+        // (ggml_reshape_3d asserts ggml_is_contiguous), and they're tiny so they
+        // stay fully resident regardless — page-alignment buys them nothing. Padding
+        // them would both break the reshape and balloon them to a page each.
+        if (n_exp >= 1 && last >= 0 && raw_stride >= LLAMA_METAL_EXPERT_ALIGN) {
+            const size_t padded     = (raw_stride + (LLAMA_METAL_EXPERT_ALIGN - 1)) &
+                                      ~(static_cast<size_t>(LLAMA_METAL_EXPERT_ALIGN) - 1);
+            tensor->nb[last] = padded;
+            // Keep higher dims (ne == 1) consistent so the tensor stays well-formed.
+            for (int i = last + 1; i < GGML_MAX_DIMS; ++i) {
+                tensor->nb[i] = tensor->nb[i - 1] * tensor->ne[i - 1];
+            }
+        }
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(cur);
@@ -1332,6 +1658,15 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
+bool llama_model_loader::is_per_expert_source(const std::string & name) const {
+    if (!per_expert_moe) {
+        return false;
+    }
+    // Pattern: blk.N.ffn_XXX_exps.E.suffix  (E is a non-negative integer)
+    static const std::regex re(R"(^blk\.\d+\.ffn_[a-z_]+_exps\.\d+\..+$)");
+    return std::regex_match(name, re);
+}
+
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
     if (use_mmap) {
         mappings.reserve(files.size());
@@ -1348,7 +1683,15 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
+            // [rrl] In zero-copy MoE mode, do NOT prefetch (WILLNEED) the whole file:
+            // that faults the entire GGUF — every expert (~9.6 GiB @20L) — resident at
+            // load, which has no headroom on a 16 GiB box during prefill. The experts
+            // must fault on-demand (routed only, via the staging memcpy); non-expert
+            // weights fault on bind. This is the zero-copy analog of the copy path's
+            // per-tensor stream-reclaim (llama-model-loader.cpp ~2020): keep the
+            // expert pages from being resident-all-at-once.
+            const size_t prefetch_bytes = (prefetch && !per_expert_zerocopy) ? (size_t) -1 : 0;
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_bytes, is_numa);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1359,8 +1702,14 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
         }
     }
 
-    // compute the total size of all tensors for progress reporting
+    // compute the total size of all tensors for progress reporting.
+    // When per_expert_moe is active, weights_map contains both per-expert source tensors
+    // and the fused synthetic entries.  Skip the per-expert source tensors here: their
+    // bytes are counted through the fused synthetic entry that assembles them.
     for (const auto & it : weights_map) {
+        if (is_per_expert_source(it.first)) {
+            continue;
+        }
         size_data += ggml_nbytes(it.second.tensor);
     }
 }
@@ -1375,6 +1724,13 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
     for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
         const auto * weight = get_weight(ggml_get_name(tensor));
         if (!weight || weight->idx != idx) {
+            continue;
+        }
+        // Skip synthetic assembled tensors whose (idx=0, offs=0) is a placeholder
+        // (they were not given a real mmap offset — e.g. sub-page scale tensors that
+        // cannot go zero-copy).  Real GGUF tensor data never starts at file offset 0
+        // (the GGUF header always precedes data), so offs==0 is a safe sentinel.
+        if (weight->offs == 0 && per_expert_assembled.count(ggml_get_name(tensor))) {
             continue;
         }
         *first = std::min(*first, weight->offs);
@@ -1419,8 +1775,34 @@ bool llama_model_loader::load_all_data(
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
+#if defined(__APPLE__)
+    // [keep-separate Metal] On the per-expert layout the source weights are read
+    // exactly once (use_mmap is disabled on this path) and never needed again —
+    // each expert is assembled into the mmap-metal region and its destination
+    // pages are reclaimed per fused tensor (msync + MADV_FREE_REUSABLE). Mark every
+    // source fd F_NOCACHE so those ~14 GiB of one-time reads do NOT populate the
+    // unified buffer cache; otherwise the leftover source page-cache (on top of the
+    // destination temp file) drives the watchdog's free% metric below threshold
+    // during the first context build, killing the run before decode. F_NOCACHE
+    // (unlike O_DIRECT / F_DIRECT) imposes no read-alignment requirement and only
+    // affects this fd's caching. Best-effort: ignore fcntl failures.
+    if (per_expert_moe) {
+        for (const auto & file : files) {
+            const int fd = file->file_id();
+            if (fd >= 0) {
+                fcntl(fd, F_NOCACHE, 1);
+            }
+        }
+    }
+#endif
+
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
+    // [rrl] Zero-copy region registration tracking: each GGUF file mmap that
+    // hosts zero-copy expert data must be registered with rrl_is_expert_mmap_metal
+    // so the ptr-mode hook recognizes src0->data as an expert tensor. Track which
+    // file indices have already been registered to avoid duplicate entries.
+    std::vector<bool> zcopy_registered(mappings.size(), false);
 
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
     // NVMe raid configurations might require more / larger buffers.
@@ -1524,6 +1906,297 @@ bool llama_model_loader::load_all_data(
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models
+            continue;
+        }
+
+        // Per-expert assembled tensor: concatenate per-expert slices into the fused layout.
+        // This intercept fires before the normal mmap/non-mmap path, which would otherwise
+        // incorrectly map the synthetic entry's placeholder offs=0 into file data.
+        if (per_expert_moe && per_expert_assembled.count(ggml_get_name(cur))) {
+            const size_t fused_nbytes = ggml_nbytes(cur);
+            // n_expert is the LAST non-trivial dimension of the fused tensor:
+            //   1D [n_exp]           → ne[0]
+            //   2D [ne0, n_exp]      → ne[1]
+            //   3D [ne0, ne1, n_exp] → ne[2]
+            // ggml_n_dims returns the number of meaningful dimensions.
+            const int n_dims = ggml_n_dims(cur);
+            const int64_t n_exp = cur->ne[n_dims - 1];
+            if (n_exp <= 0) {
+                throw std::runtime_error(format(
+                    "assembled tensor '%s' has invalid n_expert=%" PRId64,
+                    ggml_get_name(cur), n_exp));
+            }
+            // [keep-separate Metal, step 1] The per-expert STRIDE inside the fused
+            // tensor is the last meaningful nb. For the CPU per-expert path this is
+            // the contiguous (tightly packed) raw size and equals fused_nbytes/n_exp.
+            // For the mmap-metal path create_tensor padded it up to 16 KiB, so the
+            // stride is LARGER than the raw per-expert size and the experts land on
+            // page boundaries. Reading the stride from cur->nb makes a single code
+            // path correct for both layouts (dst = e*stride is page-aligned exactly
+            // when the stride was padded). The per-expert COPY size is the source
+            // tensor's raw bytes (computed in the loop below), never the padded
+            // stride — the inter-expert gap stays uninitialised (fine for load-only).
+            const size_t per_expert_stride = cur->nb[n_dims - 1];
+            // Sanity: the fused buffer must hold at least all experts at this stride
+            // up to the last expert's raw bytes (ggml_nbytes accounts the last
+            // expert unpadded), i.e. (n_exp-1)*stride < fused_nbytes <= n_exp*stride.
+            if (per_expert_stride == 0 ||
+                static_cast<size_t>(n_exp - 1) * per_expert_stride >= fused_nbytes ||
+                fused_nbytes > static_cast<size_t>(n_exp) * per_expert_stride) {
+                throw std::runtime_error(format(
+                    "assembled tensor '%s' stride=%zu inconsistent with fused_nbytes=%zu n_exp=%" PRId64,
+                    ggml_get_name(cur), per_expert_stride, fused_nbytes, n_exp));
+            }
+
+            // Decompose fused name into base + suffix:
+            //   fused name: blk.N.ffn_XXX_exps.suffix
+            //   per-expert: blk.N.ffn_XXX_exps.E.suffix
+            const std::string fused_name = ggml_get_name(cur);
+            const size_t last_dot = fused_name.rfind('.');
+            if (last_dot == std::string::npos) {
+                throw std::runtime_error(format(
+                    "assembled tensor name '%s' has no dot suffix", fused_name.c_str()));
+            }
+            const std::string base   = fused_name.substr(0, last_dot);   // "blk.N.ffn_XXX_exps"
+            const std::string suffix = fused_name.substr(last_dot + 1);  // "weight" etc.
+
+            LLAMA_LOG_DEBUG("%s: assembling per-expert tensor %s (%" PRId64 " experts, stride %zu bytes)\n",
+                __func__, fused_name.c_str(), n_exp, per_expert_stride);
+
+            // [Site C / D] Zero-copy fast path: if enabled and all source slices share
+            // one mmap index and are contiguous at exactly per_expert_stride, point the
+            // fused tensor's data directly into the GGUF mmap instead of copying.
+            // Requires use_mmap (so the mapping exists) and the aligned on-disk layout
+            // produced by the Phase 1 generator (general.alignment = 16384).
+            if (use_mmap && per_expert_zerocopy) {
+                // Collect all per-expert weights in order.
+                struct ExpertSlice { uint16_t idx; size_t offs; size_t nbytes; };
+                std::vector<ExpertSlice> slices(n_exp);
+                bool slices_ok = true;
+                for (int64_t e = 0; e < n_exp && slices_ok; ++e) {
+                    const std::string expert_name = format("%s.%" PRId64 ".%s",
+                        base.c_str(), e, suffix.c_str());
+                    const auto * ew = get_weight(expert_name.c_str());
+                    if (!ew) {
+                        throw std::runtime_error(format(
+                            "assembled tensor '%s': per-expert tensor '%s' (expert %" PRId64 ") not found in GGUF",
+                            fused_name.c_str(), expert_name.c_str(), e));
+                    }
+                    slices[e] = { ew->idx, ew->offs, ggml_nbytes(ew->tensor) };
+                    if (slices[e].nbytes > per_expert_stride) {
+                        slices_ok = false; // expert too large for stride — should not happen
+                    }
+                }
+                // [expert-major] Derive the per-expert stride from the ACTUAL on-disk slice
+                // spacing rather than assuming it equals the create_tensor matrix-padded
+                // nb. Type-major spaces experts by the padded matrix (== per_expert_stride);
+                // expert-major (moe.layout=per_expert_major) spaces them by the whole
+                // (gate_up+down) super-block. Reading the spacing from disk makes the
+                // contiguity check and the fused tensor's nb02 correct for both layouts —
+                // the matmul steps experts by nb02 and reads each matrix via nb00/nb01
+                // (bounded by ne0/ne1), so a super-block nb02 is compute-correct.
+                // Only the LARGE per-expert weight tensors are page-padded by
+                // create_tensor (raw_stride >= LLAMA_METAL_EXPERT_ALIGN) and zero-copied;
+                // the sub-page scale tensors stay tightly packed and MUST keep their
+                // contiguous nb (the gemma4 graph reshapes them — ggml_is_contiguous
+                // asserts). Derive the disk stride only for the padded weights: for the
+                // scales keep per_expert_stride, so their 16 KiB-spaced on-disk layout
+                // fails the contiguity check and they take the contiguous copy path,
+                // exactly as before this change.
+                const size_t disk_stride =
+                    (n_exp >= 2 && per_expert_stride >= (size_t) LLAMA_METAL_EXPERT_ALIGN)
+                        ? (slices[1].offs - slices[0].offs)
+                        : per_expert_stride;
+                // Contiguity check: all slices share idx[0], lie at offs[0] + e*disk_stride,
+                // and each matrix fits within its stride slot.
+                bool contiguous = slices_ok && disk_stride > 0;
+                if (contiguous && n_exp > 0) {
+                    const uint16_t idx0 = slices[0].idx;
+                    const size_t   off0 = slices[0].offs;
+                    for (int64_t e = 0; e < n_exp; ++e) {
+                        if (slices[e].idx != idx0 ||
+                            slices[e].offs != off0 + static_cast<size_t>(e) * disk_stride ||
+                            slices[e].nbytes > disk_stride) {
+                            contiguous = false;
+                            break;
+                        }
+                    }
+                }
+                if (contiguous && n_exp > 0) {
+                    // [expert-major] Set the fused tensor's per-expert stride (nb02) to the
+                    // ACTUAL on-disk spacing. create_tensor padded nb[last] up to the
+                    // matrix size; for expert-major the experts are spaced by the larger
+                    // super-block, so override it here from the validated disk_stride.
+                    // The matmul steps experts by nb02 and reads each matrix via nb00/nb01
+                    // (bounded by ne0/ne1), so the trailing super-block bytes are ignored.
+                    // For type-major disk_stride == the padded nb, so this is a no-op.
+                    if (n_dims >= 1) {
+                        cur->nb[n_dims - 1] = disk_stride;
+                        for (int i = n_dims; i < GGML_MAX_DIMS; ++i) {
+                            cur->nb[i] = cur->nb[i - 1] * cur->ne[i - 1];
+                        }
+                    }
+                    // [Site C] Point the fused tensor's data directly into the GGUF mmap.
+                    const auto & mapping = mappings.at(slices[0].idx);
+                    uint8_t * mmap_ptr = static_cast<uint8_t *>(mapping->addr()) + slices[0].offs;
+                    cur->data = mmap_ptr;
+                    // Wire cur->buffer to the Metal buffer that wraps the expert mmap range.
+                    // The mmap buffer phase (llama-model.cpp:1459) created this buffer via
+                    // our dev_buffer_from_host_ptr (no-residency + registered) and stored it
+                    // in bufs keyed by file index.  Without a non-null buffer the scheduler
+                    // cannot place this tensor.
+                    if (cur->buffer == nullptr && bufs.count(slices[0].idx)) {
+                        cur->buffer = bufs.at(slices[0].idx);
+                    }
+#if defined(__APPLE__)
+                    // [rrl] Zero-copy region registration: register the GGUF file
+                    // mmap with rrl_is_expert_mmap_metal so the ptr-mode hook in
+                    // ggml-metal-ops.cpp recognizes src0->data (which now points
+                    // into the GGUF mmap, not the mmap-metal device's temp file)
+                    // as an expert tensor. Without this, rrl_is_expert_mmap_metal
+                    // returns false (GGUF addr not in the registered device region),
+                    // the ptr-mode hook never fires, and the GPU reads from the
+                    // wrong bump-allocated buffer → garbage logits. Register each
+                    // GGUF file's full mmap range once (deduplicated by file index).
+                    if (g_rrl_zcopy_region_hook != nullptr &&
+                        slices[0].idx < (uint16_t) zcopy_registered.size() &&
+                        !zcopy_registered[slices[0].idx]) {
+                        g_rrl_zcopy_region_hook(
+                            mapping->addr(), mapping->size());
+                        zcopy_registered[slices[0].idx] = true;
+                    }
+#endif
+                    LLAMA_LOG_DEBUG("%s: zero-copy mmap: %s → mmap[%u]+0x%zx (%zu MiB)\n",
+                        __func__, fused_name.c_str(),
+                        (unsigned)slices[0].idx, slices[0].offs,
+                        fused_nbytes / 1024 / 1024);
+                    // [rrl] Track the zero-copy expert region in mmap_used so
+                    // unmap_fragment (post-load) does NOT tear down the expert pages
+                    // we rely on at decode time. Without this the expert range is not
+                    // registered, and the tail-unmap [mmap_used.second, mapping->size())
+                    // could cover it if experts live near the end of the file.
+                    {
+                        auto & mu = mmaps_used[slices[0].idx];
+                        mu.first  = std::min(mu.first,  slices[0].offs);
+                        // [expert-major] Use the actual last-slice end, not slices[0]+fused_nbytes:
+                        // fused_nbytes is the tightly-packed matrix total, which understates
+                        // the super-block span under expert-major (experts spaced by
+                        // disk_stride > matrix). Keeps the tail-unmap from reclaiming the
+                        // last experts' pages. Exact for type-major too.
+                        const auto & last = slices[n_exp - 1];
+                        mu.second = std::max(mu.second, last.offs + last.nbytes);
+                    }
+                    size_done += fused_nbytes;
+                    if (progress_callback) {
+                        if (!progress_callback((float) size_done / size_data,
+                                               progress_callback_user_data)) {
+                            return false;
+                        }
+                    }
+                    continue; // skip copy loop, skip reclaim, skip tensor_set
+                }
+                // Contiguity check failed — on-disk layout is not page-aligned, so the
+                // fused tensor cannot be pointed into the mmap. On the mmap-metal path
+                // cur->data is null and the tensor's backend buffer is metadata-only (no
+                // MTLBuffer); the copy fallback below would ggml_backend_tensor_set into a
+                // null tensor->data and crash (issue #138). Fail loudly instead: un-aligned
+                // per-expert GGUFs are unsupported on this path — regenerate the fixture
+                // with page-aligned expert sub-buffers (the -aligned variants). The
+                // CPU/tight path keeps cur->data pre-allocated and assembles in place below,
+                // so it is unaffected.
+                if (cur->data == nullptr) {
+                    throw std::runtime_error(format(
+                        "per-expert tensor '%s': zero-copy contiguity check failed and no "
+                        "writable backend buffer is available (un-aligned per-expert GGUF on "
+                        "the mmap-metal single-device path). Regenerate with a page-aligned "
+                        "(-aligned) per-expert GGUF.",
+                        fused_name.c_str()));
+                }
+                LLAMA_LOG_WARN("%s: zero-copy contiguity check FAILED for %s — falling back to copy path\n",
+                    __func__, fused_name.c_str());
+            }
+
+            // Determine write target.  For CPU host buffers, cur->data is pre-allocated.
+            // For the mmap path, cur->data may be nullptr; use a staging buffer and write
+            // via ggml_backend_tensor_set.
+            uint8_t * dst_base = nullptr;
+            std::vector<no_init<uint8_t>> assemble_buf;
+            if (cur->data != nullptr) {
+                dst_base = static_cast<uint8_t *>(cur->data);
+            } else {
+                assemble_buf.resize(fused_nbytes);
+                dst_base = reinterpret_cast<uint8_t *>(assemble_buf.data());
+            }
+
+            for (int64_t e = 0; e < n_exp; ++e) {
+                const std::string expert_name = format("%s.%" PRId64 ".%s",
+                    base.c_str(), e, suffix.c_str());
+                const auto * ew = get_weight(expert_name.c_str());
+                if (!ew) {
+                    throw std::runtime_error(format(
+                        "assembled tensor '%s': per-expert tensor '%s' (expert %" PRId64 ") not found in GGUF",
+                        fused_name.c_str(), expert_name.c_str(), e));
+                }
+                // The RAW per-expert byte count is the source tensor's size; it
+                // must fit within one stride slot (== stride on the CPU/tight path,
+                // <= stride on the padded mmap-metal path).
+                const size_t expert_nbytes = ggml_nbytes(ew->tensor);
+                if (expert_nbytes > per_expert_stride) {
+                    throw std::runtime_error(format(
+                        "per-expert tensor '%s' has %zu bytes but stride is only %zu",
+                        expert_name.c_str(), expert_nbytes, per_expert_stride));
+                }
+                uint8_t * dst = dst_base + static_cast<size_t>(e) * per_expert_stride;
+                if (use_mmap) {
+                    const auto & mapping = mappings.at(ew->idx);
+                    memcpy(dst, static_cast<const uint8_t *>(mapping->addr()) + ew->offs, expert_nbytes);
+                } else {
+                    const auto & file = files.at(ew->idx);
+                    file->seek(ew->offs, SEEK_SET);
+                    file->read_raw(dst, expert_nbytes);
+                }
+            }
+
+#if defined(__APPLE__)
+            // Stream-reclaim the just-assembled fused tensor's destination pages so
+            // assembling ~14.4 GiB of experts doesn't accumulate a fatal resident
+            // peak on a memory-tight box. The mmap-metal destination is a file-backed
+            // MAP_SHARED region whose dirty pages would otherwise stay resident until
+            // the OS hits pressure (and the run watchdog kills first). Flush them to
+            // the backing file (msync MS_SYNC) then mark reusable (MADV_FREE_REUSABLE
+            // — the documented Darwin reclaim for MAP_SHARED file-backed pages;
+            // MADV_DONTNEED is a near-no-op there). Pages fault back in from the file
+            // on first decode — the paged-expert design. msync guarantees the data is
+            // persisted before reclaim, so nothing is lost.
+            //
+            // Gated on page alignment: the mmap-metal path pads each expert stride to
+            // 16 KiB, so dst_base and fused_nbytes are page-aligned; the CPU/tight
+            // path (32-byte aligned) is skipped (msync would EINVAL and the CPU path
+            // is not the memory-constrained target here).
+            if (cur->data != nullptr) {
+                const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
+                if (pg != 0 &&
+                    ((uintptr_t) dst_base % pg) == 0 &&
+                    (fused_nbytes % pg) == 0) {
+                    if (msync(dst_base, fused_nbytes, MS_SYNC) == 0) {
+                        // Best-effort reclaim; failure just means pages stay resident.
+                        madvise(dst_base, fused_nbytes, MADV_FREE_REUSABLE);
+                    }
+                }
+            }
+#endif
+
+            if (cur->data == nullptr) {
+                // Write assembled data into the backend buffer (GPU or other backend).
+                ggml_backend_tensor_set(cur, assemble_buf.data(), 0, fused_nbytes);
+            }
+
+            size_done += fused_nbytes;
+            if (progress_callback) {
+                if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+                    return false;
+                }
+            }
             continue;
         }
 

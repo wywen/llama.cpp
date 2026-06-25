@@ -13,6 +13,11 @@
 #include <map>
 #include <stdexcept>
 
+// [Step 4 Increment 3a] rrl_residency_register is declared in
+// llama-barriers.h (included via llama-kv-cache.h → ... → llama.h).
+// We include it directly here.
+#include "llama-barriers.h"
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -115,20 +120,43 @@ llama_kv_cache::llama_kv_cache(
 
     const uint32_t n_layer = hparams.n_layer_all;
 
-    // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
-    struct ggml_backend_buft_comparator {
-        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
-            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+    // The mmap-metal device wants each transformer layer's K/V in its
+    // own ggml_backend_buffer, so the per-layer residency manager can free/recreate
+    // one layer's Metal buffer (over a stable host mmap range) without disturbing the
+    // others. This is gated strictly by buft name: every other device (CPU, default
+    // Metal, mmap-cpu) keeps the historical single-buffer-per-buft layout.
+    auto buft_per_layer = [](ggml_backend_buffer_type_t buft) -> bool {
+        return strcmp(ggml_backend_buft_name(buft), "mmap-metal") == 0;
+    };
+
+    // define a comparator for the (buft, layer) -> ctx map to ensure that the order
+    // is well-defined. layer == -1 means "one shared context for this buft" (the
+    // default); a per-layer buft instead gets one context — hence one buffer — per il.
+    struct buft_layer_key {
+        ggml_backend_buffer_type_t buft;
+        int layer;
+    };
+    struct buft_layer_comparator {
+        bool operator()(const buft_layer_key & lhs, const buft_layer_key & rhs) const {
+            const int c = strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft));
+            if (c != 0) {
+                return c < 0;
+            }
+            return lhs.layer < rhs.layer;
         }
     };
-    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    std::map<buft_layer_key, ggml_context_ptr, buft_layer_comparator> ctx_map;
 
-    // create a context for each buffer type
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        auto it = ctx_map.find(buft);
+    // create a context for each buffer type (and, for a per-layer buft, each layer)
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft, int il) -> ggml_context * {
+        const int key_layer = buft_per_layer(buft) ? il : -1;
+        const buft_layer_key key{ buft, key_layer };
+        auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
+            // A per-layer context only ever holds one layer's tensors.
+            const uint32_t n_ctx_layers = buft_per_layer(buft) ? 1u : n_layer;
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_ctx_layers*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -138,7 +166,7 @@ llama_kv_cache::llama_kv_cache(
                 return nullptr;
             }
 
-            ctx_map.emplace(buft, ctx);
+            ctx_map.emplace(key, ctx);
 
             return ctx;
         }
@@ -234,7 +262,7 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
-        ggml_context * ctx = ctx_for_buft(buft);
+        ggml_context * ctx = ctx_for_buft(buft, (int) il);
         if (!ctx) {
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
@@ -285,8 +313,35 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    // allocate tensors and initialize the buffers to avoid NaNs in the padding
-    for (auto & [buft, ctx] : ctx_map) {
+    // allocate tensors and initialize the buffers to avoid NaNs in the padding.
+    // For a per-layer buft this map has one entry per layer, so each iteration
+    // allocates that layer's own buffer (independently freeable by the manager).
+    // Reserve so emplace_back never reallocates: the residency manager stores raw
+    // pointers INTO these slots (&ctxs_bufs[i].second) and a realloc would dangle them.
+    ctxs_bufs.reserve(ctx_map.size());
+
+    // [Step 4] If this ctor throws AFTER registering some per-layer KV buffers
+    // (e.g. a later layer's KV allocation fails under memory pressure — exactly
+    // this feature's operating regime), the dtor never runs on the partially-
+    // constructed object, so the device-lifetime residency manager would keep
+    // entries whose `slot` points into the half-built ctxs_bufs that is about to
+    // be freed. This guard unregisters them on the throw path; it is dismissed
+    // once construction completes, after which the dtor owns teardown. It only
+    // dereferences a device handle + calls a free function, so it needs no access
+    // to llama_kv_cache internals.
+    struct rrl_reg_guard {
+        ggml_backend_dev_t * dev_slot;
+        const void *         owner;
+        bool                 armed = true;
+        ~rrl_reg_guard() {
+            if (armed && *dev_slot) {
+                rrl_residency_unregister(*dev_slot, owner);
+            }
+        }
+    } rrl_guard{ &rrl_kv_dev, this };
+
+    for (auto & [key, ctx] : ctx_map) {
+        ggml_backend_buffer_type_t buft = key.buft;
         ggml_backend_buffer_t buf;
         if (hparams.no_alloc) {
             buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
@@ -302,8 +357,74 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
-        ggml_backend_buffer_clear(buf, 0);
+        // [Step 4] Per-layer mmap-metal KV buffers sit over a freshly
+        // fallocated (all-zero) backing file, so this clear is redundant on
+        // first use — and actively harmful: memsetting every layer faults in
+        // and dirties the entire KV region (sized to exceed RAM by design),
+        // so context creation wedges in the pager before the residency
+        // window ever runs. Skip it for per-layer managed buffers. A REUSED
+        // region (scheduler spill/restore) re-allocates over stale KV bytes;
+        // those cells are masked before use, but if a needs-clear contract
+        // is ever required there it must be scoped to the reused range via
+        // the device — never this whole-region clear.
+        if (!buft_per_layer(buft)) {
+            ggml_backend_buffer_clear(buf, 0);
+        }
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+
+        // [Step 4 Increment 3a/3b] Register per-layer KV buffers with the
+        // residency manager.  Gate strictly on "mmap-metal" name — every other
+        // device (CPU, standard Metal, mmap-cpu) keeps the old layout unchanged.
+        // Register AFTER emplace so we can hand the manager a pointer to llama's
+        // OWNING handle (the raw ggml_backend_buffer_t inside the ctxs_bufs
+        // unique_ptr): the manager frees/recreates through that slot, keeping
+        // llama the single owner (no double-free at teardown). The unique_ptr has
+        // a stateless deleter so it is layout-compatible with the raw handle.
+        if (buft_per_layer(buft)) {
+            static_assert(sizeof(ggml_backend_buffer_ptr) == sizeof(ggml_backend_buffer_t),
+                          "ctxs_bufs slot must be layout-compatible with a raw buffer handle");
+            const int il = key.layer;
+            ggml_backend_dev_t kv_dev = ggml_backend_buft_get_device(buft);
+            // Capture the KV device so ~llama_kv_cache can unregister it (RAII).
+            rrl_kv_dev = kv_dev;
+
+            // Find the K and V tensors for this layer from the layers vector.
+            // map_layer_ids[il] maps model layer id → KV cache layer index.
+            ggml_tensor * k_tensor = nullptr;
+            ggml_tensor * v_tensor = nullptr;
+            auto it = map_layer_ids.find(il);
+            if (it != map_layer_ids.end()) {
+                const auto & lkv = layers[static_cast<size_t>(it->second)];
+                k_tensor = lkv.k;
+                v_tensor = lkv.v;
+            }
+
+            // Reader range for sharing-aware eviction. Under KV-cache reuse
+            // (layer_reuse_cb), several model layers map to ONE buffer:
+            // map_layer_ids[il'] == map_layer_ids[il]. first/last_reader are the
+            // min/max such model-layer index. The residency manager frees this
+            // buffer only after a barrier past last_reader, so a buffer a later
+            // layer still reads is never reclaimed mid-pass (the gemma-3n fix).
+            // Non-shared layers collapse to first == last == il.
+            int first_reader = il;
+            int last_reader  = il;
+            if (it != map_layer_ids.end()) {
+                for (const auto & m : map_layer_ids) {
+                    if (m.second == it->second) {
+                        const int mi = static_cast<int>(m.first);
+                        if (mi < first_reader) { first_reader = mi; }
+                        if (mi > last_reader)  { last_reader  = mi; }
+                    }
+                }
+            }
+
+            ggml_backend_buffer_t * slot =
+                reinterpret_cast<ggml_backend_buffer_t *>(&ctxs_bufs.back().second);
+            // `this` is the owner token: unregistration (teardown or ctor-throw)
+            // drops exactly the entries this cache made, never a live sibling's.
+            rrl_residency_register(kv_dev, il, slot, k_tensor, v_tensor,
+                                   first_reader, last_reader, this);
+        }
     }
 
     {
@@ -374,6 +495,22 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    // [Step 4] Construction completed — hand teardown to the dtor.
+    rrl_guard.armed = false;
+}
+
+// [Step 4] RAII teardown: unregister this cache's per-layer KV buffers from the
+// residency manager BEFORE the ctxs_bufs unique_ptrs free them. The mmap-metal
+// MmapMetalDevice (and its manager) outlives the cache across the scheduler's
+// spill/restore cycle, so without this the manager would keep LayerKv entries
+// whose `slot` points into freed buffers — a use-after-free on the next decode,
+// plus double-counted budget bytes. No-op for every non-mmap-metal layout
+// (rrl_kv_dev stays null) and when the residency hooks were never installed.
+llama_kv_cache::~llama_kv_cache() {
+    if (rrl_kv_dev) {
+        rrl_residency_unregister(rrl_kv_dev, this);
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -384,7 +521,16 @@ void llama_kv_cache::clear(bool data) {
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
-            ggml_backend_buffer_clear(buf.get(), 0);
+            // [Step 4] With eviction armed, a per-layer KV slot is null whenever
+            // its layer sits in the freed dead state — free-on-register at
+            // creation, or between decode steps. clear(true) fires from the
+            // session-state restore paths, and ggml_backend_buffer_clear opens
+            // with GGML_ASSERT(buffer), so skip freed slots: a skipped slot
+            // re-faults zero from its fresh-fallocated backing file (or is masked
+            // before use). A genuine scoped clear must go through the device.
+            if (buf) {
+                ggml_backend_buffer_clear(buf.get(), 0);
+            }
         }
     }
 }
@@ -694,6 +840,19 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, buf] : ctxs_bufs) {
+        // On the bounded rolling-KV eviction path (KvEviction::Segment/Budget)
+        // the residency manager frees a per-layer KV buffer and nulls its
+        // ctxs_bufs slot until the next pre-decode reset recreates it. A freed
+        // buffer holds no host/GPU bytes, so it contributes nothing to the
+        // breakdown — skip it. Without this guard ggml_backend_buffer_get_type
+        // dereferences the null buffer (GGML_ASSERT(buffer)) and aborts the
+        // whole process, making any footprint probe unusable on exactly the
+        // rolling-KV path it most needs to measure (issue #143). The
+        // non-evicting CPU/standard paths never null a slot, so they are
+        // unaffected.
+        if (!buf) {
+            continue;
+        }
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
 
         if (hparams.no_alloc) {
@@ -1956,7 +2115,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
-    GGML_UNUSED(flags);
+    const bool meta_only = flags & LLAMA_STATE_SEQ_FLAGS_META_ONLY;
 
     io.write(&n_stream, sizeof(n_stream));
 
@@ -2015,6 +2174,17 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
             continue;
         }
 
+        if (meta_only) {
+            // Meta-only spill (mmap-metal): the KV tensor bytes persist in the
+            // backing region across the spill, so only the cell bookkeeping is
+            // serialized. Restore must put each cell back at the same physical
+            // slot its bytes occupy, so emit the per-cell physical index
+            // (position-preserving) — this handles a rotated SWA window or a
+            // fragmented single-sequence cache, not just a contiguous run from 0.
+            state_write_meta_pos(io, cr, seq_id);
+            continue;
+        }
+
         state_write_meta(io, cr, seq_id);
         state_write_data(io, cr);
     }
@@ -2026,7 +2196,7 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
         return;
     }
 
-    GGML_UNUSED(flags);
+    const bool meta_only = flags & LLAMA_STATE_SEQ_FLAGS_META_ONLY;
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
@@ -2049,8 +2219,16 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
         slot_info sinfo;
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id);
-        res = res && state_read_data(io, strm, cell_count, sinfo);
+        if (meta_only) {
+            // Position-preserving restore: place each cell back at the physical
+            // index its KV bytes occupy in the backing region (read from the
+            // buffer), instead of repacking via find_slot. No tensor bytes are
+            // read — they are already in place.
+            res = res && state_read_meta_pos(io, strm, cell_count, sinfo, seq_id);
+        } else {
+            res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id);
+            res = res && state_read_data(io, strm, cell_count, sinfo);
+        }
 
         if (!res) {
             if (seq_id == -1) {
@@ -2091,6 +2269,43 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
 
             for (const auto & seq_id : seq_ids) {
                 io.write(&seq_id, sizeof(seq_id));
+            }
+        }
+    }
+}
+
+void llama_kv_cache::state_write_meta_pos(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
+    const auto & cells = v_cells[cr.strm];
+
+    // Like state_write_meta, but each cell is prefixed with its physical index
+    // so state_read_meta_pos can restore it at the exact slot its bytes occupy.
+    for (const auto & range : cr.data) {
+        for (uint32_t i = range.first; i < range.second; ++i) {
+            std::vector<llama_seq_id> seq_ids;
+
+            for (llama_seq_id cur = 0; cur < (int) n_seq_max; ++cur) {
+                if (cur == seq_id || seq_id == -1) {
+                    if (cells.seq_has(i, cur)) {
+                        seq_ids.push_back(cur);
+                    }
+                }
+            }
+
+            const uint32_t idx      = i;
+            const llama_pos pos      = cells.pos_get(i);
+            const uint32_t n_seq_id  = seq_ids.size();
+
+            io.write(&idx,      sizeof(idx));
+            io.write(&pos,      sizeof(pos));
+            io.write(&n_seq_id, sizeof(n_seq_id));
+
+            if (hparams.n_pos_per_embd() > 1) {
+                const llama_kv_cell_ext ext = cells.ext_get(i);
+                io.write(&ext, sizeof(ext));
+            }
+
+            for (const auto & sid : seq_ids) {
+                io.write(&sid, sizeof(sid));
             }
         }
     }
@@ -2310,6 +2525,88 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         head = 0;
     }
+
+    return true;
+}
+
+bool llama_kv_cache::state_read_meta_pos(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id) {
+    auto & cells = v_cells[strm];
+    auto & head  = v_heads[strm];
+
+    // Position-preserving restore reassigns the saved cells to a single
+    // destination sequence at their original physical indices. A whole-cache
+    // (-1) restore would need to honour per-cell seq sets and is not used by the
+    // meta-only (mmap-metal) path.
+    if (dest_seq_id == -1) {
+        LLAMA_LOG_ERROR("%s: meta-only restore requires a destination sequence\n", __func__);
+        return false;
+    }
+
+    if (cell_count > cells.size()) {
+        LLAMA_LOG_ERROR("%s: cell_count %u exceeds cache size %u\n", __func__, cell_count, cells.size());
+        return false;
+    }
+
+    // Drop any cells already held by this sequence; we rebuild them below at the
+    // exact slots their KV bytes occupy in the backing region.
+    seq_rm(dest_seq_id, -1, -1);
+
+    sinfo.s0 = strm;
+    sinfo.s1 = strm;
+    sinfo.resize(1);
+    sinfo.strm[0] = strm;
+    sinfo.idxs[0].resize(cell_count);
+
+    for (uint32_t i = 0; i < cell_count; ++i) {
+        uint32_t  idx;
+        llama_pos pos;
+        uint32_t  n_seq_id;
+
+        io.read(&idx,      sizeof(idx));
+        io.read(&pos,      sizeof(pos));
+        io.read(&n_seq_id, sizeof(n_seq_id));
+
+        if (n_seq_id != 1) {
+            LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
+            return false;
+        }
+
+        if (idx >= cells.size()) {
+            LLAMA_LOG_ERROR("%s: cell index %u out of range (size %u)\n", __func__, idx, cells.size());
+            return false;
+        }
+
+        if (!cells.is_empty(idx)) {
+            LLAMA_LOG_ERROR("%s: cell index %u already occupied on restore\n", __func__, idx);
+            return false;
+        }
+
+        cells.pos_set(idx, pos);
+
+        if (hparams.n_pos_per_embd() > 1) {
+            // Unlike state_read_meta (which routes through apply_ubatch and cannot
+            // yet carry ext), this path sets cells directly, so restore M-RoPE ext
+            // like the whole-cache branch does.
+            llama_kv_cell_ext ext;
+            io.read(&ext, sizeof(ext));
+            cells.ext_set(idx, ext);
+        }
+
+        // The serialized seq id is discarded; cells are reassigned to dest_seq_id.
+        {
+            llama_seq_id sid;
+            io.read(&sid, sizeof(sid));
+        }
+
+        cells.seq_add(idx, dest_seq_id);
+
+        sinfo.idxs[0][i] = idx;
+    }
+
+    // head is only a search-start hint for find_slot (which scans the whole cache
+    // and selects cells by emptiness / SWA position-masking, never by head), so a
+    // fresh 0 is sufficient — matching the whole-cache restore branch.
+    head = 0;
 
     return true;
 }

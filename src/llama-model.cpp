@@ -1493,7 +1493,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
-    for (auto & [buft, ctx_ptr] : ml.ctx_map) {
+    for (auto & [key, ctx_ptr] : ml.ctx_map) {
+        ggml_backend_buffer_type_t buft = key.buft;
         ggml_context * ctx = ctx_ptr.get();
 
         // skip contexts without tensors
@@ -1518,6 +1519,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
+        // [rrl] NOTE: forcing the real-Metal default-buft to the COPY path under
+        // zero-copy (to avoid the whole-file resident mmap buffer) SEGFAULTS — the
+        // experts' fused tensor lives in this same default context with
+        // cur->buffer = the mmap buffer and cur->data pointing into it, so copying
+        // the buffer out-of-bounds the experts. Experts + non-expert share the
+        // default mmap buffer; they can't be separated here. (See memory.)
         std::vector<ggml_backend_buffer_ptr> bufs;
         if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
@@ -1532,6 +1539,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (first >= last) {
                     continue;
                 }
+                // [rrl #125] If this is an expert context (per-expert fused FFN
+                // tensors), register its mmap range BEFORE creating the buffer so the
+                // mmap-metal shim's dev_buffer_from_host_ptr treats it as an expert
+                // (metadata-only) while leaving GENERAL weights real-mapped. Required
+                // when KV is routed onto the same mmap-metal device as the experts
+                // (issue #125): otherwise general weights take the expert
+                // metadata-only path and the GPU reads garbage. Detected by the
+                // "_exps" tensor-name suffix; each expert fused tensor has its own ctx.
+                const ggml_tensor * t0 = ggml_get_first_tensor(ctx);
+                const bool is_expert_ctx =
+                    t0 != nullptr && std::strstr(ggml_get_name(t0), "_exps") != nullptr;
+                if (is_expert_ctx) {
+                    ml.rrl_register_expert_region((const char *) addr + first, last - first);
+                }
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
                 if (buf == nullptr) {
@@ -1539,6 +1560,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 }
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
+                // [rrl #201] Register the finalized buffer for the weight roller.
+                // Skip experts (owned by the per-expert ptr-mode path). Each
+                // mmap-metal tensor has its own per-tensor context/buffer
+                // (buft_per_layer_wt), so t0 is THE tensor and buf base/size are
+                // its page-aligned range; the shim parses blk.<il>. from the name.
+                if (t0 != nullptr && !is_expert_ctx) {
+                    ml.rrl_register_weight_tensor(ggml_get_name(t0),
+                        ggml_backend_buffer_get_base(buf),
+                        ggml_backend_buffer_get_size(buf));
+                }
+            }
+            // [zero-copy per-expert] If no mmap range was found for any file (e.g. a
+            // context that contains only sub-page assembled tensors whose offs=0
+            // placeholder was excluded from get_mapping_range), fall through to the
+            // bump-alloc path so those tensors get a proper backend buffer.
+            if (bufs.empty()) {
+                ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+                if (buf == nullptr) {
+                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                }
+                bufs.emplace_back(buf);
+                for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                    buf_map.emplace(idx, buf);
+                }
             }
         } else {
             ggml_backend_buffer_t buf;
@@ -2661,6 +2706,131 @@ ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int 
         return nullptr;
     }
     return model->devices[i].dev;
+}
+
+int32_t rrl_per_expert_layout_probe(
+        const struct llama_model * model,
+        uint64_t region_base,
+        struct rrl_per_expert_probe_out * out,
+        uint8_t * spot0_out,
+        uint8_t * spotN_out,
+        size_t    spot_n) {
+    if (model == nullptr) {
+        return -1;
+    }
+
+    const size_t kAlign = 16384; // Metal page size on Apple Silicon
+
+    if (out != nullptr) {
+        *out = rrl_per_expert_probe_out{};
+        out->all_page_aligned = 1;
+    }
+
+    int32_t n_fused   = 0;
+    int32_t n_buffers = 0;
+    int32_t n_misaligned = 0;
+    uint64_t total_raw    = 0;
+    uint64_t total_stride = 0;
+    bool spot_have    = false; // any tensor captured for the spot-check yet
+    bool spot_locked  = false; // the deterministic target was captured
+
+    for (const auto & nt : model->tensors_by_name) {
+        const std::string & name = nt.first;
+        ggml_tensor * t = nt.second;
+        if (t == nullptr) {
+            continue;
+        }
+        // Match ffn_*_exps.weight (the per-expert weight matrices; skip scales).
+        if (name.find(".ffn_") == std::string::npos) {
+            continue;
+        }
+        if (name.find("_exps") == std::string::npos) {
+            continue;
+        }
+        if (name.size() < 7 || name.compare(name.size() - 7, 7, ".weight") != 0) {
+            continue;
+        }
+
+        const int     ndims  = ggml_n_dims(t);
+        const int     last   = ndims - 1;
+        if (last < 0) {
+            continue;
+        }
+        const int64_t n_exp  = t->ne[last];
+        if (n_exp <= 0) {
+            continue;
+        }
+        const size_t  stride = t->nb[last];
+        // Raw per-expert bytes = ggml_nbytes of a single-expert view: the
+        // contiguous extent of dims [0..last-1], i.e. nb[last] would be in a
+        // contiguous tensor. Reconstruct it from the lower dims so the padded
+        // stride does not inflate it.
+        size_t raw = ggml_type_size(t->type);
+        {
+            const size_t blck = ggml_blck_size(t->type);
+            if (blck == 1) {
+                raw = ggml_type_size(t->type);
+                for (int i = 0; i < last; ++i) {
+                    raw += (t->ne[i] - 1) * t->nb[i];
+                }
+            } else {
+                raw = t->ne[0]*t->nb[0]/blck;
+                for (int i = 1; i < last; ++i) {
+                    raw += (t->ne[i] - 1) * t->nb[i];
+                }
+            }
+        }
+
+        n_fused   += 1;
+        n_buffers += (int32_t) n_exp;
+        total_raw    += (uint64_t) raw * (uint64_t) n_exp;
+        total_stride += (uint64_t) stride * (uint64_t) n_exp;
+
+        const uint64_t data_addr = (uint64_t)(uintptr_t) t->data;
+        for (int64_t e = 0; e < n_exp; ++e) {
+            const uint64_t expert_addr = data_addr + (uint64_t) e * (uint64_t) stride;
+            const uint64_t off = expert_addr - region_base;
+            if ((off % kAlign) != 0) {
+                n_misaligned += 1;
+            }
+        }
+
+        // Spot-check a DETERMINISTIC tensor (blk.0.ffn_down_exps.weight) so the
+        // Rust side can read the matching per-expert source bytes from the GGUF.
+        // Fall back to the first matched tensor if that exact name is absent.
+        const bool is_spot_target = (name == "blk.0.ffn_down_exps.weight");
+        if (!spot_locked && (is_spot_target || !spot_have) && out != nullptr) {
+            out->first_stride  = (uint64_t) stride;
+            out->first_raw     = (uint64_t) raw;
+            out->first_n_exp   = n_exp;
+            out->first_base_off = data_addr - region_base;
+            if (spot_n > 0 && t->data != nullptr) {
+                const uint8_t * base = (const uint8_t *) t->data;
+                if (spot0_out != nullptr) {
+                    memcpy(spot0_out, base, spot_n);
+                }
+                if (spotN_out != nullptr) {
+                    const uint8_t * lastp = base + (size_t)(n_exp - 1) * stride;
+                    memcpy(spotN_out, lastp, spot_n);
+                }
+            }
+            spot_have = true;
+            if (is_spot_target) {
+                spot_locked = true; // deterministic target wins; stop overwriting
+            }
+        }
+    }
+
+    if (out != nullptr) {
+        out->n_fused_tensors   = n_fused;
+        out->n_expert_buffers  = n_buffers;
+        out->n_misaligned      = n_misaligned;
+        out->all_page_aligned  = (n_misaligned == 0) ? 1 : 0;
+        out->total_raw_bytes   = total_raw;
+        out->total_stride_bytes = total_stride;
+    }
+
+    return n_buffers;
 }
 
 //

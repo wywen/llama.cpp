@@ -506,6 +506,393 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // short-hand
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
 
+        // [rrl] #135 Stage 2: windowed-sequential compute mode.
+        // Walk gf->nodes to build per-layer window ranges [start, end), commit one
+        // command buffer per window, and reclaim each window's experts on completion.
+        // This releases the GPU useResource residency for each layer's experts as soon
+        // as that layer's CB completes, bounding peak to ~1-2 layers (~480 MiB-1 GiB).
+        // The existing rolling msync evictor (installed via cb_eval) handles the CPU
+        // page side; this handles the GPU useResource side.
+        //
+        // [rrl] #128 Phase 1: windowing is default-ON for the per-expert MoE path.
+        // It auto-enables when the graph contains per-expert mmap-metal expert nodes
+        // (the path whose useResource residency must be bounded); RRL_METAL_CB_WINDOW=0
+        // forces it off, and an explicit non-zero value forces it on even without
+        // detected expert nodes (back-compat / testing).  Capture mode and graphs with
+        // no per-expert experts fall through to the stock parallel dispatch_apply path
+        // unchanged, so this default is inert for dense / non-expert models.
+        const char * rrl_cb_window_env = getenv("RRL_METAL_CB_WINDOW");
+        const bool rrl_window_forced_off = (rrl_cb_window_env != NULL && rrl_cb_window_env[0] == '0');
+        const bool rrl_window_forced_on  = (rrl_cb_window_env != NULL && rrl_cb_window_env[0] != '0');
+        bool rrl_has_expert_nodes = false;
+        if (!rrl_window_forced_off && !rrl_window_forced_on) {
+            for (int i = 0; i < gf->n_nodes; ++i) {
+                struct ggml_tensor * n = gf->nodes[i];
+                if (n->op == GGML_OP_MUL_MAT_ID && rrl_is_expert_mmap_metal_c(n->src[0])) {
+                    rrl_has_expert_nodes = true;
+                    break;
+                }
+            }
+        }
+        const bool use_cb_window = !use_capture && !rrl_window_forced_off &&
+                                   (rrl_window_forced_on || rrl_has_expert_nodes);
+        if (use_cb_window) {
+            // -- Window planner -------------------------------------------------
+            // Two planner modes depending on whether RRL_METAL_CB_WEXP is set:
+            //
+            // W=0 (PR2-A per-layer mode): Cut one window per MoE layer.  A new
+            //   window starts at the first expert node whose layer id differs from
+            //   the previous expert layer seen.  Non-expert nodes trailing a layer
+            //   share that layer's window.
+            //
+            // W>0 (PR2-B per-expert sub-window mode, requires RRL_METAL_CB_ASYNC):
+            //   Cut a window at EACH expert mul_mat_id node AND immediately after
+            //   it, isolating every expert node as a singleton window.  Non-expert
+            //   nodes between expert nodes get their own windows.  The async loop
+            //   then calls rrl_encode_expert_node_windows for each singleton expert
+            //   window (which creates W-expert sub-CBs internally); non-expert
+            //   windows use the existing single-CB async path.
+            //
+            // Implementation: collect the start indices of each boundary; the end
+            // of window[i] is start of window[i+1] (or gf->n_nodes for the last).
+
+            const int rrl_wexp = rrl_metal_cb_wexp();
+            const int rrl_async_d = rrl_metal_cb_async_depth();
+
+            // [rrl] #128 Phase 1: log windowed-compute engagement once per process so
+            // the default-on path is observable (silent under the default noop logger;
+            // surfaces with RRL_LLAMA_LOG=1).  async_d=0 means the synchronous drain.
+            static bool rrl_window_logged = false;
+            if (!rrl_window_logged) {
+                rrl_window_logged = true;
+                GGML_LOG_INFO("%s: [rrl] #128 windowed compute active: async_d=%d wexp=%d "
+                              "(forced_on=%d auto_experts=%d)\n",
+                              __func__, rrl_async_d, rrl_wexp,
+                              (int) rrl_window_forced_on, (int) rrl_has_expert_nodes);
+            }
+
+            // rrl_is_wexp_mode: W-expert sub-windowing is active when W>0 AND we
+            // are in async mode (rrl_async_d>0).  If W>0 but no async, fall back to
+            // per-layer windowing (the W-expert entry needs async semaphore).
+            const bool rrl_is_wexp_mode = (rrl_wexp > 0) && (rrl_async_d > 0);
+
+            struct rrl_window { int start; };
+            NSMutableArray * windows_arr = [NSMutableArray array];
+
+            {
+                int prev_layer = -2; // -2 = no layer seen yet
+                for (int i = 0; i < gf->n_nodes; ++i) {
+                    struct ggml_tensor * node = gf->nodes[i];
+                    if (node->op != GGML_OP_MUL_MAT_ID) { continue; }
+                    struct ggml_tensor * s0 = node->src[0];
+                    // Use the same gate as the encoder: only per-expert mmap-metal
+                    // tensors trigger windowing (via the C-callable wrapper so we
+                    // don't duplicate the detection logic in this .m file).
+                    if (!rrl_is_expert_mmap_metal_c(s0)) { continue; }
+
+                    if (rrl_is_wexp_mode) {
+                        // W-expert mode: isolate each expert node as a singleton
+                        // window.  Emit a boundary at node i (start of expert
+                        // singleton) and at i+1 (start of the following non-expert
+                        // run), but only if they don't duplicate an existing entry.
+                        // Since we walk in order and emit monotonically increasing
+                        // indices, duplication can only happen if two expert nodes
+                        // are adjacent (i+1 == next expert node); that is handled
+                        // naturally because the next iteration emits i+1 again
+                        // (which the loop below deduplicates by skipping empty windows).
+
+                        // boundary at node i (start of this expert singleton)
+                        struct rrl_window wi = { .start = i };
+                        [windows_arr addObject:[NSValue valueWithBytes:&wi objCType:@encode(struct rrl_window)]];
+                        // boundary at node i+1 (start of trailing non-expert run,
+                        // or next expert node) — only add if within range
+                        if (i + 1 < gf->n_nodes) {
+                            struct rrl_window wi1 = { .start = i + 1 };
+                            [windows_arr addObject:[NSValue valueWithBytes:&wi1 objCType:@encode(struct rrl_window)]];
+                        }
+                    } else {
+                        // Per-layer mode (PR2-A): cut at each new layer.
+                        int layer = -1;
+                        const char * p = s0->name;
+                        if (p[0]=='b' && p[1]=='l' && p[2]=='k' && p[3]=='.') {
+                            p += 4;
+                            int val = 0; bool ok = false;
+                            while (*p >= '0' && *p <= '9') { val = val*10 + (*p-'0'); ++p; ok=true; }
+                            if (ok && *p == '.') { layer = val; }
+                        }
+
+                        if (layer != prev_layer) {
+                            struct rrl_window w = { .start = i };
+                            [windows_arr addObject:[NSValue valueWithBytes:&w objCType:@encode(struct rrl_window)]];
+                            prev_layer = layer;
+                        }
+                    }
+                }
+            }
+
+            // Build the flat start[] array.  Window 0 always starts at 0 (prefix).
+            // If the planner found no expert nodes, there is one implicit window
+            // covering the whole graph.
+            // In W-expert mode, duplicate start indices can appear when two expert
+            // nodes are adjacent (both emit i and i+1, and the next emits i+1 and
+            // i+2 — so i+1 appears twice).  The commit loop skips empty windows
+            // (w_start >= w_end) which covers duplicates naturally.
+            int n_win = (int) windows_arr.count + 1; // +1 for the prefix window
+            int * win_starts = (int *) alloca((size_t)(n_win + 1) * sizeof(int));
+            win_starts[0] = 0; // prefix window
+            for (int wi = 0; wi < (int) windows_arr.count; ++wi) {
+                struct rrl_window w;
+                [[windows_arr objectAtIndex:wi] getValue:&w];
+                win_starts[wi + 1] = w.start;
+            }
+            win_starts[n_win] = gf->n_nodes; // sentinel (end of last window)
+
+            // -- Sequential commit loop -----------------------------------------
+            // Two sub-paths:
+            //
+            //   Sync  (RRL_METAL_CB_ASYNC unset): per-window waitUntilCompleted
+            //     before the next window starts; sync rolling-evict runs inside
+            //     the encoder (ops.cpp).  Retain accounting: retain→count 1; last
+            //     CB goes into cmd_bufs_ext→count 2; synchronize releases both.
+            //
+            //   Async (RRL_METAL_CB_ASYNC=D): counting semaphore of depth D limits
+            //     in-flight CBs.  Each window's addCompletedHandler runs the reclaim
+            //     (rrl_async_window_reclaim_and_free) and releases the CB.  After all
+            //     windows are committed, drain the semaphore D times to ensure every
+            //     handler has fired before graph_compute returns.  The handler is the
+            //     SOLE evictor; the sync rolling-evict block in ops.cpp is bypassed.
+            //     cmd_buf_last is set to nil (all work done; synchronize is a no-op).
+
+            // rrl_async_d and rrl_wexp are declared above in the planner section.
+            if (rrl_async_d > 0) {
+                // -- Async path (RRL_METAL_CB_ASYNC=D) ----------------------------
+                // Semaphore starts at D: the main thread takes one slot before
+                // creating each CB; the completion handler signals one slot back.
+                //
+                // W-expert sub-window mode (rrl_is_wexp_mode):
+                //   Expert-node singleton windows are routed to
+                //   rrl_encode_expert_node_windows which creates ceil(N/W) sub-CBs
+                //   internally, each acquiring sem once and signaling once in its
+                //   handler.  The outer loop does NOT call dispatch_semaphore_wait
+                //   for these windows; the entry does its own waits.
+                //   Non-expert windows use the existing one-CB-per-window path.
+                //   The drain at the end is still D waits: semaphore starts at D,
+                //   each committed CB's handler signals exactly once, so after all
+                //   handlers fire the semaphore = D again; D drain-waits = 0.
+                dispatch_semaphore_t sem = dispatch_semaphore_create(rrl_async_d);
+
+                for (int wi = 0; wi < n_win; ++wi) {
+                    const int w_start = win_starts[wi];
+                    const int w_end   = win_starts[wi + 1];
+
+                    if (w_start >= w_end) { continue; } // skip empty windows
+
+                    // [rrl] PR2-B: detect singleton expert-node windows and route to
+                    // rrl_encode_expert_node_windows when W-expert mode is active.
+                    // A singleton expert window has w_end == w_start + 1 AND the
+                    // single node is a per-expert mmap-metal MUL_MAT_ID.
+                    if (rrl_is_wexp_mode &&
+                        w_end == w_start + 1 &&
+                        rrl_is_expert_mmap_metal_c(gf->nodes[w_start]->src[0]) &&
+                        gf->nodes[w_start]->op == GGML_OP_MUL_MAT_ID) {
+
+                        // Delegate entirely: the entry creates and commits sub-CBs,
+                        // each acquiring sem before creation and signaling in its
+                        // completion handler.  Returns 0 on fallback (not ptr-mode);
+                        // in that case fall through to the normal single-CB path.
+                        int n_sub = rrl_encode_expert_node_windows(
+                            ctx->dev, gf, w_start,
+                            (__bridge void *) queue,
+                            (void *) sem,
+                            rrl_async_d, rrl_wexp,
+                            &ctx->has_error);
+                        if (n_sub > 0) {
+                            // sub-CBs were committed; move to next window.
+                            // error detection: rrl_encode_expert_node_windows sets
+                            // ctx->has_error via the handler's has_error_ptr (which
+                            // we passed as nil — see note in ops.cpp).  We check
+                            // ctx->has_error after the loop.
+                            continue;
+                        }
+                        // fallthrough: rrl_encode_expert_node_windows returned 0
+                        // (hook not installed, ids null, etc.) — encode normally.
+                    }
+
+                    // -- Normal single-CB path (non-expert window OR wexp fallback) --
+                    // Throttle: block until a slot is available (<D in-flight CBs).
+                    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+
+                    id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+                    [cmd_buf retain]; // our explicit retain → count 1
+                    [cmd_buf enqueue];
+
+                    ggml_metal_op_t ctx_op = ggml_metal_op_init(
+                        ctx->dev,
+                        (ggml_metal_cmd_buf_t) cmd_buf,
+                        gf,
+                        w_start,
+                        w_end,
+                        ctx->use_fusion,
+                        ctx->use_concurrency,
+                        /*use_capture=*/false,
+                        ctx->debug_graph,
+                        ctx->debug_fusion);
+
+                    for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+                        const int res = ggml_metal_op_encode(ctx_op, idx);
+                        if (res == 0) { break; }
+                        idx += res - 1;
+                    }
+
+                    // ends encoding and frees the encoder
+                    ggml_metal_op_free(ctx_op);
+
+                    // Drain the async-records accumulated by this window's encoder
+                    // calls into a heap allocation.  The completion handler owns it.
+                    void * rrl_handle = rrl_async_window_take_records();
+
+                    // Completion handler: sole evictor + release + signal.
+                    // h is captured by value (opaque void* — no C++ copy needed).
+                    // The handler executes on the Metal driver thread after the CB
+                    // finishes; by that time all GPU reads of this window's experts
+                    // are complete, so it is safe to msync-evict them.
+                    void * h = rrl_handle; // explicit local for Block capture (C)
+                    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                        if (cb.status != MTLCommandBufferStatusCompleted) {
+                            ctx->has_error = true;
+                        }
+                        rrl_async_window_reclaim_and_free(h); // sole evictor; safe if NULL
+                        [cb release];                          // balance our [retain] above
+                        dispatch_semaphore_signal(sem);
+                    }];
+
+                    [cmd_buf commit]; // NO waitUntilCompleted
+                    // DO NOT add to cmd_bufs_ext — the handler owns the release.
+                }
+
+                // Drain: acquire all D permits so every in-flight completion handler
+                // has fired.  Each committed CB's handler signals exactly once, so the
+                // initial D permits plus those signals make these D waits always
+                // complete regardless of how many windows committed (no deadlock).
+                for (int i = 0; i < rrl_async_d; ++i) {
+                    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+                }
+                // Restore the count to its creation value BEFORE releasing: libdispatch
+                // traps (EXC_BREAKPOINT in _dispatch_semaphore_dispose) if a semaphore is
+                // deallocated while its value is below the value it was created with.
+                for (int i = 0; i < rrl_async_d; ++i) {
+                    dispatch_semaphore_signal(sem);
+                }
+                dispatch_release(sem);
+
+                // All window CBs are done and released.  Set cmd_buf_last to nil so
+                // synchronize() skips its waitUntilCompleted (no live reference left).
+                ctx->cmd_buf_last = nil;
+
+                if (ctx->has_error) {
+                    return GGML_STATUS_FAILED;
+                }
+
+            } else {
+                // -- Sync path (RRL_METAL_CB_ASYNC unset) -------------------------
+                // For each window [start, end):
+                //   create CB → enqueue → build op → encode → free (ends encoding)
+                //   → commit → waitUntilCompleted → check status
+                // waitUntilCompleted after each CB releases that window's useResource
+                // residency before the next window faults its experts.
+                //
+                // Memory management: commandBufferWithUnretainedReferences + explicit
+                // [retain] gives us a retain count of 1.  We transfer that retain to
+                // cmd_bufs_ext (for the last window) so synchronize() can hold a live
+                // reference via cmd_buf_last.  Intermediate window CBs are released
+                // immediately after drain (they have already completed).
+                id<MTLCommandBuffer> last_win_cmd_buf = nil;
+
+                for (int wi = 0; wi < n_win; ++wi) {
+                    const int w_start = win_starts[wi];
+                    const int w_end   = win_starts[wi + 1];
+
+                    if (w_start >= w_end) { continue; } // skip empty windows
+
+                    id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+                    [cmd_buf retain];
+                    [cmd_buf enqueue];
+
+                    ggml_metal_op_t ctx_op = ggml_metal_op_init(
+                        ctx->dev,
+                        (ggml_metal_cmd_buf_t) cmd_buf,
+                        gf,
+                        w_start,
+                        w_end,
+                        ctx->use_fusion,
+                        ctx->use_concurrency,
+                        /*use_capture=*/false,
+                        ctx->debug_graph,
+                        ctx->debug_fusion);
+
+                    for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+                        const int res = ggml_metal_op_encode(ctx_op, idx);
+                        if (res == 0) { break; }
+                        idx += res - 1;
+                    }
+
+                    // ends encoding and frees the encoder
+                    ggml_metal_op_free(ctx_op);
+
+                    [cmd_buf commit];
+
+                    // Drain: waitUntilCompleted releases this window's useResource
+                    // residency before the next window faults its experts.
+                    [cmd_buf waitUntilCompleted];
+
+                    MTLCommandBufferStatus status = [cmd_buf status];
+                    if (status != MTLCommandBufferStatusCompleted) {
+                        GGML_LOG_INFO("%s: [rrl] windowed CB %d failed with status %lu\n",
+                                      __func__, wi, (unsigned long) status);
+                        if (status == MTLCommandBufferStatusError) {
+                            GGML_LOG_INFO("error: %s\n",
+                                          [[cmd_buf error].localizedDescription UTF8String]);
+                        }
+                        ctx->has_error = true;
+                        // Release the failed CB's retain (it is not stored in cmd_bufs_ext).
+                        [cmd_buf release];
+                        // Release any prior window CB we were holding in last_win_cmd_buf
+                        // (it succeeded but we haven't added it to cmd_bufs_ext yet).
+                        if (last_win_cmd_buf != nil) {
+                            [last_win_cmd_buf release];
+                            last_win_cmd_buf = nil;
+                        }
+                        return GGML_STATUS_FAILED;
+                    }
+
+                    // Release the previous last-window CB (it has completed and we are
+                    // about to replace last_win_cmd_buf).
+                    if (last_win_cmd_buf != nil) {
+                        [last_win_cmd_buf release];
+                    }
+                    last_win_cmd_buf = cmd_buf; // transfer our retain to last_win_cmd_buf
+                }
+
+                // Track the last window's CB in cmd_bufs_ext so synchronize() can
+                // wait on it via cmd_buf_last.  Retain count accounting:
+                //   commandBufferWithUnretainedReferences starts at 0.
+                //   Our [retain] (at top of loop)   → count 1
+                //   addObject (array retains)        → count 2
+                //   synchronize [release]            → count 1
+                //   synchronize removeAllObjects     → count 0 → dealloc ✓
+                // Do NOT call an extra [release] here — we need count=2 entering
+                // synchronize so both its explicit [release] and removeAllObjects
+                // balance correctly.
+                if (last_win_cmd_buf != nil) {
+                    [ctx->cmd_bufs_ext addObject:last_win_cmd_buf];
+                    ctx->cmd_buf_last = last_win_cmd_buf;
+                    // Our explicit [retain] is still live; addObject added the second
+                    // retain.  Leave both — synchronize consumes them.
+                }
+            } // end sync/async branch
+        } else {
+        // -- Original parallel dispatch_apply path (unchanged) ------------------
+
         // the main thread commits the first few commands immediately
         // cmd_buf[n_cb]
         {
@@ -551,6 +938,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
+
+        } // end else (original parallel path)
 
         // enter here only when capturing in order to wait for all computation to finish
         // otherwise, we leave the graph to compute asynchronously

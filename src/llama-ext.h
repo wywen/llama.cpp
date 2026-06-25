@@ -86,6 +86,43 @@ using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
+//
+// [keep-separate Metal, step 1] per-expert page-alignment probe
+//
+// Diagnostic for the keep-separate per-expert loader: walks the loaded model's
+// ffn_*_exps.weight tensors and, treating each expert as starting at
+// tensor->data + e*nb[ndims-1] (the per-expert stride), reports whether every
+// expert base is 16 KiB-aligned relative to `region_base`, the total raw expert
+// bytes vs total strided (padded) bytes, and the per-expert buffer count.
+//
+// It also spot-checks bytes: for the FIRST matched weight tensor it copies the
+// first `spot_n` bytes of expert 0 into spot0_out and of expert (n_exp-1) into
+// spotN_out (caller-allocated, each >= spot_n). These let the test compare the
+// region bytes against the GGUF source.
+//
+// Returns the number of per-expert buffers (slices) examined, or a negative
+// value on error (e.g. null model). All out-params are optional (may be null).
+struct rrl_per_expert_probe_out {
+    int32_t n_fused_tensors;   // # of ffn_*_exps.weight tensors matched
+    int32_t n_expert_buffers;  // total per-expert slices (sum of n_exp over matched)
+    int32_t all_page_aligned;  // 1 if every expert base is 16 KiB-aligned
+    int32_t n_misaligned;      // count of experts whose base is not 16 KiB-aligned
+    uint64_t total_raw_bytes;  // sum of raw per-expert bytes (ggml_nbytes of a slice)
+    uint64_t total_stride_bytes; // sum of strided per-expert bytes (n_exp*stride)
+    uint64_t first_stride;     // per-expert stride of the first matched tensor
+    uint64_t first_raw;        // raw per-expert bytes of the first matched tensor
+    int64_t  first_n_exp;      // n_exp of the first matched tensor
+    uint64_t first_base_off;   // (first tensor data - region_base) for expert 0
+};
+
+LLAMA_API int32_t rrl_per_expert_layout_probe(
+        const struct llama_model * model,
+        uint64_t region_base,
+        struct rrl_per_expert_probe_out * out,
+        uint8_t * spot0_out,
+        uint8_t * spotN_out,
+        size_t    spot_n);
+
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
