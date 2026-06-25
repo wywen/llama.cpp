@@ -1502,9 +1502,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 // (buft_per_layer_wt), so t0 is THE tensor and buf base/size are
                 // its page-aligned range; the shim parses blk.<il>. from the name.
                 if (t0 != nullptr && !is_expert_ctx) {
+                    // [rrl #283] Pass the buffer's GGUF file offset (= `first`, the
+                    // min tensor data offset for this ctx; addr is the file-base
+                    // mmap) and the file's fd so the DIRECT_IO weight roller can
+                    // pread() the bytes straight from the GGUF. The crate dup()s the
+                    // fd during this call (valid here at load) since the loader
+                    // closes its own fd at teardown.
                     ml.rrl_register_weight_tensor(ggml_get_name(t0),
                         ggml_backend_buffer_get_base(buf),
-                        ggml_backend_buffer_get_size(buf));
+                        ggml_backend_buffer_get_size(buf),
+                        first,
+                        ml.files[idx]->file_id());
                 }
             }
             // [zero-copy per-expert] If no mmap range was found for any file (e.g. a
