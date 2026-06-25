@@ -72,7 +72,8 @@ ggml_metal_op_t ggml_metal_op_init(
         bool use_concurrency,
         bool use_capture,
         int  debug_graph,
-        int  debug_fusion);
+        int  debug_fusion,
+        int  rrl_cb_async_depth); // [rrl] #280: per-context async depth D snapshot
 
 void ggml_metal_op_free(ggml_metal_op_t ctx);
 
