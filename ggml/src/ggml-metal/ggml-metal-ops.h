@@ -28,6 +28,10 @@ int rrl_is_expert_mmap_metal_c(const struct ggml_tensor *t);
 //   in the handle and free it.  Safe to call with NULL.  Call from the MTL
 //   completion handler — the handler is the SOLE evictor in async mode.
 int   rrl_metal_cb_async_depth(void);
+// rrl_metal_set_cb_async_depth: crate-side override of D (#268). Sets a
+//   process-global override consulted by rrl_metal_cb_async_depth before the
+//   RRL_METAL_CB_ASYNC env value; pass < 0 to clear (fall back to env/default).
+void  rrl_metal_set_cb_async_depth(int d);
 void *rrl_async_window_take_records(void);
 void  rrl_async_window_reclaim_and_free(void *handle);
 
@@ -45,6 +49,9 @@ void  rrl_async_window_reclaim_and_free(void *handle);
 //   and signals sem.  Returns the number of sub-CBs committed (0 on fallback to the
 //   single-CB path).
 int rrl_metal_cb_wexp(void);
+// rrl_metal_set_cb_wexp: crate-side override of W (#268). Process-global override
+//   consulted by rrl_metal_cb_wexp before RRL_METAL_CB_WEXP; pass < 0 to clear.
+void rrl_metal_set_cb_wexp(int w);
 int rrl_encode_expert_node_windows(
         ggml_metal_device_t   dev,
         struct ggml_cgraph  * gf,
@@ -65,7 +72,8 @@ ggml_metal_op_t ggml_metal_op_init(
         bool use_concurrency,
         bool use_capture,
         int  debug_graph,
-        int  debug_fusion);
+        int  debug_fusion,
+        int  rrl_cb_async_depth); // [rrl] #280: per-context async depth D snapshot
 
 void ggml_metal_op_free(ggml_metal_op_t ctx);
 

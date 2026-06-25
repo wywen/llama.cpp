@@ -59,7 +59,7 @@ extern "C" void rrl_install_expert_buffer_hook(rrl_expert_buffer_hook_fn fn) {
 // be double-managed by the weight roller. Each mmap-metal tensor lands in its own
 // 16 KiB-aligned context/buffer (buft_per_layer_wt), so base/size is per-tensor.
 // Null when not wired; the call is skipped safely.
-typedef void (*rrl_weight_tensor_hook_fn)(const char *name, const void *base, size_t size);
+typedef void (*rrl_weight_tensor_hook_fn)(const char *name, const void *base, size_t size, size_t file_offset, int fd);
 static rrl_weight_tensor_hook_fn g_rrl_weight_tensor_hook = nullptr;
 
 extern "C" void rrl_install_weight_tensor_hook(rrl_weight_tensor_hook_fn fn);
@@ -87,15 +87,17 @@ void llama_model_loader::rrl_register_expert_region(const void * base, size_t si
 // [rrl #201] Invoke the dedicated weight-tensor hook for a general (non-expert)
 // per-layer weight buffer. Called from the buffer phase (llama-model.cpp) AFTER
 // the buffer is created so base/size reflect the finalized mmap-metal buffer.
-void llama_model_loader::rrl_register_weight_tensor(const char * name, const void * base, size_t size) const {
+void llama_model_loader::rrl_register_weight_tensor(const char * name, const void * base, size_t size, size_t file_offset, int fd) const {
 #if defined(__APPLE__)
     if (g_rrl_weight_tensor_hook != nullptr && name != nullptr && base != nullptr && size > 0) {
-        g_rrl_weight_tensor_hook(name, base, size);
+        g_rrl_weight_tensor_hook(name, base, size, file_offset, fd);
     }
 #else
     (void) name;
     (void) base;
     (void) size;
+    (void) file_offset;
+    (void) fd;
 #endif
 }
 

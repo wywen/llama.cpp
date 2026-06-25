@@ -43,6 +43,14 @@ struct ggml_metal {
     int debug_graph;
     int debug_fusion;
 
+    // [rrl] #280: per-context snapshot of the async-overlap window (depth D and
+    // W-expert sub-window), taken once at ggml_metal_init from the thread-local
+    // crate override (g_rrl_cb_*_override in ggml-metal-ops.cpp). These are the
+    // authoritative values read during graph_compute / mul_mat_id, so two contexts
+    // built with different windows no longer clobber each other via a process global.
+    int rrl_cb_async_depth;
+    int rrl_cb_wexp;
+
     // how many times a given op was fused
     uint64_t fuse_cnt[GGML_OP_COUNT];
 
@@ -110,6 +118,15 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     }
 
     res->dev = dev;
+
+    // [rrl] #280: snapshot the async-overlap window for THIS context, on the build
+    // thread, before any graph_compute. The crate's assemble() set the thread-local
+    // override just before llama_new_context_with_model (same thread), so these
+    // getters resolve to this session's D/W; after this point nothing reads the
+    // override during decode — ctx->rrl_cb_* is authoritative and per-context.
+    res->rrl_cb_async_depth = rrl_metal_cb_async_depth();
+    res->rrl_cb_wexp        = rrl_metal_cb_wexp();
+
     res->lib = ggml_metal_device_get_library(dev);
     if (res->lib == NULL) {
         GGML_LOG_WARN("%s: the device does not have a precompiled Metal library - this is unexpected\n", __func__);
@@ -556,8 +573,11 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             // Implementation: collect the start indices of each boundary; the end
             // of window[i] is start of window[i+1] (or gf->n_nodes for the last).
 
-            const int rrl_wexp = rrl_metal_cb_wexp();
-            const int rrl_async_d = rrl_metal_cb_async_depth();
+            // [rrl] #280: read the per-context snapshot (taken at ggml_metal_init),
+            // NOT the thread-local override — decode may run on a different thread
+            // than the build, and concurrent sessions must each see their own window.
+            const int rrl_wexp = ctx->rrl_cb_wexp;
+            const int rrl_async_d = ctx->rrl_cb_async_depth;
 
             // [rrl] #128 Phase 1: log windowed-compute engagement once per process so
             // the default-on path is observable (silent under the default noop logger;
@@ -736,7 +756,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                         ctx->use_concurrency,
                         /*use_capture=*/false,
                         ctx->debug_graph,
-                        ctx->debug_fusion);
+                        ctx->debug_fusion,
+                        ctx->rrl_cb_async_depth); // [rrl] #280: per-context D
 
                     for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
                         const int res = ggml_metal_op_encode(ctx_op, idx);
@@ -828,7 +849,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                         ctx->use_concurrency,
                         /*use_capture=*/false,
                         ctx->debug_graph,
-                        ctx->debug_fusion);
+                        ctx->debug_fusion,
+                        ctx->rrl_cb_async_depth); // [rrl] #280: per-context D
 
                     for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
                         const int res = ggml_metal_op_encode(ctx_op, idx);
@@ -1091,7 +1113,8 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             ctx->use_concurrency,
             ctx->capture_compute,
             ctx->debug_graph,
-            ctx->debug_fusion);
+            ctx->debug_fusion,
+            ctx->rrl_cb_async_depth); // [rrl] #280: per-context D
 
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);
