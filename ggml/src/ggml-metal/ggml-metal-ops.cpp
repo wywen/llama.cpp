@@ -160,12 +160,20 @@ static std::vector<int32_t> s_rrl_prev_wired;
 // the RRL_METAL_CB_ASYNC env/default below); >= 0 = explicit from the typed session
 // field (0 = sync drain, >0 = that depth). Checked before the cached env read so a
 // setter call wins even if the env value was already cached on an earlier read.
-static std::atomic<int> g_rrl_cb_async_override{-1};
+//
+// [rrl] #280: thread-local, NOT a process global. The crate's assemble() calls the
+// setter immediately before llama_new_context_with_model on the same thread, and
+// ggml_metal_init snapshots the resolved value into the per-context struct ggml_metal
+// (the authoritative copy read during decode). Scoping the override to the build
+// thread means two contexts built concurrently on different threads can't clobber
+// each other's value — the process-global wart this getter used to have. Decode never
+// reads this; an off-thread build (none today) would harmlessly fall back to env.
+static thread_local int g_rrl_cb_async_override = -1;
 extern "C" void rrl_metal_set_cb_async_depth(int d) {
-    g_rrl_cb_async_override.store(d, std::memory_order_relaxed);
+    g_rrl_cb_async_override = d;
 }
 extern "C" int rrl_metal_cb_async_depth(void) {
-    const int ov = g_rrl_cb_async_override.load(std::memory_order_relaxed);
+    const int ov = g_rrl_cb_async_override;
     if (ov >= 0) {
         return ov;
     }
@@ -415,12 +423,14 @@ extern "C" void rrl_async_window_reclaim_and_free(void * handle) {
 // disabled; the per-layer PR2-A async path remains unchanged.
 // [rrl] #268: crate-side override of W. -1 = unset (fall through to RRL_METAL_CB_WEXP
 // env/default); >= 0 = explicit from the typed session field (0 = disabled, >0 = window).
-static std::atomic<int> g_rrl_cb_wexp_override{-1};
+// [rrl] #280: thread-local handoff, snapshotted per-context at ggml_metal_init — see
+// the g_rrl_cb_async_override note above.
+static thread_local int g_rrl_cb_wexp_override = -1;
 extern "C" void rrl_metal_set_cb_wexp(int w) {
-    g_rrl_cb_wexp_override.store(w, std::memory_order_relaxed);
+    g_rrl_cb_wexp_override = w;
 }
 extern "C" int rrl_metal_cb_wexp(void) {
-    const int ov = g_rrl_cb_wexp_override.load(std::memory_order_relaxed);
+    const int ov = g_rrl_cb_wexp_override;
     if (ov >= 0) {
         return ov;
     }
@@ -807,7 +817,8 @@ struct ggml_metal_op {
         bool use_concurrency,
         bool use_capture,
         int  debug_graph,
-        int  debug_fusion) {
+        int  debug_fusion,
+        int  rrl_cb_async_depth) {
         this->dev             = dev;
         this->lib             = ggml_metal_device_get_library(dev);
         this->enc             = ggml_metal_encoder_init(cmd_buf, use_concurrency);
@@ -819,6 +830,10 @@ struct ggml_metal_op {
         this->use_capture     = use_capture;
         this->debug_graph     = debug_graph;
         this->debug_fusion    = debug_fusion;
+        // [rrl] #280: per-op snapshot of the async depth, taken from the per-context
+        // ggml_metal at op_init. Read at decode by ggml_metal_op_mul_mat_id instead of
+        // the (now thread-local, build-time-only) g_rrl_cb_async_override.
+        this->rrl_cb_async_depth = rrl_cb_async_depth;
         this->gf              = gf;
 
         idxs.reserve(gf->n_nodes);
@@ -871,6 +886,10 @@ struct ggml_metal_op {
     int debug_graph;
     int debug_fusion;
 
+    // [rrl] #280: per-op snapshot of the async overlap depth D (from the per-context
+    // ggml_metal at op_init); read by ggml_metal_op_mul_mat_id at decode.
+    int rrl_cb_async_depth;
+
 private:
     ggml_cgraph * gf;
 
@@ -891,7 +910,8 @@ ggml_metal_op_t ggml_metal_op_init(
         bool use_concurrency,
         bool use_capture,
         int debug_graph,
-        int debug_fusion) {
+        int debug_fusion,
+        int rrl_cb_async_depth) {
     ggml_metal_op_t res = new ggml_metal_op(
         dev,
         cmd_buf,
@@ -902,7 +922,8 @@ ggml_metal_op_t ggml_metal_op_init(
         use_concurrency,
         use_capture,
         debug_graph,
-        debug_fusion);
+        debug_fusion,
+        rrl_cb_async_depth);
 
     return res;
 }
@@ -3105,7 +3126,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     // [rrl] PR2-A.2: in async CB mode the completion handler is the SOLE evictor.
     // Running the sync rolling-evict-previous here too would double-evict (race).
     // Gate the entire block on !async so the sync path is unchanged.
-    if (!rrl_metal_cb_async_depth()) {
+    if (!ctx->rrl_cb_async_depth) {
         const bool rrl_evict = (g_rrl_evict_on.load(std::memory_order_relaxed) != 0);
         static void *     s_prev_addr   = nullptr;
         static size_t     s_prev_len    = 0;
@@ -3381,7 +3402,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         // a LATER window's encoder bumps refcount for a shared eid BEFORE this
         // window's handler fires, so the handler's recheck (refcount==0) aborts
         // the reclaim for any expert a later in-flight window still needs.
-        if (rrl_metal_cb_async_depth() > 0 &&
+        if (ctx->rrl_cb_async_depth > 0 &&
                 g_rrl_evict_on.load(std::memory_order_relaxed) != 0 &&
                 rrl_is_expert_mmap_metal(src0_mm) &&
                 !dispatch_eids.empty()) {
@@ -3702,7 +3723,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         // encoder bumps refcount for a shared eid BEFORE this window's handler fires,
         // so the handler's recheck (refcount==0) aborts reclaim for any expert a
         // later in-flight window still needs.
-        if (rrl_metal_cb_async_depth() > 0 &&
+        if (ctx->rrl_cb_async_depth > 0 &&
                 g_rrl_evict_on.load(std::memory_order_relaxed) != 0 &&
                 rrl_is_expert_mmap_metal(src0) &&
                 !dispatch_eids_mv.empty()) {
