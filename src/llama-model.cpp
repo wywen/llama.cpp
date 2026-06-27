@@ -1606,7 +1606,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             const ggml_tensor * t0_stream = ggml_get_first_tensor(ctx);
             const bool is_expert_ctx_stream =
                 t0_stream != nullptr && std::strstr(ggml_get_name(t0_stream), "_exps") != nullptr;
-            if ((ml.rrl_direct_io_stream && !is_expert_ctx_stream) || ml.no_alloc) {
+            if (ml.rrl_direct_io_stream && !is_expert_ctx_stream) {
+                // [rrl #301] Streaming dummy. Request a 1-byte (sub-page) size, NOT
+                // 0: ggml_backend_buft_alloc_buffer short-circuits size==0 to an
+                // empty buffer bound to this buft with a null backend, which
+                // graph_reserve rejects ("cannot run the operation (NONE)"). The
+                // crate buft returns a real no-residency Metal placeholder for any
+                // sub-page request (Metal-capable buft ⇒ reserve succeeds); the
+                // crate rebinds these tensors (floor at load, layers via the ring)
+                // before any compute.
+                buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 1);
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    t->buffer = buf;
+                }
+            } else if (ml.no_alloc) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
