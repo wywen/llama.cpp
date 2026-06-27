@@ -66,6 +66,21 @@ extern "C" void rrl_install_weight_tensor_hook(rrl_weight_tensor_hook_fn fn);
 extern "C" void rrl_install_weight_tensor_hook(rrl_weight_tensor_hook_fn fn) {
     g_rrl_weight_tensor_hook = fn;
 }
+
+// [rrl #301] DIRECT_IO streaming-load hook. Fired from load_all_data (NOT the
+// buffer phase) for each dense non-expert weight tensor when rrl_direct_io_stream
+// is set: passes the ggml_tensor* directly (the tensor has a 0-size dummy buffer,
+// so there is no mmap base to map back from), its byte size, the per-tensor GGUF
+// file offset, and the source fd. The crate records (tensor, offset, fd, size)
+// and the eager read is SUPPRESSED — the crate's weight ring owns the bytes
+// (floor pinned via one F_NOCACHE pread, layers paged). Null when not wired.
+typedef void (*rrl_stream_weight_hook_fn)(const char *name, void *tensor, size_t size, size_t file_offset, int fd);
+static rrl_stream_weight_hook_fn g_rrl_stream_weight_hook = nullptr;
+
+extern "C" void rrl_install_stream_weight_hook(rrl_stream_weight_hook_fn fn);
+extern "C" void rrl_install_stream_weight_hook(rrl_stream_weight_hook_fn fn) {
+    g_rrl_stream_weight_hook = fn;
+}
 #endif
 
 // [rrl #125] Invoke the dedicated expert-buffer hook for an expert mmap range.
@@ -95,6 +110,24 @@ void llama_model_loader::rrl_register_weight_tensor(const char * name, const voi
 #else
     (void) name;
     (void) base;
+    (void) size;
+    (void) file_offset;
+    (void) fd;
+#endif
+}
+
+// [rrl #301] Invoke the DIRECT_IO streaming-load hook for a dense non-expert
+// weight tensor. Called from load_all_data (where the per-tensor file offset is
+// available as weight->offs) when rrl_direct_io_stream is set. `tensor` is the
+// ggml_tensor* (cast to void* across the C ABI).
+void llama_model_loader::rrl_register_stream_weight(const char * name, void * tensor, size_t size, size_t file_offset, int fd) const {
+#if defined(__APPLE__)
+    if (g_rrl_stream_weight_hook != nullptr && name != nullptr && tensor != nullptr && size > 0) {
+        g_rrl_stream_weight_hook(name, tensor, size, file_offset, fd);
+    }
+#else
+    (void) name;
+    (void) tensor;
     (void) size;
     (void) file_offset;
     (void) fd;
@@ -2209,6 +2242,25 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        // [rrl #301] DIRECT_IO streaming load: this dense non-expert weight was
+        // given a 0-size dummy buffer in the buffer phase. SUPPRESS the eager
+        // per-tensor read and hand the crate the (tensor*, file offset, fd, size)
+        // tuple; the crate's weight ring owns the bytes — the floor is pinned via
+        // a single F_NOCACHE pread and the per-layer weights are paged at barriers
+        // (zero page-cache pollution, no whole-file mmap). `weight->offs` is the
+        // true per-tensor GGUF offset.
+        if (rrl_direct_io_stream) {
+            rrl_register_stream_weight(ggml_get_name(cur), cur, n_size, weight->offs,
+                files.at(weight->idx)->file_id());
+            size_done += n_size;
+            if (progress_callback) {
+                if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+                    return false;
+                }
+            }
+            continue;
+        }
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);

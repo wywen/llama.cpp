@@ -87,6 +87,11 @@ struct llama_model_loader {
     bool use_direct_io = false;
     bool check_tensors;
     bool no_alloc;
+    // [rrl #301] DIRECT_IO streaming load: set by the caller after construction
+    // (use_mmap is forced false in tandem). Gates the dense-weight dummy-buffer
+    // path (llama-model.cpp buffer phase) and the read-suppress + stream-hook
+    // path (load_all_data).
+    bool rrl_direct_io_stream = false;
 
     bool per_expert_moe = false;  // true when moe.layout == "per_expert" in this GGUF
     // Set to use_mmap for a per_expert model: skip the assembly memcpy and point the
@@ -244,6 +249,10 @@ struct llama_model_loader {
     // in/out at barriers. No-op when the hook is not installed (non-Apple / crate
     // not linked / weight rolling off).
     void rrl_register_weight_tensor(const char * name, const void * base, size_t size, size_t file_offset, int fd) const;
+
+    // [rrl #301] DIRECT_IO streaming-load hook: see the .cpp definition. Fired
+    // from load_all_data with the ggml_tensor* and per-tensor GGUF file offset.
+    void rrl_register_stream_weight(const char * name, void * tensor, size_t size, size_t file_offset, int fd) const;
 
     // for backwards compatibility, does not support ggml-backend
     void load_data_for(struct ggml_tensor * cur) const;

@@ -324,6 +324,12 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        // [rrl #301] DIRECT_IO streaming load: never mmap the model file. Dense
+        // non-expert weight tensors get 0-size dummy buffers and are registered
+        // (via the rrl stream-weight hook) for F_NOCACHE pread by the crate's
+        // weight ring (floor pinned, layers paged); the eager per-tensor read at
+        // load is suppressed. Forces use_mmap=false. Default false.
+        bool rrl_direct_io_stream;
     };
 
     struct llama_sampler_seq_config {

@@ -1595,7 +1595,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         } else {
             ggml_backend_buffer_t buf;
-            if (ml.no_alloc) {
+            // [rrl #301] DIRECT_IO streaming: dense non-expert weight tensors get a
+            // 0-size dummy buffer (no real allocation) — the crate's weight ring
+            // owns their bytes (floor pinned via one F_NOCACHE pread, layers paged).
+            // Expert ctxs (the "_exps" suffix) are out of the ring's scope and stay
+            // on the normal alloc path. The dummy buffer keeps the backend scheduler
+            // from allocating weights (same trick as no_alloc); load_all_data
+            // suppresses the eager read and fires the stream hook with each tensor's
+            // file offset so the crate can pread it.
+            const ggml_tensor * t0_stream = ggml_get_first_tensor(ctx);
+            const bool is_expert_ctx_stream =
+                t0_stream != nullptr && std::strstr(ggml_get_name(t0_stream), "_exps") != nullptr;
+            if ((ml.rrl_direct_io_stream && !is_expert_ctx_stream) || ml.no_alloc) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
@@ -2328,6 +2339,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.rrl_direct_io_stream        =*/ false,
     };
 
     return result;

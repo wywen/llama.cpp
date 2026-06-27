@@ -279,8 +279,13 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
-        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.use_mmap, params.use_direct_io,
+        // [rrl #301] DIRECT_IO streaming load forces mmap off (the file is never
+        // mapped; dense weights stream via F_NOCACHE pread). Pass use_mmap=false
+        // up front, then record the flag on the loader for the buffer/load paths.
+        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file,
+            params.use_mmap && !params.rrl_direct_io_stream, params.use_direct_io,
             params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
+        ml.rrl_direct_io_stream = params.rrl_direct_io_stream;
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
