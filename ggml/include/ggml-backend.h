@@ -328,6 +328,15 @@ extern "C" {
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
+    // Get the scheduler's current compute graph (the last one split/reserved).
+    // Its nodes are in execution order; each node's assigned backend is
+    // queryable via ggml_backend_sched_get_tensor_backend. Valid after
+    // ggml_backend_sched_reserve (which llama runs at context construction);
+    // before any graph is split the returned graph has n_nodes == 0. The
+    // scheduler owns the graph — do not free or mutate it. Never NULL for a
+    // valid sched. (titanium-chicken: memory/scheduler observability.)
+    GGML_API struct ggml_cgraph * ggml_backend_sched_get_graph(ggml_backend_sched_t sched);
+
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 

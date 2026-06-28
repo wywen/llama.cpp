@@ -1934,6 +1934,11 @@ int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
     return sched->n_copies;
 }
 
+struct ggml_cgraph * ggml_backend_sched_get_graph(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return &sched->graph;
+}
+
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_backends;
