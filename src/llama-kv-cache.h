@@ -265,6 +265,12 @@ private:
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
+    // [MTP/EAGLE3 shared-KV] One size-0 dummy buffer handed to shared source
+    // tensors that arrive in the bounded rolling-KV "dead" state (null buffer),
+    // so this context's graph_reserve does not try to allocate them. Owned here
+    // so it outlives reserve and is freed with the cache.
+    ggml_backend_buffer_ptr shared_dead_dummy;
+
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;

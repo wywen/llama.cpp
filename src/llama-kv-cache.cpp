@@ -17,6 +17,7 @@
 // llama-barriers.h (included via llama-kv-cache.h → ... → llama.h).
 // We include it directly here.
 #include "llama-barriers.h"
+#include "llama-kv-shared-backing.h"
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -425,6 +426,22 @@ llama_kv_cache::llama_kv_cache(
             rrl_residency_register(kv_dev, il, slot, k_tensor, v_tensor,
                                    first_reader, last_reader, this);
         }
+    }
+
+    // [MTP/EAGLE3 shared-KV] A shared source layer can arrive in the bounded
+    // rolling-KV "dead" state (null tensor->buffer), which would make this
+    // context's graph_reserve abort. Back such tensors with a size-0 dummy so
+    // reserve treats them as externally allocated; see llama-kv-shared-backing.h
+    // for the why and the safety argument. Only shared caches (other) hit this.
+    if (other) {
+        std::vector<ggml_tensor *> shared_tensors;
+        shared_tensors.reserve(layers.size() * 2);
+        for (auto & lkv : layers) {
+            shared_tensors.push_back(lkv.k);
+            shared_tensors.push_back(lkv.v);
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(model.dev_layer(0));
+        rrl_back_shared_dead_kv(shared_tensors, buft, shared_dead_dummy);
     }
 
     {
