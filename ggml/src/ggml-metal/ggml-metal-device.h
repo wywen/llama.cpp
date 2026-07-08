@@ -269,6 +269,19 @@ typedef struct ggml_metal_event * ggml_metal_event_t;
 void ggml_metal_event_encode_signal(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf);
 void ggml_metal_event_encode_wait  (ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf);
 
+// Explicit-value event primitives (#226 paged-decode boundary events). Unlike
+// the auto-incrementing pair above (which drive the event's internal `value`
+// counter for ggml_backend_sched's own cross-backend sync), these let a caller
+// coordinate an MTLSharedEvent across threads with values IT chooses: the
+// decode graph encodes a signal/wait at a specific value, and an engine-side
+// reclaim/prefetch thread waits-for / host-signals that same value. Do not mix
+// the auto pair and this explicit pair on one event.
+void     ggml_metal_event_encode_signal_value(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf, uint64_t value);
+void     ggml_metal_event_encode_wait_value  (ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf, uint64_t value);
+void     ggml_metal_event_host_signal        (ggml_metal_event_t ev, uint64_t value); // event.signaledValue = value
+bool     ggml_metal_event_host_wait          (ggml_metal_event_t ev, uint64_t value, uint64_t timeout_ms); // waitUntilSignaledValue
+uint64_t ggml_metal_event_host_value         (ggml_metal_event_t ev); // current signaledValue
+
 ggml_metal_device_t ggml_metal_device_init(int device);
 void ggml_metal_device_free(ggml_metal_device_t dev);
 
