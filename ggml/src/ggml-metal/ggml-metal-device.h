@@ -277,6 +277,13 @@ void ggml_metal_event_encode_wait  (ggml_metal_event_t ev, ggml_metal_cmd_buf_t 
 // reclaim/prefetch thread waits-for / host-signals that same value. Do not mix
 // the auto pair and this explicit pair on one event.
 void     ggml_metal_event_encode_signal_value(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf, uint64_t value);
+// Like encode_signal_value, but the event is set from the command buffer's
+// COMPLETION handler rather than mid-stream as the GPU reaches the signal
+// command. A host waiter (ggml_metal_event_host_wait) that then reads the
+// command buffer's shared-storage outputs sees COHERENT data -- a mid-stream
+// encodeSignalEvent can fire before the writing command buffer's shared writes
+// are host-visible, so a CPU spill of just-written KV would read stale bytes.
+void     ggml_metal_event_signal_on_complete(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf, uint64_t value);
 void     ggml_metal_event_encode_wait_value  (ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf, uint64_t value);
 void     ggml_metal_event_host_signal        (ggml_metal_event_t ev, uint64_t value); // event.signaledValue = value
 bool     ggml_metal_event_host_wait          (ggml_metal_event_t ev, uint64_t value, uint64_t timeout_ms); // waitUntilSignaledValue

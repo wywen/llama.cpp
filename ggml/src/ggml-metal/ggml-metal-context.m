@@ -633,7 +633,11 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
                 struct ggml_tensor * node = gf->nodes[seg_last];
                 for (int c = 0; c < n_cuts; ++c) {
                     if (cut_nodes[c] == node && sig_ev[c] != NULL) {
-                        ggml_metal_event_encode_signal_value(sig_ev[c], (ggml_metal_cmd_buf_t) cmd_buf, sig_val[c]);
+                        // Signal on COMPLETION (not mid-stream): a host reclaim
+                        // thread waits this to spill the just-written KV to disk,
+                        // and must see coherent shared-storage bytes (see
+                        // ggml_metal_event_signal_on_complete's doc).
+                        ggml_metal_event_signal_on_complete(sig_ev[c], (ggml_metal_cmd_buf_t) cmd_buf, sig_val[c]);
                     }
                 }
             }

@@ -1015,6 +1015,16 @@ void ggml_metal_event_encode_signal_value(ggml_metal_event_t ev, ggml_metal_cmd_
     [cmd_buf encodeSignalEvent:event value:value];
 }
 
+void ggml_metal_event_signal_on_complete(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw, uint64_t value) {
+    id<MTLSharedEvent>   event   = (id<MTLSharedEvent>)   ev->obj;
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull unused) {
+        (void) unused;
+        event.signaledValue = value;
+    }];
+}
+
 void ggml_metal_event_encode_wait_value(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw, uint64_t value) {
     id<MTLSharedEvent>   event   = (id<MTLSharedEvent>)   ev->obj;
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
