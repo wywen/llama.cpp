@@ -3586,7 +3586,6 @@ uint32_t llama_n_ctx(const llama_context * ctx) {
     return ctx->n_ctx();
 }
 
-// [titanium-chicken patch] See llama.h / issue #59.
 ggml_backend_sched_t llama_get_sched(llama_context * ctx) {
     return ctx->get_sched();
 }

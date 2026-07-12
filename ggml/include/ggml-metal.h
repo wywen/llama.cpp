@@ -56,36 +56,15 @@ GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t bac
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
-// Paged-decode boundary-event schedule (opaque event handle).
-//
-// A quantized KV cache pages by evicting/admitting per-layer regions mid-decode.
-// Fencing those with GPU events (instead of a whole-graph host synchronize)
-// lets the decode graph run as one fused stream while a host thread reclaims and
-// prefetches KV in the background. `ggml_metal_event_t` is created on the
-// backend's device and shared between the GPU-side encode (signal/wait injected
-// by the schedule) and the host reclaim/prefetch threads.
 typedef struct ggml_metal_event * ggml_metal_event_t;
 
 GGML_BACKEND_API ggml_metal_event_t ggml_backend_metal_event_init(ggml_backend_t backend);
 GGML_BACKEND_API void               ggml_backend_metal_event_free(ggml_backend_t backend, ggml_metal_event_t ev);
 
-// Host-side event ops (no backend needed -- the event owns its device queue).
-// `host_signal` publishes a value a GPU `wait` is blocked on (prefetch done);
-// `host_wait` blocks until the GPU signals `value` (eviction's last read done),
-// returning false on timeout; `host_value` reads the current signalled value.
 GGML_BACKEND_API void     ggml_backend_metal_event_host_signal(ggml_metal_event_t ev, uint64_t value);
 GGML_BACKEND_API bool     ggml_backend_metal_event_host_wait  (ggml_metal_event_t ev, uint64_t value, uint64_t timeout_ms);
 GGML_BACKEND_API uint64_t ggml_backend_metal_event_host_value (ggml_metal_event_t ev);
 
-// Install the persistent, pointer-keyed boundary schedule on `backend`'s Metal
-// context. It applies to every subsequent graph compute until cleared (call
-// with n_cuts == 0). The graph is cut into a command buffer after each
-// `cut_nodes[i]` (emitting a completion signal on `sig_ev[i]` at `sig_val[i]`
-// when non-NULL) and a command buffer boundary is opened before each
-// `wait_nodes[j]` (emitting a GPU wait on `wait_ev[j]` for `wait_val[j]` when
-// non-NULL). NULL event entries make a boundary a pure segmentation point (no
-// fence) -- an unarmed decode installs the same cut set with all-NULL events so
-// its segmentation matches the armed decode bit-for-bit.
 GGML_BACKEND_API void ggml_backend_metal_set_boundary_schedule(
         ggml_backend_t backend,
         int n_cuts,  struct ggml_tensor * const * cut_nodes,  ggml_metal_event_t * sig_ev,  const uint64_t * sig_val,

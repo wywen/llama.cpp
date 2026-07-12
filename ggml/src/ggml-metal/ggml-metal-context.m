@@ -80,7 +80,7 @@ struct ggml_metal {
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
 
-    // #226 paged-decode boundary-event schedule (PERSISTENT + pointer-keyed;
+    // Paged-decode boundary-event schedule (PERSISTENT + pointer-keyed;
     // see ggml_metal_set_boundary_schedule). Owned copies, replaced on each set
     // and freed on clear/free. When bsched_n_cuts == 0 the stock n_cb encode
     // path runs unchanged. Nodes are matched by pointer against each computed
@@ -97,7 +97,7 @@ struct ggml_metal {
     uint64_t *             bsched_wait_val;
 };
 
-// #226 boundary-event schedule helpers (definitions below).
+// Boundary-event schedule helpers (definitions below).
 static void             ggml_metal_bsched_clear        (ggml_metal_t ctx);
 static enum ggml_status ggml_metal_graph_compute_paged (ggml_metal_t ctx, struct ggml_cgraph * gf);
 
@@ -462,7 +462,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 }
 
 // ---------------------------------------------------------------------------
-// #226 paged-decode boundary-event schedule
+// paged-decode boundary-event schedule
 // ---------------------------------------------------------------------------
 
 static void ggml_metal_bsched_clear(ggml_metal_t ctx) {
@@ -667,7 +667,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         return GGML_STATUS_FAILED;
     }
 
-    // #226: while a (persistent) paged-decode schedule is set, divert to the
+    // While a (persistent) paged-decode schedule is set, divert to the
     // sequential per-boundary-committed encode with event signal/wait. It stays
     // in force until the caller clears it, so it covers every split of a decode.
     if (ctx->bsched_n_cuts > 0) {
