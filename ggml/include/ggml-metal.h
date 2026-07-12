@@ -46,6 +46,14 @@ GGML_BACKEND_API bool ggml_backend_is_metal(ggml_backend_t backend);
 
 GGML_BACKEND_API void ggml_backend_metal_set_abort_callback(ggml_backend_t backend, ggml_abort_callback abort_callback, void * user_data);
 
+// Enable/disable Metal kernel fusion (the encode-time can_fuse pass) for this
+// backend. Default enabled (unless GGML_METAL_FUSION_DISABLE is set). Fusion
+// makes a graph's result depend on how it is split into compute sub-views, so
+// a quantized KV cache read back through a fused flash-attention is not
+// invariant to command-buffer cuts (block-scale coupling amplifies a sub-ULP
+// f32 delta into different codes); disable it when that invariance is required.
+GGML_BACKEND_API void ggml_backend_metal_set_fusion(ggml_backend_t backend, bool enable);
+
 // helper to check if the device supports a specific family
 // ideally, the user code should be doing these checks
 // ref: https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf

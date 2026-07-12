@@ -726,6 +726,10 @@ void ggml_metal_set_abort_callback(ggml_metal_t ctx, ggml_abort_callback abort_c
     ctx->abort_callback_data = user_data;
 }
 
+void ggml_metal_set_fusion(ggml_metal_t ctx, bool enable) {
+    ctx->use_fusion = enable;
+}
+
 bool ggml_metal_supports_family(ggml_metal_t ctx, int family) {
     GGML_ASSERT(ctx->dev != nil);
 
