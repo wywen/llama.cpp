@@ -625,6 +625,45 @@ void ggml_backend_metal_set_abort_callback(ggml_backend_t backend, ggml_abort_ca
     ggml_metal_set_abort_callback(ctx, abort_callback, user_data);
 }
 
+ggml_metal_event_t ggml_backend_metal_event_init(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    return ggml_metal_device_event_init(ggml_metal_get_device(ctx));
+}
+
+void ggml_backend_metal_event_free(ggml_backend_t backend, ggml_metal_event_t ev) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    ggml_metal_device_event_free(ggml_metal_get_device(ctx), ev);
+}
+
+void ggml_backend_metal_event_host_signal(ggml_metal_event_t ev, uint64_t value) {
+    ggml_metal_event_host_signal(ev, value);
+}
+
+bool ggml_backend_metal_event_host_wait(ggml_metal_event_t ev, uint64_t value, uint64_t timeout_ms) {
+    return ggml_metal_event_host_wait(ev, value, timeout_ms);
+}
+
+uint64_t ggml_backend_metal_event_host_value(ggml_metal_event_t ev) {
+    return ggml_metal_event_host_value(ev);
+}
+
+void ggml_backend_metal_set_boundary_schedule(
+        ggml_backend_t backend,
+        int n_cuts,  struct ggml_tensor * const * cut_nodes,  ggml_metal_event_t * sig_ev,  const uint64_t * sig_val,
+        int n_waits, struct ggml_tensor * const * wait_nodes, ggml_metal_event_t * wait_ev, const uint64_t * wait_val) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    ggml_metal_set_boundary_schedule(ctx, n_cuts, cut_nodes, sig_ev, sig_val, n_waits, wait_nodes, wait_ev, wait_val);
+}
+
 bool ggml_backend_metal_supports_family(ggml_backend_t backend, int family) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
 
