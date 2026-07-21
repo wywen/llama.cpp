@@ -202,6 +202,9 @@ typedef std::unique_ptr<ggml_backend_metal_buffer_type, ggml_backend_metal_buffe
 static ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size, bool shared) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)buft->device->context;
     ggml_metal_buffer_t res = ggml_metal_buffer_init(ctx_dev, size, shared);
+    if (!res) {
+        return NULL;
+    }
 
     ggml_backend_buffer_i buf_i = ggml_metal_buffer_is_shared(res)
         ? ggml_backend_metal_buffer_shared_i
@@ -721,6 +724,9 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
     ggml_metal_buffer_t res = ggml_metal_buffer_map(ctx_dev, ptr, size, max_tensor_size);
+    if (!res) {
+        return NULL;
+    }
 
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
 

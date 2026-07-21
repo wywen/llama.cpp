@@ -95,6 +95,9 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     // init context
     ggml_metal_t res = calloc(1, sizeof(struct ggml_metal));
+    if (res == NULL) {
+        return NULL;
+    }
 
     id<MTLDevice> device = ggml_metal_device_get_obj(dev);
 
