@@ -161,6 +161,10 @@ static int ggml_dyn_tallocr_new_chunk(struct ggml_dyn_tallocr * alloc, size_t mi
         return -1;
     }
     struct tallocr_chunk * chunk = calloc(1, sizeof(struct tallocr_chunk));
+    if (!chunk) {
+        return -1;
+    }
+
     chunk->n_free_blocks = 1;
     chunk->free_blocks[0].offset = 0;
     // available space in a chunk is limited to max_chunk_size, but can be higher if:

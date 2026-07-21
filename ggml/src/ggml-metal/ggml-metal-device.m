@@ -76,6 +76,10 @@ struct ggml_metal_pipeline {
 
 ggml_metal_pipeline_t ggml_metal_pipeline_init(void) {
     ggml_metal_pipeline_t res = calloc(1, sizeof(struct ggml_metal_pipeline));
+        if (!res) {
+        GGML_LOG_ERROR("%s: calloc failed\n", __func__);
+        return NULL;
+    }
 
     *res = (struct ggml_metal_pipeline) {
         /*.obj  =*/ nil,
@@ -250,6 +254,10 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
     }
 
     ggml_metal_library_t res = calloc(1, sizeof(struct ggml_metal_library));
+        if (!res) {
+        GGML_LOG_ERROR("%s: calloc failed\n", __func__);
+        return NULL;
+    }
 
     res->obj       = library;
     res->dev       = dev;
@@ -442,6 +450,10 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
         }
 
         res.pipeline = ggml_metal_pipeline_init();
+        if (error) {
+            GGML_LOG_ERROR("%s: %s\n", __func__, [[error description] UTF8String]);
+        }
+
         res.pipeline->obj = obj;
 
         ggml_metal_pipelines_add(lib->pipelines, name, res.pipeline);
@@ -1012,6 +1024,9 @@ ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev) {
     id<MTLSharedEvent> event = [dev->mtl_device newSharedEvent];
 
     ggml_metal_event_t ev = calloc(1, sizeof(struct ggml_metal_event));
+    if (!ev) {
+        return NULL;
+    }
 
     ev->obj = (__bridge void *)event;
     ev->value = 0;
@@ -1498,6 +1513,9 @@ static void * ggml_metal_host_malloc(size_t n) {
 
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
+    if (!res) {
+        return NULL;
+    }
 
     res->dev = dev;
 
@@ -1568,6 +1586,9 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
 
 ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
+    if (!res) {
+        return NULL;
+    }
 
     res->dev = dev;
 
