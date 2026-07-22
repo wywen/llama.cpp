@@ -79,7 +79,41 @@ struct ggml_metal {
     // error state - set when a command buffer fails during synchronize
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
+
+    // Paged-decode boundary-event schedule (PERSISTENT + pointer-keyed;
+    // see ggml_metal_set_boundary_schedule). Owned copies, replaced on each set
+    // and freed on clear/free. When bsched_n_cuts == 0 the stock n_cb encode
+    // path runs unchanged. Nodes are matched by pointer against each computed
+    // graph, so the schedule is NOT cleared after a graph_compute -- it stays in
+    // force across the splits of one decode (and the reused graph of later
+    // tokens) until the caller clears it.
+    int                    bsched_n_cuts;
+    struct ggml_tensor  ** bsched_cut_nodes;  // node ptrs; segment ends (signal after)
+    ggml_metal_event_t  *  bsched_sig_ev;     // per cut; NULL entry => no signal there
+    uint64_t *             bsched_sig_val;
+    int                    bsched_n_waits;
+    struct ggml_tensor  ** bsched_wait_nodes; // node ptrs; segment starts (wait before)
+    ggml_metal_event_t  *  bsched_wait_ev;
+    uint64_t *             bsched_wait_val;
+
+    // Encode window over the paged path (PERSISTENT + pointer-keyed, like the
+    // boundary schedule above; see ggml_metal_set_encode_window). While set,
+    // ggml_metal_graph_compute_paged encodes only the segments intersecting
+    // [first_node, last_node] and moves the boundary activation through the
+    // blit tensor pairs: in_src -> in_dst before the first encoded segment,
+    // out_src -> out_dst after the last. Raw pointers only, nothing owned.
+    bool                   ewin_active;
+    struct ggml_tensor  *  ewin_first_node;
+    struct ggml_tensor  *  ewin_last_node;
+    struct ggml_tensor  *  ewin_blit_in_src;
+    struct ggml_tensor  *  ewin_blit_in_dst;
+    struct ggml_tensor  *  ewin_blit_out_src;
+    struct ggml_tensor  *  ewin_blit_out_dst;
 };
+
+// Boundary-event schedule helpers (definitions below).
+static void             ggml_metal_bsched_clear        (ggml_metal_t ctx);
+static enum ggml_status ggml_metal_graph_compute_paged (ggml_metal_t ctx, struct ggml_cgraph * gf);
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     GGML_LOG_INFO("%s: allocating\n", __func__);
@@ -223,6 +257,8 @@ void ggml_metal_free(ggml_metal_t ctx) {
 
     Block_release(ctx->encode_async);
 
+    ggml_metal_bsched_clear(ctx);
+
     //[ctx->queue release]; // [TAG_QUEUE_PER_BACKEND]
 
     dispatch_release(ctx->d_queue);
@@ -234,6 +270,10 @@ void ggml_metal_free(ggml_metal_t ctx) {
 
 const char * ggml_metal_get_name(ggml_metal_t ctx) {
     return ctx->name;
+}
+
+ggml_metal_device_t ggml_metal_get_device(ggml_metal_t ctx) {
+    return ctx->dev;
 }
 
 void ggml_metal_synchronize(ggml_metal_t ctx) {
@@ -435,10 +475,325 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
+// ---------------------------------------------------------------------------
+// paged-decode boundary-event schedule
+// ---------------------------------------------------------------------------
+
+static void ggml_metal_bsched_clear(ggml_metal_t ctx) {
+    free(ctx->bsched_cut_nodes);
+    free(ctx->bsched_sig_ev);
+    free(ctx->bsched_sig_val);
+    free(ctx->bsched_wait_nodes);
+    free(ctx->bsched_wait_ev);
+    free(ctx->bsched_wait_val);
+    ctx->bsched_cut_nodes  = NULL;
+    ctx->bsched_sig_ev     = NULL;
+    ctx->bsched_sig_val    = NULL;
+    ctx->bsched_wait_nodes = NULL;
+    ctx->bsched_wait_ev    = NULL;
+    ctx->bsched_wait_val   = NULL;
+    ctx->bsched_n_cuts     = 0;
+    ctx->bsched_n_waits    = 0;
+}
+
+void ggml_metal_set_boundary_schedule(
+        ggml_metal_t ctx,
+        int n_cuts,  struct ggml_tensor * const * cut_nodes,  ggml_metal_event_t * sig_ev, const uint64_t * sig_val,
+        int n_waits, struct ggml_tensor * const * wait_nodes, ggml_metal_event_t * wait_ev, const uint64_t * wait_val) {
+    ggml_metal_bsched_clear(ctx);
+    if (n_cuts <= 0) {
+        return; // cleared -> subsequent computes take the stock n_cb path
+    }
+
+    ctx->bsched_n_cuts    = n_cuts;
+    ctx->bsched_cut_nodes = malloc(sizeof(struct ggml_tensor *) * n_cuts);
+    ctx->bsched_sig_ev    = malloc(sizeof(ggml_metal_event_t) * n_cuts);
+    ctx->bsched_sig_val   = malloc(sizeof(uint64_t) * n_cuts);
+    memcpy(ctx->bsched_cut_nodes, cut_nodes, sizeof(struct ggml_tensor *) * n_cuts);
+    memcpy(ctx->bsched_sig_ev,    sig_ev,    sizeof(ggml_metal_event_t) * n_cuts);
+    memcpy(ctx->bsched_sig_val,   sig_val,   sizeof(uint64_t) * n_cuts);
+
+    if (n_waits > 0) {
+        ctx->bsched_n_waits    = n_waits;
+        ctx->bsched_wait_nodes = malloc(sizeof(struct ggml_tensor *) * n_waits);
+        ctx->bsched_wait_ev    = malloc(sizeof(ggml_metal_event_t) * n_waits);
+        ctx->bsched_wait_val   = malloc(sizeof(uint64_t) * n_waits);
+        memcpy(ctx->bsched_wait_nodes, wait_nodes, sizeof(struct ggml_tensor *) * n_waits);
+        memcpy(ctx->bsched_wait_ev,    wait_ev,    sizeof(ggml_metal_event_t) * n_waits);
+        memcpy(ctx->bsched_wait_val,   wait_val,   sizeof(uint64_t) * n_waits);
+    }
+}
+
+// The banded-prefill encode window. Endpoints delimit the encoded node range
+// INCLUSIVE and are matched by pointer against each computed graph, exactly
+// like the boundary schedule's cut/wait nodes: on a graph containing neither
+// endpoint (another split of the same decode) the window does not apply and
+// the full graph encodes. Blit pairs are optional (both-or-neither); their
+// byte sizes must match because the blit copies the src's full extent onto
+// the dst's allocation.
+void ggml_metal_set_encode_window(
+        ggml_metal_t ctx,
+        struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
+        struct ggml_tensor * blit_in_src, struct ggml_tensor * blit_in_dst,
+        struct ggml_tensor * blit_out_src, struct ggml_tensor * blit_out_dst) {
+    GGML_ASSERT(first_node != NULL && last_node != NULL);
+    GGML_ASSERT((blit_in_src  == NULL) == (blit_in_dst  == NULL));
+    GGML_ASSERT((blit_out_src == NULL) == (blit_out_dst == NULL));
+    if (blit_in_src != NULL) {
+        GGML_ASSERT(ggml_nbytes(blit_in_src) == ggml_nbytes(blit_in_dst));
+    }
+    if (blit_out_src != NULL) {
+        GGML_ASSERT(ggml_nbytes(blit_out_src) == ggml_nbytes(blit_out_dst));
+    }
+
+    ctx->ewin_active       = true;
+    ctx->ewin_first_node   = first_node;
+    ctx->ewin_last_node    = last_node;
+    ctx->ewin_blit_in_src  = blit_in_src;
+    ctx->ewin_blit_in_dst  = blit_in_dst;
+    ctx->ewin_blit_out_src = blit_out_src;
+    ctx->ewin_blit_out_dst = blit_out_dst;
+}
+
+void ggml_metal_clear_encode_window(ggml_metal_t ctx) {
+    ctx->ewin_active       = false;
+    ctx->ewin_first_node   = NULL;
+    ctx->ewin_last_node    = NULL;
+    ctx->ewin_blit_in_src  = NULL;
+    ctx->ewin_blit_in_dst  = NULL;
+    ctx->ewin_blit_out_src = NULL;
+    ctx->ewin_blit_out_dst = NULL;
+}
+
+// One full-tensor blit between two resident tensors, encoded into the given
+// command buffer -- the transport for the encode window's boundary
+// activation (device-side copy, no host round trip).
+static void ggml_metal_ewin_blit(id<MTLCommandBuffer> cmd_buf, const struct ggml_tensor * src, const struct ggml_tensor * dst) {
+    struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(src);
+    struct ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(dst);
+    GGML_ASSERT(bid_src.metal != nil);
+    GGML_ASSERT(bid_dst.metal != nil);
+
+    id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+    [encoder copyFromBuffer:bid_src.metal
+               sourceOffset:bid_src.offs
+                   toBuffer:bid_dst.metal
+          destinationOffset:bid_dst.offs
+                       size:ggml_nbytes(src)];
+    [encoder endEncoding];
+}
+
+// Sequential per-boundary-committed encode (see ggml_metal_set_boundary_schedule).
+// Runs on the calling thread with NO dispatch_apply: deterministic submit order
+// is what makes the cross-command-buffer event signals monotonic and the waits
+// land on the right segment. Async like the stock path -- failures surface at
+// the next ggml_metal_synchronize (which drains cmd_bufs_ext), not here.
+static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    const int n_nodes = gf->n_nodes;
+
+    // The schedule persists (pointer-keyed; NOT cleared here) -- see
+    // ggml_metal_set_boundary_schedule. Cuts/waits are matched by node POINTER
+    // against THIS graph, which may be one split of a multi-split decode.
+    const int                    n_cuts     = ctx->bsched_n_cuts;
+    struct ggml_tensor ** const  cut_nodes  = ctx->bsched_cut_nodes;
+    ggml_metal_event_t * const   sig_ev     = ctx->bsched_sig_ev;
+    const uint64_t     * const   sig_val    = ctx->bsched_sig_val;
+    const int                    n_waits    = ctx->bsched_n_waits;
+    struct ggml_tensor ** const  wait_nodes = ctx->bsched_wait_nodes;
+    ggml_metal_event_t * const   wait_ev    = ctx->bsched_wait_ev;
+    const uint64_t     * const   wait_val   = ctx->bsched_wait_val;
+
+    @autoreleasepool {
+        ctx->gf = gf;
+
+        // keep the memory wired (mirrors the stock graph_compute)
+        ggml_metal_device_rsets_keep_alive(ctx->dev);
+
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+
+        // Per-node flags: which of THIS graph's nodes are cut ends / wait starts
+        // (a schedule node not present in this graph simply never matches). One
+        // pass over the graph, O(n_nodes * (n_cuts + n_waits)) -- both schedule
+        // sizes are ~n_layer, negligible next to the encode itself.
+        bool * is_cut  = (bool *) calloc((size_t) n_nodes, sizeof(bool));
+        bool * is_wait = (bool *) calloc((size_t) n_nodes, sizeof(bool));
+        for (int i = 0; i < n_nodes; ++i) {
+            struct ggml_tensor * node = gf->nodes[i];
+            for (int c = 0; c < n_cuts; ++c) {
+                if (cut_nodes[c] == node) { is_cut[i] = true; break; }
+            }
+            for (int w = 0; w < n_waits; ++w) {
+                if (wait_nodes[w] == node) { is_wait[i] = true; break; }
+            }
+        }
+
+        // Sorted-unique segment START indices: 0, every (cut index + 1), and
+        // every wait index (each in (0, n_nodes)). Consecutive starts delimit
+        // the segments; the last segment ends at n_nodes.
+        const int cap = 2 * n_nodes + 2;
+        int * starts = (int *) malloc(sizeof(int) * (size_t) cap);
+        int n_starts = 0;
+        starts[n_starts++] = 0;
+        for (int i = 0; i < n_nodes; ++i) {
+            if (is_cut[i] && i + 1 < n_nodes) { starts[n_starts++] = i + 1; }
+            if (is_wait[i] && i > 0)          { starts[n_starts++] = i;     }
+        }
+        // insertion sort (n_starts is small, ~2*n_layer) + dedup in place
+        for (int a = 1; a < n_starts; ++a) {
+            const int key = starts[a];
+            int b = a - 1;
+            while (b >= 0 && starts[b] > key) { starts[b + 1] = starts[b]; --b; }
+            starts[b + 1] = key;
+        }
+        int m = 0;
+        for (int a = 0; a < n_starts; ++a) {
+            if (a == 0 || starts[a] != starts[a - 1]) { starts[m++] = starts[a]; }
+        }
+        n_starts = m;
+
+        // Resolve the encode window against THIS graph. Both endpoints must
+        // be present (a graph with neither is another split the window does
+        // not restrict; requiring both keeps a half-matching graph loud via
+        // the ordering assert instead of silently mis-windowed).
+        int  window_lo      = 0;
+        int  window_hi      = n_nodes - 1;
+        bool window_applies = false;
+        if (ctx->ewin_active) {
+            int idx_first = -1;
+            int idx_last  = -1;
+            for (int i = 0; i < n_nodes; ++i) {
+                if (gf->nodes[i] == ctx->ewin_first_node) { idx_first = i; }
+                if (gf->nodes[i] == ctx->ewin_last_node)  { idx_last  = i; }
+            }
+            if (idx_first >= 0 || idx_last >= 0) {
+                GGML_ASSERT(idx_first >= 0 && idx_last >= idx_first);
+                window_applies = true;
+                window_lo      = idx_first;
+                window_hi      = idx_last;
+            }
+        }
+        bool window_entered = false;
+
+        // Encode each segment into its own command buffer, in order.
+        for (int seg = 0; seg < n_starts; ++seg) {
+            const int seg_start = starts[seg];
+            const int seg_end   = (seg + 1 < n_starts) ? starts[seg + 1] : n_nodes;
+            if (seg_end <= seg_start) {
+                continue;
+            }
+            // Outside the encode window: the segment's command buffer is
+            // never created, so neither its ops nor its schedule signals ever
+            // fire (the pager's per-step wait/signal values come from the
+            // same frozen plan, so it never waits on a skipped layer).
+            if (window_applies && (seg_end <= window_lo || seg_start > window_hi)) {
+                continue;
+            }
+            const bool window_first = window_applies && !window_entered;
+            const bool window_last  = window_applies && seg_start <= window_hi && seg_end > window_hi;
+            window_entered = true;
+
+            id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+            [cmd_buf retain];
+            [cmd_buf enqueue]; // reserve the queue slot so execution order == creation order
+
+            // Waits BEFORE this segment's ops. The segment begins exactly at a
+            // wait node (every wait node was injected as a segment start); more
+            // than one schedule wait can target the same node (a layer's K and V
+            // regions sharing a first-reader), so emit ALL that match.
+            if (is_wait[seg_start]) {
+                struct ggml_tensor * node = gf->nodes[seg_start];
+                for (int w = 0; w < n_waits; ++w) {
+                    if (wait_nodes[w] == node && wait_ev[w] != NULL) {
+                        ggml_metal_event_encode_wait_value(wait_ev[w], (ggml_metal_cmd_buf_t) cmd_buf, wait_val[w]);
+                    }
+                }
+            }
+
+            // Window entry: deliver the boundary activation into its
+            // producer's allocation before the first encoded segment's ops
+            // read it. After the schedule waits (the blit must not outrun an
+            // admit gate) and before the compute encoder.
+            if (window_first && ctx->ewin_blit_in_src != NULL) {
+                ggml_metal_ewin_blit(cmd_buf, ctx->ewin_blit_in_src, ctx->ewin_blit_in_dst);
+            }
+
+            // Encode nodes [seg_start, seg_end) with fusion (one ggml_metal_op),
+            // exactly as the stock encode_async does over its slice.
+            ggml_metal_op_t op = ggml_metal_op_init(
+                ctx->dev,
+                (ggml_metal_cmd_buf_t) cmd_buf,
+                gf,
+                seg_start,
+                seg_end,
+                ctx->use_fusion,
+                ctx->use_concurrency,
+                false, // capture unsupported on the paged path
+                ctx->debug_graph,
+                ctx->debug_fusion);
+
+            for (int idx = 0; idx < ggml_metal_op_n_nodes(op); ++idx) {
+                const int r = ggml_metal_op_encode(op, idx);
+                if (r == 0) {
+                    break;
+                }
+                idx += r - 1;
+            }
+
+            ggml_metal_op_free(op);
+
+            // Window exit: capture the boundary activation after the last
+            // encoded segment's ops produced it. In-order queue => this blit
+            // completes before any later compute that re-enters the window
+            // blits it back in.
+            if (window_last && ctx->ewin_blit_out_src != NULL) {
+                ggml_metal_ewin_blit(cmd_buf, ctx->ewin_blit_out_src, ctx->ewin_blit_out_dst);
+            }
+
+            // Signals AFTER this segment (it ends at seg_end-1, a cut node).
+            const int seg_last = seg_end - 1;
+            if (is_cut[seg_last]) {
+                struct ggml_tensor * node = gf->nodes[seg_last];
+                for (int c = 0; c < n_cuts; ++c) {
+                    if (cut_nodes[c] == node && sig_ev[c] != NULL) {
+                        // Signal on COMPLETION (not mid-stream): a host reclaim
+                        // thread waits this to spill the just-written KV to disk,
+                        // and must see coherent shared-storage bytes (see
+                        // ggml_metal_event_signal_on_complete's doc).
+                        ggml_metal_event_signal_on_complete(sig_ev[c], (ggml_metal_cmd_buf_t) cmd_buf, sig_val[c]);
+                    }
+                }
+            }
+
+            [cmd_buf commit];
+
+            // Hand ownership to cmd_bufs_ext (drained by ggml_metal_synchronize,
+            // once per token) and track the last buffer for synchronize's wait.
+            [ctx->cmd_bufs_ext addObject:cmd_buf];
+            ctx->cmd_buf_last = cmd_buf;
+        }
+
+        free(starts);
+        free(is_cut);
+        free(is_wait);
+    }
+
+    // Persistent: do NOT clear the schedule here -- it stays in force for the
+    // remaining splits of this decode and the reused graph of later tokens,
+    // until the caller clears it (set_boundary_schedule with n_cuts == 0).
+    return GGML_STATUS_SUCCESS;
+}
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_FAILED;
+    }
+
+    // While a (persistent) paged-decode schedule is set, divert to the
+    // sequential per-boundary-committed encode with event signal/wait. It stays
+    // in force until the caller clears it, so it covers every split of a decode.
+    if (ctx->bsched_n_cuts > 0) {
+        return ggml_metal_graph_compute_paged(ctx, gf);
     }
 
     // number of nodes encoded by the main thread (empirically determined)

@@ -1008,6 +1008,45 @@ void ggml_metal_event_encode_wait(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cm
     [cmd_buf encodeWaitForEvent:event value:atomic_load_explicit(&ev->value, memory_order_relaxed)];
 }
 
+void ggml_metal_event_encode_signal_value(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw, uint64_t value) {
+    id<MTLSharedEvent>   event   = (id<MTLSharedEvent>)   ev->obj;
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+
+    [cmd_buf encodeSignalEvent:event value:value];
+}
+
+void ggml_metal_event_signal_on_complete(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw, uint64_t value) {
+    id<MTLSharedEvent>   event   = (id<MTLSharedEvent>)   ev->obj;
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull unused) {
+        (void) unused;
+        event.signaledValue = value;
+    }];
+}
+
+void ggml_metal_event_encode_wait_value(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw, uint64_t value) {
+    id<MTLSharedEvent>   event   = (id<MTLSharedEvent>)   ev->obj;
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+
+    [cmd_buf encodeWaitForEvent:event value:value];
+}
+
+void ggml_metal_event_host_signal(ggml_metal_event_t ev, uint64_t value) {
+    id<MTLSharedEvent> event = (id<MTLSharedEvent>) ev->obj;
+    event.signaledValue = value;
+}
+
+bool ggml_metal_event_host_wait(ggml_metal_event_t ev, uint64_t value, uint64_t timeout_ms) {
+    id<MTLSharedEvent> event = (id<MTLSharedEvent>) ev->obj;
+    return [event waitUntilSignaledValue:value timeoutMS:timeout_ms];
+}
+
+uint64_t ggml_metal_event_host_value(ggml_metal_event_t ev) {
+    id<MTLSharedEvent> event = (id<MTLSharedEvent>) ev->obj;
+    return event.signaledValue;
+}
+
 ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev) {
     id<MTLSharedEvent> event = [dev->mtl_device newSharedEvent];
 

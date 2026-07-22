@@ -555,9 +555,6 @@ extern "C" {
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
-    // [titanium-chicken patch] Expose the context's backend scheduler so callers
-    // can enumerate per-backend compute buffer sizes via the public
-    // ggml_backend_sched_* API (memory-observability; see issue #59).
     LLAMA_API ggml_backend_sched_t       llama_get_sched   (struct llama_context * ctx);
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
