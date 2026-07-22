@@ -524,19 +524,24 @@ void ggml_metal_set_boundary_schedule(
     }
 }
 
-// The banded-prefill encode window. Endpoints delimit the encoded node range
-// INCLUSIVE and are matched by pointer against each computed graph, exactly
-// like the boundary schedule's cut/wait nodes: on a graph containing neither
-// endpoint (another split of the same decode) the window does not apply and
-// the full graph encodes. Blit pairs are optional (both-or-neither); their
-// byte sizes must match because the blit copies the src's full extent onto
-// the dst's allocation.
+// The banded-prefill encode window. `first_node` is the EXCLUSIVE lower
+// boundary (the band-entry residual -- its own segment is outside the
+// window) and `last_node` the INCLUSIVE upper boundary; either may be NULL
+// for an open edge (from split start / to split end). Endpoints are matched
+// by pointer against each computed graph and PROJECTED per split: a split
+// containing only the lower boundary windows to its end, one containing
+// only the upper windows from its start, and one containing neither
+// non-NULL endpoint encodes in full -- which is exactly what the
+// input-processing splits outside the trunk need (masks/positions must be
+// recomputed every tile). Blit pairs are optional (both-or-neither); each
+// fires only in the split where its boundary node matched, and byte sizes
+// must match because the blit copies the src's full extent onto the dst's
+// allocation.
 void ggml_metal_set_encode_window(
         ggml_metal_t ctx,
         struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
         struct ggml_tensor * blit_in_src, struct ggml_tensor * blit_in_dst,
         struct ggml_tensor * blit_out_src, struct ggml_tensor * blit_out_dst) {
-    GGML_ASSERT(first_node != NULL && last_node != NULL);
     GGML_ASSERT((blit_in_src  == NULL) == (blit_in_dst  == NULL));
     GGML_ASSERT((blit_out_src == NULL) == (blit_out_dst == NULL));
     if (blit_in_src != NULL) {
@@ -651,13 +656,16 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
         }
         n_starts = m;
 
-        // Resolve the encode window against THIS graph. Both endpoints must
-        // be present (a graph with neither is another split the window does
-        // not restrict; requiring both keeps a half-matching graph loud via
-        // the ordering assert instead of silently mis-windowed).
+        // Resolve the encode window against THIS split's graph (see
+        // ggml_metal_set_encode_window's doc for the per-split projection).
+        // `window_lo` is the first IN-window node index (the exclusive lower
+        // boundary's successor); blits fire only where their boundary node
+        // actually matched.
         int  window_lo      = 0;
         int  window_hi      = n_nodes - 1;
         bool window_applies = false;
+        bool blit_in_here   = false;
+        bool blit_out_here  = false;
         if (ctx->ewin_active) {
             int idx_first = -1;
             int idx_last  = -1;
@@ -665,11 +673,20 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
                 if (gf->nodes[i] == ctx->ewin_first_node) { idx_first = i; }
                 if (gf->nodes[i] == ctx->ewin_last_node)  { idx_last  = i; }
             }
-            if (idx_first >= 0 || idx_last >= 0) {
-                GGML_ASSERT(idx_first >= 0 && idx_last >= idx_first);
-                window_applies = true;
-                window_lo      = idx_first;
-                window_hi      = idx_last;
+            const bool first_open  = ctx->ewin_first_node == NULL;
+            const bool last_open   = ctx->ewin_last_node  == NULL;
+            const bool first_found = idx_first >= 0;
+            const bool last_found  = idx_last  >= 0;
+            if (first_found || last_found || first_open || last_open) {
+                if (first_found && last_found) {
+                    GGML_ASSERT(idx_last > idx_first);
+                }
+                window_applies = !(first_open && last_open) &&
+                                 (first_found || last_found);
+                window_lo     = first_found ? idx_first + 1 : 0;
+                window_hi     = last_found  ? idx_last      : n_nodes - 1;
+                blit_in_here  = first_found;
+                blit_out_here = last_found;
             }
         }
         bool window_entered = false;
@@ -713,7 +730,7 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             // producer's allocation before the first encoded segment's ops
             // read it. After the schedule waits (the blit must not outrun an
             // admit gate) and before the compute encoder.
-            if (window_first && ctx->ewin_blit_in_src != NULL) {
+            if (window_first && blit_in_here && ctx->ewin_blit_in_src != NULL) {
                 ggml_metal_ewin_blit(cmd_buf, ctx->ewin_blit_in_src, ctx->ewin_blit_in_dst);
             }
 
@@ -745,7 +762,7 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             // encoded segment's ops produced it. In-order queue => this blit
             // completes before any later compute that re-enters the window
             // blits it back in.
-            if (window_last && ctx->ewin_blit_out_src != NULL) {
+            if (window_last && blit_out_here && ctx->ewin_blit_out_src != NULL) {
                 ggml_metal_ewin_blit(cmd_buf, ctx->ewin_blit_out_src, ctx->ewin_blit_out_dst);
             }
 
