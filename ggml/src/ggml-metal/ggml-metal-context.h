@@ -31,6 +31,20 @@ void ggml_metal_event_wait  (ggml_metal_t ctx, ggml_metal_event_t ev);
 
 ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx);
 
+ggml_metal_device_t ggml_metal_get_device(ggml_metal_t ctx);
+
+void ggml_metal_set_boundary_schedule(
+        ggml_metal_t ctx,
+        int n_cuts,  struct ggml_tensor * const * cut_nodes,  ggml_metal_event_t * sig_ev, const uint64_t * sig_val,
+        int n_waits, struct ggml_tensor * const * wait_nodes, ggml_metal_event_t * wait_ev, const uint64_t * wait_val);
+
+void ggml_metal_set_encode_window(
+        ggml_metal_t ctx,
+        struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
+        struct ggml_tensor * blit_in_src, struct ggml_tensor * blit_in_dst,
+        struct ggml_tensor * blit_out_src, struct ggml_tensor * blit_out_dst);
+void ggml_metal_clear_encode_window(ggml_metal_t ctx);
+
 void ggml_metal_set_n_cb            (ggml_metal_t ctx, int n_cb);
 void ggml_metal_set_abort_callback  (ggml_metal_t ctx, ggml_abort_callback abort_callback, void * user_data);
 bool ggml_metal_supports_family     (ggml_metal_t ctx, int family);
