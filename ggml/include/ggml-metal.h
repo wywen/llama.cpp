@@ -70,6 +70,20 @@ GGML_BACKEND_API void ggml_backend_metal_set_boundary_schedule(
         int n_cuts,  struct ggml_tensor * const * cut_nodes,  ggml_metal_event_t * sig_ev,  const uint64_t * sig_val,
         int n_waits, struct ggml_tensor * const * wait_nodes, ggml_metal_event_t * wait_ev, const uint64_t * wait_val);
 
+// Restrict the boundary-scheduled (paged) compute path to the segments
+// intersecting the inclusive node range [first_node, last_node], with an
+// optional device-side blit of a boundary activation into the window before
+// its first segment (in_src -> in_dst) and out of it after its last
+// (out_src -> out_dst). Persistent and pointer-keyed like the boundary
+// schedule; a graph containing neither endpoint encodes in full. Only
+// meaningful while a boundary schedule is set.
+GGML_BACKEND_API void ggml_backend_metal_set_encode_window(
+        ggml_backend_t backend,
+        struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
+        struct ggml_tensor * blit_in_src, struct ggml_tensor * blit_in_dst,
+        struct ggml_tensor * blit_out_src, struct ggml_tensor * blit_out_dst);
+GGML_BACKEND_API void ggml_backend_metal_clear_encode_window(ggml_backend_t backend);
+
 #ifdef __cplusplus
 }
 #endif

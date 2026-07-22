@@ -668,6 +668,26 @@ void ggml_backend_metal_set_boundary_schedule(
     ggml_metal_set_boundary_schedule(ctx, n_cuts, cut_nodes, sig_ev, sig_val, n_waits, wait_nodes, wait_ev, wait_val);
 }
 
+void ggml_backend_metal_set_encode_window(
+        ggml_backend_t backend,
+        struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
+        struct ggml_tensor * blit_in_src, struct ggml_tensor * blit_in_dst,
+        struct ggml_tensor * blit_out_src, struct ggml_tensor * blit_out_dst) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    ggml_metal_set_encode_window(ctx, first_node, last_node, blit_in_src, blit_in_dst, blit_out_src, blit_out_dst);
+}
+
+void ggml_backend_metal_clear_encode_window(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    ggml_metal_clear_encode_window(ctx);
+}
+
 bool ggml_backend_metal_supports_family(ggml_backend_t backend, int family) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
 

@@ -95,6 +95,20 @@ struct ggml_metal {
     struct ggml_tensor  ** bsched_wait_nodes; // node ptrs; segment starts (wait before)
     ggml_metal_event_t  *  bsched_wait_ev;
     uint64_t *             bsched_wait_val;
+
+    // Encode window over the paged path (PERSISTENT + pointer-keyed, like the
+    // boundary schedule above; see ggml_metal_set_encode_window). While set,
+    // ggml_metal_graph_compute_paged encodes only the segments intersecting
+    // [first_node, last_node] and moves the boundary activation through the
+    // blit tensor pairs: in_src -> in_dst before the first encoded segment,
+    // out_src -> out_dst after the last. Raw pointers only, nothing owned.
+    bool                   ewin_active;
+    struct ggml_tensor  *  ewin_first_node;
+    struct ggml_tensor  *  ewin_last_node;
+    struct ggml_tensor  *  ewin_blit_in_src;
+    struct ggml_tensor  *  ewin_blit_in_dst;
+    struct ggml_tensor  *  ewin_blit_out_src;
+    struct ggml_tensor  *  ewin_blit_out_dst;
 };
 
 // Boundary-event schedule helpers (definitions below).
@@ -510,6 +524,65 @@ void ggml_metal_set_boundary_schedule(
     }
 }
 
+// The banded-prefill encode window. Endpoints delimit the encoded node range
+// INCLUSIVE and are matched by pointer against each computed graph, exactly
+// like the boundary schedule's cut/wait nodes: on a graph containing neither
+// endpoint (another split of the same decode) the window does not apply and
+// the full graph encodes. Blit pairs are optional (both-or-neither); their
+// byte sizes must match because the blit copies the src's full extent onto
+// the dst's allocation.
+void ggml_metal_set_encode_window(
+        ggml_metal_t ctx,
+        struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
+        struct ggml_tensor * blit_in_src, struct ggml_tensor * blit_in_dst,
+        struct ggml_tensor * blit_out_src, struct ggml_tensor * blit_out_dst) {
+    GGML_ASSERT(first_node != NULL && last_node != NULL);
+    GGML_ASSERT((blit_in_src  == NULL) == (blit_in_dst  == NULL));
+    GGML_ASSERT((blit_out_src == NULL) == (blit_out_dst == NULL));
+    if (blit_in_src != NULL) {
+        GGML_ASSERT(ggml_nbytes(blit_in_src) == ggml_nbytes(blit_in_dst));
+    }
+    if (blit_out_src != NULL) {
+        GGML_ASSERT(ggml_nbytes(blit_out_src) == ggml_nbytes(blit_out_dst));
+    }
+
+    ctx->ewin_active       = true;
+    ctx->ewin_first_node   = first_node;
+    ctx->ewin_last_node    = last_node;
+    ctx->ewin_blit_in_src  = blit_in_src;
+    ctx->ewin_blit_in_dst  = blit_in_dst;
+    ctx->ewin_blit_out_src = blit_out_src;
+    ctx->ewin_blit_out_dst = blit_out_dst;
+}
+
+void ggml_metal_clear_encode_window(ggml_metal_t ctx) {
+    ctx->ewin_active       = false;
+    ctx->ewin_first_node   = NULL;
+    ctx->ewin_last_node    = NULL;
+    ctx->ewin_blit_in_src  = NULL;
+    ctx->ewin_blit_in_dst  = NULL;
+    ctx->ewin_blit_out_src = NULL;
+    ctx->ewin_blit_out_dst = NULL;
+}
+
+// One full-tensor blit between two resident tensors, encoded into the given
+// command buffer -- the transport for the encode window's boundary
+// activation (device-side copy, no host round trip).
+static void ggml_metal_ewin_blit(id<MTLCommandBuffer> cmd_buf, const struct ggml_tensor * src, const struct ggml_tensor * dst) {
+    struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(src);
+    struct ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(dst);
+    GGML_ASSERT(bid_src.metal != nil);
+    GGML_ASSERT(bid_dst.metal != nil);
+
+    id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+    [encoder copyFromBuffer:bid_src.metal
+               sourceOffset:bid_src.offs
+                   toBuffer:bid_dst.metal
+          destinationOffset:bid_dst.offs
+                       size:ggml_nbytes(src)];
+    [encoder endEncoding];
+}
+
 // Sequential per-boundary-committed encode (see ggml_metal_set_boundary_schedule).
 // Runs on the calling thread with NO dispatch_apply: deterministic submit order
 // is what makes the cross-command-buffer event signals monotonic and the waits
@@ -578,6 +651,29 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
         }
         n_starts = m;
 
+        // Resolve the encode window against THIS graph. Both endpoints must
+        // be present (a graph with neither is another split the window does
+        // not restrict; requiring both keeps a half-matching graph loud via
+        // the ordering assert instead of silently mis-windowed).
+        int  window_lo      = 0;
+        int  window_hi      = n_nodes - 1;
+        bool window_applies = false;
+        if (ctx->ewin_active) {
+            int idx_first = -1;
+            int idx_last  = -1;
+            for (int i = 0; i < n_nodes; ++i) {
+                if (gf->nodes[i] == ctx->ewin_first_node) { idx_first = i; }
+                if (gf->nodes[i] == ctx->ewin_last_node)  { idx_last  = i; }
+            }
+            if (idx_first >= 0 || idx_last >= 0) {
+                GGML_ASSERT(idx_first >= 0 && idx_last >= idx_first);
+                window_applies = true;
+                window_lo      = idx_first;
+                window_hi      = idx_last;
+            }
+        }
+        bool window_entered = false;
+
         // Encode each segment into its own command buffer, in order.
         for (int seg = 0; seg < n_starts; ++seg) {
             const int seg_start = starts[seg];
@@ -585,6 +681,16 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             if (seg_end <= seg_start) {
                 continue;
             }
+            // Outside the encode window: the segment's command buffer is
+            // never created, so neither its ops nor its schedule signals ever
+            // fire (the pager's per-step wait/signal values come from the
+            // same frozen plan, so it never waits on a skipped layer).
+            if (window_applies && (seg_end <= window_lo || seg_start > window_hi)) {
+                continue;
+            }
+            const bool window_first = window_applies && !window_entered;
+            const bool window_last  = window_applies && seg_start <= window_hi && seg_end > window_hi;
+            window_entered = true;
 
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
@@ -601,6 +707,14 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
                         ggml_metal_event_encode_wait_value(wait_ev[w], (ggml_metal_cmd_buf_t) cmd_buf, wait_val[w]);
                     }
                 }
+            }
+
+            // Window entry: deliver the boundary activation into its
+            // producer's allocation before the first encoded segment's ops
+            // read it. After the schedule waits (the blit must not outrun an
+            // admit gate) and before the compute encoder.
+            if (window_first && ctx->ewin_blit_in_src != NULL) {
+                ggml_metal_ewin_blit(cmd_buf, ctx->ewin_blit_in_src, ctx->ewin_blit_in_dst);
             }
 
             // Encode nodes [seg_start, seg_end) with fusion (one ggml_metal_op),
@@ -626,6 +740,14 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             }
 
             ggml_metal_op_free(op);
+
+            // Window exit: capture the boundary activation after the last
+            // encoded segment's ops produced it. In-order queue => this blit
+            // completes before any later compute that re-enters the window
+            // blits it back in.
+            if (window_last && ctx->ewin_blit_out_src != NULL) {
+                ggml_metal_ewin_blit(cmd_buf, ctx->ewin_blit_out_src, ctx->ewin_blit_out_dst);
+            }
 
             // Signals AFTER this segment (it ends at seg_end-1, a cut node).
             const int seg_last = seg_end - 1;
