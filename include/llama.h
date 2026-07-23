@@ -64,6 +64,7 @@ extern "C" {
     struct llama_sampler;
 
     typedef struct llama_memory_i * llama_memory_t;
+    typedef struct llama_memory_cells_i * llama_memory_cells_t;
 
     typedef int32_t llama_pos;
     typedef int32_t llama_token;
@@ -772,6 +773,33 @@ extern "C" {
     LLAMA_API llama_pos llama_memory_seq_pos_max(
             llama_memory_t mem,
               llama_seq_id seq_id);
+
+    // Snapshot / restore a sequence's CELL METADATA (positions, sequence
+    // membership, slot-search cursor) without touching cell DATA.
+    //
+    // For a caller that submits the same ubatches more than once and needs
+    // every pass placed identically -- e.g. writing a graph's layers in
+    // several passes, one band at a time. Removing the span and re-submitting
+    // is not enough on its own: a windowed (SWA) cache RECYCLES cells as
+    // positions scroll out, so the first pass destroys earlier positions the
+    // next pass still needs, and the search cursor the removal rewinds to is
+    // unrelated to where the pass began.
+    //
+    // Metadata only: cell DATA is untouched, so passes writing disjoint layers
+    // still find each layer's data intact under the restored positions.
+    //
+    // Returns NULL for memory types that have no such state. The handle is
+    // owned by the caller -- release it with llama_memory_cells_free.
+    LLAMA_API llama_memory_cells_t llama_memory_cells_snapshot(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    LLAMA_API void llama_memory_cells_restore(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+      llama_memory_cells_t snap);
+
+    LLAMA_API void llama_memory_cells_free(llama_memory_cells_t snap);
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
