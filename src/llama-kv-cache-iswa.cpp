@@ -123,6 +123,33 @@ llama_pos llama_kv_cache_iswa::seq_pos_min(llama_seq_id seq_id) const {
     return kv_swa->seq_pos_min(seq_id);
 }
 
+llama_memory_cells_t llama_kv_cache_iswa::cells_snapshot(llama_seq_id seq_id) const {
+    auto * res = new llama_kv_cache_cells();
+
+    // Order matters: restore walks the entries in exactly this sequence.
+    kv_base->cells_snapshot_append(seq_id, *res);
+    kv_swa ->cells_snapshot_append(seq_id, *res);
+
+    return res;
+}
+
+void llama_kv_cache_iswa::cells_restore(llama_seq_id seq_id, const llama_memory_cells_i * snap) {
+    const auto * s = dynamic_cast<const llama_kv_cache_cells *>(snap);
+    if (!s) {
+        return;
+    }
+
+    // Both sub-caches or neither: a half-restored pair would leave the two
+    // searching from states that never coexisted.
+    if (s->entries.size() < 2) {
+        return;
+    }
+
+    size_t idx = 0;
+    kv_base->cells_restore_at(seq_id, *s, idx);
+    kv_swa ->cells_restore_at(seq_id, *s, idx);
+}
+
 llama_pos llama_kv_cache_iswa::seq_pos_max(llama_seq_id seq_id) const {
     return kv_swa->seq_pos_max(seq_id);
 }

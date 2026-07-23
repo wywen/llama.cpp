@@ -70,6 +70,14 @@ using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
 
 // general concept of LLM memory
 // the KV cache is a type of LLM memory, but there can be other types
+// Opaque owner of a sequence's saved cell metadata (see cells_snapshot).
+// Owned by the caller; release with llama_memory_cells_free.
+struct llama_memory_cells_i {
+    virtual ~llama_memory_cells_i() = default;
+};
+
+using llama_memory_cells_t = llama_memory_cells_i *;
+
 struct llama_memory_i {
     // this callback is used to filter out layers that should not be included in the cache
     using layer_filter_cb = std::function<bool(int32_t il)>;
@@ -115,6 +123,24 @@ struct llama_memory_i {
 
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
+
+    // Snapshot / restore a sequence's CELL METADATA (positions, sequence
+    // membership and the slot-search cursor) without touching cell DATA.
+    //
+    // Exists for a caller that submits the same ubatches more than once and
+    // needs every pass placed identically -- e.g. writing a graph's layers in
+    // several passes, one band of layers at a time. Removing the span and
+    // re-submitting does not achieve that on its own: a windowed cache
+    // RECYCLES cells as positions scroll out, so the first pass destroys
+    // earlier positions the next pass still needs, and the cursor the removal
+    // rewinds to is unrelated to where the pass began. Restoring the snapshot
+    // puts both back.
+    //
+    // Metadata only, by design: cell DATA is left alone, so a caller whose
+    // passes write disjoint layers still finds each layer's data intact under
+    // the restored positions.
+    virtual llama_memory_cells_t cells_snapshot(llama_seq_id /*seq_id*/) const { return nullptr; }
+    virtual void cells_restore(llama_seq_id /*seq_id*/, const llama_memory_cells_i * /*snap*/) {}
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 

@@ -678,6 +678,63 @@ llama_pos llama_kv_cache::seq_pos_min(llama_seq_id seq_id) const {
     return cells.seq_pos_min(seq_id);
 }
 
+void llama_kv_cache::cells_snapshot_append(llama_seq_id seq_id, llama_kv_cache_cells & out) const {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other) {
+        other->cells_snapshot_append(seq_id, out);
+        return;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    const uint32_t stream = seq_to_stream[seq_id];
+
+    out.entries.push_back({ v_cells[stream].cp(0, v_cells[stream].size()), v_heads[stream] });
+}
+
+void llama_kv_cache::cells_restore_at(llama_seq_id seq_id, const llama_kv_cache_cells & in, size_t & idx) {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other) {
+        other->cells_restore_at(seq_id, in, idx);
+        return;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    if (idx >= in.entries.size()) {
+        return;
+    }
+
+    const auto & e = in.entries[idx++];
+
+    const uint32_t stream = seq_to_stream[seq_id];
+
+    // A snapshot from a differently sized cache is not restorable here.
+    if (e.cells.size() != v_cells[stream].size()) {
+        return;
+    }
+
+    v_cells[stream].set(0, e.cells);
+    v_heads[stream] = e.head;
+}
+
+llama_memory_cells_t llama_kv_cache::cells_snapshot(llama_seq_id seq_id) const {
+    auto * res = new llama_kv_cache_cells();
+    cells_snapshot_append(seq_id, *res);
+
+    return res;
+}
+
+void llama_kv_cache::cells_restore(llama_seq_id seq_id, const llama_memory_cells_i * snap) {
+    const auto * s = dynamic_cast<const llama_kv_cache_cells *>(snap);
+    if (!s) {
+        return;
+    }
+
+    size_t idx = 0;
+    cells_restore_at(seq_id, *s, idx);
+}
+
 llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {

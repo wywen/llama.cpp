@@ -3917,6 +3917,31 @@ llama_pos llama_memory_seq_pos_max(
     return mem->seq_pos_max(seq_id);
 }
 
+llama_memory_cells_t llama_memory_cells_snapshot(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (!mem) {
+        return nullptr;
+    }
+
+    return mem->cells_snapshot(seq_id);
+}
+
+void llama_memory_cells_restore(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+  llama_memory_cells_t snap) {
+    if (!mem || !snap) {
+        return;
+    }
+
+    mem->cells_restore(seq_id, snap);
+}
+
+void llama_memory_cells_free(llama_memory_cells_t snap) {
+    delete snap;
+}
+
 bool llama_memory_can_shift(llama_memory_t mem) {
     if (!mem) {
         return false;
