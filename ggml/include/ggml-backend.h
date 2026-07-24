@@ -337,6 +337,14 @@ extern "C" {
     // `graph_size_changed` is true if the graph size changed since the last allocation
     typedef void (*ggml_backend_sched_realloc_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
+    // Per-graph-compute callback (set with ggml_backend_sched_set_graph_compute_callback).
+    // Fired exactly once per graph compute, after the graph has been split and allocated
+    // but before any split is encoded -- NOT per node, so it does not force the per-node
+    // dispatch loop that ggml_backend_sched_eval_callback does and therefore preserves op
+    // fusion. Intended for one-shot, whole-graph setup (e.g. installing a Metal boundary
+    // schedule) that needs the finalized graph but no per-node observation.
+    typedef void (*ggml_backend_sched_graph_compute_callback)(ggml_backend_sched_t sched, void * user_data);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
@@ -376,6 +384,7 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_graph_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_compute_callback callback, void * user_data);
 
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);

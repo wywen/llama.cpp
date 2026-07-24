@@ -1232,6 +1232,11 @@ struct ggml_backend_sched {
     ggml_backend_sched_realloc_callback callback_realloc;
     void * callback_realloc_user_data;
 
+    // Fired once per graph compute (after split/alloc, before encode). Preserves fusion
+    // because it is not per-node. Zero-initialized with the rest of the sched struct.
+    ggml_backend_sched_graph_compute_callback callback_graph;
+    void * callback_graph_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -2124,6 +2129,14 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+
+    // Fire the per-graph-compute callback once, now that the graph is split and
+    // allocated but before any split is encoded. Unlike callback_eval this does not
+    // run per node, so it does not disable op fusion. See ggml-backend.h.
+    if (sched->callback_graph) {
+        sched->callback_graph(sched, sched->callback_graph_user_data);
+    }
+
     struct ggml_backend_sched_split * splits = sched->splits;
 
     int prev_backend_id = -1;
@@ -2419,6 +2432,12 @@ void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_ba
     GGML_ASSERT(sched);
     sched->callback_realloc = callback;
     sched->callback_realloc_user_data = user_data;
+}
+
+void ggml_backend_sched_set_graph_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_compute_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_graph = callback;
+    sched->callback_graph_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
