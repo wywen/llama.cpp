@@ -2,6 +2,7 @@
 
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
+#import "ggml-metal.h"
 
 #import "ggml-metal-impl.h"
 #import "ggml-metal-common.h"
@@ -99,16 +100,16 @@ struct ggml_metal {
     // Encode window over the paged path (PERSISTENT + pointer-keyed, like the
     // boundary schedule above; see ggml_metal_set_encode_window). While set,
     // ggml_metal_graph_compute_paged encodes only the segments intersecting
-    // [first_node, last_node] and moves the boundary activation through the
-    // blit tensor pairs: in_src -> in_dst before the first encoded segment,
-    // out_src -> out_dst after the last. Raw pointers only, nothing owned.
-    bool                   ewin_active;
-    struct ggml_tensor  *  ewin_first_node;
-    struct ggml_tensor  *  ewin_last_node;
-    struct ggml_tensor  *  ewin_blit_in_src;
-    struct ggml_tensor  *  ewin_blit_in_dst;
-    struct ggml_tensor  *  ewin_blit_out_src;
-    struct ggml_tensor  *  ewin_blit_out_dst;
+    // [first_node, last_node] and moves boundary tensors through ordered ingress
+    // copies before the first encoded segment and egress copies after the last.
+    // Pair arrays are owned copies; the tensors remain caller-owned.
+    bool                                  ewin_active;
+    struct ggml_tensor                 *  ewin_first_node;
+    struct ggml_tensor                 *  ewin_last_node;
+    size_t                                ewin_n_ingress;
+    struct ggml_metal_tensor_copy_pair *  ewin_ingress;
+    size_t                                ewin_n_egress;
+    struct ggml_metal_tensor_copy_pair *  ewin_egress;
 };
 
 // Boundary-event schedule helpers (definitions below).
@@ -260,6 +261,7 @@ void ggml_metal_free(ggml_metal_t ctx) {
     Block_release(ctx->encode_async);
 
     ggml_metal_bsched_clear(ctx);
+    ggml_metal_clear_encode_window(ctx);
 
     //[ctx->queue release]; // [TAG_QUEUE_PER_BACKEND]
 
@@ -535,41 +537,63 @@ void ggml_metal_set_boundary_schedule(
 // only the upper windows from its start, and one containing neither
 // non-NULL endpoint encodes in full -- which is exactly what the
 // input-processing splits outside the trunk need (masks/positions must be
-// recomputed every tile). Blit pairs are optional (both-or-neither); each
-// fires only in the split where its boundary node matched, and byte sizes
-// must match because the blit copies the src's full extent onto the dst's
-// allocation.
+// recomputed every tile). Ordered ingress and egress copies fire only in the
+// split where their boundary node matched. Every pair must contain two tensors
+// of equal byte size because each blit copies the src's full extent onto the
+// dst's allocation. The context owns copies of the pair arrays, not the tensors.
 void ggml_metal_set_encode_window(
         ggml_metal_t ctx,
         struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
-        struct ggml_tensor * blit_in_src, struct ggml_tensor * blit_in_dst,
-        struct ggml_tensor * blit_out_src, struct ggml_tensor * blit_out_dst) {
-    GGML_ASSERT((blit_in_src  == NULL) == (blit_in_dst  == NULL));
-    GGML_ASSERT((blit_out_src == NULL) == (blit_out_dst == NULL));
-    if (blit_in_src != NULL) {
-        GGML_ASSERT(ggml_nbytes(blit_in_src) == ggml_nbytes(blit_in_dst));
+        size_t n_ingress, const struct ggml_metal_tensor_copy_pair * ingress,
+        size_t n_egress,  const struct ggml_metal_tensor_copy_pair * egress) {
+    GGML_ASSERT(n_ingress == 0 || ingress != NULL);
+    GGML_ASSERT(n_egress  == 0 || egress  != NULL);
+    GGML_ASSERT(n_ingress <= SIZE_MAX / sizeof(*ingress));
+    GGML_ASSERT(n_egress  <= SIZE_MAX / sizeof(*egress));
+    for (size_t i = 0; i < n_ingress; ++i) {
+        GGML_ASSERT(ingress[i].src != NULL);
+        GGML_ASSERT(ingress[i].dst != NULL);
+        GGML_ASSERT(ggml_nbytes(ingress[i].src) == ggml_nbytes(ingress[i].dst));
     }
-    if (blit_out_src != NULL) {
-        GGML_ASSERT(ggml_nbytes(blit_out_src) == ggml_nbytes(blit_out_dst));
+    for (size_t i = 0; i < n_egress; ++i) {
+        GGML_ASSERT(egress[i].src != NULL);
+        GGML_ASSERT(egress[i].dst != NULL);
+        GGML_ASSERT(ggml_nbytes(egress[i].src) == ggml_nbytes(egress[i].dst));
     }
 
-    ctx->ewin_active       = true;
-    ctx->ewin_first_node   = first_node;
-    ctx->ewin_last_node    = last_node;
-    ctx->ewin_blit_in_src  = blit_in_src;
-    ctx->ewin_blit_in_dst  = blit_in_dst;
-    ctx->ewin_blit_out_src = blit_out_src;
-    ctx->ewin_blit_out_dst = blit_out_dst;
+    struct ggml_metal_tensor_copy_pair * ingress_copy = NULL;
+    struct ggml_metal_tensor_copy_pair * egress_copy  = NULL;
+    if (n_ingress > 0) {
+        ingress_copy = malloc(sizeof(*ingress_copy) * n_ingress);
+        GGML_ASSERT(ingress_copy != NULL);
+        memcpy(ingress_copy, ingress, sizeof(*ingress_copy) * n_ingress);
+    }
+    if (n_egress > 0) {
+        egress_copy = malloc(sizeof(*egress_copy) * n_egress);
+        GGML_ASSERT(egress_copy != NULL);
+        memcpy(egress_copy, egress, sizeof(*egress_copy) * n_egress);
+    }
+
+    ggml_metal_clear_encode_window(ctx);
+    ctx->ewin_active     = true;
+    ctx->ewin_first_node = first_node;
+    ctx->ewin_last_node  = last_node;
+    ctx->ewin_n_ingress  = n_ingress;
+    ctx->ewin_ingress    = ingress_copy;
+    ctx->ewin_n_egress   = n_egress;
+    ctx->ewin_egress     = egress_copy;
 }
 
 void ggml_metal_clear_encode_window(ggml_metal_t ctx) {
-    ctx->ewin_active       = false;
-    ctx->ewin_first_node   = NULL;
-    ctx->ewin_last_node    = NULL;
-    ctx->ewin_blit_in_src  = NULL;
-    ctx->ewin_blit_in_dst  = NULL;
-    ctx->ewin_blit_out_src = NULL;
-    ctx->ewin_blit_out_dst = NULL;
+    free(ctx->ewin_ingress);
+    free(ctx->ewin_egress);
+    ctx->ewin_active     = false;
+    ctx->ewin_first_node = NULL;
+    ctx->ewin_last_node  = NULL;
+    ctx->ewin_n_ingress  = 0;
+    ctx->ewin_ingress    = NULL;
+    ctx->ewin_n_egress   = 0;
+    ctx->ewin_egress     = NULL;
 }
 
 // One full-tensor blit between two resident tensors, encoded into the given
@@ -732,8 +756,10 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             // producer's allocation before the first encoded segment's ops
             // read it. After the schedule waits (the blit must not outrun an
             // admit gate) and before the compute encoder.
-            if (window_first && blit_in_here && ctx->ewin_blit_in_src != NULL) {
-                ggml_metal_ewin_blit(cmd_buf, ctx->ewin_blit_in_src, ctx->ewin_blit_in_dst);
+            if (window_first && blit_in_here) {
+                for (size_t i = 0; i < ctx->ewin_n_ingress; ++i) {
+                    ggml_metal_ewin_blit(cmd_buf, ctx->ewin_ingress[i].src, ctx->ewin_ingress[i].dst);
+                }
             }
 
             // Encode nodes [seg_start, seg_end) with fusion (one ggml_metal_op),
@@ -764,8 +790,10 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             // encoded segment's ops produced it. In-order queue => this blit
             // completes before any later compute that re-enters the window
             // blits it back in.
-            if (window_last && blit_out_here && ctx->ewin_blit_out_src != NULL) {
-                ggml_metal_ewin_blit(cmd_buf, ctx->ewin_blit_out_src, ctx->ewin_blit_out_dst);
+            if (window_last && blit_out_here) {
+                for (size_t i = 0; i < ctx->ewin_n_egress; ++i) {
+                    ggml_metal_ewin_blit(cmd_buf, ctx->ewin_egress[i].src, ctx->ewin_egress[i].dst);
+                }
             }
 
             // Signals AFTER this segment (it ends at seg_end-1, a cut node).

@@ -11,6 +11,7 @@ extern "C" {
 //
 
 typedef struct ggml_metal * ggml_metal_t;
+struct ggml_metal_tensor_copy_pair;
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev);
 void ggml_metal_free(ggml_metal_t ctx);
@@ -41,8 +42,8 @@ void ggml_metal_set_boundary_schedule(
 void ggml_metal_set_encode_window(
         ggml_metal_t ctx,
         struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
-        struct ggml_tensor * blit_in_src, struct ggml_tensor * blit_in_dst,
-        struct ggml_tensor * blit_out_src, struct ggml_tensor * blit_out_dst);
+        size_t n_ingress, const struct ggml_metal_tensor_copy_pair * ingress,
+        size_t n_egress,  const struct ggml_metal_tensor_copy_pair * egress);
 void ggml_metal_clear_encode_window(ggml_metal_t ctx);
 
 void ggml_metal_set_n_cb            (ggml_metal_t ctx, int n_cb);
