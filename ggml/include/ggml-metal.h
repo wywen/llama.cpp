@@ -58,6 +58,11 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
 typedef struct ggml_metal_event * ggml_metal_event_t;
 
+struct ggml_metal_tensor_copy_pair {
+    struct ggml_tensor * src;
+    struct ggml_tensor * dst;
+};
+
 GGML_BACKEND_API ggml_metal_event_t ggml_backend_metal_event_init(ggml_backend_t backend);
 GGML_BACKEND_API void               ggml_backend_metal_event_free(ggml_backend_t backend, ggml_metal_event_t ev);
 
@@ -73,18 +78,18 @@ GGML_BACKEND_API void ggml_backend_metal_set_boundary_schedule(
 // Restrict the boundary-scheduled (paged) compute path to the node range
 // (first_node, last_node] -- lower boundary EXCLUSIVE (pass the band-entry
 // residual node itself), upper INCLUSIVE, either NULL for an open edge --
-// with an optional device-side blit of a boundary activation into the
-// window before its first segment (in_src -> in_dst, fired in the split
-// where first_node matched) and out of it after its last (out_src ->
-// out_dst, fired where last_node matched). Persistent and pointer-keyed
-// like the boundary schedule, projected per split: a split containing
-// neither non-NULL boundary encodes in full. Only meaningful while a
-// boundary schedule is set.
+// with ordered device-side tensor copies at window entry (fired in the split
+// where first_node matched) and exit (fired where last_node matched). The pair
+// arrays are copied and owned by the Metal context until replaced or cleared.
+// Each pair must contain non-NULL tensors with equal byte sizes.
+// Persistent and pointer-keyed like the boundary schedule, projected per split:
+// a split containing neither non-NULL boundary encodes in full. Only meaningful
+// while a boundary schedule is set.
 GGML_BACKEND_API void ggml_backend_metal_set_encode_window(
         ggml_backend_t backend,
         struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
-        struct ggml_tensor * blit_in_src, struct ggml_tensor * blit_in_dst,
-        struct ggml_tensor * blit_out_src, struct ggml_tensor * blit_out_dst);
+        size_t n_ingress, const struct ggml_metal_tensor_copy_pair * ingress,
+        size_t n_egress,  const struct ggml_metal_tensor_copy_pair * egress);
 GGML_BACKEND_API void ggml_backend_metal_clear_encode_window(ggml_backend_t backend);
 
 #ifdef __cplusplus
