@@ -103,6 +103,13 @@ struct ggml_metal {
     // [first_node, last_node] and moves boundary tensors through ordered ingress
     // copies before the first encoded segment and egress copies after the last.
     // Pair arrays are owned copies; the tensors remain caller-owned.
+    //
+    // ewin_out_of_band is the caller's assertion of which FULL-GRAPH nodes lie
+    // outside the active band. It is not used to select what to encode -- it is
+    // a guard: any split that would encode one of these nodes is rejected before
+    // a single command buffer exists (see ggml_metal_ewin_split_is_in_band).
+    // Empty (the default) makes the guard vacuous and the path byte-identical to
+    // one compiled without it. Owned copy of the array; nodes stay caller-owned.
     bool                                  ewin_active;
     struct ggml_tensor                 *  ewin_first_node;
     struct ggml_tensor                 *  ewin_last_node;
@@ -110,6 +117,8 @@ struct ggml_metal {
     struct ggml_metal_tensor_copy_pair *  ewin_ingress;
     size_t                                ewin_n_egress;
     struct ggml_metal_tensor_copy_pair *  ewin_egress;
+    size_t                                ewin_n_out_of_band;
+    struct ggml_tensor                 ** ewin_out_of_band;
 };
 
 // Boundary-event schedule helpers (definitions below).
@@ -539,15 +548,35 @@ void ggml_metal_set_boundary_schedule(
 // split where their boundary node matched. Every pair must contain two tensors
 // of equal byte size because each blit copies the src's full extent onto the
 // dst's allocation. The context owns copies of the pair arrays, not the tensors.
+//
+// `out_of_band` closes the hole that per-split projection leaves open. Because
+// the window is resolved per split, a split holding NEITHER non-NULL endpoint
+// gets window_applies == false and encodes in full -- intended for the
+// input-processing splits, but indistinguishable from a TRUNK split that fell
+// after the boundary split and whose nodes are all out of band. The caller
+// therefore names the full-graph nodes it asserts lie OUTSIDE the active band
+// (titanium-chicken passes each out-of-band layer's `l_out-<il>` marker) and
+// ggml_metal_graph_compute_paged refuses -- with GGML_STATUS_FAILED, before any
+// command buffer is created -- to submit a split that would encode one of them.
+// The invariant enforced is: no submitted split may ever encode a node that
+// lies outside the active band. This is a GUARD, not a selector: it never
+// changes which segments are encoded, only whether the split is submitted at
+// all. Matching is by pointer against each computed graph, so a named node
+// absent from a split simply never fires. Pass n_out_of_band == 0 (the default
+// for every non-banded caller) and the guard is vacuous. The context owns a
+// copy of the array; the nodes remain caller-owned.
 void ggml_metal_set_encode_window(
         ggml_metal_t ctx,
         struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
-        size_t n_ingress, const struct ggml_metal_tensor_copy_pair * ingress,
-        size_t n_egress,  const struct ggml_metal_tensor_copy_pair * egress) {
-    GGML_ASSERT(n_ingress == 0 || ingress != NULL);
-    GGML_ASSERT(n_egress  == 0 || egress  != NULL);
-    GGML_ASSERT(n_ingress <= SIZE_MAX / sizeof(*ingress));
-    GGML_ASSERT(n_egress  <= SIZE_MAX / sizeof(*egress));
+        size_t n_ingress,     const struct ggml_metal_tensor_copy_pair * ingress,
+        size_t n_egress,      const struct ggml_metal_tensor_copy_pair * egress,
+        size_t n_out_of_band, struct ggml_tensor * const * out_of_band) {
+    GGML_ASSERT(n_ingress     == 0 || ingress     != NULL);
+    GGML_ASSERT(n_egress      == 0 || egress      != NULL);
+    GGML_ASSERT(n_out_of_band == 0 || out_of_band != NULL);
+    GGML_ASSERT(n_ingress     <= SIZE_MAX / sizeof(*ingress));
+    GGML_ASSERT(n_egress      <= SIZE_MAX / sizeof(*egress));
+    GGML_ASSERT(n_out_of_band <= SIZE_MAX / sizeof(*out_of_band));
     for (size_t i = 0; i < n_ingress; ++i) {
         GGML_ASSERT(ingress[i].src != NULL);
         GGML_ASSERT(ingress[i].dst != NULL);
@@ -558,9 +587,15 @@ void ggml_metal_set_encode_window(
         GGML_ASSERT(egress[i].dst != NULL);
         GGML_ASSERT(ggml_nbytes(egress[i].src) == ggml_nbytes(egress[i].dst));
     }
+    for (size_t i = 0; i < n_out_of_band; ++i) {
+        // A NULL entry would silently match nothing and quietly weaken the
+        // guard, so reject it at the door rather than at encode time.
+        GGML_ASSERT(out_of_band[i] != NULL);
+    }
 
-    struct ggml_metal_tensor_copy_pair * ingress_copy = NULL;
-    struct ggml_metal_tensor_copy_pair * egress_copy  = NULL;
+    struct ggml_metal_tensor_copy_pair * ingress_copy     = NULL;
+    struct ggml_metal_tensor_copy_pair * egress_copy      = NULL;
+    struct ggml_tensor                ** out_of_band_copy = NULL;
     if (n_ingress > 0) {
         ingress_copy = malloc(sizeof(*ingress_copy) * n_ingress);
         GGML_ASSERT(ingress_copy != NULL);
@@ -571,27 +606,37 @@ void ggml_metal_set_encode_window(
         GGML_ASSERT(egress_copy != NULL);
         memcpy(egress_copy, egress, sizeof(*egress_copy) * n_egress);
     }
+    if (n_out_of_band > 0) {
+        out_of_band_copy = malloc(sizeof(*out_of_band_copy) * n_out_of_band);
+        GGML_ASSERT(out_of_band_copy != NULL);
+        memcpy(out_of_band_copy, out_of_band, sizeof(*out_of_band_copy) * n_out_of_band);
+    }
 
     ggml_metal_clear_encode_window(ctx);
-    ctx->ewin_active     = true;
-    ctx->ewin_first_node = first_node;
-    ctx->ewin_last_node  = last_node;
-    ctx->ewin_n_ingress  = n_ingress;
-    ctx->ewin_ingress    = ingress_copy;
-    ctx->ewin_n_egress   = n_egress;
-    ctx->ewin_egress     = egress_copy;
+    ctx->ewin_active        = true;
+    ctx->ewin_first_node    = first_node;
+    ctx->ewin_last_node     = last_node;
+    ctx->ewin_n_ingress     = n_ingress;
+    ctx->ewin_ingress       = ingress_copy;
+    ctx->ewin_n_egress      = n_egress;
+    ctx->ewin_egress        = egress_copy;
+    ctx->ewin_n_out_of_band = n_out_of_band;
+    ctx->ewin_out_of_band   = out_of_band_copy;
 }
 
 void ggml_metal_clear_encode_window(ggml_metal_t ctx) {
     free(ctx->ewin_ingress);
     free(ctx->ewin_egress);
-    ctx->ewin_active     = false;
-    ctx->ewin_first_node = NULL;
-    ctx->ewin_last_node  = NULL;
-    ctx->ewin_n_ingress  = 0;
-    ctx->ewin_ingress    = NULL;
-    ctx->ewin_n_egress   = 0;
-    ctx->ewin_egress     = NULL;
+    free(ctx->ewin_out_of_band);
+    ctx->ewin_active        = false;
+    ctx->ewin_first_node    = NULL;
+    ctx->ewin_last_node     = NULL;
+    ctx->ewin_n_ingress     = 0;
+    ctx->ewin_ingress       = NULL;
+    ctx->ewin_n_egress      = 0;
+    ctx->ewin_egress        = NULL;
+    ctx->ewin_n_out_of_band = 0;
+    ctx->ewin_out_of_band   = NULL;
 }
 
 // One full-tensor blit between two resident tensors, encoded into the given
@@ -610,6 +655,68 @@ static void ggml_metal_ewin_blit(id<MTLCommandBuffer> cmd_buf, const struct ggml
           destinationOffset:bid_dst.offs
                        size:ggml_nbytes(src)];
     [encoder endEncoding];
+}
+
+// The band invariant check: does this split encode ONLY in-band nodes?
+//
+// The encode window is resolved per split, and that projection is lossy in one
+// direction. A split holding neither non-NULL endpoint windows to nothing
+// (window_applies == false) and therefore encodes in FULL -- correct for the
+// input-processing splits, whose masks/positions must be rebuilt for every
+// tile, but wrong for a trunk split that happened to land after the boundary
+// split, which would then quietly encode layers the band excludes. The window
+// alone cannot tell those two cases apart: both look like "no endpoint here".
+//
+// So the caller supplies the discriminator -- the nodes it asserts are out of
+// band -- and this walks the split the way the encode loop will, segment by
+// segment, applying the SAME skip rule, and reports the first node that would
+// actually be encoded while sitting in that set. It is deliberately stronger
+// than a test on endpoint-free splits alone: a split that contains the lower
+// endpoint but runs past the band (first_found && !last_found windows to the
+// split's end) is caught here too.
+//
+// Returns true when the split is clean -- including the vacuous cases: no
+// window set, or no out-of-band nodes named. On false, *out_bad_node_idx holds
+// the offending node's index in `gf`. O(n_nodes * n_out_of_band), the same
+// shape as the is_cut/is_wait pass above and negligible beside the encode.
+static bool ggml_metal_ewin_split_is_in_band(
+        ggml_metal_t         ctx,
+        struct ggml_cgraph * gf,
+        const int *          starts,
+        int                  n_starts,
+        int                  window_lo,
+        int                  window_hi,
+        bool                 window_applies,
+        int *                out_bad_node_idx) {
+    if (!ctx->ewin_active || ctx->ewin_n_out_of_band == 0) {
+        return true;
+    }
+
+    const int n_nodes = gf->n_nodes;
+
+    for (int seg = 0; seg < n_starts; ++seg) {
+        const int seg_start = starts[seg];
+        const int seg_end   = (seg + 1 < n_starts) ? starts[seg + 1] : n_nodes;
+        if (seg_end <= seg_start) {
+            continue;
+        }
+        // Must mirror the encode loop's skip verbatim: anything this rule drops
+        // is never submitted, so it cannot violate the invariant.
+        if (window_applies && (seg_end <= window_lo || seg_start > window_hi)) {
+            continue;
+        }
+        for (int i = seg_start; i < seg_end; ++i) {
+            struct ggml_tensor * node = gf->nodes[i];
+            for (size_t k = 0; k < ctx->ewin_n_out_of_band; ++k) {
+                if (ctx->ewin_out_of_band[k] == node) {
+                    *out_bad_node_idx = i;
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
 }
 
 // Sequential per-boundary-committed encode (see ggml_metal_set_boundary_schedule).
@@ -713,6 +820,31 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
                 blit_out_here = last_found;
             }
         }
+        // Enforce the band invariant BEFORE anything is submitted: no split may
+        // encode a node the caller declared out of band. Rejecting here -- ahead
+        // of the first commandBufferWithUnretainedReferences -- is what makes
+        // the failure recoverable: nothing was enqueued, no event was signalled,
+        // and the pager's frozen plan is still consistent with the device. Hence
+        // a returned status and not a GGML_ASSERT; ggml_backend_sched_compute_splits
+        // short-circuits on a non-SUCCESS status, so the caller can fail this
+        // prefill and retry. Vacuous when no out-of-band nodes were named.
+        {
+            int bad_node_idx = -1;
+            if (!ggml_metal_ewin_split_is_in_band(ctx, gf, starts, n_starts, window_lo, window_hi, window_applies, &bad_node_idx)) {
+                struct ggml_tensor * bad_node = gf->nodes[bad_node_idx];
+                GGML_LOG_ERROR("%s: encode window violation - split would encode out-of-band node '%s' "
+                               "(node %d of %d in this split; window applies=%s lo=%d hi=%d)\n",
+                        __func__, ggml_get_name(bad_node), bad_node_idx, n_nodes,
+                        window_applies ? "true" : "false", window_lo, window_hi);
+
+                free(starts);
+                free(is_cut);
+                free(is_wait);
+
+                return GGML_STATUS_FAILED;
+            }
+        }
+
         bool window_entered = false;
 
         // Encode each segment into its own command buffer, in order.
