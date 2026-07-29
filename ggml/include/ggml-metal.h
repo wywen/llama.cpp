@@ -85,11 +85,27 @@ GGML_BACKEND_API void ggml_backend_metal_set_boundary_schedule(
 // Persistent and pointer-keyed like the boundary schedule, projected per split:
 // a split containing neither non-NULL boundary encodes in full. Only meaningful
 // while a boundary schedule is set.
+//
+// `out_of_band` is a caller-owned array of full-graph nodes the caller asserts
+// lie OUTSIDE the active band; it is copied and owned by the Metal context
+// alongside the pair arrays. It enforces, and only enforces, the invariant:
+//
+//   no submitted split may ever encode a node that lies outside the active band
+//
+// which the per-split projection above cannot uphold on its own -- "contains
+// neither boundary, so encode in full" is right for the input-processing splits
+// but wrong for a trunk split landing after the boundary split, and the window
+// cannot distinguish them. A split that would encode any named node is refused:
+// graph_compute returns GGML_STATUS_FAILED with nothing enqueued and no event
+// signalled, so the caller can fail the prefill and recover. It never changes
+// which nodes are selected for encoding. Pass n_out_of_band == 0 to disable the
+// check entirely -- behaviour is then exactly as before this parameter existed.
 GGML_BACKEND_API void ggml_backend_metal_set_encode_window(
         ggml_backend_t backend,
         struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
-        size_t n_ingress, const struct ggml_metal_tensor_copy_pair * ingress,
-        size_t n_egress,  const struct ggml_metal_tensor_copy_pair * egress);
+        size_t n_ingress,     const struct ggml_metal_tensor_copy_pair * ingress,
+        size_t n_egress,      const struct ggml_metal_tensor_copy_pair * egress,
+        size_t n_out_of_band, struct ggml_tensor * const * out_of_band);
 GGML_BACKEND_API void ggml_backend_metal_clear_encode_window(ggml_backend_t backend);
 
 #ifdef __cplusplus
