@@ -831,6 +831,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_graph_compute_callback callback_graph;
     void * callback_graph_user_data;
 
+    ggml_backend_sched_graph_submit_callback callback_graph_submit;
+    void * callback_graph_submit_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -1666,6 +1669,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         sched->callback_graph(sched, sched->callback_graph_user_data);
     }
 
+    auto graph_submitted = [&](enum ggml_status status) {
+        if (sched->callback_graph_submit) {
+            sched->callback_graph_submit(sched, status, sched->callback_graph_submit_user_data);
+        }
+    };
+
     struct ggml_backend_sched_split * splits = sched->splits;
 
     ggml_tensor * prev_ids_tensor = nullptr;
@@ -1815,6 +1824,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
+                graph_submitted(ec);
                 return ec;
             }
         } else {
@@ -1837,6 +1847,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    graph_submitted(ec);
                     return ec;
                 }
 
@@ -1859,6 +1870,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    graph_submitted(GGML_STATUS_SUCCESS);
     return GGML_STATUS_SUCCESS;
 }
 
@@ -2069,6 +2081,12 @@ void ggml_backend_sched_set_graph_compute_callback(ggml_backend_sched_t sched, g
     GGML_ASSERT(sched);
     sched->callback_graph = callback;
     sched->callback_graph_user_data = user_data;
+}
+
+void ggml_backend_sched_set_graph_submit_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_submit_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_graph_submit = callback;
+    sched->callback_graph_submit_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
