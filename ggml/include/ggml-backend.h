@@ -321,8 +321,8 @@ extern "C" {
     // schedule) that needs the finalized graph but no per-node observation.
     typedef void (*ggml_backend_sched_graph_compute_callback)(ggml_backend_sched_t sched, void * user_data);
 
-    // Per-graph-submission callback. Fired after every split has been submitted, or when a
-    // submission fails.
+    // Per-graph-submission callback. Fired after the first split is submitted, or when a
+    // submission fails before any split was submitted.
     typedef void (*ggml_backend_sched_graph_submit_callback)(ggml_backend_sched_t sched, enum ggml_status status, void * user_data);
 
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
