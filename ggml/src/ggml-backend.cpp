@@ -1669,6 +1669,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         sched->callback_graph(sched, sched->callback_graph_user_data);
     }
 
+    bool split_submitted = false;
     auto graph_submitted = [&](enum ggml_status status) {
         if (sched->callback_graph_submit) {
             sched->callback_graph_submit(sched, status, sched->callback_graph_submit_user_data);
@@ -1824,8 +1825,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
-                graph_submitted(ec);
+                if (!split_submitted) {
+                    graph_submitted(ec);
+                }
                 return ec;
+            }
+            if (!split_submitted) {
+                split_submitted = true;
+                graph_submitted(GGML_STATUS_SUCCESS);
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
@@ -1847,8 +1854,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
-                    graph_submitted(ec);
+                    if (!split_submitted) {
+                        graph_submitted(ec);
+                    }
                     return ec;
+                }
+                if (!split_submitted) {
+                    split_submitted = true;
+                    graph_submitted(GGML_STATUS_SUCCESS);
                 }
 
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
@@ -1870,7 +1883,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
-    graph_submitted(GGML_STATUS_SUCCESS);
     return GGML_STATUS_SUCCESS;
 }
 
