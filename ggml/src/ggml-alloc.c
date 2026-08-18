@@ -484,6 +484,9 @@ struct ggml_gallocr {
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
     int n_buffers;
 
+    ggml_gallocr_reserve_callback callback_reserve;
+    void * callback_reserve_user_data;
+
     struct ggml_hash_set hash_set;
     struct hash_node * hash_values; // [hash_set.size]
 
@@ -532,6 +535,12 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
 
 ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft) {
     return ggml_gallocr_new_n(&buft, 1);
+}
+
+void ggml_gallocr_set_reserve_callback(ggml_gallocr_t galloc, ggml_gallocr_reserve_callback callback, void * user_data) {
+    GGML_ASSERT(galloc != NULL);
+    galloc->callback_reserve = callback;
+    galloc->callback_reserve_user_data = user_data;
 }
 
 void ggml_gallocr_free(ggml_gallocr_t galloc) {
@@ -846,6 +855,56 @@ static bool ggml_gallocr_reserve_n_impl(
     // allocate in hash table
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
 
+    if (!no_alloc && galloc->callback_reserve != NULL) {
+        if ((size_t) galloc->n_buffers > SIZE_MAX / GGML_VBUFFER_MAX_CHUNKS ||
+            (size_t) galloc->n_buffers * GGML_VBUFFER_MAX_CHUNKS >
+                SIZE_MAX / sizeof(struct ggml_backend_sched_buffer_reservation)) {
+            return false;
+        }
+        const size_t capacity = (size_t) galloc->n_buffers * GGML_VBUFFER_MAX_CHUNKS;
+        struct ggml_backend_sched_buffer_reservation * reservations =
+            malloc(capacity * sizeof(*reservations));
+        GGML_ASSERT(reservations != NULL);
+
+        size_t n_reservations = 0;
+        for (int i = 0; i < galloc->n_buffers; i++) {
+            bool shared = false;
+            for (int j = 0; j < i; j++) {
+                if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
+                    shared = true;
+                    break;
+                }
+            }
+            if (shared) {
+                continue;
+            }
+
+            struct vbuffer * buffer = galloc->buffers[i];
+            for (int c = 0; c < GGML_VBUFFER_MAX_CHUNKS; c++) {
+                const size_t current_size = buffer ? ggml_vbuffer_chunk_size(buffer, c) : 0;
+                const size_t planned_size = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
+                const size_t candidate_size = MAX(current_size, planned_size);
+                if (candidate_size == 0) {
+                    continue;
+                }
+                reservations[n_reservations++] =
+                    (struct ggml_backend_sched_buffer_reservation) {
+                        .backend_index = i,
+                        .size = candidate_size,
+                    };
+            }
+        }
+
+        const bool accepted = galloc->callback_reserve(
+            reservations, n_reservations, galloc->callback_reserve_user_data);
+        free(reservations);
+        if (!accepted) {
+            return false;
+        }
+    }
+
+    // Publish the planned layout only after admission succeeds. A refusal keeps
+    // the previous node/leaf layout paired with its existing backing buffers.
     // set the node_allocs from the hash table
     if (galloc->n_nodes < graph->n_nodes) {
         free(galloc->node_allocs);

@@ -548,6 +548,56 @@ static void test_buffer_size_zero() {
     GGML_ASSERT(backend_b.context->allocated_total() == 0);
 }
 
+struct reserve_callback_state {
+    bool accept = false;
+    std::vector<ggml_backend_sched_buffer_reservation> reservations;
+};
+
+static bool reserve_callback(
+        const ggml_backend_sched_buffer_reservation * reservations,
+        size_t n_reservations,
+        void * user_data) {
+    auto * state = static_cast<reserve_callback_state *>(user_data);
+    state->reservations.assign(reservations, reservations + n_reservations);
+    return state->accept;
+}
+
+static void test_reserve_refusal_preserves_published_layout() {
+    dummy_backend backend = dummy_backend_init(64, /*align*/ 4);
+    auto [old_ctx, old_graph, old_ctx_ptr] = make_context();
+    ggml_tensor * old_x0 = make_input_with_size(old_ctx, 16);
+    ggml_tensor * old_x1 = make_input_with_size(old_ctx, 16);
+    ggml_tensor * old_out = ggml_add(old_ctx, old_x0, old_x1);
+    ggml_set_output(old_out);
+    ggml_build_forward_expand(old_graph, old_out);
+
+    ggml_gallocr_ptr galloc(ggml_gallocr_new(&backend.buffer_type));
+    GGML_ASSERT(ggml_gallocr_reserve(galloc.get(), old_graph));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), old_graph));
+    const size_t old_total = backend.context->allocated_total();
+
+    reserve_callback_state callback;
+    ggml_gallocr_set_reserve_callback(galloc.get(), reserve_callback, &callback);
+
+    auto [new_ctx, new_graph, new_ctx_ptr] = make_context();
+    ggml_tensor * new_x0 = make_input_with_size(new_ctx, 48);
+    ggml_tensor * new_x1 = make_input_with_size(new_ctx, 48);
+    ggml_tensor * new_out = ggml_add(new_ctx, new_x0, new_x1);
+    ggml_set_output(new_out);
+    ggml_build_forward_expand(new_graph, new_out);
+
+    GGML_ASSERT(!ggml_gallocr_reserve(galloc.get(), new_graph));
+    GGML_ASSERT(!callback.reservations.empty());
+    GGML_ASSERT(backend.context->allocated_total() == old_total);
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), old_graph));
+    check_all_allocated(old_graph);
+
+    callback.accept = true;
+    GGML_ASSERT(ggml_gallocr_reserve(galloc.get(), new_graph));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), new_graph));
+    check_all_allocated(new_graph);
+}
+
 // Test re-using gallocr for a different graph. The new graph has the same
 // total size, but one of the chunks is larger, so reallocation is required.
 static void test_reallocation() {
@@ -603,6 +653,7 @@ int main() {
     run("test_prefer_already_allocated_memory", test_prefer_already_allocated_memory);
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
+    run("test_reserve_refusal_preserves_published_layout", test_reserve_refusal_preserves_published_layout);
     run("test_reallocation", test_reallocation);
     return 0;
 }

@@ -813,6 +813,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
 
+    ggml_backend_sched_reserve_callback callback_reserve;
+    void * callback_reserve_user_data;
+
     // Fired once per graph compute (after split/alloc, before encode). Preserves fusion
     // because it is not per-node. Zero-initialized with the rest of the sched struct.
     ggml_backend_sched_graph_compute_callback callback_graph;
@@ -1536,7 +1539,9 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             ggml_backend_synchronize(sched->backends[i]);
         }
 
-        ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+            return false;
+        }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
@@ -1959,6 +1964,24 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+static bool ggml_backend_sched_reserve_callback_impl(
+        const struct ggml_backend_sched_buffer_reservation * reservations,
+        size_t n_reservations,
+        void * user_data) {
+    ggml_backend_sched_t sched = (ggml_backend_sched_t) user_data;
+    return sched->callback_reserve(
+        sched, reservations, n_reservations, sched->callback_reserve_user_data);
+}
+
+void ggml_backend_sched_set_reserve_callback(ggml_backend_sched_t sched, ggml_backend_sched_reserve_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_reserve = callback;
+    sched->callback_reserve_user_data = user_data;
+    ggml_gallocr_set_reserve_callback(sched->galloc,
+            callback ? ggml_backend_sched_reserve_callback_impl : nullptr,
+            callback ? sched : nullptr);
 }
 
 void ggml_backend_sched_set_graph_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_compute_callback callback, void * user_data) {
