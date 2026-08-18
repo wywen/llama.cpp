@@ -1232,6 +1232,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_realloc_callback callback_realloc;
     void * callback_realloc_user_data;
 
+    ggml_backend_sched_reserve_callback callback_reserve;
+    void * callback_reserve_user_data;
+
     // Fired once per graph compute (after split/alloc, before encode). Preserves fusion
     // because it is not per-node. Zero-initialized with the rest of the sched struct.
     ggml_backend_sched_graph_compute_callback callback_graph;
@@ -2456,6 +2459,24 @@ void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_ba
     GGML_ASSERT(sched);
     sched->callback_realloc = callback;
     sched->callback_realloc_user_data = user_data;
+}
+
+static bool ggml_backend_sched_reserve_callback_impl(
+        const struct ggml_backend_sched_buffer_reservation * reservations,
+        size_t n_reservations,
+        void * user_data) {
+    ggml_backend_sched_t sched = (ggml_backend_sched_t) user_data;
+    return sched->callback_reserve(
+        sched, reservations, n_reservations, sched->callback_reserve_user_data);
+}
+
+void ggml_backend_sched_set_reserve_callback(ggml_backend_sched_t sched, ggml_backend_sched_reserve_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_reserve = callback;
+    sched->callback_reserve_user_data = user_data;
+    ggml_gallocr_set_reserve_callback(sched->galloc,
+            callback ? ggml_backend_sched_reserve_callback_impl : nullptr,
+            callback ? sched : nullptr);
 }
 
 void ggml_backend_sched_set_graph_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_compute_callback callback, void * user_data) {
