@@ -10,6 +10,9 @@ extern "C" {
 
     #define GGML_BACKEND_API_VERSION 2
 
+    typedef bool (*ggml_gallocr_reserve_callback)(const struct ggml_backend_sched_buffer_reservation * reservations, size_t n_reservations, void * user_data);
+    GGML_API void ggml_gallocr_set_reserve_callback(ggml_gallocr_t galloc, ggml_gallocr_reserve_callback callback, void * user_data);
+
     //
     // Backend buffer type
     //

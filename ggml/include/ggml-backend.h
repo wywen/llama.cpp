@@ -315,6 +315,18 @@ extern "C" {
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
 
+    // One independently allocated compute-buffer chunk in a reserve candidate.
+    // Shared buffer allocators appear once, under their first backend index.
+    struct ggml_backend_sched_buffer_reservation {
+        int    backend_index;
+        size_t size;
+    };
+
+    // Called after graph allocation planning but before the planned layout is
+    // published or any compute buffer is freed/reallocated. Each entry's size
+    // is max(current chunk size, newly required chunk size).
+    typedef bool (*ggml_backend_sched_reserve_callback)(ggml_backend_sched_t sched, const struct ggml_backend_sched_buffer_reservation * reservations, size_t n_reservations, void * user_data);
+
     // Per-graph-compute callback (set with ggml_backend_sched_set_graph_compute_callback).
     // Fired exactly once per graph compute, after the graph has been split and allocated
     // but before any split is encoded -- NOT per node, so it does not force the per-node
@@ -366,6 +378,7 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_reserve_callback(ggml_backend_sched_t sched, ggml_backend_sched_reserve_callback callback, void * user_data);
     GGML_API void                 ggml_backend_sched_set_graph_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_compute_callback callback, void * user_data);
     GGML_API void                 ggml_backend_sched_set_graph_submit_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_submit_callback callback, void * user_data);
 
