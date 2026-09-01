@@ -21,8 +21,9 @@ struct llama_fused_node_info {
     int32_t layer;
 };
 
-// Copies structural metadata for the current graph's fused nodes. Tensor pointers are borrowed
-// until the context's next decode or graph reset. With `out == nullptr`, returns the required size.
+// Copies flash-attention metadata for the last decoded graph. Tensor pointers are borrowed until
+// the next decode or graph reset. Returns the total available count whether or not `out` is null
+// or large enough; copies at most `capacity` entries.
 LLAMA_API size_t llama_get_fused_node_info(
     const struct llama_context * ctx,
     struct llama_fused_node_info * out,

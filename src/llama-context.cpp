@@ -3779,13 +3779,17 @@ size_t llama_get_fused_node_info(
         return 0;
     }
     const auto & nodes = ctx->get_gf_res_prev()->get_fused_nodes();
-    if (out != nullptr) {
-        const size_t count = std::min(capacity, nodes.size());
-        for (size_t i = 0; i < count; ++i) {
-            out[i] = { nodes[i].tensor, static_cast<int32_t>(nodes[i].il) };
+    size_t available = 0;
+    for (const llm_graph_fused_node & node : nodes) {
+        if (node.op != LLM_FUSED_OP_FLASH_ATTN) {
+            continue;
         }
+        if (out != nullptr && available < capacity) {
+            out[available] = { node.tensor, static_cast<int32_t>(node.il) };
+        }
+        ++available;
     }
-    return nodes.size();
+    return available;
 }
 
 uint32_t llama_n_ctx_seq(const llama_context * ctx) {
