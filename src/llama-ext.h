@@ -16,6 +16,18 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+struct llama_fused_node_info {
+    const struct ggml_tensor * tensor;
+    int32_t layer;
+};
+
+// Copies structural metadata for the current graph's fused nodes. Tensor pointers are borrowed
+// until the context's next decode or graph reset. With `out == nullptr`, returns the required size.
+LLAMA_API size_t llama_get_fused_node_info(
+    const struct llama_context * ctx,
+    struct llama_fused_node_info * out,
+    size_t capacity);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

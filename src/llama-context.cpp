@@ -2358,6 +2358,10 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
+const llm_graph_result * llama_context::get_gf_res_prev() const {
+    return gf_res_prev.get();
+}
+
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
 static void ubatch_prepare_reserve(
               llama_ubatch                            & ubatch,
@@ -3765,6 +3769,23 @@ uint32_t llama_n_ctx(const llama_context * ctx) {
 
 ggml_backend_sched_t llama_get_sched(llama_context * ctx) {
     return ctx->get_sched();
+}
+
+size_t llama_get_fused_node_info(
+        const llama_context * ctx,
+        llama_fused_node_info * out,
+        size_t capacity) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    const auto & nodes = ctx->get_gf_res_prev()->get_fused_nodes();
+    if (out != nullptr) {
+        const size_t count = std::min(capacity, nodes.size());
+        for (size_t i = 0; i < count; ++i) {
+            out[i] = { nodes[i].tensor, static_cast<int32_t>(nodes[i].il) };
+        }
+    }
+    return nodes.size();
 }
 
 uint32_t llama_n_ctx_seq(const llama_context * ctx) {
