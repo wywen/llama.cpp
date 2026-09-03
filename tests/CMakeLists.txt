@@ -223,6 +223,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
+    llama_build(test-model-tensor-sources.cpp)
+    llama_test(test-model-tensor-sources)
 endif()
 
 llama_build(test-llama-archs.cpp)
