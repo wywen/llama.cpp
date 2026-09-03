@@ -1188,6 +1188,30 @@ llama_model::~llama_model() {
     }
 }
 
+void llama_model::retain_tensor_sources(llama_model_loader & loader) {
+    source_paths = std::move(loader.source_paths);
+    tensor_sources.clear();
+    if (source_paths.empty()) {
+        return;
+    }
+    tensor_sources.reserve(loader.weights_map.size());
+    for (const auto & [name, weight] : loader.weights_map) {
+        if (weight.idx >= source_paths.size()) {
+            throw std::runtime_error(format("tensor '%s' has invalid source index %u (source count %zu)", name.c_str(),
+                                            static_cast<unsigned>(weight.idx), source_paths.size()));
+        }
+        tensor_sources.push_back({
+            name,
+            weight.idx,
+            weight.offs,
+            static_cast<uint64_t>(ggml_nbytes(weight.tensor)),
+        });
+    }
+    std::sort(
+        tensor_sources.begin(), tensor_sources.end(),
+        [](const llama_tensor_source_info & lhs, const llama_tensor_source_info & rhs) { return lhs.name < rhs.name; });
+}
+
 void llama_model_base::load_stats(llama_model_loader & ml) {
     pimpl->n_elements = ml.n_elements;
     pimpl->n_bytes = ml.n_bytes;
@@ -3047,18 +3071,6 @@ llama_ftype llama_model_ftype(const llama_model * model) {
 
 uint64_t llama_model_size(const llama_model * model) {
     return model->size();
-}
-
-size_t llama_model_tensor_sources(const llama_model * model, const llama_model_tensor_source ** sources) {
-    if (sources == nullptr) {
-        return 0;
-    }
-    if (model == nullptr) {
-        *sources = nullptr;
-        return 0;
-    }
-    *sources = model->tensor_source_views.data();
-    return model->tensor_source_views.size();
 }
 
 const char * llama_model_chat_template(const llama_model * model, const char * name) {

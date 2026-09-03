@@ -368,25 +368,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
-        model->tensor_sources.reserve(ml.weights_map.size());
-        model->tensor_source_views.reserve(ml.weights_map.size());
-        for (const auto & [name, weight] : ml.weights_map) {
-            if (weight.idx >= ml.source_paths.size()) {
-                continue;
-            }
-            llama_tensor_source_info source;
-            source.name = name;
-            source.path = ml.source_paths[weight.idx];
-            source.offset = weight.offs;
-            model->tensor_sources.push_back(std::move(source));
-            const auto & retained = model->tensor_sources.back();
-            model->tensor_source_views.push_back({
-                retained.name.c_str(),
-                retained.path.c_str(),
-                retained.offset,
-                ggml_nbytes(weight.tensor),
-            });
-        }
+        model->retain_tensor_sources(ml);
 
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {

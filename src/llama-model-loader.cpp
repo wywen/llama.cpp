@@ -11,8 +11,19 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <future>
 #include <regex>
+
+static std::string llama_resolve_source_path(const std::string & path) {
+    std::error_code error;
+    const std::filesystem::path absolute = std::filesystem::absolute(path, error);
+    if (error) {
+        throw std::runtime_error(
+            format("failed to resolve tensor source path '%s': %s", path.c_str(), error.message().c_str()));
+    }
+    return absolute.lexically_normal().string();
+}
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -577,7 +588,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
-        source_paths.push_back(fname);
+        source_paths.push_back(llama_resolve_source_path(fname));
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -646,7 +657,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
-                source_paths.emplace_back(fname_split);
+                source_paths.push_back(llama_resolve_source_path(fname_split));
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
