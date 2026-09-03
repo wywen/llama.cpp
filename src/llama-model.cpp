@@ -1188,6 +1188,31 @@ llama_model::~llama_model() {
     }
 }
 
+void llama_model::retain_tensor_sources(llama_model_loader & loader, std::vector<std::string> paths) {
+    source_paths = std::move(paths);
+    tensor_sources.clear();
+    // Metadata and FILE* loads have no disk source paths.
+    if (source_paths.empty()) {
+        return;
+    }
+    tensor_sources.reserve(loader.weights_map.size());
+    for (const auto & [name, weight] : loader.weights_map) {
+        if (weight.idx >= source_paths.size()) {
+            throw std::runtime_error(format("tensor '%s' has invalid source index %u (source count %zu)", name.c_str(),
+                                            static_cast<unsigned>(weight.idx), source_paths.size()));
+        }
+        tensor_sources.push_back({
+            name,
+            weight.idx,
+            weight.offs,
+            static_cast<uint64_t>(ggml_nbytes(weight.tensor)),
+        });
+    }
+    std::sort(
+        tensor_sources.begin(), tensor_sources.end(),
+        [](const llama_tensor_source_info & lhs, const llama_tensor_source_info & rhs) { return lhs.name < rhs.name; });
+}
+
 void llama_model_base::load_stats(llama_model_loader & ml) {
     pimpl->n_elements = ml.n_elements;
     pimpl->n_bytes = ml.n_bytes;

@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <string>
@@ -604,11 +605,23 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+/// Resolved source location retained for each tensor after model loading.
+struct llama_tensor_source_info {
+    std::string name;
+    uint16_t    source_idx = 0;
+    uint64_t    offset     = 0;
+    uint64_t    size       = 0;
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
     std::string name = "n/a";
+    /// Resolved GGUF source paths, indexed by llama_tensor_source_info::source_idx.
+    std::vector<std::string>              source_paths;
+    /// Tensor source records sorted by name for binary-search lookup.
+    std::vector<llama_tensor_source_info> tensor_sources;
 
     llama_hparams hparams = {};
     llama_vocab   vocab;
@@ -743,6 +756,25 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+
+    /// Return the resolved source record for `name`, or nullptr when absent.
+    [[nodiscard]] const llama_tensor_source_info * tensor_source(const char * name) const noexcept {
+        if (name == nullptr) {
+            return nullptr;
+        }
+        const auto it = std::lower_bound(
+            tensor_sources.begin(), tensor_sources.end(), name,
+            [](const llama_tensor_source_info & source, const char * needle) noexcept { return source.name < needle; });
+        return it != tensor_sources.end() && it->name == name ? &*it : nullptr;
+    }
+
+    /// Return a resolved source path by its canonical source index, or nullptr when out of bounds.
+    [[nodiscard]] const std::string * source_path(uint16_t source_idx) const noexcept {
+        return source_idx < source_paths.size() ? &source_paths[source_idx] : nullptr;
+    }
+
+    /// Move resolved source paths and loader metadata into the model's durable source index.
+    void retain_tensor_sources(llama_model_loader & loader, std::vector<std::string> source_paths);
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

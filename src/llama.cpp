@@ -23,7 +23,9 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -311,11 +313,28 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
     return true;
 }
 
+static std::string llama_normalize_load_path(const std::string & path) {
+    std::error_code error;
+    const std::filesystem::path absolute = std::filesystem::absolute(path, error);
+    if (error) {
+        throw std::runtime_error(
+            format("failed to resolve tensor source path '%s': %s", path.c_str(), error.message().c_str()));
+    }
+    return absolute.lexically_normal().string();
+}
+
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
-        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
+        std::string normalized_fname = fname;
+        if (!normalized_fname.empty()) {
+            normalized_fname = llama_normalize_load_path(normalized_fname);
+        }
+        for (std::string & split : splits) {
+            split = llama_normalize_load_path(split);
+        }
+        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, normalized_fname, splits, file, params.load_mode,
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.lazy.mode = params.lazy_mode;
@@ -368,6 +387,12 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
+        if (normalized_fname.empty()) {
+            splits.clear();
+        } else if (splits.empty()) {
+            splits.push_back(normalized_fname);
+        }
+        model->retain_tensor_sources(ml, std::move(splits));
 
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
