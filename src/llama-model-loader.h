@@ -118,9 +118,6 @@ struct llama_model_loader {
     } lazy;
 
     llama_files files;
-    /// Filesystem paths parallel to `files`; used to retain the resolved source
-    /// of each tensor after the loader itself is destroyed.
-    std::vector<std::string> source_paths;
     llama_ftype ftype;
     llama_fver  fver;
 

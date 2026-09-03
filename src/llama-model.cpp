@@ -1188,9 +1188,10 @@ llama_model::~llama_model() {
     }
 }
 
-void llama_model::retain_tensor_sources(llama_model_loader & loader) {
-    source_paths = std::move(loader.source_paths);
+void llama_model::retain_tensor_sources(llama_model_loader & loader, std::vector<std::string> paths) {
+    source_paths = std::move(paths);
     tensor_sources.clear();
+    // Metadata and FILE* loads have no disk source paths.
     if (source_paths.empty()) {
         return;
     }

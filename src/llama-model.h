@@ -773,8 +773,8 @@ struct llama_model {
         return source_idx < source_paths.size() ? &source_paths[source_idx] : nullptr;
     }
 
-    /// Move resolved loader metadata into the model's durable source index.
-    void retain_tensor_sources(llama_model_loader & loader);
+    /// Move resolved source paths and loader metadata into the model's durable source index.
+    void retain_tensor_sources(llama_model_loader & loader, std::vector<std::string> source_paths);
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

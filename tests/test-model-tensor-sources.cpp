@@ -9,9 +9,11 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -66,12 +68,15 @@ int main() {
     const std::filesystem::path original_cwd = std::filesystem::current_path();
     std::filesystem::current_path(directory);
     std::vector<std::string> splits{ first.filename().string(), second.filename().string() };
-    llama_model_loader loader(nullptr, nullptr, nullptr, first.filename().string(), splits, nullptr, LLAMA_LOAD_MODE_MMAP, true,
+    const std::string normalized_fname = std::filesystem::absolute(splits.front()).lexically_normal().string();
+    for (std::string & split : splits) {
+        split = std::filesystem::absolute(split).lexically_normal().string();
+    }
+    llama_model_loader loader(nullptr, nullptr, nullptr, normalized_fname, splits, nullptr, LLAMA_LOAD_MODE_MMAP, true,
                               true, false, nullptr, nullptr);
     std::filesystem::current_path(original_cwd);
-    require(loader.source_paths.size() == 2, "loader did not retain both shard paths");
-    require(loader.source_paths[0] == first.string(), "first source path was not retained");
-    require(loader.source_paths[1] == second.string(), "second source path was not retained");
+    require(splits[0] == first.string(), "first split path was not normalized");
+    require(splits[1] == second.string(), "second split path was not normalized");
     const auto * first_weight  = loader.get_weight("token_embd.weight");
     const auto * second_weight = loader.get_weight("output.weight");
     require(first_weight != nullptr && first_weight->idx == 0 && first_weight->offs > 0,
@@ -83,8 +88,7 @@ int main() {
     std::unique_ptr<llama_model, decltype(&llama_model_free)> model(llama_model_create(LLM_ARCH_LLAMA, params),
                                                                     &llama_model_free);
     require(model != nullptr, "could not create model source index");
-    model->retain_tensor_sources(loader);
-    require(loader.source_paths.empty(), "model did not take ownership of source paths");
+    model->retain_tensor_sources(loader, std::move(splits));
     require(model->source_paths.size() == 2, "model did not retain both shard paths");
     require(model->source_paths[0] == first.string(), "model retained the wrong first source path");
     require(model->source_paths[1] == second.string(), "model retained the wrong second source path");
@@ -104,6 +108,20 @@ int main() {
     require(model->source_path(0) != nullptr && *model->source_path(0) == first.string(),
             "source path lookup failed for shard zero");
     require(model->source_path(2) == nullptr, "out-of-bounds source path lookup did not fail");
+    const uint16_t original_idx = loader.weights_map.at("output.weight").idx;
+    loader.weights_map.at("output.weight").idx = 2;
+    bool rejected_invalid_idx = false;
+    try {
+        model->retain_tensor_sources(loader, {first.string(), second.string()});
+    } catch (const std::exception &) {
+        rejected_invalid_idx = true;
+    }
+    require(rejected_invalid_idx, "out-of-bounds tensor source index was not rejected");
+    loader.weights_map.at("output.weight").idx = original_idx;
+    model->retain_tensor_sources(loader, {first.string(), second.string()});
+    model->retain_tensor_sources(loader, {});
+    require(model->source_paths.empty() && model->tensor_sources.empty(),
+            "source-less load retained disk tensor sources");
 
     std::filesystem::remove_all(directory, error);
     return 0;
