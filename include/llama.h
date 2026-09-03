@@ -62,6 +62,12 @@ extern "C" {
     struct llama_model;
     struct llama_context;
     struct llama_sampler;
+    struct llama_model_tensor_source {
+        const char * tensor_name;
+        const char * path;
+        uint64_t offset;
+        uint64_t size;
+    };
 
     typedef struct llama_memory_i * llama_memory_t;
     typedef struct llama_memory_cells_i * llama_memory_cells_t;
@@ -644,6 +650,12 @@ extern "C" {
 
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
+
+    // Returns borrowed source path, file offset, and byte size metadata for each model tensor.
+
+    // The returned array and strings remain valid until the model is freed.
+    LLAMA_API size_t llama_model_tensor_sources(const struct llama_model * model,
+                                                const struct llama_model_tensor_source ** sources);
 
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template

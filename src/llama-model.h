@@ -604,11 +604,21 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+/// Resolved source location retained for each tensor after model loading.
+/// The public C API exposes this as borrowed string pointers.
+struct llama_tensor_source_info {
+    std::string name;
+    std::string path;
+    uint64_t offset = 0;
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
     std::string name = "n/a";
+    std::vector<llama_tensor_source_info> tensor_sources;
+    std::vector<llama_model_tensor_source> tensor_source_views;
 
     llama_hparams hparams = {};
     llama_vocab   vocab;

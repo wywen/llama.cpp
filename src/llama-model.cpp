@@ -3049,6 +3049,18 @@ uint64_t llama_model_size(const llama_model * model) {
     return model->size();
 }
 
+size_t llama_model_tensor_sources(const llama_model * model, const llama_model_tensor_source ** sources) {
+    if (sources == nullptr) {
+        return 0;
+    }
+    if (model == nullptr) {
+        *sources = nullptr;
+        return 0;
+    }
+    *sources = model->tensor_source_views.data();
+    return model->tensor_source_views.size();
+}
+
 const char * llama_model_chat_template(const llama_model * model, const char * name) {
     const auto key = name ? LLM_KV(model->arch, name)(LLM_KV_TOKENIZER_CHAT_TEMPLATE)
         : LLM_KV(model->arch)(LLM_KV_TOKENIZER_CHAT_TEMPLATE);
