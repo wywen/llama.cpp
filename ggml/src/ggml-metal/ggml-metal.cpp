@@ -662,6 +662,14 @@ uint64_t ggml_backend_metal_event_host_value(ggml_metal_event_t ev) {
     return ggml_metal_event_host_value(ev);
 }
 
+const char * ggml_backend_metal_last_error(ggml_backend_t backend) {
+    if (!ggml_backend_is_metal(backend)) {
+        return NULL;
+    }
+
+    return ggml_metal_last_error((ggml_metal_t)backend->context);
+}
+
 void ggml_backend_metal_set_boundary_schedule(
         ggml_backend_t backend,
         int n_cuts,  struct ggml_tensor * const * cut_nodes,  ggml_metal_event_t * sig_ev,  const uint64_t * sig_val,
