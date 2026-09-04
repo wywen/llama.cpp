@@ -623,7 +623,8 @@ struct llama_model {
     /// Resolved GGUF source paths, indexed by llama_tensor_source_info::source_idx.
     std::vector<std::string>              source_paths;
     /// Tensor source records indexed by the canonical model-wide tensor ordinal
-    /// (ggml_tensor::src_ordinal), NOT sorted by name.
+    /// (the UNBIASED ordinal; ggml_tensor::src_ordinal stores that ordinal plus
+    /// one, see tensor_source_at()), NOT sorted by name.
     std::vector<llama_tensor_source_info> tensor_sources;
 
     llama_hparams hparams = {};
@@ -760,9 +761,15 @@ struct llama_model {
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
-    /// Return the resolved source record for a canonical tensor ordinal, or nullptr when out of range.
-    [[nodiscard]] const llama_tensor_source_info * tensor_source_at(int32_t ordinal) const noexcept {
-        return ordinal >= 0 && (size_t) ordinal < tensor_sources.size() ? &tensor_sources[ordinal] : nullptr;
+    /// Return the resolved source record for a STAMPED tensor ordinal (i.e. a
+    /// ggml_tensor::src_ordinal value, which is the canonical ordinal plus one),
+    /// or nullptr when the stamp is GGML_TENSOR_SRC_ORDINAL_NONE or out of range.
+    [[nodiscard]] const llama_tensor_source_info * tensor_source_at(int32_t stamped_ordinal) const noexcept {
+        if (stamped_ordinal <= GGML_TENSOR_SRC_ORDINAL_NONE) {
+            return nullptr;
+        }
+        const size_t ordinal = (size_t) stamped_ordinal - 1;
+        return ordinal < tensor_sources.size() ? &tensor_sources[ordinal] : nullptr;
     }
 
     /// Return a resolved source path by its canonical source index, or nullptr when out of bounds.

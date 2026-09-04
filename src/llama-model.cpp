@@ -1206,7 +1206,7 @@ void llama_model::retain_tensor_sources(llama_model_loader & loader, std::vector
                                             static_cast<unsigned>(weight.idx), source_paths.size()));
         }
         if (weight.ordinal >= tensor_sources.size()) {
-            throw std::runtime_error(format("tensor '%s' has out-of-range ordinal %u (source count %zu)", name.c_str(),
+            throw std::runtime_error(format("tensor '%s' has out-of-range ordinal %u (tensor count %zu)", name.c_str(),
                                             weight.ordinal, tensor_sources.size()));
         }
         if (filled[weight.ordinal]) {
@@ -1214,6 +1214,8 @@ void llama_model::retain_tensor_sources(llama_model_loader & loader, std::vector
                                             name.c_str(), weight.ordinal));
         }
         filled[weight.ordinal] = true;
+        // Indexed by the UNBIASED ordinal (weight.ordinal), unlike the stamp on
+        // ggml_tensor::src_ordinal itself, which is that ordinal plus one.
         tensor_sources[weight.ordinal] = {
             name,
             weight.idx,

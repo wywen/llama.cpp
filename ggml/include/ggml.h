@@ -670,7 +670,7 @@ extern "C" {
         bool   no_alloc;   // don't allocate memory for the tensor data
     };
 
-#define GGML_TENSOR_SRC_ORDINAL_NONE (-1)
+#define GGML_TENSOR_SRC_ORDINAL_NONE (0)
 
     // n-dimensional tensor
     struct ggml_tensor {
@@ -705,7 +705,8 @@ extern "C" {
         void * extra; // extra things e.g. for ggml-cuda.cu
 
         // Canonical model-wide source ordinal assigned by the model loader for
-        // tensors backed by a GGUF file; GGML_TENSOR_SRC_ORDINAL_NONE otherwise.
+        // tensors backed by a GGUF file, stored as the ordinal plus one so that
+        // a zeroed (memset/calloc'd) tensor reads as GGML_TENSOR_SRC_ORDINAL_NONE.
         int32_t src_ordinal;
 
         char padding[4];
