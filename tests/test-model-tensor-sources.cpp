@@ -142,10 +142,11 @@ int main() {
     require(model->tensor_sources[0].name == "output.weight" && model->tensor_sources[1].name == "token_embd.weight",
             "model tensor records were not indexed by ordinal");
 
-    // every captured tensor must resolve, by its own ordinal, to the source shard and
-    // offset that the loader recorded for that same tensor
-    const auto * first_source  = model->tensor_source_at(static_cast<int32_t>(first_weight->ordinal));
-    const auto * second_source = model->tensor_source_at(static_cast<int32_t>(second_weight->ordinal));
+    // every captured tensor must resolve, by its own stamped ordinal (ordinal + 1, per
+    // GGML_TENSOR_SRC_ORDINAL_NONE), to the source shard and offset that the loader
+    // recorded for that same tensor
+    const auto * first_source  = model->tensor_source_at(static_cast<int32_t>(first_weight->ordinal + 1));
+    const auto * second_source = model->tensor_source_at(static_cast<int32_t>(second_weight->ordinal + 1));
     require(first_source != nullptr && first_source->name == "token_embd.weight" && first_source->source_idx == 0 &&
                 first_source->offset == first_weight->offs && first_source->size == 4,
             "ordinal lookup returned the wrong source for the first-shard tensor");
@@ -156,8 +157,8 @@ int main() {
     require(model->tensor_source_at(GGML_TENSOR_SRC_ORDINAL_NONE) == nullptr,
             "ordinal lookup accepted the sentinel ordinal");
     require(model->tensor_source_at(-5) == nullptr, "ordinal lookup accepted a negative ordinal");
-    require(model->tensor_source_at(static_cast<int32_t>(model->tensor_sources.size())) == nullptr,
-            "ordinal lookup accepted an out-of-range ordinal");
+    require(model->tensor_source_at(static_cast<int32_t>(model->tensor_sources.size()) + 1) == nullptr,
+            "ordinal lookup accepted an out-of-range stamped ordinal");
 
     require(model->source_path(0) != nullptr && *model->source_path(0) == first.string(),
             "source path lookup failed for shard zero");
@@ -176,6 +177,61 @@ int main() {
     model->retain_tensor_sources(loader, {});
     require(model->source_paths.empty() && model->tensor_sources.empty(),
             "source-less load retained disk tensor sources");
+
+    // retain_tensor_sources() cross-checks every tensors_by_name entry's stamped ordinal
+    // against the source table it just built from the loader; that is the entire safety
+    // argument for dropping name-based lookup, and llama_model_create() alone (without
+    // load_tensors) leaves tensors_by_name empty, so it otherwise never runs. Populate it
+    // directly, one case at a time, to exercise all three outcomes.
+    {
+        struct ggml_init_params ictx_params { /*.mem_size   =*/ ggml_tensor_overhead() * 4,
+                                               /*.mem_buffer =*/ nullptr,
+                                               /*.no_alloc   =*/ true };
+        ggml_context_ptr ctx(ggml_init(ictx_params));
+        require(ctx != nullptr, "could not allocate scratch ggml context");
+
+        // correctly stamped: token_embd.weight carries its own ordinal
+        ggml_tensor * correct = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 1);
+        ggml_set_name(correct, "token_embd.weight");
+        correct->src_ordinal = static_cast<int32_t>(first_weight->ordinal + 1);
+        model->tensors_by_name = { { "token_embd.weight", correct } };
+        bool threw_on_correct_stamp = false;
+        try {
+            model->retain_tensor_sources(loader, {first.string(), second.string()});
+        } catch (const std::exception &) {
+            threw_on_correct_stamp = true;
+        }
+        require(!threw_on_correct_stamp, "retain_tensor_sources rejected a correctly stamped tensor");
+        model->tensors_by_name.clear();
+
+        // wrong stamp: token_embd.weight carries output.weight's (otherwise valid) ordinal
+        ggml_tensor * mislabeled = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 1);
+        ggml_set_name(mislabeled, "token_embd.weight");
+        mislabeled->src_ordinal = static_cast<int32_t>(second_weight->ordinal + 1);
+        model->tensors_by_name = { { "token_embd.weight", mislabeled } };
+        bool rejected_wrong_stamp = false;
+        try {
+            model->retain_tensor_sources(loader, {first.string(), second.string()});
+        } catch (const std::exception &) {
+            rejected_wrong_stamp = true;
+        }
+        require(rejected_wrong_stamp, "retain_tensor_sources accepted a tensor stamped with another tensor's ordinal");
+        model->tensors_by_name.clear();
+
+        // missed stamp: left at the sentinel even though the loader has a matching weight
+        ggml_tensor * unstamped = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 1);
+        ggml_set_name(unstamped, "token_embd.weight");
+        unstamped->src_ordinal = GGML_TENSOR_SRC_ORDINAL_NONE;
+        model->tensors_by_name = { { "token_embd.weight", unstamped } };
+        bool rejected_missed_stamp = false;
+        try {
+            model->retain_tensor_sources(loader, {first.string(), second.string()});
+        } catch (const std::exception &) {
+            rejected_missed_stamp = true;
+        }
+        require(rejected_missed_stamp, "retain_tensor_sources accepted an unstamped tensor with a matching loader weight");
+        model->tensors_by_name.clear();
+    }
 
     // single, non-split shard: both tensors must still get distinct, dense ordinals and
     // resolve to source index 0 with the loader's own offsets
@@ -197,8 +253,8 @@ int main() {
     require(single_model != nullptr, "could not create single-shard model source index");
     single_model->retain_tensor_sources(single_loader, { single.string() });
     require(single_model->tensor_sources.size() == 2, "single-shard model did not retain both tensor records");
-    const auto * zeta_source  = single_model->tensor_source_at(static_cast<int32_t>(zeta_weight->ordinal));
-    const auto * alpha_source = single_model->tensor_source_at(static_cast<int32_t>(alpha_weight->ordinal));
+    const auto * zeta_source  = single_model->tensor_source_at(static_cast<int32_t>(zeta_weight->ordinal + 1));
+    const auto * alpha_source = single_model->tensor_source_at(static_cast<int32_t>(alpha_weight->ordinal + 1));
     require(zeta_source != nullptr && zeta_source->name == "zeta.weight" && zeta_source->source_idx == 0 &&
                 zeta_source->offset == zeta_weight->offs && zeta_source->size == 4,
             "ordinal lookup returned the wrong source for the single-shard tensor 'zeta.weight'");

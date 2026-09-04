@@ -714,7 +714,7 @@ llama_model_loader::llama_model_loader(
     // been indexed. weights_map is keyed by tensor name across all shards and
     // iterates in weight_name_comparer order (layer number, then name), so this
     // ordinal is dense, unique, and deterministic across equivalent loads.
-    if (weights_map.size() > (size_t) INT32_MAX) {
+    if (weights_map.size() > (size_t) INT32_MAX - 1) {
         throw std::runtime_error(format("%s: too many tensors (%zu) to assign a canonical ordinal", __func__, weights_map.size()));
     }
     {
@@ -1388,10 +1388,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     ggml_set_name(tensor, ggml_get_name(&t_meta));
 
     // stamp the canonical model-wide ordinal so the engine can look up this
-    // tensor's GGUF source by a checked direct index instead of by name
+    // tensor's GGUF source by a checked direct index instead of by name.
+    // Stored as ordinal + 1 so that a zeroed tensor reads as unset (see
+    // GGML_TENSOR_SRC_ORDINAL_NONE).
     const llama_tensor_weight * weight = get_weight(tn.str().c_str());
     if (weight) {
-        tensor->src_ordinal = (int32_t) weight->ordinal;
+        tensor->src_ordinal = (int32_t) (weight->ordinal + 1);
     }
 
     if (duplicated) {
