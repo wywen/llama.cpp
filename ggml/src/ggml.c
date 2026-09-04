@@ -1819,6 +1819,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
+        /*.src_ordinal  =*/ GGML_TENSOR_SRC_ORDINAL_NONE,
         /*.padding      =*/ { 0 },
     };
 

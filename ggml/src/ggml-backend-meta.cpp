@@ -2291,8 +2291,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     auto get_node_aux = [&](ggml_tensor * t) -> ggml_tensor * {
         ggml_tensor * ret = backend_ctx->nodes_aux[ina++];
         memset(ret, 0, sizeof(ggml_tensor));
-        ret->op   = GGML_OP_NONE;
-        ret->type = t->type;
+        ret->op          = GGML_OP_NONE;
+        ret->type        = t->type;
+        ret->src_ordinal = GGML_TENSOR_SRC_ORDINAL_NONE; // memset above would otherwise leave a valid-looking ordinal 0
         for (size_t k = 0; k < GGML_MAX_DIMS; k++) {
             ret->ne[k] = t->ne[k];
             ret->nb[k] = t->nb[k];
