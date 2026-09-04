@@ -37,6 +37,12 @@ struct llama_model_loader {
 
         ggml_tensor * tensor;
 
+        // Canonical model-wide ordinal, assigned once every shard has been indexed
+        // into weights_map. It follows weights_map's own iteration order
+        // (weight_name_comparer: layer number, then name), which is what makes it
+        // deterministic across equivalent loads.
+        uint32_t ordinal = 0;
+
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
             if (tensor_idx < 0) {

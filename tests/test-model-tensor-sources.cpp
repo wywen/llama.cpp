@@ -50,6 +50,46 @@ void write_shard(const std::filesystem::path & path, uint16_t split_no, const ch
     require(std::fclose(file) == 0, "could not close GGUF shard");
 }
 
+// Writes a single, non-split GGUF file holding every tensor in `tensor_names`.
+void write_single_file(const std::filesystem::path & path, const std::vector<const char *> & tensor_names) {
+    gguf_context_ptr context(gguf_init_empty());
+    require(context != nullptr, "could not allocate GGUF context");
+    gguf_set_val_str(context.get(), "general.architecture", "llama");
+
+    std::vector<ggml_tensor> tensors(tensor_names.size());
+    for (size_t i = 0; i < tensor_names.size(); i++) {
+        ggml_tensor & tensor = tensors[i];
+        tensor      = ggml_tensor{};
+        tensor.type = GGML_TYPE_F32;
+        tensor.ne[0] = 1;
+        tensor.ne[1] = 1;
+        tensor.ne[2] = 1;
+        tensor.ne[3] = 1;
+        ggml_set_name(&tensor, tensor_names[i]);
+        gguf_add_tensor(context.get(), &tensor);
+    }
+    require(gguf_write_to_file(context.get(), path.c_str(), true), "could not write GGUF metadata");
+
+    // the freshly-built context never had its data-section offset resolved (that only
+    // happens when reading a real file), so re-read the file we just wrote to learn the
+    // actual on-disk offsets before writing each tensor's data at its own offset
+    struct gguf_init_params read_params { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context_ptr written(gguf_init_from_file(path.c_str(), read_params));
+    require(written != nullptr, "could not re-read GGUF metadata");
+
+    FILE * file = std::fopen(path.c_str(), "r+b");
+    require(file != nullptr, "could not open GGUF file for tensor data");
+    for (size_t i = 0; i < tensor_names.size(); i++) {
+        const int64_t tid = gguf_find_tensor(written.get(), tensor_names[i]);
+        require(tid != -1, "tensor not found after writing GGUF metadata");
+        const uint64_t offset = gguf_get_data_offset(written.get()) + gguf_get_tensor_offset(written.get(), tid);
+        require(std::fseek(file, static_cast<long>(offset), SEEK_SET) == 0, "could not seek to tensor data offset");
+        const float value = static_cast<float>(i + 1);
+        require(std::fwrite(&value, sizeof(value), 1, file) == 1, "could not write tensor data");
+    }
+    require(std::fclose(file) == 0, "could not close GGUF file");
+}
+
 }  // namespace
 
 int main() {
@@ -84,6 +124,12 @@ int main() {
     require(second_weight != nullptr && second_weight->idx == 1 && second_weight->offs > 0,
             "second tensor was not assigned shard one");
 
+    // weights_map iterates in weight_name_comparer order (layer number, then name); neither
+    // tensor has a "blk.N." prefix, so this falls back to plain name order: "output.weight"
+    // sorts before "token_embd.weight" even though it is the *second* shard on disk.
+    require(second_weight->ordinal == 0, "output.weight (shard 1) did not get the first ordinal");
+    require(first_weight->ordinal == 1, "token_embd.weight (shard 0) did not get the second ordinal");
+
     llama_model_params params = llama_model_default_params();
     std::unique_ptr<llama_model, decltype(&llama_model_free)> model(llama_model_create(LLM_ARCH_LLAMA, params),
                                                                     &llama_model_free);
@@ -94,17 +140,25 @@ int main() {
     require(model->source_paths[1] == second.string(), "model retained the wrong second source path");
     require(model->tensor_sources.size() == 2, "model did not retain both tensor records");
     require(model->tensor_sources[0].name == "output.weight" && model->tensor_sources[1].name == "token_embd.weight",
-            "model tensor records were not sorted by name");
-    const auto * first_source = model->tensor_source("token_embd.weight");
-    const auto * second_source = model->tensor_source("output.weight");
-    require(first_source != nullptr && first_source->source_idx == 0 && first_source->offset == first_weight->offs &&
-                first_source->size == 4,
-            "binary lookup returned the wrong first tensor source");
-    require(second_source != nullptr && second_source->source_idx == 1 &&
+            "model tensor records were not indexed by ordinal");
+
+    // every captured tensor must resolve, by its own ordinal, to the source shard and
+    // offset that the loader recorded for that same tensor
+    const auto * first_source  = model->tensor_source_at(static_cast<int32_t>(first_weight->ordinal));
+    const auto * second_source = model->tensor_source_at(static_cast<int32_t>(second_weight->ordinal));
+    require(first_source != nullptr && first_source->name == "token_embd.weight" && first_source->source_idx == 0 &&
+                first_source->offset == first_weight->offs && first_source->size == 4,
+            "ordinal lookup returned the wrong source for the first-shard tensor");
+    require(second_source != nullptr && second_source->name == "output.weight" && second_source->source_idx == 1 &&
                 second_source->offset == second_weight->offs && second_source->size == 4,
-            "binary lookup returned the wrong second tensor source");
-    require(model->tensor_source("missing.weight") == nullptr, "binary lookup returned a missing tensor source");
-    require(model->tensor_source(nullptr) == nullptr, "null tensor lookup did not return null");
+            "ordinal lookup returned the wrong source for the split-shard tensor");
+
+    require(model->tensor_source_at(GGML_TENSOR_SRC_ORDINAL_NONE) == nullptr,
+            "ordinal lookup accepted the sentinel ordinal");
+    require(model->tensor_source_at(-5) == nullptr, "ordinal lookup accepted a negative ordinal");
+    require(model->tensor_source_at(static_cast<int32_t>(model->tensor_sources.size())) == nullptr,
+            "ordinal lookup accepted an out-of-range ordinal");
+
     require(model->source_path(0) != nullptr && *model->source_path(0) == first.string(),
             "source path lookup failed for shard zero");
     require(model->source_path(2) == nullptr, "out-of-bounds source path lookup did not fail");
@@ -122,6 +176,35 @@ int main() {
     model->retain_tensor_sources(loader, {});
     require(model->source_paths.empty() && model->tensor_sources.empty(),
             "source-less load retained disk tensor sources");
+
+    // single, non-split shard: both tensors must still get distinct, dense ordinals and
+    // resolve to source index 0 with the loader's own offsets
+    const std::filesystem::path single = directory / "single.gguf";
+    write_single_file(single, { "zeta.weight", "alpha.weight" });
+    std::vector<std::string> no_splits;
+    llama_model_loader single_loader(nullptr, nullptr, nullptr, single.string(), no_splits, nullptr,
+                                     LLAMA_LOAD_MODE_MMAP, true, true, false, nullptr, nullptr);
+    const auto * zeta_weight  = single_loader.get_weight("zeta.weight");
+    const auto * alpha_weight = single_loader.get_weight("alpha.weight");
+    require(zeta_weight != nullptr && zeta_weight->idx == 0 && zeta_weight->offs > 0,
+            "zeta.weight was not assigned the single source shard");
+    require(alpha_weight != nullptr && alpha_weight->idx == 0, "alpha.weight was not assigned the single source shard");
+    require(alpha_weight->ordinal == 0 && zeta_weight->ordinal == 1,
+            "single-file ordinals were not assigned in weights_map order");
+
+    std::unique_ptr<llama_model, decltype(&llama_model_free)> single_model(llama_model_create(LLM_ARCH_LLAMA, params),
+                                                                           &llama_model_free);
+    require(single_model != nullptr, "could not create single-shard model source index");
+    single_model->retain_tensor_sources(single_loader, { single.string() });
+    require(single_model->tensor_sources.size() == 2, "single-shard model did not retain both tensor records");
+    const auto * zeta_source  = single_model->tensor_source_at(static_cast<int32_t>(zeta_weight->ordinal));
+    const auto * alpha_source = single_model->tensor_source_at(static_cast<int32_t>(alpha_weight->ordinal));
+    require(zeta_source != nullptr && zeta_source->name == "zeta.weight" && zeta_source->source_idx == 0 &&
+                zeta_source->offset == zeta_weight->offs && zeta_source->size == 4,
+            "ordinal lookup returned the wrong source for the single-shard tensor 'zeta.weight'");
+    require(alpha_source != nullptr && alpha_source->name == "alpha.weight" && alpha_source->source_idx == 0 &&
+                alpha_source->offset == alpha_weight->offs && alpha_source->size == 4,
+            "ordinal lookup returned the wrong source for the single-shard tensor 'alpha.weight'");
 
     std::filesystem::remove_all(directory, error);
     return 0;
