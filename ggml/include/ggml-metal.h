@@ -70,6 +70,14 @@ GGML_BACKEND_API void     ggml_backend_metal_event_host_signal(ggml_metal_event_
 GGML_BACKEND_API bool     ggml_backend_metal_event_host_wait  (ggml_metal_event_t ev, uint64_t value, uint64_t timeout_ms);
 GGML_BACKEND_API uint64_t ggml_backend_metal_event_host_value (ggml_metal_event_t ev);
 
+// The command buffer error that put this backend into its error state, or NULL if it has not
+// entered one. Valid until the backend computes again or is freed.
+//
+// A caller that only sees a failed compute cannot tell a GPU timeout from an allocation fault
+// from an abandoned queue, and those want different responses. This is where the distinction is
+// written down.
+GGML_BACKEND_API const char * ggml_backend_metal_last_error(ggml_backend_t backend);
+
 GGML_BACKEND_API void ggml_backend_metal_set_boundary_schedule(
         ggml_backend_t backend,
         int n_cuts,  struct ggml_tensor * const * cut_nodes,  ggml_metal_event_t * sig_ev,  const uint64_t * sig_val,
