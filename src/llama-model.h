@@ -606,6 +606,8 @@ struct llama_meta_device_get_split_state_userdata {
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
 /// Resolved source location retained for each tensor after model loading.
+/// `name` is kept for diagnostics and for the ordinal validation done in
+/// retain_tensor_sources(); it is never used for lookup.
 struct llama_tensor_source_info {
     std::string name;
     uint16_t    source_idx = 0;
@@ -620,7 +622,9 @@ struct llama_model {
     std::string name = "n/a";
     /// Resolved GGUF source paths, indexed by llama_tensor_source_info::source_idx.
     std::vector<std::string>              source_paths;
-    /// Tensor source records sorted by name for binary-search lookup.
+    /// Tensor source records indexed by the canonical model-wide tensor ordinal
+    /// (the UNBIASED ordinal; ggml_tensor::src_ordinal stores that ordinal plus
+    /// one, see tensor_source_at()), NOT sorted by name.
     std::vector<llama_tensor_source_info> tensor_sources;
 
     llama_hparams hparams = {};
@@ -757,15 +761,15 @@ struct llama_model {
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
-    /// Return the resolved source record for `name`, or nullptr when absent.
-    [[nodiscard]] const llama_tensor_source_info * tensor_source(const char * name) const noexcept {
-        if (name == nullptr) {
+    /// Return the resolved source record for a STAMPED tensor ordinal (i.e. a
+    /// ggml_tensor::src_ordinal value, which is the canonical ordinal plus one),
+    /// or nullptr when the stamp is GGML_TENSOR_SRC_ORDINAL_NONE or out of range.
+    [[nodiscard]] const llama_tensor_source_info * tensor_source_at(int32_t stamped_ordinal) const noexcept {
+        if (stamped_ordinal <= GGML_TENSOR_SRC_ORDINAL_NONE) {
             return nullptr;
         }
-        const auto it = std::lower_bound(
-            tensor_sources.begin(), tensor_sources.end(), name,
-            [](const llama_tensor_source_info & source, const char * needle) noexcept { return source.name < needle; });
-        return it != tensor_sources.end() && it->name == name ? &*it : nullptr;
+        const size_t ordinal = (size_t) stamped_ordinal - 1;
+        return ordinal < tensor_sources.size() ? &tensor_sources[ordinal] : nullptr;
     }
 
     /// Return a resolved source path by its canonical source index, or nullptr when out of bounds.

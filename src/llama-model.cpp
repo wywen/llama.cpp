@@ -1195,22 +1195,48 @@ void llama_model::retain_tensor_sources(llama_model_loader & loader, std::vector
     if (source_paths.empty()) {
         return;
     }
-    tensor_sources.reserve(loader.weights_map.size());
+    // loader.weights_map assigns ordinal densely over its own iteration order
+    // (weight_name_comparer: layer number, then name), so writing each weight
+    // at its ordinal here reproduces that same deterministic order.
+    tensor_sources.resize(loader.weights_map.size());
+    std::vector<bool> filled(tensor_sources.size(), false);
     for (const auto & [name, weight] : loader.weights_map) {
         if (weight.idx >= source_paths.size()) {
             throw std::runtime_error(format("tensor '%s' has invalid source index %u (source count %zu)", name.c_str(),
                                             static_cast<unsigned>(weight.idx), source_paths.size()));
         }
-        tensor_sources.push_back({
+        if (weight.ordinal >= tensor_sources.size()) {
+            throw std::runtime_error(format("tensor '%s' has out-of-range ordinal %u (tensor count %zu)", name.c_str(),
+                                            weight.ordinal, tensor_sources.size()));
+        }
+        if (filled[weight.ordinal]) {
+            throw std::runtime_error(format("tensor '%s' claims ordinal %u already assigned to another tensor",
+                                            name.c_str(), weight.ordinal));
+        }
+        filled[weight.ordinal] = true;
+        // Indexed by the UNBIASED ordinal (weight.ordinal), unlike the stamp on
+        // ggml_tensor::src_ordinal itself, which is that ordinal plus one.
+        tensor_sources[weight.ordinal] = {
             name,
             weight.idx,
             weight.offs,
             static_cast<uint64_t>(ggml_nbytes(weight.tensor)),
-        });
+        };
     }
-    std::sort(
-        tensor_sources.begin(), tensor_sources.end(),
-        [](const llama_tensor_source_info & lhs, const llama_tensor_source_info & rhs) { return lhs.name < rhs.name; });
+
+    // Fail loudly here, at model initialization, rather than let the engine
+    // resolve a mismatched or stale ordinal later.
+    for (const auto & [name, tensor] : tensors_by_name) {
+        // a tensor llama synthesized itself (not backed by a GGUF weight) is left
+        // at the sentinel ordinal and has nothing to validate against
+        if (tensor->src_ordinal == GGML_TENSOR_SRC_ORDINAL_NONE && loader.get_weight(name.c_str()) == nullptr) {
+            continue;
+        }
+        const llama_tensor_source_info * source = tensor_source_at(tensor->src_ordinal);
+        if (source == nullptr || source->name != name) {
+            throw std::runtime_error(format("tensor '%s' has a mismatched source ordinal %d", name.c_str(), tensor->src_ordinal));
+        }
+    }
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {
