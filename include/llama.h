@@ -1039,6 +1039,11 @@ extern "C" {
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
 
+    // Set the ubatch width that graph reservations are sized for, clamped to [1, n_ubatch].
+    // Compute buffers are sized for the widest graph the context can run, so narrowing this before a decode loop releases the prefill width. Takes effect on the next encode/decode.
+    // A wider batch widens the reservation again on its own, so this is a hint and never a constraint.
+    LLAMA_API void llama_set_ubatch_reserve(struct llama_context * ctx, uint32_t n_tokens);
+
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
