@@ -13,6 +13,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -247,6 +248,7 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    cparams.n_ubatch_reserve = cparams.n_ubatch;
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -594,7 +596,7 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch_reserve);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -1193,6 +1195,30 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_ubatch_reserve(uint32_t n_tokens) {
+    LLAMA_LOG_DEBUG("%s: n_tokens = %u\n", __func__, n_tokens);
+
+    const uint32_t width = std::clamp(n_tokens, 1u, cparams.n_ubatch);
+
+    if (cparams.n_ubatch_reserve == width) {
+        return;
+    }
+
+    cparams.n_ubatch_reserve = width;
+
+    sched_need_reserve = true;
+}
+
+void llama_context::widen_ubatch_reserve(uint32_t n_tokens) {
+    const uint32_t needed = std::min(cparams.n_ubatch, n_tokens);
+
+    if (cparams.n_ubatch_reserve >= needed) {
+        return;
+    }
+
+    set_ubatch_reserve(needed);
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1433,6 +1459,8 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // [TAG_NO_CACHE_PAD]
     // TODO: add new split mode where we pad the input sequences so that ubatch.equal_seqs == true
     const llama_ubatch ubatch = balloc->split_simple(n_tokens);
+
+    widen_ubatch_reserve(n_tokens);
 
     // micro-batching is not possible for non-causal encoding, so we process the batch in a single shot
     GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens");
@@ -1739,6 +1767,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     n_queued_tokens += n_tokens_all;
 
     output_swaps.clear();
+
+    widen_ubatch_reserve(n_tokens_all);
 
     sched_reserve();
 
@@ -3849,6 +3879,10 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
+}
+
+void llama_set_ubatch_reserve(llama_context * ctx, uint32_t n_tokens) {
+    ctx->set_ubatch_reserve(n_tokens);
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
