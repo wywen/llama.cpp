@@ -78,6 +78,13 @@ GGML_BACKEND_API uint64_t ggml_backend_metal_event_host_value (ggml_metal_event_
 // written down.
 GGML_BACKEND_API const char * ggml_backend_metal_last_error(ggml_backend_t backend);
 
+// Bound how many command buffers of the paged encode may be outstanding.
+// 0 (default) commits the whole chain up front. A committed buffer waiting on a
+// pager event is already being timed by the GPU, so an unbounded chain makes a
+// late segment's timeout budget cover every read ahead of it. Must stay above
+// the pager's admit-lead window.
+GGML_BACKEND_API void ggml_backend_metal_set_commit_depth(ggml_backend_t backend, int depth);
+
 GGML_BACKEND_API void ggml_backend_metal_set_boundary_schedule(
         ggml_backend_t backend,
         int n_cuts,  struct ggml_tensor * const * cut_nodes,  ggml_metal_event_t * sig_ev,  const uint64_t * sig_val,

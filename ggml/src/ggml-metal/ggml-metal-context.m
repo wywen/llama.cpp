@@ -100,6 +100,13 @@ struct ggml_metal {
     struct ggml_tensor  ** bsched_wait_nodes; // node ptrs; segment starts (wait before)
     ggml_metal_event_t  *  bsched_wait_ev;
     uint64_t *             bsched_wait_val;
+    // How many command buffers of the paged encode may be outstanding at once.
+    // 0 = unbounded (every segment is committed before any of them runs).
+    // A committed buffer waiting on a pager event holds the GPU's timeout clock,
+    // so an unbounded chain lets a late segment age out while it waits its turn.
+    // Must stay above the pager's admit-lead window: the pager cannot signal a
+    // wait for a segment that has not been committed yet.
+    int                    bsched_commit_depth;
 
     // Encode window over the paged path (PERSISTENT + pointer-keyed, like the
     // boundary schedule above; see ggml_metal_set_encode_window). While set,
@@ -556,6 +563,10 @@ static void ggml_metal_bsched_clear(ggml_metal_t ctx) {
     ctx->bsched_n_waits    = 0;
 }
 
+void ggml_metal_set_commit_depth(ggml_metal_t ctx, int depth) {
+    ctx->bsched_commit_depth = depth > 0 ? depth : 0;
+}
+
 void ggml_metal_set_boundary_schedule(
         ggml_metal_t ctx,
         int n_cuts,  struct ggml_tensor * const * cut_nodes,  ggml_metal_event_t * sig_ev, const uint64_t * sig_val,
@@ -913,6 +924,18 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             const bool window_first = window_applies && !window_entered;
             const bool window_last  = window_applies && seg_start <= window_hi && seg_end > window_hi;
             window_entered = true;
+
+            // Bound how far ahead segments are committed. A committed buffer
+            // that is waiting on its pager event is already being timed by the
+            // GPU, so committing the whole chain up front makes the last
+            // segment's timeout budget cover every read before it.
+            if (ctx->bsched_commit_depth > 0) {
+                const NSUInteger live = [ctx->cmd_bufs_ext count];
+                if (live >= (NSUInteger) ctx->bsched_commit_depth) {
+                    id<MTLCommandBuffer> oldest = ctx->cmd_bufs_ext[live - (NSUInteger) ctx->bsched_commit_depth];
+                    [oldest waitUntilCompleted];
+                }
+            }
 
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
