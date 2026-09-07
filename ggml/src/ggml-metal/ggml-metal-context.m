@@ -832,6 +832,11 @@ static bool ggml_metal_ewin_split_is_in_band(
 // is what makes the cross-command-buffer event signals monotonic and the waits
 // land on the right segment. Async like the stock path -- failures surface at
 // the next ggml_metal_synchronize (which drains cmd_bufs_ext), not here.
+// How long the encode will wait for a segment's gate before committing anyway.
+// Generous: exceeding it is not an error, only a return to committing ahead of
+// the data for that one segment.
+#define GGML_METAL_PAGED_GATE_WAIT_MS 30000
+
 static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     const int n_nodes = gf->n_nodes;
 
@@ -1010,6 +1015,31 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             // wait node (every wait node was injected as a segment start); more
             // than one schedule wait can target the same node (a layer's K and V
             // regions sharing a first-reader), so emit ALL that match.
+            //
+            // The GPU-side waits below stay as the ordering guarantee, but the
+            // host waits for the same values FIRST, so the buffer is normally
+            // committed only once its data is already there.
+            //
+            // A committed buffer parked on an event is occupying a queue slot and
+            // being timed by the GPU for the whole park -- committing the whole
+            // chain up front is what let a late segment's timeout budget cover
+            // every read ahead of it. Committing when the gate is already
+            // satisfied means the buffer runs rather than waits, so a segment
+            // holds device resources only while it is executing.
+            //
+            // On timeout this proceeds and commits anyway: the encoded wait below
+            // is still correct, so the fallback is the old behaviour for that one
+            // segment rather than a failure.
+            if (is_wait[seg_start]) {
+                struct ggml_tensor * wnode = gf->nodes[seg_start];
+                for (int w = 0; w < n_waits; ++w) {
+                    if (wait_nodes[w] == wnode && wait_ev[w] != NULL) {
+                        (void) ggml_metal_event_host_wait(wait_ev[w], wait_val[w],
+                                GGML_METAL_PAGED_GATE_WAIT_MS);
+                    }
+                }
+            }
+
             if (is_wait[seg_start]) {
                 struct ggml_tensor * node = gf->nodes[seg_start];
                 for (int w = 0; w < n_waits; ++w) {
