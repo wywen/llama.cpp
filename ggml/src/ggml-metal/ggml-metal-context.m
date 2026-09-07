@@ -20,6 +20,13 @@
 // max number of MTLCommandBuffer used to submit a graph for processing
 #define GGML_METAL_MAX_COMMAND_BUFFERS 8
 
+// One paged-encode segment's terminal state. `desc` is empty unless the buffer
+// reported an error with a description.
+struct ggml_metal_seg_result {
+    int    status;
+    char   desc[256];
+};
+
 struct ggml_metal_command_buffer {
     id<MTLCommandBuffer> obj;
 };
@@ -69,6 +76,18 @@ struct ggml_metal {
 
     // extra command buffers for things like getting, setting and copying tensors
     NSMutableArray * cmd_bufs_ext;
+
+    // Terminal state of each paged-encode segment, captured by that segment's
+    // completion handler rather than read back off the buffer afterwards.
+    //
+    // A failure ABANDONS the rest of the queue, and an abandoned buffer carries
+    // a bare status with no localizedDescription -- so reading state back after
+    // the fact can only find the first buffer that did not complete, which is
+    // usually not the one that failed. Capturing at completion records what
+    // each buffer actually reported, at the instant it reported it.
+    struct ggml_metal_seg_result * seg_results;
+    int                            seg_results_cap;
+    int                            seg_results_n;
 
     // the last command buffer queued into the Metal queue with operations relevant to the current Metal backend
     id<MTLCommandBuffer> cmd_buf_last;
@@ -262,6 +281,11 @@ void ggml_metal_free(ggml_metal_t ctx) {
     [ctx->cmd_bufs_ext removeAllObjects];
     [ctx->cmd_bufs_ext release];
 
+    free(ctx->seg_results);
+    ctx->seg_results = NULL;
+    ctx->seg_results_cap = 0;
+    ctx->seg_results_n = 0;
+
     if (ctx->pipelines_ext) {
         ggml_metal_pipelines_free(ctx->pipelines_ext);
         ctx->pipelines_ext = nil;
@@ -367,6 +391,30 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
             }
         }
     }
+
+    // Report from what the segments themselves recorded at completion. A failure
+    // abandons the rest of the queue, so reading state back off the buffers now
+    // finds the first ABANDONED one rather than the one that failed; these were
+    // captured at the instant each buffer reported.
+    for (int i = 0; i < ctx->seg_results_n; ++i) {
+        if (ctx->seg_results[i].status == (int) MTLCommandBufferStatusCompleted) {
+            continue;
+        }
+        GGML_LOG_ERROR("%s: paged segment %d finished with status %d\n", __func__, i,
+                ctx->seg_results[i].status);
+        for (int j = i; j < ctx->seg_results_n; ++j) {
+            if (ctx->seg_results[j].desc[0] == '\0') {
+                continue;
+            }
+            GGML_LOG_ERROR("%s: paged segment %d is the first carrying an error: %s\n", __func__, j,
+                    ctx->seg_results[j].desc);
+            snprintf(ctx->last_error, sizeof(ctx->last_error), "paged segment %d: %s", j,
+                    ctx->seg_results[j].desc);
+            break;
+        }
+        break;
+    }
+    ctx->seg_results_n = 0;
 
     // release any completed extra command buffers
     if (ctx->cmd_bufs_ext.count > 0) {
@@ -784,6 +832,11 @@ static bool ggml_metal_ewin_split_is_in_band(
 // is what makes the cross-command-buffer event signals monotonic and the waits
 // land on the right segment. Async like the stock path -- failures surface at
 // the next ggml_metal_synchronize (which drains cmd_bufs_ext), not here.
+// How long the encode will wait for a segment's gate before committing anyway.
+// Generous: exceeding it is not an error, only a return to committing ahead of
+// the data for that one segment.
+#define GGML_METAL_PAGED_GATE_WAIT_MS 30000
+
 static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     const int n_nodes = gf->n_nodes;
 
@@ -907,6 +960,23 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
 
         bool window_entered = false;
 
+        // Room for this graph's segments, grown ONLY while nothing is pending.
+        //
+        // Handlers hold a pointer into this array and run on a Metal thread, so
+        // reallocating while an earlier graph's handlers are still outstanding
+        // would move the storage under them. A token can span several graphs, so
+        // that is reachable: grow at the start of the token, and if a later
+        // graph in the same token would overflow, capture nothing for it rather
+        // than move the array. `ggml_metal_synchronize` waits on the last buffer
+        // before resetting the count, so every handler has run by then.
+        if (ctx->seg_results_n == 0 && ctx->seg_results_cap < n_starts) {
+            free(ctx->seg_results);
+            ctx->seg_results = (struct ggml_metal_seg_result *) malloc(
+                    sizeof(struct ggml_metal_seg_result) * (size_t) n_starts);
+            GGML_ASSERT(ctx->seg_results != NULL);
+            ctx->seg_results_cap = n_starts;
+        }
+
         // Encode each segment into its own command buffer, in order.
         for (int seg = 0; seg < n_starts; ++seg) {
             const int seg_start = starts[seg];
@@ -945,6 +1015,31 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             // wait node (every wait node was injected as a segment start); more
             // than one schedule wait can target the same node (a layer's K and V
             // regions sharing a first-reader), so emit ALL that match.
+            //
+            // The GPU-side waits below stay as the ordering guarantee, but the
+            // host waits for the same values FIRST, so the buffer is normally
+            // committed only once its data is already there.
+            //
+            // A committed buffer parked on an event is occupying a queue slot and
+            // being timed by the GPU for the whole park -- committing the whole
+            // chain up front is what let a late segment's timeout budget cover
+            // every read ahead of it. Committing when the gate is already
+            // satisfied means the buffer runs rather than waits, so a segment
+            // holds device resources only while it is executing.
+            //
+            // On timeout this proceeds and commits anyway: the encoded wait below
+            // is still correct, so the fallback is the old behaviour for that one
+            // segment rather than a failure.
+            if (is_wait[seg_start]) {
+                struct ggml_tensor * wnode = gf->nodes[seg_start];
+                for (int w = 0; w < n_waits; ++w) {
+                    if (wait_nodes[w] == wnode && wait_ev[w] != NULL) {
+                        (void) ggml_metal_event_host_wait(wait_ev[w], wait_val[w],
+                                GGML_METAL_PAGED_GATE_WAIT_MS);
+                    }
+                }
+            }
+
             if (is_wait[seg_start]) {
                 struct ggml_tensor * node = gf->nodes[seg_start];
                 for (int w = 0; w < n_waits; ++w) {
@@ -1011,6 +1106,26 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
                         ggml_metal_event_signal_on_complete(sig_ev[c], (ggml_metal_cmd_buf_t) cmd_buf, sig_val[c]);
                     }
                 }
+            }
+
+            // Capture this segment's outcome when it finishes, rather than
+            // reading it back later: by then a failure has abandoned the rest of
+            // the queue and the descriptions are gone. The slot is reserved
+            // before commit so the handler only ever writes its own index.
+            if (ctx->seg_results_n < ctx->seg_results_cap) {
+                struct ggml_metal_seg_result * slot = &ctx->seg_results[ctx->seg_results_n++];
+                slot->status = -1;
+                slot->desc[0] = '\0';
+                [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                    slot->status = (int) [cb status];
+                    NSError * err = [cb error];
+                    if (err != nil) {
+                        const char * d = [[err localizedDescription] UTF8String];
+                        if (d != NULL) {
+                            snprintf(slot->desc, sizeof(slot->desc), "%s", d);
+                        }
+                    }
+                }];
             }
 
             [cmd_buf commit];
