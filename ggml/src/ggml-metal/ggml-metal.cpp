@@ -670,6 +670,12 @@ const char * ggml_backend_metal_last_error(ggml_backend_t backend) {
     return ggml_metal_last_error((ggml_metal_t)backend->context);
 }
 
+void ggml_backend_metal_set_commit_depth(ggml_backend_t backend, int depth) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_set_commit_depth((ggml_metal_t)backend->context, depth);
+}
+
 void ggml_backend_metal_set_boundary_schedule(
         ggml_backend_t backend,
         int n_cuts,  struct ggml_tensor * const * cut_nodes,  ggml_metal_event_t * sig_ev,  const uint64_t * sig_val,
