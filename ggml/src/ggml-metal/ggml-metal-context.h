@@ -38,6 +38,11 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx);
 
 ggml_metal_device_t ggml_metal_get_device(ggml_metal_t ctx);
 
+// Bound the number of outstanding command buffers on the paged encode path.
+// 0 (default) keeps the whole chain committed up front. Must exceed the
+// pager's admit-lead window.
+void ggml_metal_set_commit_depth(ggml_metal_t ctx, int depth);
+
 void ggml_metal_set_boundary_schedule(
         ggml_metal_t ctx,
         int n_cuts,  struct ggml_tensor * const * cut_nodes,  ggml_metal_event_t * sig_ev, const uint64_t * sig_val,
