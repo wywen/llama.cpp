@@ -117,7 +117,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = llama_memory_alloc_buffer(ctx.get(), buft, hparams);
+        ggml_backend_buffer_t buf = llama_memory_alloc_buffer(ctx.get(), buft, hparams, LLAMA_MEMORY_PLAN_BUFFER_RECURRENT);
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for rs cache");
         }

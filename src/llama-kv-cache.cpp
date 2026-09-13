@@ -277,7 +277,8 @@ llama_kv_cache::llama_kv_cache(
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = llama_memory_alloc_buffer(ctx.get(), buft, hparams);
+        ggml_backend_buffer_t buf = llama_memory_alloc_buffer(ctx.get(), buft, hparams,
+                swa_type == LLAMA_SWA_TYPE_NONE ? LLAMA_MEMORY_PLAN_BUFFER_KV : LLAMA_MEMORY_PLAN_BUFFER_KV_SWA);
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
         }

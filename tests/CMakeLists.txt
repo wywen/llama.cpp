@@ -248,6 +248,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --models "${MODEL_DIR}"
     )
     set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    llama_build(test-memory-plan.cpp)
+    llama_test(
+        test-memory-plan
+        LABEL main
+        ARGS --models "${MODEL_DIR}"
+    )
+    set_tests_properties(test-memory-plan PROPERTIES FIXTURES_REQUIRED generate-models)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)

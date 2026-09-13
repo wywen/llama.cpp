@@ -983,7 +983,7 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
     }
 
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = llama_memory_alloc_buffer(ctx.get(), buft, hparams);
+        ggml_backend_buffer_t buf = llama_memory_alloc_buffer(ctx.get(), buft, hparams, LLAMA_MEMORY_PLAN_BUFFER_DSV4_STATE);
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for DSV4 compressor state");
         }

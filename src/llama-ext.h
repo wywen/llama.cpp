@@ -8,6 +8,8 @@
 
 #include <cstdint>
 #include <map>
+#include <string>
+#include <vector>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -102,6 +104,59 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+
+//
+// memory planning
+//
+
+// the memory component a planned buffer backs
+enum llama_memory_plan_buffer_kind {
+    LLAMA_MEMORY_PLAN_BUFFER_KV,         // attention KV cache without a sliding window
+    LLAMA_MEMORY_PLAN_BUFFER_KV_SWA,     // attention KV cache that masks attention to a sliding window; the tensor shapes give its cell count
+    LLAMA_MEMORY_PLAN_BUFFER_RECURRENT,  // recurrent state
+    LLAMA_MEMORY_PLAN_BUFFER_DSV4_STATE, // DeepSeek V4 compressor state
+};
+
+struct llama_memory_plan_tensor {
+    std::string name;                // e.g. cache_k_l3, cache_idx_k_l3, cache_r_l0, dsv4_csa_state_kv_l2
+    int32_t     il;                  // layer from the trailing _l<N> of the name; -1 when it has none
+    ggml_type   type;
+    int64_t     ne[GGML_MAX_DIMS];
+    size_t      nb[GGML_MAX_DIMS];
+    size_t      nbytes;              // ggml_nbytes, before buffer alignment
+};
+
+struct llama_memory_plan_buffer {
+    llama_memory_plan_buffer_kind kind;
+    ggml_backend_buffer_type_t    buft;
+    size_t                        size; // bytes the buffer takes, including alignment padding
+    std::vector<llama_memory_plan_tensor> tensors; // the tensors owning storage, in allocation order
+};
+
+// the memory a context would build for a set of context parameters
+struct llama_memory_plan {
+    // the resolved shape the memory is built with
+    uint32_t n_ctx;
+    uint32_t n_ctx_seq;
+    uint32_t n_seq_max;
+    uint32_t n_ubatch;
+    uint32_t n_rs_seq;
+    bool     flash_attn;  // as the memory is built; automatic flash attention counts as enabled
+    bool     kv_unified;
+    bool     offload_kqv;
+
+    bool has_memory; // false when the architecture keeps no memory, or the model is vocab-only
+
+    std::vector<llama_memory_plan_buffer> buffers; // in allocation order
+};
+
+// Builds the memory module a context created from `params` would own, with every buffer allocation
+// replaced by a record of what it would allocate, then destroys it.
+// Allocates no tensor data, though host-side cell metadata proportional to the cell count is still built
+// and freed. Does not modify the model. A memory that shares cells with params.ctx_other
+// resets that context's cell metadata while it is built, exactly as creating the context does.
+// Throws std::runtime_error when the parameters would fail context creation.
+LLAMA_API llama_memory_plan llama_model_memory_plan(const struct llama_model * model, const llama_context_params & params);
 
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
