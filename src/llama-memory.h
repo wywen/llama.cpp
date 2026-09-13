@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-ext.h"
 #include "llama-graph.h"
 
 #include <map>
@@ -33,12 +34,14 @@ struct llama_memory_params {
 
 // the tensor contexts and backend buffers of a memory instance
 // with no_alloc, dummy buffers are attached instead of allocating the tensor data, so the memory use can still be measured
+// a memory instance built while a memory plan is recorded (see llama_memory_alloc_planning) is also no_alloc
 struct llama_memory_bufs {
-    explicit llama_memory_bufs(bool no_alloc) : no_alloc(no_alloc) {}
+    explicit llama_memory_bufs(bool no_alloc);
 
     // allocate the tensors of ctx on buft, or attach a dummy buffer if no_alloc is set
+    // `kind` is the memory component the buffer backs, as a memory plan records it
     // returns the buffer, for logging
-    ggml_backend_buffer_t emplace(ggml_context_ptr ctx, ggml_backend_buffer_type_t buft, const char * name);
+    ggml_backend_buffer_t emplace(ggml_context_ptr ctx, ggml_backend_buffer_type_t buft, const char * name, llama_memory_plan_buffer_kind kind);
 
     // the memory used by the tensors: the buffer sizes, or the simulated sizes if no_alloc is set
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;

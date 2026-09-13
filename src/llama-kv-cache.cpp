@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-io.h"
+#include "llama-memory-alloc.h"
 #include "llama-model.h"
 #include "llama-context.h"
 
@@ -84,7 +85,8 @@ llama_kv_cache::llama_kv_cache(
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_swa(n_swa),
     attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
     other(static_cast<llama_kv_cache *>(mem_other)),
-    v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
+    // a plan must leave the source cache's cells alone, so it sizes a private copy instead
+    v_cells_impl(other && !llama_memory_alloc_planning() ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
 
     // shared cells view the source cache's K/V tensors, so the cell count
@@ -274,7 +276,8 @@ llama_kv_cache::llama_kv_cache(
 
     // allocate the tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ctxs_bufs.emplace(std::move(ctx), buft, "kv cache");
+        ggml_backend_buffer_t buf = ctxs_bufs.emplace(std::move(ctx), buft, "kv cache",
+                swa_type == LLAMA_SWA_TYPE_NONE ? LLAMA_MEMORY_PLAN_BUFFER_KV : LLAMA_MEMORY_PLAN_BUFFER_KV_SWA);
 
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
     }
@@ -406,7 +409,7 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
     }
 
     for (auto & [buft, ctx] : ctx_map) {
-        auto * buf = attn_rot_bufs.emplace(std::move(ctx), buft, "rotation matrices");
+        auto * buf = attn_rot_bufs.emplace(std::move(ctx), buft, "rotation matrices", LLAMA_MEMORY_PLAN_BUFFER_KV_ROT);
         ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         LLAMA_LOG_INFO("%s: %10s rotation buffer size = %8.2f MiB\n", __func__,
                 ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
