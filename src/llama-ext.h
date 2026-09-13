@@ -129,7 +129,9 @@ struct llama_memory_plan_tensor {
 struct llama_memory_plan_buffer {
     llama_memory_plan_buffer_kind kind;
     ggml_backend_buffer_type_t    buft;
-    size_t                        size; // bytes the buffer takes, including alignment padding
+    // bytes ggml's allocator places the tensors in: the sum of their sizes, each padded to the buffer type's
+    // alignment, as memory_breakdown reports; a backend may round the physical allocation up further (Metal rounds to pages)
+    size_t                        size;
     std::vector<llama_memory_plan_tensor> tensors; // the tensors owning storage, in allocation order
 };
 
@@ -154,7 +156,9 @@ struct llama_memory_plan {
 // replaced by a record of what it would allocate, then destroys it.
 // Allocates no tensor data, though host-side cell metadata proportional to the cell count is still built
 // and freed. Modifies neither the model nor params.ctx_other.
-// Throws std::runtime_error when the parameters would fail context creation.
+// Throws std::runtime_error when the model is null, or when a parameter check of context creation refuses
+// the parameters; failures context creation meets later (backend, sampler, output or compute buffer
+// initialization) are not checked.
 LLAMA_API llama_memory_plan llama_model_memory_plan(const struct llama_model * model, const llama_context_params & params);
 
 // Set whether the context outputs nextn embeddings or not

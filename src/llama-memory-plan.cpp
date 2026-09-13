@@ -5,7 +5,13 @@
 #include "llama-memory-alloc.h"
 #include "llama-model.h"
 
+#include <stdexcept>
+
 llama_memory_plan llama_model_memory_plan(const llama_model * model, const llama_context_params & params) {
+    if (!model) {
+        throw std::runtime_error("model cannot be NULL");
+    }
+
     const llama_context_params resolved = llama_context_params_resolve(*model, params);
     const llama_cparams        cparams  = llama_cparams_memory_shape(*model, resolved);
 
