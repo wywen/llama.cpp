@@ -7,12 +7,15 @@
 #include "llama.h"
 #include "llama-cpp.h"
 
+#include "../src/llama-context.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-kv-cache.h"
 #include "../src/llama-memory-alloc.h"
 #include "../src/llama-model.h"
 
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
 
 #include <algorithm>
 #include <cinttypes>
@@ -206,6 +209,12 @@ void compare_shape(mismatch_log & log, const llama_memory_plan & plan, const lla
     check("n_ubatch",  llama_n_ubatch(ctx),  plan.n_ubatch);
     check("n_rs_seq",  llama_n_rs_seq(ctx),  plan.n_rs_seq);
 
+    // on the CPU the flash attention probe keeps an automatic request enabled, so the built flag is also the resolved one
+    const llama_cparams & cparams = ctx->get_cparams();
+    check("flash_attn",  cparams.flash_attn,  plan.flash_attn);
+    check("kv_unified",  cparams.kv_unified,  plan.kv_unified);
+    check("offload_kqv", cparams.offload_kqv, plan.offload_kqv);
+
     const bool built_memory = llama_get_memory(ctx) != nullptr;
     if (built_memory != plan.has_memory) {
         log.add("memory built = %d, planned = %d", built_memory, plan.has_memory);
@@ -272,6 +281,7 @@ void check_case(outcome & out, const std::string & subject, llama_model * model,
     }
 }
 
+#ifndef _WIN32
 size_t peak_rss_bytes() {
     rusage usage {};
     getrusage(RUSAGE_SELF, &usage);
@@ -311,6 +321,12 @@ bool check_plan_does_not_allocate(const std::string & path) {
     }
     return true;
 }
+#else
+bool check_plan_does_not_allocate(const std::string &) {
+    printf("large plan: SKIPPED, peak RSS is not measured on Windows\n");
+    return true;
+}
+#endif
 
 bool check_vocab_only(const std::string & path) {
     const llama_model_ptr model = load_cpu_model(path, model_load::vocab_only);
@@ -327,7 +343,17 @@ bool check_vocab_only(const std::string & path) {
     return true;
 }
 
-// a planning recorder on one thread must not capture the allocations of a context built on another
+bool check_null_model_throws() {
+    try {
+        llama_model_memory_plan(nullptr, llama_context_default_params());
+    } catch (const std::runtime_error &) {
+        return true;
+    }
+    fprintf(stderr, "FAIL null model: planning did not throw\n");
+    return false;
+}
+
+// a planning recorder on one thread must neither capture nor replace the allocations of a context built on another
 bool check_recorder_is_thread_local(const std::string & path) {
     const llama_model_ptr model = load_cpu_model(path, model_load::allocated);
     if (!model) {
@@ -337,17 +363,23 @@ bool check_recorder_is_thread_local(const std::string & path) {
 
     llama_memory_alloc_recorder recorder(llama_memory_alloc_mode::plan);
 
-    size_t built_buffers = 0;
+    size_t allocated_layers = 0;
     std::thread builder([&]() {
-        llama_memory_alloc_recorder own(llama_memory_alloc_mode::observe);
         const llama_context_ptr ctx(llama_init_from_model(model.get(), llama_context_default_params()));
-        built_buffers = ctx ? own.buffers().size() : 0;
+        const auto * cache = ctx ? dynamic_cast<const llama_kv_cache *>(llama_get_memory(ctx.get())) : nullptr;
+        if (cache == nullptr) {
+            return;
+        }
+        // the breakdown reports a placeholder at its would-be size, so look for tensor data instead
+        for (const uint32_t il : cache->get_layer_ids()) {
+            allocated_layers += cache->get_k_storage((int32_t) il)->data != nullptr;
+        }
     });
     builder.join();
 
-    if (built_buffers == 0 || !recorder.buffers().empty()) {
-        fprintf(stderr, "FAIL thread isolation: other thread recorded %zu buffers, this thread %zu\n",
-                built_buffers, recorder.buffers().size());
+    if (allocated_layers == 0 || !recorder.buffers().empty()) {
+        fprintf(stderr, "FAIL thread isolation: other thread allocated K storage for %zu layers, this thread recorded %zu buffers\n",
+                allocated_layers, recorder.buffers().size());
         return false;
     }
     return true;
@@ -447,6 +479,7 @@ int main(int argc, char ** argv) {
 
     bool ok = check_plan_does_not_allocate(dense);
     ok = check_vocab_only(dense) && ok;
+    ok = check_null_model_throws() && ok;
     ok = check_recorder_is_thread_local(dense) && ok;
     ok = check_plan_leaves_shared_cells_alone(dense) && ok;
 
@@ -478,6 +511,24 @@ int main(int argc, char ** argv) {
             models_loaded, std::size(context_cases), out.compared, out.refused, out.failed);
 
     ok = ok && out.failed == 0;
+
+    // the fixture models cover every buffer kind; a kind never compared means a model family went missing
+    if (out.compared == 0) {
+        fprintf(stderr, "FAIL no case was compared\n");
+        ok = false;
+    }
+    const std::pair<llama_memory_plan_buffer_kind, const char *> fixture_kinds[] = {
+        { LLAMA_MEMORY_PLAN_BUFFER_KV,         "kv"         },
+        { LLAMA_MEMORY_PLAN_BUFFER_KV_SWA,     "kv_swa"     },
+        { LLAMA_MEMORY_PLAN_BUFFER_RECURRENT,  "recurrent"  },
+        { LLAMA_MEMORY_PLAN_BUFFER_DSV4_STATE, "dsv4_state" },
+    };
+    for (const auto & [kind, name] : fixture_kinds) {
+        if (out.kinds_compared[kind] == 0) {
+            fprintf(stderr, "FAIL no %s buffer was compared\n", name);
+            ok = false;
+        }
+    }
     printf("test-memory-plan: %s\n", ok ? "OK" : "FAILED");
     return ok ? 0 : 1;
 }
