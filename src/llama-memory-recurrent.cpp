@@ -4,6 +4,7 @@
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-batch.h"
+#include "llama-memory-alloc.h"
 #include "llama-model.h"
 
 #include <algorithm>
@@ -116,7 +117,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        ggml_backend_buffer_t buf = llama_memory_alloc_buffer(ctx.get(), buft, hparams);
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for rs cache");
         }
@@ -419,8 +420,8 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
-    for (const auto & [_, buf] : ctxs_bufs) {
-        ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+    for (const auto & [ctx, buf] : ctxs_bufs) {
+        ret[ggml_backend_buffer_get_type(buf.get())] += llama_memory_buffer_size(ctx.get(), buf.get());
     }
     return ret;
 }
