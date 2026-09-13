@@ -81,21 +81,85 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
-llama_context::llama_context(
-        const llama_model & model,
-              llama_context_params params) :
-    model(model),
-    cvec(std::make_unique<llama_adapter_cvec>()),
-    loras(std::make_unique<llama_adapter_loras>()),
-    balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
-    // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
-    //     may need to be backend-dependent
-    LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+llama_context_params llama_context_params_resolve(const llama_model & model, llama_context_params params) {
+    if (params.n_batch == 0 && params.n_ubatch == 0) {
+        throw std::runtime_error("n_batch and n_ubatch cannot both be zero");
+    }
 
-    t_start_us = model.t_start_us;
-    t_load_us  = model.t_load_us;
+    if (params.n_ctx == 0 && model.hparams.n_ctx_train == 0) {
+        throw std::runtime_error("n_ctx and model->hparams.n_ctx_train cannot both be zero");
+    }
 
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model.arch == LLM_ARCH_GROK) {
+        LLAMA_LOG_WARN("%s: flash_attn is not compatible with Grok - forcing off\n", __func__);
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
+
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
+        if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+            throw std::runtime_error("SPLIT_MODE_TENSOR requires flash_attn to be enabled");
+        }
+    }
+
+    if ((model.hparams.is_mla() || model.arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
+        throw std::runtime_error(format("model does not support different K (%s) and V (%s) cache types",
+                ggml_type_name(params.type_k), ggml_type_name(params.type_v)));
+    }
+
+    if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            throw std::runtime_error("quantized V cache requires flash_attn to be enabled");
+        }
+    }
+
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
+        const uint32_t blck_size = ggml_blck_size(params.type_k);
+        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            if (model.hparams.n_embd_head_k(il) % blck_size != 0) {
+                throw std::runtime_error(format("K cache type %s with block size %u does not divide n_embd_head_k=%u",
+                        ggml_type_name(params.type_k), blck_size, model.hparams.n_embd_head_k(il)));
+            }
+        }
+    }
+
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
+        const uint32_t blck_size = ggml_blck_size(params.type_v);
+        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            if (model.hparams.n_embd_head_v(il) % blck_size != 0) {
+                throw std::runtime_error(format("V cache type %s with block size %u does not divide n_embd_head_v=%u",
+                        ggml_type_name(params.type_v), blck_size, model.hparams.n_embd_head_v(il)));
+            }
+        }
+    }
+
+    if (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&
+        params.pooling_type != model.hparams.pooling_type) {
+        //user-specified pooling-type is different from the model default
+        LLAMA_LOG_WARN("%s: model default pooling_type is [%d], but [%d] was specified\n", __func__,
+                       model.hparams.pooling_type, params.pooling_type);
+    }
+
+    // router_layer >= 0 means n_layer_nextn is repurposed for a router layer, not real MTP
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+        (model.hparams.n_layer_nextn == 0 || model.hparams.router_layer >= 0)) {
+        throw std::runtime_error("context type MTP requested but model doesn't contain MTP layers");
+    }
+
+    return params;
+}
+
+llama_cparams llama_cparams_memory_shape(const llama_model & model, const llama_context_params & params) {
     const auto & hparams = model.hparams;
+
+    llama_cparams cparams{};
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -109,38 +173,9 @@ llama_context::llama_context(
         cparams.n_rs_seq = 0;
     }
 
-    cparams.n_threads               = params.n_threads;
-    cparams.n_threads_batch         = params.n_threads_batch;
-    cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
-    cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
-    cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
-    cparams.yarn_beta_slow          = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
-    cparams.embeddings              = params.embeddings;
-    cparams.embeddings_nextn        = false;
-    cparams.embeddings_nextn_masked = false;
-    cparams.offload_kqv             = params.offload_kqv;
-    cparams.no_perf                 = params.no_perf;
-    cparams.warmup                  = false;
-
-    // +1: id n_layer() taps the output of the last layer ("input" of the head)
-    cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
-    embd_layer_inp.resize(hparams.n_layer() + 1);
-
-    cparams.ctx_type     = params.ctx_type;
-    cparams.pooling_type = params.pooling_type;
-
-    cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
-    cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
-    cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
-
-    cparams.n_ctx_orig_yarn  = params.yarn_orig_ctx    != 0 ? params.yarn_orig_ctx    :
-                               hparams.n_ctx_orig_yarn != 0 ? hparams.n_ctx_orig_yarn :
-                                                              hparams.n_ctx_train;
-
-    cparams.cb_eval              = params.cb_eval;
-    cparams.cb_eval_user_data    = params.cb_eval_user_data;
-    cparams.cb_reserve           = params.cb_reserve;
-    cparams.cb_reserve_user_data = params.cb_reserve_user_data;
+    cparams.offload_kqv = params.offload_kqv;
+    cparams.ctx_type    = params.ctx_type;
+    cparams.n_ctx       = params.n_ctx == 0 ? hparams.n_ctx_train : params.n_ctx;
 
     cparams.ctx_other = nullptr;
 
@@ -162,6 +197,108 @@ llama_context::llama_context(
             cparams.ctx_other = params.ctx_other;
         }
     }
+
+    if (params.attention_type == LLAMA_ATTENTION_TYPE_UNSPECIFIED) {
+        cparams.causal_attn = hparams.causal_attn;
+    } else {
+        cparams.causal_attn = params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
+    }
+
+    cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
+
+    // with causal attention, the batch size is limited by the context size
+    cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
+
+    cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    cparams.n_ubatch_reserve = cparams.n_ubatch;
+
+    cparams.kv_unified = params.kv_unified;
+
+    // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
+    cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
+
+    if (cparams.kv_unified) {
+        cparams.n_ctx_seq = cparams.n_ctx;
+    } else {
+        cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
+        cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
+
+        if (cparams.n_ctx_seq == 0) {
+            throw std::runtime_error("n_ctx_seq == 0");
+        }
+
+        if (cparams.n_ctx != cparams.n_ctx_seq * cparams.n_seq_max) {
+            cparams.n_ctx =  cparams.n_ctx_seq * cparams.n_seq_max;
+            LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
+        }
+    }
+
+    return cparams;
+}
+
+llama_memory_i * llama_context_create_memory(
+        const llama_model          & model,
+        const llama_context_params & params,
+        const llama_cparams        & cparams) {
+    llama_memory_params params_mem = {
+        /*.type_k    =*/ params.type_k,
+        /*.type_v    =*/ params.type_v,
+        /*.swa_full  =*/ params.swa_full,
+        /*.ctx_type  =*/ cparams.ctx_type,
+        /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+    };
+
+    return model.create_memory(params_mem, cparams);
+}
+
+llama_context::llama_context(
+        const llama_model & model,
+              llama_context_params params) :
+    model(model),
+    cvec(std::make_unique<llama_adapter_cvec>()),
+    loras(std::make_unique<llama_adapter_loras>()),
+    balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
+    // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
+    //     may need to be backend-dependent
+    LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+
+    t_start_us = model.t_start_us;
+    t_load_us  = model.t_load_us;
+
+    const auto & hparams = model.hparams;
+
+    cparams = llama_cparams_memory_shape(model, params);
+
+    cparams.n_threads               = params.n_threads;
+    cparams.n_threads_batch         = params.n_threads_batch;
+    cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
+    cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
+    cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
+    cparams.yarn_beta_slow          = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
+    cparams.embeddings              = params.embeddings;
+    cparams.embeddings_nextn        = false;
+    cparams.embeddings_nextn_masked = false;
+    cparams.no_perf                 = params.no_perf;
+    cparams.warmup                  = false;
+
+    // +1: id n_layer() taps the output of the last layer ("input" of the head)
+    cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
+    embd_layer_inp.resize(hparams.n_layer() + 1);
+
+    cparams.pooling_type = params.pooling_type;
+
+    cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
+    cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
+
+    cparams.n_ctx_orig_yarn  = params.yarn_orig_ctx    != 0 ? params.yarn_orig_ctx    :
+                               hparams.n_ctx_orig_yarn != 0 ? hparams.n_ctx_orig_yarn :
+                                                              hparams.n_ctx_train;
+
+    cparams.cb_eval              = params.cb_eval;
+    cparams.cb_eval_user_data    = params.cb_eval_user_data;
+    cparams.cb_reserve           = params.cb_reserve;
+    cparams.cb_reserve_user_data = params.cb_reserve_user_data;
 
     auto rope_scaling_type = params.rope_scaling_type;
     if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
@@ -223,15 +360,6 @@ llama_context::llama_context(
         }
     }
 
-    if (params.attention_type == LLAMA_ATTENTION_TYPE_UNSPECIFIED) {
-        cparams.causal_attn = hparams.causal_attn;
-    } else {
-        cparams.causal_attn = params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
-    }
-
-    cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
-    cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
-
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = false;
@@ -243,12 +371,6 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
-
-    // with causal attention, the batch size is limited by the context size
-    cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
-
-    cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
-    cparams.n_ubatch_reserve = cparams.n_ubatch;
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -274,7 +396,6 @@ llama_context::llama_context(
     }
 
     cparams.op_offload = params.op_offload;
-    cparams.kv_unified = params.kv_unified;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -285,25 +406,6 @@ llama_context::llama_context(
 
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
-        }
-    }
-
-    // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
-    cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
-
-    if (cparams.kv_unified) {
-        cparams.n_ctx_seq = cparams.n_ctx;
-    } else {
-        cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
-        cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
-
-        if (cparams.n_ctx_seq == 0) {
-            throw std::runtime_error("n_ctx_seq == 0");
-        }
-
-        if (cparams.n_ctx != cparams.n_ctx_seq * cparams.n_seq_max) {
-            cparams.n_ctx =  cparams.n_ctx_seq * cparams.n_seq_max;
-            LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
         }
     }
 
@@ -388,15 +490,7 @@ llama_context::llama_context(
 
     // init the memory module
     if (!hparams.vocab_only) {
-        llama_memory_params params_mem = {
-            /*.type_k    =*/ params.type_k,
-            /*.type_v    =*/ params.type_v,
-            /*.swa_full  =*/ params.swa_full,
-            /*.ctx_type  =*/ cparams.ctx_type,
-            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
-        };
-
-        memory.reset(model.create_memory(params_mem, cparams));
+        memory.reset(llama_context_create_memory(model, params, cparams));
     }
 
     // init backends
@@ -3694,86 +3788,8 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
-    if (params.n_batch == 0 && params.n_ubatch == 0) {
-        LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
-        return nullptr;
-    }
-
-    if (params.n_ctx == 0 && model->hparams.n_ctx_train == 0) {
-        LLAMA_LOG_ERROR("%s: n_ctx and model->hparams.n_ctx_train cannot both be zero\n", __func__);
-        return nullptr;
-    }
-
-    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {
-        LLAMA_LOG_WARN("%s: flash_attn is not compatible with Grok - forcing off\n", __func__);
-        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
-    }
-
-    if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
-            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
-            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-        }
-        if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
-            LLAMA_LOG_ERROR("%s: SPLIT_MODE_TENSOR requires flash_attn to be enabled\n", __func__);
-            return nullptr;
-        }
-    }
-
-    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
-        LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
-        return nullptr;
-    }
-
-    if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
-        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
-            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);
-            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-        }
-        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-            LLAMA_LOG_ERROR("%s: quantized V cache requires flash_attn to be enabled\n", __func__);
-            return nullptr;
-        }
-    }
-
-    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
-        const uint32_t blck_size = ggml_blck_size(params.type_k);
-        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
-            if (model->hparams.n_embd_head_k(il) % blck_size != 0) {
-                LLAMA_LOG_ERROR("%s: K cache type %s with block size %u does not divide n_embd_head_k=%u\n",
-                    __func__, ggml_type_name(params.type_k), blck_size, model->hparams.n_embd_head_k(il));
-                return nullptr;
-            }
-        }
-    }
-
-    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
-        const uint32_t blck_size = ggml_blck_size(params.type_v);
-        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
-            if (model->hparams.n_embd_head_v(il) % blck_size != 0) {
-                LLAMA_LOG_ERROR("%s: V cache type %s with block size %u does not divide n_embd_head_v=%u\n",
-                    __func__, ggml_type_name(params.type_v), blck_size, model->hparams.n_embd_head_v(il));
-                return nullptr;
-            }
-        }
-    }
-
-    if (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&
-        params.pooling_type != model->hparams.pooling_type) {
-        //user-specified pooling-type is different from the model default
-        LLAMA_LOG_WARN("%s: model default pooling_type is [%d], but [%d] was specified\n", __func__,
-                       model->hparams.pooling_type, params.pooling_type);
-    }
-
-    // router_layer >= 0 means n_layer_nextn is repurposed for a router layer, not real MTP
-    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-        (model->hparams.n_layer_nextn == 0 || model->hparams.router_layer >= 0)) {
-        LLAMA_LOG_WARN("%s: context type MTP requested but model doesn't contain MTP layers\n", __func__);
-        return nullptr;
-    }
-
     try {
-        auto * ctx = new llama_context(*model, params);
+        auto * ctx = new llama_context(*model, llama_context_params_resolve(*model, params));
         return ctx;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to initialize the context: %s\n", __func__, err.what());
