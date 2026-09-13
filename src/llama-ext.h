@@ -153,8 +153,7 @@ struct llama_memory_plan {
 // Builds the memory module a context created from `params` would own, with every buffer allocation
 // replaced by a record of what it would allocate, then destroys it.
 // Allocates no tensor data, though host-side cell metadata proportional to the cell count is still built
-// and freed. Does not modify the model. A memory that shares cells with params.ctx_other
-// resets that context's cell metadata while it is built, exactly as creating the context does.
+// and freed. Modifies neither the model nor params.ctx_other.
 // Throws std::runtime_error when the parameters would fail context creation.
 LLAMA_API llama_memory_plan llama_model_memory_plan(const struct llama_model * model, const llama_context_params & params);
 

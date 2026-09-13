@@ -85,7 +85,8 @@ llama_kv_cache::llama_kv_cache(
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
-    v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
+    // a plan must leave the source cache's cells alone, so it sizes a private copy instead
+    v_cells_impl(other && !llama_memory_alloc_planning() ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
 
     // shared cells view the source cache's K/V tensors, so the cell count

@@ -18,6 +18,10 @@ llama_memory_alloc_recorder::~llama_memory_alloc_recorder() {
     memory_alloc_recorder = outer;
 }
 
+bool llama_memory_alloc_planning() {
+    return memory_alloc_recorder != nullptr && memory_alloc_recorder->mode == llama_memory_alloc_mode::plan;
+}
+
 static int32_t llama_memory_tensor_layer(const char * name) {
     const char * sep = strrchr(name, '_');
     if (sep == nullptr || sep[1] != 'l' || sep[2] == '\0') {

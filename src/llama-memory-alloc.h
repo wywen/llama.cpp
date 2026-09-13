@@ -16,6 +16,9 @@ enum class llama_memory_alloc_mode {
     observe, // back every buffer as it would be without a recorder
 };
 
+// True while a planning recorder is installed on this thread: memory being built must not modify live state.
+bool llama_memory_alloc_planning();
+
 // Records every buffer llama_memory_alloc_buffer backs on the installing thread while in scope.
 // Other threads are unaffected. Recorders nest: the innermost one receives the buffers.
 class llama_memory_alloc_recorder {
@@ -34,6 +37,7 @@ public:
 private:
     friend ggml_backend_buffer_t llama_memory_alloc_buffer(
             ggml_context *, ggml_backend_buffer_type_t, const llama_hparams &, llama_memory_plan_buffer_kind);
+    friend bool llama_memory_alloc_planning();
 
     const llama_memory_alloc_mode mode;
 

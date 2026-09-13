@@ -8,6 +8,7 @@
 #include "llama-cpp.h"
 
 #include "../src/llama-ext.h"
+#include "../src/llama-kv-cache.h"
 #include "../src/llama-memory-alloc.h"
 #include "../src/llama-model.h"
 
@@ -352,6 +353,59 @@ bool check_recorder_is_thread_local(const std::string & path) {
     return true;
 }
 
+// a planned cache sharing cells with a live cache must record the same buffers a real one allocates,
+// while leaving the live cache's cell metadata untouched
+bool check_plan_leaves_shared_cells_alone(const std::string & path) {
+    const llama_model_ptr model = load_cpu_model(path, model_load::allocated);
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx = 256;
+    const llama_context_ptr ctx(model ? llama_init_from_model(model.get(), params) : nullptr);
+    const auto * source = ctx ? dynamic_cast<llama_kv_cache *>(llama_get_memory(ctx.get())) : nullptr;
+    if (source == nullptr) {
+        fprintf(stderr, "FAIL shared cells: %s did not build a plain KV cache\n", path.c_str());
+        return false;
+    }
+
+    llama_token tokens[] = { 1, 2, 3, 4 };
+    if (llama_decode(ctx.get(), llama_batch_get_one(tokens, (int32_t) std::size(tokens))) != 0) {
+        fprintf(stderr, "FAIL shared cells: decode failed\n");
+        return false;
+    }
+    const llama_pos pos_live = llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0);
+
+    // layer 0 views the source's tensors, every other layer gets its own; the requested size yields to the source's
+    const auto build_sharing_cache = [&](llama_memory_alloc_mode mode) {
+        llama_memory_alloc_recorder recorder(mode);
+        const llama_kv_cache cache(*model, model->hparams, GGML_TYPE_F16, GGML_TYPE_F16, true, false, false,
+                2*source->get_size(), 1, 1, 0, LLAMA_SWA_TYPE_NONE, llama_get_memory(ctx.get()),
+                nullptr, nullptr, [](int32_t il) { return il == 0 ? 0 : -1; });
+        return recorder.release();
+    };
+
+    mismatch_log log("shared cells");
+
+    const std::vector<llama_memory_plan_buffer> planned = build_sharing_cache(llama_memory_alloc_mode::plan);
+    const llama_pos pos_after_plan = llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0);
+    if (pos_live != 3 || pos_after_plan != pos_live) {
+        log.add("live cache seq 0 ends at %d after decoding 4 tokens and at %d after planning", pos_live, pos_after_plan);
+    }
+
+    // a real sharing cache resets the source's cells by design, which also shows the probe above can see a reset
+    const std::vector<llama_memory_plan_buffer> built = build_sharing_cache(llama_memory_alloc_mode::observe);
+    const llama_pos pos_after_build = llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0);
+    if (pos_after_build != -1) {
+        log.add("control: building a real sharing cache left seq 0 ending at %d instead of resetting it", pos_after_build);
+    }
+
+    compare_buffers(log, planned, built);
+    if (planned.empty()) {
+        log.add("no buffer planned for the unshared layers");
+    }
+
+    log.print();
+    return log.empty();
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -394,6 +448,7 @@ int main(int argc, char ** argv) {
     bool ok = check_plan_does_not_allocate(dense);
     ok = check_vocab_only(dense) && ok;
     ok = check_recorder_is_thread_local(dense) && ok;
+    ok = check_plan_leaves_shared_cells_alone(dense) && ok;
 
     size_t models_loaded = 0;
     outcome out;
