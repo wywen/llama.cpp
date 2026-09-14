@@ -540,6 +540,12 @@ int main(int argc, char ** argv) {
     params.n_batch = 100;
     params.out_file = "dump_state.bin";
     params.sampling.seed = 1234;
+    // a restored state can place its cells in a different order, and CPU attention over F16 K/V depends on that order:
+    // about 1e-3 relative with flash attention (which casts K/V to F16) and 1e-4 without, enough to change a sampled token
+    // in a deep model; without flash attention and with an F32 cache the difference is at rounding level
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    params.cache_type_k    = GGML_TYPE_F32;
+    params.cache_type_v    = GGML_TYPE_F32;
 
     common_init();
 
