@@ -8,6 +8,8 @@
 #include "llama-cpp.h"
 #include "../src/llama-ext.h"
 
+#include "../src/llama-model.h" // the classifier head of a user-defined embedding model is dropped by hand
+
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
@@ -227,7 +229,7 @@ struct kv_writer {
     }
 };
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const enum llama_pooling_type pooling) {
     gguf_context_ptr ret(gguf_init_empty());
     kv_writer ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -636,6 +638,14 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_TOKENIZER_LIST,   tokenizer_list);
         ms.add_kv(LLM_KV_TOKENIZER_SCORES, tokenizer_scores);
     }
+    if (pooling != LLAMA_POOLING_TYPE_UNSPECIFIED) {
+        ms.add_kv(LLM_KV_POOLING_TYPE,               uint32_t(pooling));
+        ms.add_kv(LLM_KV_ATTENTION_CAUSAL,           false);
+        ms.add_kv(LLM_KV_TOKENIZER_TOKEN_TYPE_COUNT, uint32_t(2));
+        if (pooling == LLAMA_POOLING_TYPE_RANK) {
+            ms.add_kv(LLM_KV_CLASSIFIER_OUTPUT_LABELS, std::vector<std::string>({"LABEL_0"}));
+        }
+    }
 
     // ms.add_kv(LLM_KV_DENSE_2_FEAT_OUT,     n_embd);
     // ms.add_kv(LLM_KV_DENSE_3_FEAT_IN,      n_embd);
@@ -769,14 +779,18 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0) {
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
+        const enum llama_pooling_type pooling = LLAMA_POOLING_TYPE_UNSPECIFIED) {
     llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides);
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
-    if (!encode) {
+    if (pooling != LLAMA_POOLING_TYPE_UNSPECIFIED) {
+        ctx_params.embeddings = true;
+        ctx_params.n_seq_max  = 4;
+    } else if (!encode) {
         ctx_params.n_ubatch = 64;
     }
     if (moe_cache_size > 0) {
@@ -784,7 +798,13 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         ctx_params.moe_cache_size = moe_cache_size;
         ctx_params.n_ubatch = 2;
     }
-
+    if (gguf_ctx != nullptr && pooling != LLAMA_POOLING_TYPE_UNSPECIFIED && pooling != LLAMA_POOLING_TYPE_RANK) {
+        // a user-defined model gets every optional tensor, but only a reranker has a classifier head
+        model->cls       = nullptr;
+        model->cls_b     = nullptr;
+        model->cls_out   = nullptr;
+        model->cls_out_b = nullptr;
+    }
     llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
     if (!lctx) {
         throw std::runtime_error("failed to create llama context");
@@ -911,6 +931,50 @@ static bool check_causal_attn_toggle(
     return ok;
 }
 
+// pooled output per sequence: n_embd values, or n_cls_out scores with rank pooling
+static std::vector<float> get_embeddings(llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens) {
+    const uint32_t n_seq     = llama_n_seq_max(lctx);
+    const uint32_t n_seq_tok = tokens.size() / n_seq;
+    const uint32_t n_out     = llama_pooling_type(lctx) == LLAMA_POOLING_TYPE_RANK ? llama_model_n_cls_out(model) : llama_model_n_embd_out(model);
+    common_batch batch(lctx);
+    for (uint32_t s = 0; s < n_seq; s++) {
+        for (uint32_t pos = 0; pos < n_seq_tok; pos++) {
+            batch.add(tokens[s*n_seq_tok + pos], pos, llama_seq_id(s), true);
+        }
+    }
+    if (llama_process(lctx, LLAMA_PROCESS_TYPE_ENCODE, batch.get())) {
+        throw std::runtime_error("failed to encode batch");
+    }
+
+    std::vector<float> ret;
+    ret.reserve(n_seq*n_out);
+    for (uint32_t s = 0; s < n_seq; s++) {
+        const float * embd = llama_get_embeddings_seq(lctx, s);
+        if (embd == nullptr) {
+            throw std::runtime_error("no pooled embeddings for sequence " + std::to_string(s));
+        }
+        ret.insert(ret.end(), embd, embd + n_out);
+    }
+    return ret;
+}
+
+// pooled outputs are dominated by bias terms that do not depend on the input, this keeps only what differs between sequences
+static std::vector<float> seq_deviation(const std::vector<float> & out, const size_t n_seq) {
+    const size_t n_out = out.size() / n_seq;
+    std::vector<float> ret(out.size());
+    for (size_t i = 0; i < n_out; i++) {
+        double mean = 0.0;
+        for (size_t s = 0; s < n_seq; s++) {
+            mean += out[s*n_out + i];
+        }
+        mean /= n_seq;
+        for (size_t s = 0; s < n_seq; s++) {
+            ret[s*n_out + i] = out[s*n_out + i] - mean;
+        }
+    }
+    return ret;
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_FLINT:
@@ -995,6 +1059,28 @@ static bool moe_implemented(const llm_arch arch) {
     }
 }
 
+struct model_config {
+    std::string             name;
+    std::string             file_suffix;
+    bool                    moe;
+    enum llama_pooling_type pooling; // unspecified for models that return logits
+};
+
+// encoder-only archs are generated as an embedding model and as a reranker
+static std::vector<model_config> get_model_configs(const llm_arch arch) {
+    if (arch == LLM_ARCH_BERT) {
+        return {{"Dense", "dense", false, LLAMA_POOLING_TYPE_CLS}, {"Rank", "rank", false, LLAMA_POOLING_TYPE_RANK}};
+    }
+    std::vector<model_config> ret;
+    if (!moe_mandatory(arch)) {
+        ret.push_back({"Dense", "dense", false, LLAMA_POOLING_TYPE_UNSPECIFIED});
+    }
+    if (moe_implemented(arch)) {
+        ret.push_back({"MoE", "moe", true, LLAMA_POOLING_TYPE_UNSPECIFIED});
+    }
+    return ret;
+}
+
 static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_CLIP || arch == LLM_ARCH_GPTJ || arch == LLM_ARCH_UNKNOWN) {
         return false; // These models don't have usable implementations.
@@ -1014,7 +1100,7 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_RWKV6 || arch == LLM_ARCH_RWKV6QWEN2 || arch == LLM_ARCH_RWKV7 || arch == LLM_ARCH_ARWKV7) {
         return false; // FIXME RWKV models hang indefinitely.
     }
-    if (arch == LLM_ARCH_BERT || arch == LLM_ARCH_MODERN_BERT || arch == LLM_ARCH_NOMIC_BERT || arch == LLM_ARCH_NOMIC_BERT_MOE ||
+    if (arch == LLM_ARCH_MODERN_BERT || arch == LLM_ARCH_NOMIC_BERT || arch == LLM_ARCH_NOMIC_BERT_MOE ||
             arch == LLM_ARCH_NEO_BERT || arch == LLM_ARCH_JINA_BERT_V2 || arch == LLM_ARCH_JINA_BERT_V3 || arch == LLM_ARCH_EUROBERT) {
         return false; // TODO vocab
     }
@@ -1079,22 +1165,16 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue;
         }
-        for (bool moe : {false, true}) {
-            if (moe && !moe_implemented(arch)) {
-                continue;
-            }
-            if (!moe && moe_mandatory(arch)) {
-                continue;
-            }
+        for (const model_config & cfg : get_model_configs(arch)) {
             if (!llama_arch_supports_save(arch) || !arch_supported(arch)) {
-                LOG_INF("%s: %s model (%s) is unsupported, skipping\n", __func__, llama_arch_name(arch), moe ? "MoE" : "dense");
+                LOG_INF("%s: %s model (%s) is unsupported, skipping\n", __func__, llama_arch_name(arch), cfg.name.c_str());
                 continue;
             }
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
-            llama_model_ptr model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
-            const std::string path = dir + "/" + llama_arch_name(arch) + (moe ? "-moe.gguf" : "-dense.gguf");
-            LOG_INF("%s: '%s %s' -> %s ...", __func__, llama_arch_name(arch), moe ? "MoE" : "dense", path.c_str());
-            llama_model_save_to_file(model.get(), path.c_str());
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, cfg.moe, cfg.pooling);
+            auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, false, nullptr, 0, cfg.pooling);
+            const std::string path = dir + "/" + llama_arch_name(arch) + "-" + cfg.file_suffix + ".gguf";
+            LOG_INF("%s: '%s %s' -> %s ...", __func__, llama_arch_name(arch), cfg.name.c_str(), path.c_str());
+            llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
             const std::uintmax_t size = std::filesystem::file_size(path);
             LOG_CNT(" (%.2f MB)\n", (double) size / (1024.0 * 1024.0));
         }
@@ -1238,22 +1318,23 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         }
 
         const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
-        for (bool moe : {false, true}) {
-            if (moe && !moe_implemented(arch)) {
-                continue;
-            }
-            if (!moe && moe_mandatory(arch)) {
-                continue;
-            }
-            const std::string config_name = moe ? "MoE" : "Dense";
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+        for (const model_config & cfg : get_model_configs(arch)) {
+            const std::string & config_name = cfg.name;
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, cfg.moe, cfg.pooling);
             if (arch == LLM_ARCH_BAILINGMOE3) {
                 GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
             }
+            // models without logits are compared on their pooled embeddings
+            const auto get_output = [&](const std::pair<llama_model_ptr, llama_context_ptr> & model_and_ctx) {
+                if (cfg.pooling != LLAMA_POOLING_TYPE_UNSPECIFIED) {
+                    return get_embeddings(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+                }
+                return get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens, encode);
+            };
             std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
             std::vector<float> logits_cpu;
             for (device_config & dc : dev_configs) {
-                if (dc.host_experts && (!moe || !host_experts_test(arch))) {
+                if (dc.host_experts && (!cfg.moe || !host_experts_test(arch))) {
                     continue;
                 }
                 const llama_model_tensor_buft_override * overrides = dc.host_experts ? host_experts_overrides : nullptr;
@@ -1275,14 +1356,18 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 bool test_ok = true;
                 if (!skip) {
                     if (logits_cpu.empty()) {
-                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, encode);
-                        logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
+                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, encode, nullptr, 0, cfg.pooling);
+                        logits_cpu = get_output(model_and_ctx_cpu);
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llama_arch_supports_sm_tensor(arch)) {
                         test_executed = true;
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size);
-                        logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
-                        const double nmse_val = nmse(logits_cpu, logits_dev);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, cfg.pooling);
+                        logits_dev = get_output(model_and_ctx_dev);
+                        double nmse_val = nmse(logits_cpu, logits_dev);
+                        if (cfg.pooling != LLAMA_POOLING_TYPE_UNSPECIFIED) {
+                            const size_t n_seq = llama_n_seq_max(model_and_ctx_cpu.second.get());
+                            nmse_val = std::max(nmse_val, nmse(seq_deviation(logits_cpu, n_seq), seq_deviation(logits_dev, n_seq)));
+                        }
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                         status_nmse = "\033[1;32mOK\033[0m";
                         if (nmse_val > 1e-4) {
@@ -1326,7 +1411,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         }
 
                         // runs after the mixed batch check, as it leaves the context with non-causal attention
-                        if (!encode && !check_causal_attn_toggle(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens)) {
+                        if (!encode && cfg.pooling == LLAMA_POOLING_TYPE_UNSPECIFIED && !check_causal_attn_toggle(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens)) {
                             if (test_ok) {
                                 status_nmse = "\033[1;31mFAIL\033[0m (toggle)";
                             }
@@ -1345,9 +1430,8 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         GGML_ASSERT(file != nullptr);
 
                         {
-                            auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size);
-                            const std::vector<float> logits_roundtrip = get_logits(
-                                model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
+                            auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, cfg.pooling);
+                            const std::vector<float> logits_roundtrip = get_output(model_and_ctx_roundtrip);
                             status_roundtrip = "\033[1;32mOK\033[0m";
                             GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
                             for (size_t i = 0; i < logits_roundtrip.size(); i++) {
@@ -1356,6 +1440,21 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                                     status_roundtrip = "\033[1;31mFAIL\033[0m";
                                     break;
                                 }
+                            }
+                            // the reloaded model must also keep the pooling type and the classifier head
+                            const llama_model * model_dev = model_and_ctx_dev.first.get();
+                            const llama_model * model_rt  = model_and_ctx_roundtrip.first.get();
+                            bool head_ok = llama_pooling_type(model_and_ctx_roundtrip.second.get()) == llama_pooling_type(model_and_ctx_dev.second.get()) &&
+                                (model_rt->cls_out != nullptr) == (model_dev->cls_out != nullptr) &&
+                                llama_model_n_cls_out(model_rt) == llama_model_n_cls_out(model_dev);
+                            for (uint32_t i = 0; head_ok && i < llama_model_n_cls_out(model_dev); i++) {
+                                const char * label_dev = llama_model_cls_label(model_dev, i);
+                                const char * label_rt  = llama_model_cls_label(model_rt, i);
+                                head_ok = (label_dev == nullptr) == (label_rt == nullptr) && (label_dev == nullptr || strcmp(label_dev, label_rt) == 0);
+                            }
+                            if (!head_ok) {
+                                test_ok = false;
+                                status_roundtrip = "\033[1;31mFAIL\033[0m";
                             }
                         }
 
