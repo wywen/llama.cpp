@@ -230,6 +230,7 @@ struct outcome {
     std::map<llama_memory_plan_buffer_kind, size_t> kinds_compared;
     size_t shared_kv_compared = 0; // compared cases whose model has layers reusing another layer's KV
     size_t ple_iswa_compared  = 0; // compared cases whose model has per-layer embeddings and both a full and a sliding window KV buffer
+    size_t iswa_widths_compared = 0; // compared cases with full and sliding window KV rows of different widths, without per-layer embeddings or shared KV
 };
 
 std::optional<llama_memory_plan> try_plan(const llama_model * model, const llama_context_params & params, std::string & error) {
@@ -275,7 +276,8 @@ void check_case(outcome & out, const std::string & subject, llama_model * model,
             out.kinds_compared[buf.kind]++;
         }
         const int32_t n_layer_kv = model->hparams.n_layer_kv_from_start;
-        if (n_layer_kv >= 0 && (uint32_t) n_layer_kv < model->hparams.n_layer()) {
+        const bool shared_kv = n_layer_kv >= 0 && (uint32_t) n_layer_kv < model->hparams.n_layer();
+        if (shared_kv) {
             out.shared_kv_compared++;
         }
         const auto plans_kind = [&](llama_memory_plan_buffer_kind kind) {
@@ -284,6 +286,20 @@ void check_case(outcome & out, const std::string & subject, llama_model * model,
         };
         if (model->hparams.n_embd_per_layer > 0 && plans_kind(LLAMA_MEMORY_PLAN_BUFFER_KV) && plans_kind(LLAMA_MEMORY_PLAN_BUFFER_KV_SWA)) {
             out.ple_iswa_compared++;
+        }
+        // the K row width of the first cache tensor of the first buffer of a kind, 0 without one
+        const auto k_row_width = [&](llama_memory_plan_buffer_kind kind) -> int64_t {
+            for (const auto & buf : plan->buffers) {
+                if (buf.kind == kind && !buf.tensors.empty()) {
+                    return buf.tensors.front().ne[0];
+                }
+            }
+            return 0;
+        };
+        const int64_t width_kv     = k_row_width(LLAMA_MEMORY_PLAN_BUFFER_KV);
+        const int64_t width_kv_swa = k_row_width(LLAMA_MEMORY_PLAN_BUFFER_KV_SWA);
+        if (model->hparams.n_embd_per_layer == 0 && !shared_kv && width_kv > 0 && width_kv_swa > 0 && width_kv != width_kv_swa) {
+            out.iswa_widths_compared++;
         }
         compare_shape(log, *plan, ctx.get());
         compare_buffers(log, plan->buffers, built);
@@ -525,6 +541,7 @@ int main(int argc, char ** argv) {
             out.no_memory);
     printf("compared cases with shared KV layers: %zu\n", out.shared_kv_compared);
     printf("compared cases with per-layer embeddings and interleaved sliding window KV: %zu\n", out.ple_iswa_compared);
+    printf("compared cases with full and sliding window KV rows of different widths, without per-layer embeddings or shared KV: %zu\n", out.iswa_widths_compared);
     printf("%zu model loads x %zu context cases: %zu compared, %zu refused by both, %zu failed\n",
             models_loaded, std::size(context_cases), out.compared, out.refused, out.failed);
 
@@ -557,6 +574,10 @@ int main(int argc, char ** argv) {
     }
     if (out.ple_iswa_compared == 0) {
         fprintf(stderr, "FAIL no model with per-layer embeddings and interleaved sliding window KV was compared\n");
+        ok = false;
+    }
+    if (out.iswa_widths_compared == 0) {
+        fprintf(stderr, "FAIL no model without per-layer embeddings or shared KV whose full and sliding window KV rows differ in width was compared\n");
         ok = false;
     }
     printf("test-memory-plan: %s\n", ok ? "OK" : "FAILED");
