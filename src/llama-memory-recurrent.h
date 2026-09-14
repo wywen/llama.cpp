@@ -76,7 +76,13 @@ public:
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
+    // per-seq max rollback the snapshot planes can serve, set when a ubatch of the seq is applied
+    std::vector<uint32_t> rs_valid;
+
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+
+    // update rs_valid after find_slot() placed the ubatch
+    void update_rs_valid(const llama_ubatch & ubatch);
 
     // computed before each graph build
     uint32_t n = 0;

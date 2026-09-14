@@ -363,7 +363,7 @@ extern "C" {
         uint32_t n_batch;               // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;              // physical maximum batch size
         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
-        uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+        uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback), see llama_memory_seq_rm [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
         int32_t  n_threads;             // number of threads to use for generation
@@ -751,6 +751,11 @@ extern "C" {
     // seq_id < 0 : match any sequence [TAG_LLAMA_SEQ_ID_NEG]
     // p0 < 0     : [0,  p1]
     // p1 < 0     : [p0, inf)
+    // With n_rs_seq > 0, removing the last r tokens of a sequence rolls back its recurrent state. It returns false and changes nothing unless:
+    //   - r <= n_rs_seq, and no earlier rollback of the sequence waits for a decode
+    //   - the last ubatch that decoded the sequence holds more than r of its tokens (at least r for DeepSeek V4)
+    //   - the sequence does not share its state with another sequence (see llama_memory_seq_cp)
+    // Loading the sequence state, copying into the sequence, or a decode of other sequences that moves its state leave no rollback until the sequence is decoded again
     LLAMA_API bool llama_memory_seq_rm(
             llama_memory_t mem,
               llama_seq_id seq_id,
