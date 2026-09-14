@@ -106,8 +106,7 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-// all_experts routes every token to every expert
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool all_experts = false) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -318,7 +317,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_EXPERT_LATENT_LENGTH,       n_ff);
         ms.add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,  uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(2));
-        ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          all_experts ? uint32_t(2) : uint32_t(1));
+        ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(4) : uint32_t(2)); // sqrtsoftplus : sigmoid
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
@@ -939,9 +938,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                 continue;
             }
             const std::string config_name = moe ? "MoE" : "Dense";
-            // rounding differences between backends flip near-tied expert choices, and with generated weights the experts
-            // differ enough for a flip to exceed the NMSE threshold, so the comparison routes every token to every expert
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe, /*all_experts =*/ true);
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
             if (arch == LLM_ARCH_BAILINGMOE3) {
                 GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
             }
