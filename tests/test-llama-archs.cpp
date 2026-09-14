@@ -37,6 +37,8 @@
 #include <vector>
 
 // normalized mean squared error = mse(a, b) / mse(a, 0)
+// values masked to the same infinity on both sides (e.g. logits padded with -inf) are skipped, any other non-finite value
+// gives infinity, and all-zero references give NaN
 static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     GGML_ASSERT(a.size() == b.size());
     double mse_a_b = 0.0;
@@ -45,6 +47,13 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     for (size_t i = 0; i < a.size(); i++) {
         float a_i = a[i];
         float b_i = b[i];
+
+        if (!std::isfinite(a_i) || !std::isfinite(b_i)) {
+            if (std::isinf(a_i) && a_i == b_i) {
+                continue;
+            }
+            return INFINITY;
+        }
 
         mse_a_b += (a_i - b_i) * (a_i - b_i);
         mse_a_0 += a_i * a_i;
@@ -1067,7 +1076,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         }
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                         status_nmse = "\033[1;32mOK\033[0m";
-                        if (nmse_val > 1e-4) {
+                        if (!(nmse_val <= 1e-4)) { // also fails a NaN
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m";
                         }
