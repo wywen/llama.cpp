@@ -8,7 +8,19 @@
 #include "llama-cpp.h"
 #include "../src/llama-ext.h"
 
-#include "../src/llama-model.h" // the classifier head of a user-defined embedding model is dropped by hand
+// the classifier head of a user-defined embedding model is dropped by hand, and the sensitivity check of the
+// generated models corrupts the memory module's caches and states directly
+#include "../src/llama-context.h"
+#include "../src/llama-kv-cache.h"
+#include "../src/llama-kv-cache-dsa.h"
+#include "../src/llama-kv-cache-dsa-iswa.h"
+#include "../src/llama-kv-cache-dsv4.h"
+#include "../src/llama-kv-cache-iswa.h"
+#include "../src/llama-kv-cache-msa.h"
+#include "../src/llama-memory-hybrid-idx.h"
+#include "../src/llama-memory-hybrid-iswa.h"
+#include "../src/llama-memory-recurrent.h"
+#include "../src/llama-model.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -18,6 +30,8 @@
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <map>
 #include <memory>
 #include <random>
 #include <regex>
@@ -50,9 +64,14 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     return mse_a_b / mse_a_0;
 }
 
+static bool ends_with(const std::string & str, const std::string & suffix) {
+    return str.size() >= suffix.size() && str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 struct tensor_data_params {
     size_t seed;
-    float  stdev;
+    float  stdev;     // of the normal pool
+    bool   sensitive; // see set_tensor_data
 };
 
 // fills the values of one tensor, the name carries whatever the property needs
@@ -136,6 +155,24 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 
     std::vector<float> tmp(ggml_nelements(tensor));
     fill(tmp, tensor->name, params);
+
+    // sensitive: scales and norm weights are near 1 and matrices keep the variance of their input, other tensors keep the pool's
+    // with small values everywhere the product of scales, norms and matrices hides most inputs and cached state from the output
+    // scales and norm weights are 1 + N(0, 0.01) rather than 1, so that dropping an optional one is not the identity
+    if (params.sensitive && fill == fill_normal) {
+        const std::string name = tensor->name;
+        const bool near_one = ends_with(name, ".scale") || (name.find("norm") != std::string::npos && ends_with(name, ".weight"));
+        if (near_one) {
+            for (float & v : tmp) {
+                v = 1.0f + v * (1.0e-2f / params.stdev);
+            }
+        } else if (ends_with(name, ".weight") && ggml_n_dims(tensor) >= 2) {
+            const float scale = 1.0f / (std::sqrt((float) tensor->ne[0]) * params.stdev);
+            for (float & v : tmp) {
+                v *= scale;
+            }
+        }
+    }
 
     if (tensor->type == GGML_TYPE_F32) {
         ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
@@ -755,7 +792,7 @@ static llama_model_ptr get_model(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr) {
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const bool sensitive_weights = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -765,7 +802,7 @@ static llama_model_ptr get_model(
     model_params.split_mode = split_mode;
     model_params.tensor_buft_overrides = tensor_buft_overrides;
 
-    tensor_data_params tensor_params = { seed, stdev };
+    tensor_data_params tensor_params = { seed, stdev, sensitive_weights };
     llama_model_ptr model(gguf_ctx != nullptr ?
         llama_model_init_from_user(gguf_ctx, set_tensor_data, &tensor_params, model_params) :
         llama_model_load_from_file_ptr(file, model_params));
@@ -780,10 +817,12 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
-        const enum llama_pooling_type pooling = LLAMA_POOLING_TYPE_UNSPECIFIED) {
-    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides);
+        const enum llama_pooling_type pooling = LLAMA_POOLING_TYPE_UNSPECIFIED,
+        const enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO, const bool sensitive_weights = false) {
+    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides, sensitive_weights);
 
     llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.flash_attn_type = flash_attn_type;
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
@@ -928,6 +967,223 @@ static bool check_causal_attn_toggle(
         }
     }
 
+    return ok;
+}
+
+// a corrupted memory cell or a replaced input token must change the output by more than this relative amount
+static const double min_sensitivity = 2.0e-3;
+
+static double relative_change(const std::vector<float> & a, const std::vector<float> & b) {
+    GGML_ASSERT(a.size() == b.size());
+    double diff = 0.0;
+    double norm = 0.0;
+    for (size_t i = 0; i < a.size(); i++) {
+        if (a[i] == b[i]) {
+            if (std::isfinite(a[i])) {
+                norm += (double) a[i] * a[i];
+            }
+            continue; // also skips logits both masked to -inf
+        }
+        if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+            return INFINITY;
+        }
+        diff += ((double) a[i] - b[i]) * ((double) a[i] - b[i]);
+        norm += (double) a[i] * a[i];
+    }
+    return diff == 0.0 ? 0.0 : std::sqrt(diff / norm);
+}
+
+// output of the last token: logits, or the hidden state for models without an output head
+static std::vector<float> decode_last(llama_context * lctx, const std::vector<llama_token> & tokens, const llama_pos pos0) {
+    const llama_model * model = llama_get_model(lctx);
+    common_batch batch(lctx);
+    for (size_t i = 0; i < tokens.size(); i++) {
+        batch.add(tokens[i], pos0 + i, 0, i + 1 == tokens.size());
+    }
+    if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+        throw std::runtime_error("failed to decode batch");
+    }
+    if (model->output == nullptr) {
+        const float * embd = llama_get_embeddings_ith(lctx, -1);
+        return std::vector<float>(embd, embd + llama_model_n_embd_out(model));
+    }
+    const float * logits = llama_get_logits_ith(lctx, -1);
+    return std::vector<float>(logits, logits + llama_vocab_n_tokens(llama_model_get_vocab(model)));
+}
+
+// the attention caches and recurrent states inside a memory module, false if the module type is unknown
+static bool collect_memory(llama_memory_i * mem, std::vector<llama_kv_cache *> & kvs, std::vector<llama_memory_recurrent *> & rss) {
+    const auto add_kv = [&](llama_kv_cache * kv) {
+        if (kv != nullptr) {
+            kvs.push_back(kv);
+        }
+    };
+    if (auto * m = dynamic_cast<llama_kv_cache *>(mem)) {
+        add_kv(m);
+    } else if (auto * m = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        add_kv(m->get_base());
+        add_kv(m->get_swa());
+    } else if (auto * m = dynamic_cast<llama_kv_cache_dsa *>(mem)) {
+        add_kv(m->get_mla());
+        add_kv(m->get_lid());
+    } else if (auto * m = dynamic_cast<llama_kv_cache_dsa_iswa *>(mem)) {
+        add_kv(m->get_dsa()->get_mla());
+        add_kv(m->get_dsa()->get_lid());
+        add_kv(m->get_swa());
+    } else if (auto * m = dynamic_cast<llama_kv_cache_dsv4 *>(mem)) {
+        add_kv(m->get_raw()->get_base());
+        add_kv(m->get_raw()->get_swa());
+        add_kv(m->get_csa());
+        add_kv(m->get_hca());
+        add_kv(m->get_lid());
+    } else if (auto * m = dynamic_cast<llama_kv_cache_msa *>(mem)) {
+        add_kv(m->get_base());
+        add_kv(m->get_idx());
+    } else if (auto * m = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        add_kv(m->get_mem_attn());
+        if (auto * idx = dynamic_cast<llama_memory_hybrid_idx *>(mem)) {
+            add_kv(idx->get_mem_idx());
+        }
+        rss.push_back(m->get_mem_recr());
+    } else if (auto * m = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        add_kv(m->get_mem_attn()->get_base());
+        add_kv(m->get_mem_attn()->get_swa());
+        rss.push_back(m->get_mem_recr());
+    } else if (auto * m = dynamic_cast<llama_memory_recurrent *>(mem)) {
+        rss.push_back(m);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// overwrite the K and V rows of the cell at pos_dst with the rows of pos_src, as a stale page would; returns the rows written
+static size_t copy_kv_cell(const llama_kv_cache * kv, const llama_pos pos_src, const llama_pos pos_dst) {
+    const llama_kv_cells & cells = kv->get_cells(0);
+    int64_t cell_src = -1;
+    int64_t cell_dst = -1;
+    for (uint32_t i = 0; i < kv->get_size(); i++) {
+        if (!cells.is_empty(i) && cells.pos_get(i) == pos_src) {
+            cell_src = i;
+        }
+        if (!cells.is_empty(i) && cells.pos_get(i) == pos_dst) {
+            cell_dst = i;
+        }
+    }
+    if (cell_src < 0 || cell_dst < 0) {
+        return 0; // e.g. a compressed cache that keeps no cell per position
+    }
+    size_t n_rows = 0;
+    for (const uint32_t il : kv->get_layer_ids()) {
+        for (ggml_tensor * t : {kv->get_k_storage(il), kv->get_v_storage(il)}) {
+            if (t == nullptr) {
+                continue;
+            }
+            GGML_ASSERT(t->ne[1] == kv->get_size() && t->ne[2] == 1);
+            std::vector<uint8_t> row(t->nb[1]);
+            ggml_backend_tensor_get(t, row.data(), cell_src*t->nb[1], row.size());
+            ggml_backend_tensor_set(t, row.data(), cell_dst*t->nb[1], row.size());
+            n_rows++;
+        }
+    }
+    return n_rows;
+}
+
+// generated weights are random, so check that the paths a memory bug would corrupt actually reach the output
+static bool check_sensitivity(llama_model * model, const size_t seed, std::string & result) {
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx           = 0;
+    ctx_params.n_batch         = 64;
+    ctx_params.n_ubatch        = 64;
+    ctx_params.n_seq_max       = 1;
+    ctx_params.n_threads       = 4;
+    ctx_params.n_threads_batch = 4;
+    if (model->output == nullptr) {
+        ctx_params.embeddings   = true;
+        ctx_params.pooling_type = LLAMA_POOLING_TYPE_NONE;
+    }
+    const auto new_ctx = [&]() {
+        llama_context_ptr lctx(llama_init_from_model(model, ctx_params));
+        if (!lctx) {
+            throw std::runtime_error("failed to create llama context");
+        }
+        return lctx;
+    };
+
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const std::vector<llama_token> prompt = get_tokens(33, n_vocab, seed);
+    const std::vector<llama_token> tokens(prompt.begin(), prompt.end() - 1);
+    const llama_token next = prompt.back();
+
+    bool ok = true;
+    const auto check = [&](const char * name, const double rel) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s%s %.2e", result.empty() ? "" : ", ", name, rel);
+        result += buf;
+        if (!(rel > min_sensitivity)) {
+            ok = false;
+        }
+    };
+
+    std::vector<llama_kv_cache *> kvs;
+    std::vector<llama_memory_recurrent *> rss;
+    {
+        const llama_context_ptr lctx = new_ctx();
+        if (llama_get_memory(lctx.get()) == nullptr) {
+            // without memory only the input can carry a difference
+            const std::vector<float> ref = decode_last(lctx.get(), tokens, 0);
+            std::vector<llama_token> replaced = tokens;
+            replaced[0] = (replaced[0] + 1) % n_vocab;
+            check("token", relative_change(ref, decode_last(new_ctx().get(), replaced, 0)));
+            return ok;
+        }
+        if (!collect_memory(llama_get_memory(lctx.get()), kvs, rss)) {
+            result = "unknown memory module";
+            return false;
+        }
+    }
+
+    const auto corrupted_output = [&](const std::function<void(llama_memory_i *)> & corrupt) {
+        const llama_context_ptr lctx = new_ctx();
+        decode_last(lctx.get(), tokens, 0);
+        corrupt(llama_get_memory(lctx.get()));
+        return decode_last(lctx.get(), {next}, tokens.size());
+    };
+    const std::vector<float> ref = corrupted_output([](llama_memory_i *) {});
+
+    if (!kvs.empty()) {
+        size_t n_rows = 0;
+        const std::vector<float> out = corrupted_output([&](llama_memory_i * mem) {
+            std::vector<llama_kv_cache *> kvs_ctx;
+            std::vector<llama_memory_recurrent *> rss_ctx;
+            collect_memory(mem, kvs_ctx, rss_ctx);
+            for (const llama_kv_cache * kv : kvs_ctx) {
+                // every cell takes the rows of the next position, as sparse and sliding window attention read only some cells
+                for (llama_pos pos = 0; pos + 1 < (llama_pos) tokens.size(); pos++) {
+                    n_rows += copy_kv_cell(kv, pos + 1, pos);
+                }
+            }
+        });
+        check("stale kv cell", n_rows > 0 ? relative_change(ref, out) : 0.0);
+    }
+    if (!rss.empty()) {
+        const std::vector<float> out = corrupted_output([&](llama_memory_i * mem) {
+            std::vector<llama_kv_cache *> kvs_ctx;
+            std::vector<llama_memory_recurrent *> rss_ctx;
+            collect_memory(mem, kvs_ctx, rss_ctx);
+            for (const llama_memory_recurrent * rs : rss_ctx) {
+                for (const std::vector<ggml_tensor *> * states : {&rs->r_l, &rs->s_l}) {
+                    for (ggml_tensor * t : *states) {
+                        if (t != nullptr) {
+                            const std::vector<uint8_t> zeros(ggml_nbytes(t), 0);
+                            ggml_backend_tensor_set(t, zeros.data(), 0, zeros.size());
+                        }
+                    }
+                }
+            }
+        });
+        check("zeroed recurrent state", relative_change(ref, out));
+    }
     return ok;
 }
 
@@ -1155,6 +1411,7 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
         }
     }, &ud);
 
+    bool all_ok = true;
     for (const llm_arch & arch : llama_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
@@ -1171,16 +1428,25 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
                 continue;
             }
             gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, cfg.moe, cfg.pooling);
-            auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, false, nullptr, 0, cfg.pooling);
+            auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, false, nullptr, 0, cfg.pooling,
+                LLAMA_FLASH_ATTN_TYPE_AUTO, /*sensitive_weights =*/ true);
             const std::string path = dir + "/" + llama_arch_name(arch) + "-" + cfg.file_suffix + ".gguf";
             LOG_INF("%s: '%s %s' -> %s ...", __func__, llama_arch_name(arch), cfg.name.c_str(), path.c_str());
             llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
             const std::uintmax_t size = std::filesystem::file_size(path);
             LOG_CNT(" (%.2f MB)\n", (double) size / (1024.0 * 1024.0));
+            std::string sensitivity;
+            if (check_sensitivity(model_and_ctx.first.get(), seed, sensitivity)) {
+                LOG_INF("%s: %s model (%s) sensitivity: %s\n", __func__, llama_arch_name(arch), cfg.name.c_str(), sensitivity.c_str());
+            } else {
+                LOG_ERR("%s: %s model (%s) is not sensitive enough (minimum %.0e): %s\n",
+                    __func__, llama_arch_name(arch), cfg.name.c_str(), min_sensitivity, sensitivity.c_str());
+                all_ok = false;
+            }
         }
     }
     llama_log_set(ud.log_old.callback, ud.log_old.user_data);
-    return 0;
+    return all_ok ? 0 : 1;
 }
 
 // the CPU and the GPU of an Apple SoC carry the same description, the name tells them apart (CPU, MTL0)
@@ -1331,8 +1597,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 }
                 return get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens, encode);
             };
-            std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
-            std::vector<float> logits_cpu;
+            // CPU references by flash attention
+            std::map<bool, std::pair<llama_model_ptr, llama_context_ptr>> model_and_ctx_cpu;
+            std::map<bool, std::vector<float>> logits_cpu;
             for (device_config & dc : dev_configs) {
                 if (dc.host_experts && (!cfg.moe || !host_experts_test(arch))) {
                     continue;
@@ -1355,18 +1622,21 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 bool test_executed = false;
                 bool test_ok = true;
                 if (!skip) {
-                    if (logits_cpu.empty()) {
-                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, encode, nullptr, 0, cfg.pooling);
-                        logits_cpu = get_output(model_and_ctx_cpu);
-                    }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llama_arch_supports_sm_tensor(arch)) {
                         test_executed = true;
                         model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, cfg.pooling);
                         logits_dev = get_output(model_and_ctx_dev);
-                        double nmse_val = nmse(logits_cpu, logits_dev);
+                        // a device may turn flash attention off, compare it with the same attention implementation on the CPU
+                        const bool flash_attn = model_and_ctx_dev.second->get_cparams().flash_attn;
+                        if (logits_cpu[flash_attn].empty()) {
+                            model_and_ctx_cpu[flash_attn] = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, encode, nullptr, 0, cfg.pooling,
+                                flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED);
+                            logits_cpu[flash_attn] = get_output(model_and_ctx_cpu[flash_attn]);
+                        }
+                        double nmse_val = nmse(logits_cpu[flash_attn], logits_dev);
                         if (cfg.pooling != LLAMA_POOLING_TYPE_UNSPECIFIED) {
-                            const size_t n_seq = llama_n_seq_max(model_and_ctx_cpu.second.get());
-                            nmse_val = std::max(nmse_val, nmse(seq_deviation(logits_cpu, n_seq), seq_deviation(logits_dev, n_seq)));
+                            const size_t n_seq = llama_n_seq_max(model_and_ctx_dev.second.get());
+                            nmse_val = std::max(nmse_val, nmse(seq_deviation(logits_cpu[flash_attn], n_seq), seq_deviation(logits_dev, n_seq)));
                         }
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                         status_nmse = "\033[1;32mOK\033[0m";
@@ -1401,7 +1671,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             } else {
                                 // must be rejected as an invalid batch, mute the expected error log
                                 ud.verbosity = LOG_LEVEL_OUTPUT;
-                                const int32_t err = get_logits_mixed(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, embd_mixed, true, logits_mixed);
+                                const int32_t err = get_logits_mixed(model_and_ctx_cpu[flash_attn].first.get(), model_and_ctx_cpu[flash_attn].second.get(), tokens, embd_mixed, true, logits_mixed);
                                 ud.verbosity = verbosity;
                                 if (err != -1) {
                                     test_ok = false;
@@ -1421,11 +1691,14 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
 
                     if (llama_arch_supports_save(arch) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
                         test_executed = true;
-                        GGML_ASSERT(model_and_ctx_dev.first && model_and_ctx_dev.second);
                         // FIXME: when adding a tensor to a gguf_context a copy is made, this changes the pointer which the meta backend
                         //     in turn uses to map the tensors to their simple equivalents - this is fundamentally incompatible
+                        // the roundtrip compares on one device, so it uses the sensitive weights, under which a tensor the saver drops shows
+                        const auto model_and_ctx_saved = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, cfg.pooling,
+                            LLAMA_FLASH_ATTN_TYPE_AUTO, /*sensitive_weights =*/ true);
+                        const std::vector<float> logits_saved = get_output(model_and_ctx_saved);
                         const std::string path = get_tmp_gguf_path();
-                        llama_model_save_to_file(model_and_ctx_dev.first.get(), path.c_str());
+                        llama_model_save_to_file(model_and_ctx_saved.first.get(), path.c_str());
                         FILE * file = fopen(path.c_str(), "rb");
                         GGML_ASSERT(file != nullptr);
 
@@ -1433,18 +1706,18 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, cfg.pooling);
                             const std::vector<float> logits_roundtrip = get_output(model_and_ctx_roundtrip);
                             status_roundtrip = "\033[1;32mOK\033[0m";
-                            GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
+                            GGML_ASSERT(logits_roundtrip.size() == logits_saved.size());
                             for (size_t i = 0; i < logits_roundtrip.size(); i++) {
-                                if (logits_roundtrip[i] != logits_dev[i]) {
+                                if (logits_roundtrip[i] != logits_saved[i]) {
                                     test_ok = false;
                                     status_roundtrip = "\033[1;31mFAIL\033[0m";
                                     break;
                                 }
                             }
                             // the reloaded model must also keep the pooling type and the classifier head
-                            const llama_model * model_dev = model_and_ctx_dev.first.get();
+                            const llama_model * model_dev = model_and_ctx_saved.first.get();
                             const llama_model * model_rt  = model_and_ctx_roundtrip.first.get();
-                            bool head_ok = llama_pooling_type(model_and_ctx_roundtrip.second.get()) == llama_pooling_type(model_and_ctx_dev.second.get()) &&
+                            bool head_ok = llama_pooling_type(model_and_ctx_roundtrip.second.get()) == llama_pooling_type(model_and_ctx_saved.second.get()) &&
                                 (model_rt->cls_out != nullptr) == (model_dev->cls_out != nullptr) &&
                                 llama_model_n_cls_out(model_rt) == llama_model_n_cls_out(model_dev);
                             for (uint32_t i = 0; head_ok && i < llama_model_n_cls_out(model_dev); i++) {

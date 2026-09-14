@@ -329,6 +329,14 @@ int main(int argc, char ** argv) {
         params.model.path = models_dir;
     }
 
+    // a restored state can place its cells in a different order, and CPU attention over F16 K/V depends on that order:
+    // about 1e-3 relative with flash attention (which casts K/V to F16) and 1e-4 without, enough to exceed the NMSE
+    // threshold on a generated model whose weights let its memory reach the output; without flash attention and with an
+    // F32 cache the difference is at rounding level - the command line still overrides these defaults
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    params.cache_type_k    = GGML_TYPE_F32;
+    params.cache_type_v    = GGML_TYPE_F32;
+
     if (!common_params_parse(fargc, filtered_argv.data(), params, LLAMA_EXAMPLE_COMMON, print_usage)) {
         return 1;
     }
