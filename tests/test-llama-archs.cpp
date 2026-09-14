@@ -9,13 +9,25 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-kv-cache.h"
+#include "../src/llama-kv-cache-dsa.h"
+#include "../src/llama-kv-cache-dsa-iswa.h"
+#include "../src/llama-kv-cache-dsv4.h"
+#include "../src/llama-kv-cache-iswa.h"
+#include "../src/llama-kv-cache-msa.h"
+#include "../src/llama-memory-hybrid-idx.h"
+#include "../src/llama-memory-hybrid-iswa.h"
+#include "../src/llama-memory-recurrent.h"
+#include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <functional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -39,24 +51,37 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     return mse_a_b / mse_a_0;
 }
 
+static bool ends_with(const std::string & str, const std::string & suffix) {
+    return str.size() >= suffix.size() && str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+// scales and norm weights are 1 and matrices keep the variance of their input, other tensors are small
+// with N(0, 0.01) everywhere the product of scales, norms and matrices hides most inputs and cached state from the output
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     size_t seed = *(const size_t *) userdata;
+    const std::string name = tensor->name;
     std::hash<std::string> hasher;
-    seed ^= hasher(tensor->name);
+    seed ^= hasher(name);
     std::mt19937 gen(seed);
-    std::normal_distribution<float> dis(0.0f, 1.0e-2f);
+
+    const bool is_one = ends_with(name, ".scale") || (name.find("norm") != std::string::npos && ends_with(name, ".weight"));
+    float stddev = 1.0e-2f;
+    if (!is_one && ends_with(name, ".weight") && ggml_n_dims(tensor) >= 2) {
+        stddev = 1.0f / std::sqrt((float) tensor->ne[0]);
+    }
+    std::normal_distribution<float> dis(0.0f, stddev);
 
     const int64_t ne = ggml_nelements(tensor);
     if (tensor->type == GGML_TYPE_F32) {
         std::vector<float> tmp(ne);
         for (int64_t i = 0; i < ne; i++) {
-            tmp[i] = dis(gen);
+            tmp[i] = is_one ? 1.0f : dis(gen);
         }
         ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
     } else if (tensor->type == GGML_TYPE_F16) {
         std::vector<ggml_fp16_t> tmp(ne);
         for (int64_t i = 0; i < ne; i++) {
-            tmp[i] = ggml_fp32_to_fp16(dis(gen));
+            tmp[i] = ggml_fp32_to_fp16(is_one ? 1.0f : dis(gen));
         }
         ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
     } else {
@@ -412,6 +437,224 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+// a corrupted memory cell or a replaced input token must change the output by more than this relative amount
+static const double min_sensitivity = 2.0e-3;
+
+static double relative_change(const std::vector<float> & a, const std::vector<float> & b) {
+    GGML_ASSERT(a.size() == b.size());
+    double diff = 0.0;
+    double norm = 0.0;
+    for (size_t i = 0; i < a.size(); i++) {
+        if (a[i] == b[i]) {
+            if (std::isfinite(a[i])) {
+                norm += (double) a[i] * a[i];
+            }
+            continue; // also skips logits both masked to -inf
+        }
+        if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+            return INFINITY;
+        }
+        diff += ((double) a[i] - b[i]) * ((double) a[i] - b[i]);
+        norm += (double) a[i] * a[i];
+    }
+    return diff == 0.0 ? 0.0 : std::sqrt(diff / norm);
+}
+
+// output of the last token: logits, or the hidden state for models without an output head
+static std::vector<float> decode_last(llama_context * lctx, const std::vector<llama_token> & tokens, const llama_pos pos0) {
+    const llama_model * model = llama_get_model(lctx);
+    llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
+    for (size_t i = 0; i < tokens.size(); i++) {
+        common_batch_add(batch, tokens[i], pos0 + i, {0}, i + 1 == tokens.size());
+    }
+    const int ret = llama_decode(lctx, batch);
+    llama_batch_free(batch);
+    if (ret != 0) {
+        throw std::runtime_error("failed to decode batch");
+    }
+    if (model->output == nullptr) {
+        const float * embd = llama_get_embeddings_ith(lctx, -1);
+        return std::vector<float>(embd, embd + llama_model_n_embd_out(model));
+    }
+    const float * logits = llama_get_logits_ith(lctx, -1);
+    return std::vector<float>(logits, logits + llama_vocab_n_tokens(llama_model_get_vocab(model)));
+}
+
+// the attention caches and recurrent states inside a memory module, false if the module type is unknown
+static bool collect_memory(llama_memory_i * mem, std::vector<llama_kv_cache *> & kvs, std::vector<llama_memory_recurrent *> & rss) {
+    const auto add_kv = [&](llama_kv_cache * kv) {
+        if (kv != nullptr) {
+            kvs.push_back(kv);
+        }
+    };
+    if (auto * m = dynamic_cast<llama_kv_cache *>(mem)) {
+        add_kv(m);
+    } else if (auto * m = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        add_kv(m->get_base());
+        add_kv(m->get_swa());
+    } else if (auto * m = dynamic_cast<llama_kv_cache_dsa *>(mem)) {
+        add_kv(m->get_mla());
+        add_kv(m->get_lid());
+    } else if (auto * m = dynamic_cast<llama_kv_cache_dsa_iswa *>(mem)) {
+        add_kv(m->get_dsa()->get_mla());
+        add_kv(m->get_dsa()->get_lid());
+        add_kv(m->get_swa());
+    } else if (auto * m = dynamic_cast<llama_kv_cache_dsv4 *>(mem)) {
+        add_kv(m->get_raw()->get_base());
+        add_kv(m->get_raw()->get_swa());
+        add_kv(m->get_csa());
+        add_kv(m->get_hca());
+        add_kv(m->get_lid());
+    } else if (auto * m = dynamic_cast<llama_kv_cache_msa *>(mem)) {
+        add_kv(m->get_base());
+        add_kv(m->get_idx());
+    } else if (auto * m = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        add_kv(m->get_mem_attn());
+        if (auto * idx = dynamic_cast<llama_memory_hybrid_idx *>(mem)) {
+            add_kv(idx->get_mem_idx());
+        }
+        rss.push_back(m->get_mem_recr());
+    } else if (auto * m = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        add_kv(m->get_mem_attn()->get_base());
+        add_kv(m->get_mem_attn()->get_swa());
+        rss.push_back(m->get_mem_recr());
+    } else if (auto * m = dynamic_cast<llama_memory_recurrent *>(mem)) {
+        rss.push_back(m);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// overwrite the K and V rows of the cell at pos_dst with the rows of pos_src, as a stale page would; returns the rows written
+static size_t copy_kv_cell(const llama_kv_cache * kv, const llama_pos pos_src, const llama_pos pos_dst) {
+    const llama_kv_cells & cells = kv->get_cells(0);
+    int64_t cell_src = -1;
+    int64_t cell_dst = -1;
+    for (uint32_t i = 0; i < kv->get_size(); i++) {
+        if (!cells.is_empty(i) && cells.pos_get(i) == pos_src) {
+            cell_src = i;
+        }
+        if (!cells.is_empty(i) && cells.pos_get(i) == pos_dst) {
+            cell_dst = i;
+        }
+    }
+    if (cell_src < 0 || cell_dst < 0) {
+        return 0; // e.g. a compressed cache that keeps no cell per position
+    }
+    size_t n_rows = 0;
+    for (const uint32_t il : kv->get_layer_ids()) {
+        for (ggml_tensor * t : {kv->get_k_storage(il), kv->get_v_storage(il)}) {
+            if (t == nullptr) {
+                continue;
+            }
+            GGML_ASSERT(t->ne[1] == kv->get_size() && t->ne[2] == 1);
+            std::vector<uint8_t> row(t->nb[1]);
+            ggml_backend_tensor_get(t, row.data(), cell_src*t->nb[1], row.size());
+            ggml_backend_tensor_set(t, row.data(), cell_dst*t->nb[1], row.size());
+            n_rows++;
+        }
+    }
+    return n_rows;
+}
+
+// generated weights are random, so check that the paths a memory bug would corrupt actually reach the output
+static bool check_sensitivity(llama_model * model, const size_t seed, std::string & result) {
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx           = 0;
+    ctx_params.n_batch         = 64;
+    ctx_params.n_ubatch        = 64;
+    ctx_params.n_seq_max       = 1;
+    ctx_params.n_threads       = 4;
+    ctx_params.n_threads_batch = 4;
+    if (model->output == nullptr) {
+        ctx_params.embeddings   = true;
+        ctx_params.pooling_type = LLAMA_POOLING_TYPE_NONE;
+    }
+    const auto new_ctx = [&]() {
+        llama_context_ptr lctx(llama_init_from_model(model, ctx_params));
+        if (!lctx) {
+            throw std::runtime_error("failed to create llama context");
+        }
+        return lctx;
+    };
+
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const std::vector<llama_token> prompt = get_tokens(33, n_vocab, seed);
+    const std::vector<llama_token> tokens(prompt.begin(), prompt.end() - 1);
+    const llama_token next = prompt.back();
+
+    bool ok = true;
+    const auto check = [&](const char * name, const double rel) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s%s %.2e", result.empty() ? "" : ", ", name, rel);
+        result += buf;
+        if (!(rel > min_sensitivity)) {
+            ok = false;
+        }
+    };
+
+    std::vector<llama_kv_cache *> kvs;
+    std::vector<llama_memory_recurrent *> rss;
+    {
+        const llama_context_ptr lctx = new_ctx();
+        if (llama_get_memory(lctx.get()) == nullptr) {
+            // without memory only the input can carry a difference
+            const std::vector<float> ref = decode_last(lctx.get(), tokens, 0);
+            std::vector<llama_token> replaced = tokens;
+            replaced[0] = (replaced[0] + 1) % n_vocab;
+            check("token", relative_change(ref, decode_last(new_ctx().get(), replaced, 0)));
+            return ok;
+        }
+        if (!collect_memory(llama_get_memory(lctx.get()), kvs, rss)) {
+            result = "unknown memory module";
+            return false;
+        }
+    }
+
+    const auto corrupted_output = [&](const std::function<void(llama_memory_i *)> & corrupt) {
+        const llama_context_ptr lctx = new_ctx();
+        decode_last(lctx.get(), tokens, 0);
+        corrupt(llama_get_memory(lctx.get()));
+        return decode_last(lctx.get(), {next}, tokens.size());
+    };
+    const std::vector<float> ref = corrupted_output([](llama_memory_i *) {});
+
+    if (!kvs.empty()) {
+        size_t n_rows = 0;
+        const std::vector<float> out = corrupted_output([&](llama_memory_i * mem) {
+            std::vector<llama_kv_cache *> kvs_ctx;
+            std::vector<llama_memory_recurrent *> rss_ctx;
+            collect_memory(mem, kvs_ctx, rss_ctx);
+            for (const llama_kv_cache * kv : kvs_ctx) {
+                // an early and a recent cell, as sparse and sliding window attention skip some cells
+                n_rows += copy_kv_cell(kv, 5, 1);
+                n_rows += copy_kv_cell(kv, 1, tokens.size() - 2);
+            }
+        });
+        check("stale kv cell", n_rows > 0 ? relative_change(ref, out) : 0.0);
+    }
+    if (!rss.empty()) {
+        const std::vector<float> out = corrupted_output([&](llama_memory_i * mem) {
+            std::vector<llama_kv_cache *> kvs_ctx;
+            std::vector<llama_memory_recurrent *> rss_ctx;
+            collect_memory(mem, kvs_ctx, rss_ctx);
+            for (const llama_memory_recurrent * rs : rss_ctx) {
+                for (const std::vector<ggml_tensor *> * states : {&rs->r_l, &rs->s_l}) {
+                    for (ggml_tensor * t : *states) {
+                        if (t != nullptr) {
+                            const std::vector<uint8_t> zeros(ggml_nbytes(t), 0);
+                            ggml_backend_tensor_set(t, zeros.data(), 0, zeros.size());
+                        }
+                    }
+                }
+            }
+        });
+        check("zeroed recurrent state", relative_change(ref, out));
+    }
+    return ok;
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -553,6 +796,7 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
         ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
     }, &ud);
 
+    bool all_ok = true;
     for (const llm_arch & arch : llm_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
@@ -582,10 +826,18 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
             const std::string path = dir + "/" + llm_arch_name(arch) + (moe ? "-moe.gguf" : "-dense.gguf");
             LOG_INF("%s: Saving %s model (%s) to %s...\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense", path.c_str());
             llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
+            std::string sensitivity;
+            if (check_sensitivity(model_and_ctx.first.get(), seed, sensitivity)) {
+                LOG_INF("%s: %s model (%s) sensitivity: %s\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense", sensitivity.c_str());
+            } else {
+                LOG_ERR("%s: %s model (%s) is not sensitive enough (minimum %.0e): %s\n",
+                    __func__, llm_arch_name(arch), moe ? "MoE" : "dense", min_sensitivity, sensitivity.c_str());
+                all_ok = false;
+            }
         }
     }
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
-    return 0;
+    return all_ok ? 0 : 1;
 }
 
 static int test_backends(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
