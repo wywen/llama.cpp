@@ -540,6 +540,9 @@ int main(int argc, char ** argv) {
     params.n_batch = 100;
     params.out_file = "dump_state.bin";
     params.sampling.seed = 1234;
+    // a restored state can place its cells in a different order, and flash attention on the CPU (F16 K/V arithmetic)
+    // depends on that order at about 1e-3 relative, enough to change a sampled token; without it the change is about 1e-4
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
 
     common_init();
 
