@@ -37,6 +37,8 @@
 #include <vector>
 
 // normalized mean squared error = mse(a, b) / mse(a, 0)
+// values masked to the same infinity on both sides (e.g. logits padded with -inf) are skipped, any other non-finite value
+// gives infinity, and all-zero references give NaN
 static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     GGML_ASSERT(a.size() == b.size());
     double mse_a_b = 0.0;
@@ -45,6 +47,13 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     for (size_t i = 0; i < a.size(); i++) {
         float a_i = a[i];
         float b_i = b[i];
+
+        if (!std::isfinite(a_i) || !std::isfinite(b_i)) {
+            if (std::isinf(a_i) && a_i == b_i) {
+                continue;
+            }
+            return INFINITY;
+        }
 
         mse_a_b += (a_i - b_i) * (a_i - b_i);
         mse_a_0 += a_i * a_i;
@@ -77,8 +86,10 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     // gemma4 multiplies the whole residual stream by each layer's output scale: at N(0, 0.01) the stream vanishes with depth
     // and the logits underflow to zero, with either set of weights
     const bool stream_scale = params.arch == LLM_ARCH_GEMMA4 && name.find(".layer_output_scale.") != std::string::npos;
+    // activation scales (.scales) divide the activation: near 0 a few units dominate the output whatever the context
     const bool near_one = stream_scale ||
-        (params.sensitive && (ends_with(name, ".scale") || (name.find("norm") != std::string::npos && ends_with(name, ".weight"))));
+        (params.sensitive && (ends_with(name, ".scale") || ends_with(name, ".scales") ||
+            (name.find("norm") != std::string::npos && ends_with(name, ".weight"))));
     float stddev = 1.0e-2f;
     if (params.sensitive && !near_one && ends_with(name, ".weight") && ggml_n_dims(tensor) >= 2) {
         stddev = 1.0f / std::sqrt((float) tensor->ne[0]);
@@ -574,36 +585,24 @@ static bool collect_memory(llama_memory_i * mem, std::vector<llama_kv_cache *> &
     return true;
 }
 
-// overwrite the K and V rows of the cell at pos_dst with the rows of pos_src, as a stale page would; returns the rows written
-static size_t copy_kv_cell(const llama_kv_cache * kv, const llama_pos pos_src, const llama_pos pos_dst) {
-    const llama_kv_cells & cells = kv->get_cells(0);
-    int64_t cell_src = -1;
-    int64_t cell_dst = -1;
-    for (uint32_t i = 0; i < kv->get_size(); i++) {
-        if (!cells.is_empty(i) && cells.pos_get(i) == pos_src) {
-            cell_src = i;
-        }
-        if (!cells.is_empty(i) && cells.pos_get(i) == pos_dst) {
-            cell_dst = i;
-        }
-    }
-    if (cell_src < 0 || cell_dst < 0) {
-        return 0; // e.g. a compressed cache that keeps no cell per position
-    }
-    size_t n_rows = 0;
-    for (const uint32_t il : kv->get_layer_ids()) {
-        for (ggml_tensor * t : {kv->get_k_storage(il), kv->get_v_storage(il)}) {
-            if (t == nullptr) {
+// overwrite every K and V tensor of dst with the one of src, as stale pages holding another sequence would; returns the tensors written
+static size_t copy_kv_storage(const llama_kv_cache * src, const llama_kv_cache * dst) {
+    size_t n_tensors = 0;
+    for (const uint32_t il : dst->get_layer_ids()) {
+        const ggml_tensor * ts[2] = {src->get_k_storage(il), src->get_v_storage(il)};
+        ggml_tensor *       td[2] = {dst->get_k_storage(il), dst->get_v_storage(il)};
+        for (int i = 0; i < 2; i++) {
+            if (td[i] == nullptr) {
                 continue;
             }
-            GGML_ASSERT(t->ne[1] == kv->get_size() && t->ne[2] == 1);
-            std::vector<uint8_t> row(t->nb[1]);
-            ggml_backend_tensor_get(t, row.data(), cell_src*t->nb[1], row.size());
-            ggml_backend_tensor_set(t, row.data(), cell_dst*t->nb[1], row.size());
-            n_rows++;
+            GGML_ASSERT(ts[i] != nullptr && ggml_are_same_shape(ts[i], td[i]) && ts[i]->type == td[i]->type);
+            std::vector<uint8_t> data(ggml_nbytes(ts[i]));
+            ggml_backend_tensor_get(ts[i], data.data(), 0, data.size());
+            ggml_backend_tensor_set(td[i], data.data(), 0, data.size());
+            n_tensors++;
         }
     }
-    return n_rows;
+    return n_tensors;
 }
 
 // generated weights are random, so check that the paths a memory bug would corrupt actually reach the output
@@ -669,19 +668,29 @@ static bool check_sensitivity(llama_model * model, const size_t seed, std::strin
     const std::vector<float> ref = corrupted_output([](llama_memory_i *) {});
 
     if (!kvs.empty()) {
-        size_t n_rows = 0;
+        // every cell takes the rows of the same position in another sequence: content-addressed attention reads a
+        // permutation of its cells unchanged, and sparse attention reads only the cells it selects
+        std::vector<llama_token> other = tokens;
+        for (llama_token & t : other) {
+            t = (t + 1) % n_vocab;
+        }
+        const llama_context_ptr lctx_other = new_ctx();
+        decode_last(lctx_other.get(), other, 0);
+        std::vector<llama_kv_cache *> kvs_other;
+        std::vector<llama_memory_recurrent *> rss_other;
+        collect_memory(llama_get_memory(lctx_other.get()), kvs_other, rss_other);
+
+        size_t n_tensors = 0;
         const std::vector<float> out = corrupted_output([&](llama_memory_i * mem) {
             std::vector<llama_kv_cache *> kvs_ctx;
             std::vector<llama_memory_recurrent *> rss_ctx;
             collect_memory(mem, kvs_ctx, rss_ctx);
-            for (const llama_kv_cache * kv : kvs_ctx) {
-                // every cell takes the rows of the next position, as sparse and sliding window attention read only some cells
-                for (llama_pos pos = 0; pos + 1 < (llama_pos) tokens.size(); pos++) {
-                    n_rows += copy_kv_cell(kv, pos + 1, pos);
-                }
+            GGML_ASSERT(kvs_ctx.size() == kvs_other.size());
+            for (size_t i = 0; i < kvs_ctx.size(); i++) {
+                n_tensors += copy_kv_storage(kvs_other[i], kvs_ctx[i]);
             }
         });
-        check("stale kv cell", n_rows > 0 ? relative_change(ref, out) : 0.0);
+        check("stale kv", n_tensors > 0 ? relative_change(ref, out) : 0.0);
     }
     if (!rss.empty()) {
         const std::vector<float> out = corrupted_output([&](llama_memory_i * mem) {
@@ -1082,7 +1091,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         }
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                         status_nmse = "\033[1;32mOK\033[0m";
-                        if (nmse_val > 1e-4) {
+                        if (!(nmse_val <= 1e-4)) { // also fails a NaN
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m";
                         }
