@@ -57,16 +57,10 @@ static bool ends_with(const std::string & str, const std::string & suffix) {
     return str.size() >= suffix.size() && str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-struct tensor_data_params {
-    size_t seed;
-    bool   fan_in; // matrices keep the variance of their input
-};
-
 // scales and norm weights are 1 and matrices keep the variance of their input, other tensors are small
 // with N(0, 0.01) everywhere the product of scales, norms and matrices hides most inputs and cached state from the output
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
-    const tensor_data_params & params = *(const tensor_data_params *) userdata;
-    size_t seed = params.seed;
+    size_t seed = *(const size_t *) userdata;
     const std::string name = tensor->name;
     std::hash<std::string> hasher;
     seed ^= hasher(name);
@@ -74,7 +68,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 
     const bool is_one = ends_with(name, ".scale") || (name.find("norm") != std::string::npos && ends_with(name, ".weight"));
     float stddev = 1.0e-2f;
-    if (params.fan_in && !is_one && ends_with(name, ".weight") && ggml_n_dims(tensor) >= 2) {
+    if (!is_one && ends_with(name, ".weight") && ggml_n_dims(tensor) >= 2) {
         stddev = 1.0f / std::sqrt((float) tensor->ne[0]);
     }
     std::normal_distribution<float> dis(0.0f, stddev);
@@ -400,13 +394,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         ctx_params.n_ubatch = 64;
     }
 
-    tensor_data_params tmp = { seed, true };
-    if (gguf_ctx != nullptr) {
-        const int64_t kid = gguf_find_key(gguf_ctx, "general.architecture");
-        // gemma3n amplifies backend rounding over its 22 layers: flash attention rounds K and V to F16 in layer 0 (2.9e-4 relative)
-        // and with fan-in matrices the difference grows to 0.2 by the last layer, so its matrices stay small
-        tmp.fan_in = kid < 0 || llm_arch_from_string(gguf_get_val_str(gguf_ctx, kid)) != LLM_ARCH_GEMMA3N;
-    }
+    size_t tmp = seed;
     llama_model_ptr model(gguf_ctx != nullptr ?
         llama_model_init_from_user(gguf_ctx, set_tensor_data, &tmp, model_params) :
         llama_model_load_from_file_ptr(file, model_params));
