@@ -179,6 +179,30 @@ llama_pos llama_memory_hybrid::seq_pos_max(llama_seq_id seq_id) const {
     return std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id));
 }
 
+llama_memory_cells_t llama_memory_hybrid::cells_snapshot(llama_seq_id seq_id) const {
+    auto * res = new llama_memory_hybrid_cells();
+
+    mem_attn->cells_snapshot_append(seq_id, res->attn);
+    mem_recr->cells_snapshot_to(res->recr);
+
+    return res;
+}
+
+void llama_memory_hybrid::cells_restore(llama_seq_id seq_id, const llama_memory_cells_i * snap) {
+    const auto * s = dynamic_cast<const llama_memory_hybrid_cells *>(snap);
+
+    // check both parts first: restoring one cache alone would leave the two placing ubatches from states that never coexisted
+    const bool attn_ok = s && s->attn.entries.size() == 1 && s->attn.entries[0].cells.size() == mem_attn->get_size();
+    if (!attn_ok || !mem_recr->cells_can_restore(s->recr)) {
+        LLAMA_LOG_ERROR("%s: the snapshot was not taken from a hybrid memory of this size, memory left unchanged\n", __func__);
+        return;
+    }
+
+    size_t idx = 0;
+    mem_attn->cells_restore_at(seq_id, s->attn, idx);
+    mem_recr->cells_restore_from(s->recr);
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = mem_attn->memory_breakdown();
     for (const auto & buft_size : mem_recr->memory_breakdown()) {

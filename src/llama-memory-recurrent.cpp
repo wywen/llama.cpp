@@ -420,6 +420,57 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     return result;
 }
 
+void llama_memory_recurrent::cells_snapshot_to(llama_memory_recurrent_cells & out) const {
+    out.cells    = cells;
+    out.head     = head;
+    out.size     = size;
+    out.used     = used;
+    out.n        = n;
+    out.rs_z     = rs_z;
+    out.rs_idx   = rs_idx;
+    out.rs_valid = rs_valid;
+}
+
+bool llama_memory_recurrent::cells_can_restore(const llama_memory_recurrent_cells & in) const {
+    return in.size == size && in.cells.size() == cells.size() &&
+           in.rs_idx.size() == rs_idx.size() && in.rs_valid.size() == rs_valid.size();
+}
+
+void llama_memory_recurrent::cells_restore_from(const llama_memory_recurrent_cells & in) {
+    GGML_ASSERT(cells_can_restore(in));
+
+    cells = in.cells;
+    head  = in.head;
+    used  = in.used;
+    n     = in.n;
+    rs_z  = in.rs_z;
+
+    // a rollback pending at snapshot time is pending again, even if a decode since consumed it
+    rs_idx   = in.rs_idx;
+    rs_valid = in.rs_valid;
+}
+
+llama_memory_cells_t llama_memory_recurrent::cells_snapshot(llama_seq_id seq_id) const {
+    GGML_ASSERT(seq_id >= 0 && (uint32_t) seq_id < n_seq_max);
+
+    auto * res = new llama_memory_recurrent_cells();
+    cells_snapshot_to(*res);
+
+    return res;
+}
+
+void llama_memory_recurrent::cells_restore(llama_seq_id seq_id, const llama_memory_cells_i * snap) {
+    GGML_ASSERT(seq_id >= 0 && (uint32_t) seq_id < n_seq_max);
+
+    const auto * s = dynamic_cast<const llama_memory_recurrent_cells *>(snap);
+    if (!s || !cells_can_restore(*s)) {
+        LLAMA_LOG_ERROR("%s: the snapshot was not taken from a recurrent memory of this size, memory left unchanged\n", __func__);
+        return;
+    }
+
+    cells_restore_from(*s);
+}
+
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     if (seq_id < 0) {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);

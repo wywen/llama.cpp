@@ -62,6 +62,10 @@ public:
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
+    // not supported: the snapshot of the base class would leave the indexer cells out of step with the attention cells
+    llama_memory_cells_t cells_snapshot(llama_seq_id /*seq_id*/) const override { return nullptr; }
+    void cells_restore(llama_seq_id /*seq_id*/, const llama_memory_cells_i * /*snap*/) override {}
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     // state write/load
