@@ -16,7 +16,6 @@ bool llama_model_saver_supports_arch(llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_PLAMO3:
         case LLM_ARCH_GEMMA3:
-        case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_COHERE2:
         case LLM_ARCH_COHERE2MOE:
         case LLM_ARCH_OLMO2:
@@ -284,6 +283,18 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_ATTENTION_ROPE_PATTERN,            hparams.rope_pattern, true);
     add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,          hparams.n_swa);
     // add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,  ???);
+    if (model->arch == LLM_ARCH_GEMMA3N) {
+        // the loader reads a period (the last layer of each period is full attention) and defaults to 5
+        uint32_t swa_period = 0;
+        while (swa_period < hparams.n_layer() && hparams.is_swa(swa_period)) {
+            swa_period++;
+        }
+        swa_period = swa_period < hparams.n_layer() ? swa_period + 1 : 0;
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            GGML_ASSERT(hparams.is_swa(il) == (swa_period == 0 || il % swa_period < swa_period - 1));
+        }
+        add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, swa_period);
+    }
     add_kv(LLM_KV_ATTENTION_SCALE,                   hparams.f_attention_scale);
     add_kv(LLM_KV_ATTENTION_OUTPUT_SCALE,            hparams.f_attn_out_scale);
     add_kv(LLM_KV_ATTENTION_VALUE_SCALE,             hparams.f_attn_value_scale);
@@ -449,7 +460,7 @@ void llama_model_saver::add_kv_from_model() {
 }
 
 void llama_model_saver::add_tensors_from_model() {
-    if (model->output != nullptr &&
+    if (model->output == nullptr ||
             std::string(model->output->name) != std::string(model->tok_embd->name)) {
         add_tensor(model->tok_embd); // some models use the same tensor for tok_embd and output
     }
@@ -475,7 +486,11 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->hc_head_fn);
     add_tensor(model->hc_head_base);
     add_tensor(model->hc_head_scale);
+    add_tensor(model->altup_proj);
+    add_tensor(model->altup_unembd_proj);
     add_tensor(model->per_layer_tok_embd);
+    add_tensor(model->per_layer_model_proj);
+    add_tensor(model->per_layer_proj_norm);
     add_tensor(model->hc_head_norm);
     add_tensor(model->hc_head_down);
     add_tensor(model->hc_head_up);

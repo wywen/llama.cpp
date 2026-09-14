@@ -225,8 +225,10 @@ struct outcome {
     size_t compared = 0; // cases where both a plan and a context were produced and compared
     size_t refused  = 0; // cases both the plan and context creation refused
     size_t failed   = 0;
+    size_t no_memory = 0; // compared cases where neither the plan nor the context has memory, e.g. encoder-only models
 
     std::map<llama_memory_plan_buffer_kind, size_t> kinds_compared;
+    size_t shared_kv_compared = 0; // compared cases whose model has layers reusing another layer's KV
 };
 
 std::optional<llama_memory_plan> try_plan(const llama_model * model, const llama_context_params & params, std::string & error) {
@@ -267,8 +269,13 @@ void check_case(outcome & out, const std::string & subject, llama_model * model,
         log.add("plan produced but context creation failed");
     } else {
         out.compared++;
+        out.no_memory += !plan->has_memory;
         for (const auto & buf : plan->buffers) {
             out.kinds_compared[buf.kind]++;
+        }
+        const int32_t n_layer_kv = model->hparams.n_layer_kv_from_start;
+        if (n_layer_kv >= 0 && (uint32_t) n_layer_kv < model->hparams.n_layer()) {
+            out.shared_kv_compared++;
         }
         compare_shape(log, *plan, ctx.get());
         compare_buffers(log, plan->buffers, built);
@@ -504,9 +511,11 @@ int main(int argc, char ** argv) {
         }
     }
 
-    printf("compared buffers by kind: kv %zu, kv_swa %zu, recurrent %zu, dsv4_state %zu\n",
+    printf("compared buffers by kind: kv %zu, kv_swa %zu, recurrent %zu, dsv4_state %zu; cases without memory: %zu\n",
             out.kinds_compared[LLAMA_MEMORY_PLAN_BUFFER_KV], out.kinds_compared[LLAMA_MEMORY_PLAN_BUFFER_KV_SWA],
-            out.kinds_compared[LLAMA_MEMORY_PLAN_BUFFER_RECURRENT], out.kinds_compared[LLAMA_MEMORY_PLAN_BUFFER_DSV4_STATE]);
+            out.kinds_compared[LLAMA_MEMORY_PLAN_BUFFER_RECURRENT], out.kinds_compared[LLAMA_MEMORY_PLAN_BUFFER_DSV4_STATE],
+            out.no_memory);
+    printf("compared cases with shared KV layers: %zu\n", out.shared_kv_compared);
     printf("%zu model loads x %zu context cases: %zu compared, %zu refused by both, %zu failed\n",
             models_loaded, std::size(context_cases), out.compared, out.refused, out.failed);
 
@@ -528,6 +537,14 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "FAIL no %s buffer was compared\n", name);
             ok = false;
         }
+    }
+    if (out.no_memory == 0) {
+        fprintf(stderr, "FAIL no model without memory was compared\n");
+        ok = false;
+    }
+    if (out.shared_kv_compared == 0) {
+        fprintf(stderr, "FAIL no model with shared KV layers was compared\n");
+        ok = false;
     }
     printf("test-memory-plan: %s\n", ok ? "OK" : "FAILED");
     return ok ? 0 : 1;
