@@ -73,7 +73,9 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     seed ^= hasher(name);
     std::mt19937 gen(seed);
 
-    const bool near_one = params.sensitive && (ends_with(name, ".scale") || (name.find("norm") != std::string::npos && ends_with(name, ".weight")));
+    // activation scales (.scales) divide the activation: near 0 a few units dominate the output whatever the context
+    const bool near_one = params.sensitive && (ends_with(name, ".scale") || ends_with(name, ".scales") ||
+        (name.find("norm") != std::string::npos && ends_with(name, ".weight")));
     float stddev = 1.0e-2f;
     if (params.sensitive && !near_one && ends_with(name, ".weight") && ggml_n_dims(tensor) >= 2) {
         stddev = 1.0f / std::sqrt((float) tensor->ne[0]);
