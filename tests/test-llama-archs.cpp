@@ -638,9 +638,10 @@ static bool check_sensitivity(llama_model * model, const size_t seed, std::strin
             std::vector<llama_memory_recurrent *> rss_ctx;
             collect_memory(mem, kvs_ctx, rss_ctx);
             for (const llama_kv_cache * kv : kvs_ctx) {
-                // an early and a recent cell, as sparse and sliding window attention skip some cells
-                n_rows += copy_kv_cell(kv, 5, 1);
-                n_rows += copy_kv_cell(kv, 1, tokens.size() - 2);
+                // every cell takes the rows of the next position, as sparse and sliding window attention read only some cells
+                for (llama_pos pos = 0; pos + 1 < (llama_pos) tokens.size(); pos++) {
+                    n_rows += copy_kv_cell(kv, pos + 1, pos);
+                }
             }
         });
         check("stale kv cell", n_rows > 0 ? relative_change(ref, out) : 0.0);
