@@ -384,6 +384,8 @@ void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
             auto & cell = cells[tail_id];
             if (cell.has_seq_id(seq_id) && p0 <= cell.pos && cell.pos < p1) {
                 cell.pos /= d;
+                // positions no longer count tokens, so a rollback by position would not match the snapshots
+                cell.rs_max = 0;
             }
         }
     }
@@ -643,8 +645,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             auto & dst_cell = cells[dst_id];
             auto & src_cell = cells[src_id];
 
-            std::swap(dst_cell.pos, src_cell.pos);
-            std::swap(dst_cell.src, src_cell.src);
+            std::swap(dst_cell.pos,    src_cell.pos);
+            std::swap(dst_cell.src,    src_cell.src);
+            std::swap(dst_cell.rs_max, src_cell.rs_max);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
 
             // swap tails
@@ -709,6 +712,17 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 // Stage the source ids for all used cells to allow correct seq_* behavior
                 // and still make these values available when setting the inputs
                 cells[i].src0 = cells[i].src;
+            }
+            // the cells of other sequences in the range only get their state copied to snapshot 0, from another cell or
+            // from the snapshot of a pending rollback, which leaves the other snapshots of a moved or rolled back cell stale
+            if (i >= min + (int) n_seqs) {
+                bool rolled_back = false;
+                for (const llama_seq_id seq_id : cells[i].seq_id) {
+                    rolled_back = rolled_back || (n_rs_seq > 0 && rs_idx[seq_id] != 0);
+                }
+                if (cells[i].src0 != i || rolled_back) {
+                    cells[i].rs_max = 0;
+                }
             }
             cells[i].src = i; // avoid moving or clearing twice
         }

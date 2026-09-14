@@ -487,11 +487,109 @@ struct case_shared_seq_reserve : ctx_test {
     }
 };
 
+// a rollback reads snapshots that only the last ubatch of the sequence wrote into its own cell: after a state load
+// (which restores the final state only) or after a decode of other sequences moved the cell (which copies the final
+// state only), the other snapshots are stale and every rollback must be refused
+struct case_rollback_stale : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "rollback_stale"; }
+
+    const char * description() const override {
+        return "seq_rm refuses rollbacks after a state load or after a decode of other sequences moved the state";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr llama_pos n_prefix = 16;
+        constexpr llama_pos n_tail   = 3; // a ubatch whose snapshots serve rollbacks of 1 and 2
+
+        char arch_name[64] = {};
+        llama_model_meta_val_str(mr.model, "general.architecture", arch_name, sizeof(arch_name));
+        const llm_arch arch = llama_arch_from_string(arch_name);
+        const bool is_dsv4 = arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41;
+
+        const auto make_ctx = [&](uint32_t n_seq_max) {
+            ctx_opts opts;
+            opts.n_batch   = 64;
+            opts.n_ubatch  = 64;
+            opts.n_seq_max = n_seq_max;
+            opts.n_rs_seq  = 8;
+            return mr.ctx(opts);
+        };
+
+        const auto decode_with_tail = [&](llama_context * ctx, llama_seq_id seq_id) {
+            return decode_gen(ctx, n_vocab, seq_id, 0, n_prefix) &&
+                   decode_gen(ctx, n_vocab, seq_id, n_prefix, n_prefix + n_tail);
+        };
+
+        // state load
+        {
+            llama_context_ptr ctx_src = make_ctx(1);
+            llama_context_ptr ctx_dst = make_ctx(1);
+            if (!ctx_src || !ctx_dst) {
+                return case_result::fail();
+            }
+            if (llama_n_rs_seq(ctx_src.get()) == 0) {
+                return case_result::skip("n_rs_seq is disabled");
+            }
+
+            CTX_REQUIRE(decode_with_tail(ctx_src.get(), 0), "the source decode failed");
+
+            std::vector<uint8_t> state;
+            CTX_REQUIRE(get_seq_state(ctx_src.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, state) &&
+                        set_seq_state(ctx_dst.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, state),
+                    "the state save / load failed");
+
+            // control: the source still serves the rollback
+            CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx_src.get()), 0, n_prefix + n_tail - 1, -1),
+                    "a rollback of 1 after a 3-token ubatch was refused");
+            CTX_REQUIRE(!llama_memory_seq_rm(llama_get_memory(ctx_dst.get()), 0, n_prefix + n_tail - 1, -1),
+                    "a rollback after a state load was accepted");
+            CTX_REQUIRE(llama_memory_seq_pos_max(llama_get_memory(ctx_dst.get()), 0) == n_prefix + n_tail - 1,
+                    "a refused rollback changed the position");
+        }
+
+        // the DSV4 cache keeps its snapshots per sequence, not in cells that move
+        if (is_dsv4 || arch_reserves_single_seq(mr.model)) {
+            return case_result::pass();
+        }
+
+        // moved state: seqs 0, 2, 1 take cells 0, 1, 2; a decode of seqs 0 and 1 gathers them into cells 0 and 1,
+        // which moves seq 2 to cell 2 with only its final state copied
+        {
+            llama_context_ptr ctx = make_ctx(3);
+            if (!ctx) {
+                return case_result::fail();
+            }
+
+            CTX_REQUIRE(decode_with_tail(ctx.get(), 0) && decode_with_tail(ctx.get(), 2) && decode_with_tail(ctx.get(), 1),
+                    "the per-sequence decodes failed");
+
+            const llama_pos pos = n_prefix + n_tail;
+            common_batch batch(ctx.get());
+            for (const llama_seq_id s : { 0, 1 }) {
+                batch.add(gen_token(n_vocab, s, pos), pos, s, true);
+            }
+            CTX_REQUIRE(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "the two-sequence decode failed");
+
+            CTX_REQUIRE(!llama_memory_seq_rm(llama_get_memory(ctx.get()), 2, n_prefix + n_tail - 1, -1),
+                    "a rollback of a sequence whose state another decode moved was accepted");
+            CTX_REQUIRE(llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 2) == n_prefix + n_tail - 1,
+                    "a refused rollback changed the position");
+        }
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
     cases.push_back(std::make_unique<case_rollback>());
     cases.push_back(std::make_unique<case_rollback_bound>());
+    cases.push_back(std::make_unique<case_rollback_stale>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
 
