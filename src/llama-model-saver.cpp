@@ -294,6 +294,11 @@ void llama_model_saver::add_kv_from_model() {
             GGML_ASSERT(hparams.is_swa(il) == (swa_period == 0 || il % swa_period < swa_period - 1));
         }
         add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, swa_period);
+    } else if (model->arch == LLM_ARCH_GEMMA4) {
+        // the loader requires a flag per layer (a scalar applies to every layer) and the per-layer embedding length
+        add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, true);
+        add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS,       uint32_t(hparams.n_layer_all - hparams.n_layer_kv_from_start));
+        add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,       hparams.n_embd_per_layer);
     }
     add_kv(LLM_KV_ATTENTION_SCALE,                   hparams.f_attention_scale);
     add_kv(LLM_KV_ATTENTION_OUTPUT_SCALE,            hparams.f_attn_out_scale);

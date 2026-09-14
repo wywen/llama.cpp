@@ -58,8 +58,9 @@ static bool ends_with(const std::string & str, const std::string & suffix) {
 }
 
 struct tensor_data_params {
-    size_t seed;
-    bool   sensitive;
+    size_t   seed;
+    bool     sensitive;
+    llm_arch arch;
 };
 
 // sensitive: scales and norm weights are near 1 and matrices keep the variance of their input, other tensors are small
@@ -73,7 +74,11 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     seed ^= hasher(name);
     std::mt19937 gen(seed);
 
-    const bool near_one = params.sensitive && (ends_with(name, ".scale") || (name.find("norm") != std::string::npos && ends_with(name, ".weight")));
+    // gemma4 multiplies the whole residual stream by each layer's output scale: at N(0, 0.01) the stream vanishes with depth
+    // and the logits underflow to zero, with either set of weights
+    const bool stream_scale = params.arch == LLM_ARCH_GEMMA4 && name.find(".layer_output_scale.") != std::string::npos;
+    const bool near_one = stream_scale ||
+        (params.sensitive && (ends_with(name, ".scale") || (name.find("norm") != std::string::npos && ends_with(name, ".weight"))));
     float stddev = 1.0e-2f;
     if (params.sensitive && !near_one && ends_with(name, ".weight") && ggml_n_dims(tensor) >= 2) {
         stddev = 1.0f / std::sqrt((float) tensor->ne[0]);
@@ -129,7 +134,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_embd = 128;
         n_head = 2;
         n_ff   = 192;
-        n_layer = 5; // need at least 5 for swa_pattern (every 5th is full_attention)
+        n_layer = 10; // two periods of 4 sliding window layers and 1 full attention layer, the second period shares KV
     } else if (arch == LLM_ARCH_GEMMA3N) {
         n_embd = 64;
         n_head = 1;
@@ -263,12 +268,22 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
 
     if (arch == LLM_ARCH_GEMMA4) {
         ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,      n_embd/2);
-        ms.add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS,      uint32_t(0));
+        // layers of the second period reuse the KV of the last sliding window and full attention layers of the first
+        ms.add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS,      n_layer/2);
+        // full attention layers have wider heads than sliding window layers
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,            2*n_embd_head);
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,          2*n_embd_head);
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,        n_embd_head);
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,      n_embd_head);
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT_SWA,        n_embd_head);
         ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,              10000.0f);
-        // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
-        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
+        // every 5th layer is full attention, as in the E2B layer types; a scalar would mark every layer sliding window
+        std::vector<uint32_t> pattern;
+        pattern.reserve(n_layer);
+        for (uint32_t il = 0; il < n_layer; il++) {
+            pattern.push_back(il % 5 < 4);
+        }
+        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
     } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 ||
             arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_GRANITE_SWA || arch == LLM_ARCH_DOTS3NOTE) {
         std::vector<uint32_t> pattern;
@@ -412,7 +427,10 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         ctx_params.n_ubatch = 64;
     }
 
-    tensor_data_params tmp = { seed, sensitive_weights };
+    tensor_data_params tmp = { seed, sensitive_weights, LLM_ARCH_UNKNOWN };
+    if (gguf_ctx != nullptr) {
+        tmp.arch = llm_arch_from_string(gguf_get_val_str(gguf_ctx, gguf_find_key(gguf_ctx, "general.architecture")));
+    }
     llama_model_ptr model(gguf_ctx != nullptr ?
         llama_model_init_from_user(gguf_ctx, set_tensor_data, &tmp, model_params) :
         llama_model_load_from_file_ptr(file, model_params));
@@ -837,9 +855,6 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_WAVTOKENIZER_DEC) {
         return false; // FIXME CUDA backend crashes.
     }
-    if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
-        return false; // FIXME @ngxson
-    }
     if (arch == LLM_ARCH_GRANITE_SWITCH) {
         return false; // FIXME adapter fixture
     }
@@ -903,8 +918,8 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
         if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
             continue;
         }
-        if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
-            continue; // FIXME: ISWA KV cache initialization needs more fixture params
+        if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+            continue; // a context of this model needs the context of a target model
         }
         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
             continue;
@@ -1011,8 +1026,8 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
             continue;
         }
-        if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
-            continue; // FIXME: ISWA KV cache initialization needs more fixture params
+        if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+            continue; // a context of this model needs the context of a target model
         }
         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
             continue;
