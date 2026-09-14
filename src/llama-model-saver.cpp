@@ -199,7 +199,8 @@ void llama_model_saver::add_kv_from_model() {
     if (hparams.n_embd_out_impl > 0) {
         add_kv(LLM_KV_EMBEDDING_LENGTH_OUT,          hparams.n_embd_out_impl);
     }
-    if (hparams.n_embd_per_layer > 0) {
+    // the gemma4 loader requires the key, where 0 means no per-layer embeddings
+    if (hparams.n_embd_per_layer > 0 || model->arch == LLM_ARCH_GEMMA4) {
         add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,    hparams.n_embd_per_layer);
     }
     add_kv(LLM_KV_BLOCK_COUNT,                       hparams.n_layer_all);
