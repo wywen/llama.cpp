@@ -139,6 +139,10 @@ struct llama_memory_i {
     // Metadata only, by design: cell DATA is left alone, so a caller whose
     // passes write disjoint layers still finds each layer's data intact under
     // the restored positions.
+    //
+    // Restore reports no failure. The recurrent and hybrid memories log a
+    // snapshot they cannot take (another memory type or size) and leave their
+    // cells unchanged.
     virtual llama_memory_cells_t cells_snapshot(llama_seq_id /*seq_id*/) const { return nullptr; }
     virtual void cells_restore(llama_seq_id /*seq_id*/, const llama_memory_cells_i * /*snap*/) {}
 

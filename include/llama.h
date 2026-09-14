@@ -826,6 +826,11 @@ extern "C" {
     // Metadata only: cell DATA is untouched, so passes writing disjoint layers
     // still find each layer's data intact under the restored positions.
     //
+    // Recurrent state keeps one set of cells for all sequences, so for a
+    // recurrent or hybrid memory the recurrent part of the snapshot covers
+    // every sequence whatever seq_id is, and includes a partial removal
+    // (llama_memory_seq_rm) not yet consumed by a decode.
+    //
     // Returns NULL for memory types that have no such state. The handle is
     // owned by the caller -- release it with llama_memory_cells_free.
     LLAMA_API llama_memory_cells_t llama_memory_cells_snapshot(

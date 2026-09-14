@@ -404,6 +404,182 @@ static bool test_single_seq(const common_params & params, llama_model * model, c
     return done(true);
 }
 
+static llama_token tok_of(uint32_t stream, llama_pos pos, int n_vocab) {
+    return (llama_token) ((7*(uint32_t) pos + 31*stream + 1) % (uint32_t) n_vocab);
+}
+
+// decode tokens [p0, p1) of `stream` into seq 0 in one batch; with `logits`, every token is an output and its logits are appended
+static bool decode_stream(llama_context * ctx, uint32_t stream, llama_pos p0, llama_pos p1, int n_vocab, std::vector<float> * logits) {
+    llama_batch batch = llama_batch_init(p1 - p0, 0, 1);
+    for (llama_pos pos = p0; pos < p1; ++pos) {
+        common_batch_add(batch, tok_of(stream, pos, n_vocab), pos, { 0 }, logits != nullptr || pos + 1 == p1);
+    }
+    bool ok = llama_decode(ctx, batch) == 0;
+    llama_batch_free(batch);
+
+    for (int32_t i = 0; ok && logits != nullptr && i < p1 - p0; ++i) {
+        const float * l = llama_get_logits_ith(ctx, i);
+        ok = l != nullptr;
+        if (ok) {
+            logits->insert(logits->end(), l, l + n_vocab);
+        }
+    }
+    return ok;
+}
+
+// A restored cells snapshot must place the next ubatches exactly as the
+// memory would have placed them at snapshot time. Cell data is not restored,
+// so each comparison is set up to read only state the detour between snapshot
+// and restore left untouched, against a context that never took the detour.
+static bool test_cells_snapshot(const common_params & params, llama_model * model, uint32_t n_rs_seq_req, int n_vocab) {
+    const char * func = __func__;
+
+    constexpr uint32_t n_ubatch = 16;
+
+    std::vector<llama_context *> ctxs;
+    const auto new_ctx = [&](uint32_t n_seq_max) {
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_seq_max  = n_seq_max;
+        cparams.n_rs_seq   = n_rs_seq_req;
+        cparams.n_ctx      = 256*n_seq_max;
+        cparams.n_batch    = 256;
+        cparams.n_ubatch   = n_ubatch;
+        cparams.kv_unified = false;
+        llama_context * ctx = llama_init_from_model(model, cparams);
+        if (ctx != nullptr) {
+            ctxs.push_back(ctx);
+        }
+        return ctx;
+    };
+    const auto done = [&](bool ok) {
+        for (llama_context * ctx : ctxs) {
+            llama_free(ctx);
+        }
+        return ok;
+    };
+
+    // same ubatch shapes of more than 8 tokens on both sides, so a correct restore matches bitwise
+    const auto expect_same = [&](const std::vector<float> & a, const std::vector<float> & b, const char * name) {
+        float diff = a.size() == b.size() ? 0.0f : INFINITY;
+        for (size_t i = 0; i < a.size() && i < b.size(); ++i) {
+            diff = std::max(diff, std::fabs(a[i] - b[i]));
+        }
+        if (diff > 0.0f) {
+            fprintf(stderr, "%s : n_rs_seq %u: %s logits differ from the reference (max diff %g)\n", func, n_rs_seq_req, name, (double) diff);
+            return false;
+        }
+        return true;
+    };
+    const auto expect_pos_max = [&](llama_context * ctx, llama_pos expected, const char * name) {
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+        if (pos_max != expected) {
+            fprintf(stderr, "%s : n_rs_seq %u: %s: seq 0 ends at %d, expected %d\n", func, n_rs_seq_req, name, pos_max, expected);
+            return false;
+        }
+        return true;
+    };
+
+    // A fresh sequence: after the restore its cell has no source again, so the
+    // next decode starts from the zeroed state and position 0, as if the
+    // multi-ubatch detour never happened.
+    {
+        llama_context * ctx     = new_ctx(1);
+        llama_context * ctx_ref = new_ctx(1);
+        if (ctx == nullptr || ctx_ref == nullptr) {
+            fprintf(stderr, "%s : failed to init contexts\n", func);
+            return done(false);
+        }
+
+        llama_memory_cells_t snap = llama_memory_cells_snapshot(llama_get_memory(ctx), 0);
+        if (snap == nullptr) {
+            fprintf(stderr, "%s : no cells snapshot for a recurrent memory\n", func);
+            return done(false);
+        }
+
+        bool ok = decode_stream(ctx, 1, 0, 3*n_ubatch, n_vocab, nullptr) && expect_pos_max(ctx, 3*n_ubatch - 1, "fresh detour");
+        llama_memory_cells_restore(llama_get_memory(ctx), 0, snap);
+        llama_memory_cells_free(snap);
+
+        std::vector<float> logits;
+        std::vector<float> logits_ref;
+        ok = ok && expect_pos_max(ctx, -1, "fresh restore") &&
+            decode_stream(ctx,     2, 0, 2*n_ubatch, n_vocab, &logits) &&
+            decode_stream(ctx_ref, 2, 0, 2*n_ubatch, n_vocab, &logits_ref) &&
+            expect_same(logits, logits_ref, "fresh sequence");
+        if (!ok) {
+            return done(false);
+        }
+    }
+
+    // A pending partial removal: the restore must make it pending again even
+    // though the detour consumed it. The detour decodes n_rollback tokens, so it
+    // writes snapshot planes 0 .. n_rollback - 1 and leaves plane n_rollback,
+    // the one the pending removal restores, as the prompt decode left it.
+    {
+        llama_context * ctx     = new_ctx(1);
+        llama_context * ctx_ref = new_ctx(1);
+        if (ctx == nullptr || ctx_ref == nullptr) {
+            fprintf(stderr, "%s : failed to init contexts\n", func);
+            return done(false);
+        }
+
+        const uint32_t n_rollback = std::min<uint32_t>(llama_n_rs_seq(ctx), 3);
+        if (n_rollback == 0) {
+            fprintf(stderr, "%s : n_rs_seq %u: skipping the pending removal case because n_rs_seq is %u\n", func, n_rs_seq_req, llama_n_rs_seq(ctx));
+        } else {
+            const llama_pos n_prompt = 2*n_ubatch;
+            const llama_pos p0       = n_prompt - (llama_pos) n_rollback;
+
+            bool ok =
+                decode_stream(ctx,     1, 0, n_prompt, n_vocab, nullptr) && llama_memory_seq_rm(llama_get_memory(ctx),     0, p0, -1) &&
+                decode_stream(ctx_ref, 1, 0, n_prompt, n_vocab, nullptr) && llama_memory_seq_rm(llama_get_memory(ctx_ref), 0, p0, -1);
+            if (!ok) {
+                fprintf(stderr, "%s : n_rs_seq %u: prompt decode and removal failed\n", func, n_rs_seq_req);
+                return done(false);
+            }
+
+            llama_memory_cells_t snap = llama_memory_cells_snapshot(llama_get_memory(ctx), 0);
+            ok = snap != nullptr &&
+                decode_stream(ctx, 3, p0, n_prompt, n_vocab, nullptr) && expect_pos_max(ctx, n_prompt - 1, "pending detour");
+            llama_memory_cells_restore(llama_get_memory(ctx), 0, snap);
+            llama_memory_cells_free(snap);
+
+            std::vector<float> logits;
+            std::vector<float> logits_ref;
+            ok = ok && expect_pos_max(ctx, p0 - 1, "pending restore") &&
+                decode_stream(ctx,     2, p0, p0 + n_ubatch, n_vocab, &logits) &&
+                decode_stream(ctx_ref, 2, p0, p0 + n_ubatch, n_vocab, &logits_ref) &&
+                expect_same(logits, logits_ref, "pending removal");
+            if (!ok) {
+                return done(false);
+            }
+        }
+    }
+
+    // A snapshot of a memory with other cell counts must leave the cells alone.
+    {
+        llama_context * ctx   = new_ctx(1);
+        llama_context * ctx_2 = new_ctx(2);
+        if (ctx == nullptr || ctx_2 == nullptr) {
+            fprintf(stderr, "%s : failed to init contexts\n", func);
+            return done(false);
+        }
+
+        llama_memory_cells_t snap = llama_memory_cells_snapshot(llama_get_memory(ctx_2), 0);
+        bool ok = snap != nullptr && decode_stream(ctx, 1, 0, n_ubatch, n_vocab, nullptr);
+        if (ok) {
+            llama_memory_cells_restore(llama_get_memory(ctx), 0, snap);
+        }
+        llama_memory_cells_free(snap);
+        if (!ok || !expect_pos_max(ctx, n_ubatch - 1, "mismatched restore")) {
+            return done(false);
+        }
+    }
+
+    fprintf(stderr, "%s : n_rs_seq %u: restored cells placed the next ubatches like the reference\n", func, n_rs_seq_req);
+    return done(true);
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -438,6 +614,26 @@ int main(int argc, char ** argv) {
     if (ctx == nullptr) {
         fprintf(stderr, "%s : failed to init context\n", __func__);
         return 1;
+    }
+
+    // memories that keep no cells snapshot: DeepSeek V4, and the hybrid memories with sliding window attention or a sparse-attention indexer
+    char arch[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+    if (strcmp(arch, "deepseek4") == 0 || strcmp(arch, "qwen4exp") == 0 || llama_model_n_swa(model) > 0) {
+        llama_memory_cells_t snap = llama_memory_cells_snapshot(llama_get_memory(ctx), 0);
+        if (snap != nullptr) {
+            fprintf(stderr, "%s : unexpected cells snapshot for %s\n", __func__, arch);
+            llama_memory_cells_free(snap);
+            llama_free(ctx);
+            return 1;
+        }
+    } else {
+        for (uint32_t n_rs_seq : { 0u, 2u, 8u }) {
+            if (!test_cells_snapshot(params, model, n_rs_seq, n_vocab)) {
+                llama_free(ctx);
+                return 1;
+            }
+        }
     }
 
     const uint32_t n_rs_seq = llama_n_rs_seq(ctx);
