@@ -62,8 +62,9 @@ struct tensor_data_params {
     bool   sensitive;
 };
 
-// sensitive: scales and norm weights are 1 and matrices keep the variance of their input, other tensors are small
+// sensitive: scales and norm weights are near 1 and matrices keep the variance of their input, other tensors are small
 // with N(0, 0.01) everywhere the product of scales, norms and matrices hides most inputs and cached state from the output
+// scales and norm weights are 1 + N(0, 0.01) rather than 1, so that dropping an optional one is not the identity
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     const tensor_data_params & params = *(const tensor_data_params *) userdata;
     size_t seed = params.seed;
@@ -72,24 +73,24 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     seed ^= hasher(name);
     std::mt19937 gen(seed);
 
-    const bool is_one = params.sensitive && (ends_with(name, ".scale") || (name.find("norm") != std::string::npos && ends_with(name, ".weight")));
+    const bool near_one = params.sensitive && (ends_with(name, ".scale") || (name.find("norm") != std::string::npos && ends_with(name, ".weight")));
     float stddev = 1.0e-2f;
-    if (params.sensitive && !is_one && ends_with(name, ".weight") && ggml_n_dims(tensor) >= 2) {
+    if (params.sensitive && !near_one && ends_with(name, ".weight") && ggml_n_dims(tensor) >= 2) {
         stddev = 1.0f / std::sqrt((float) tensor->ne[0]);
     }
-    std::normal_distribution<float> dis(0.0f, stddev);
+    std::normal_distribution<float> dis(near_one ? 1.0f : 0.0f, stddev);
 
     const int64_t ne = ggml_nelements(tensor);
     if (tensor->type == GGML_TYPE_F32) {
         std::vector<float> tmp(ne);
         for (int64_t i = 0; i < ne; i++) {
-            tmp[i] = is_one ? 1.0f : dis(gen);
+            tmp[i] = dis(gen);
         }
         ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
     } else if (tensor->type == GGML_TYPE_F16) {
         std::vector<ggml_fp16_t> tmp(ne);
         for (int64_t i = 0; i < ne; i++) {
-            tmp[i] = ggml_fp32_to_fp16(is_one ? 1.0f : dis(gen));
+            tmp[i] = ggml_fp32_to_fp16(dis(gen));
         }
         ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
     } else {
