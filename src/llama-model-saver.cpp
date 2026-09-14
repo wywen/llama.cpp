@@ -524,6 +524,8 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->hc_head_fn);
     add_tensor(model->hc_head_base);
     add_tensor(model->hc_head_scale);
+    add_tensor(model->altup_proj);
+    add_tensor(model->altup_unembd_proj);
     add_tensor(model->per_layer_tok_embd);
     add_tensor(model->per_layer_model_proj);
     add_tensor(model->per_layer_proj_norm);

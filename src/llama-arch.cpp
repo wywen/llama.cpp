@@ -1398,7 +1398,6 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
 bool llama_arch_supports_save(llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_SENSENOVA_U1:
-        case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_BITNET:
         case LLM_ARCH_T5:
         case LLM_ARCH_APERTUS:
