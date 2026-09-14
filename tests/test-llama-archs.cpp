@@ -69,9 +69,10 @@ static bool ends_with(const std::string & str, const std::string & suffix) {
 }
 
 struct tensor_data_params {
-    size_t seed;
-    float  stdev;     // of the normal pool
-    bool   sensitive; // see set_tensor_data
+    size_t   seed;
+    float    stdev;     // of the normal pool
+    bool     sensitive; // see set_tensor_data
+    llm_arch arch;
 };
 
 // fills the values of one tensor, the name carries whatever the property needs
@@ -159,14 +160,18 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     // sensitive: scales and norm weights are near 1 and matrices keep the variance of their input, other tensors keep the pool's
     // with small values everywhere the product of scales, norms and matrices hides most inputs and cached state from the output
     // scales and norm weights are 1 + N(0, 0.01) rather than 1, so that dropping an optional one is not the identity
-    if (params.sensitive && fill == fill_normal) {
+    if (fill == fill_normal) {
         const std::string name = tensor->name;
-        const bool near_one = ends_with(name, ".scale") || (name.find("norm") != std::string::npos && ends_with(name, ".weight"));
+        // gemma4 multiplies the whole residual stream by each layer's output scale: at the pool's stdev the stream vanishes
+        // with depth and the logits underflow to zero, with either set of weights
+        const bool stream_scale = params.arch == LLM_ARCH_GEMMA4 && name.find(".layer_output_scale.") != std::string::npos;
+        const bool near_one = stream_scale ||
+            (params.sensitive && (ends_with(name, ".scale") || (name.find("norm") != std::string::npos && ends_with(name, ".weight"))));
         if (near_one) {
             for (float & v : tmp) {
                 v = 1.0f + v * (1.0e-2f / params.stdev);
             }
-        } else if (ends_with(name, ".weight") && ggml_n_dims(tensor) >= 2) {
+        } else if (params.sensitive && ends_with(name, ".weight") && ggml_n_dims(tensor) >= 2) {
             const float scale = 1.0f / (std::sqrt((float) tensor->ne[0]) * params.stdev);
             for (float & v : tmp) {
                 v *= scale;
@@ -472,8 +477,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     } else if (arch == LLM_ARCH_GEMMA4) {
         ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,      n_embd/2);
         ms.add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS,      uint32_t(5));
+        // full attention layers have wider heads than sliding window layers
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,            2*n_embd_head);
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,          2*n_embd_head);
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,        n_embd_head);
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,      n_embd_head);
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT_SWA,        n_embd_head);
         ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,              10000.0f);
         // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
         std::vector<uint32_t> pattern;
@@ -802,7 +811,10 @@ static llama_model_ptr get_model(
     model_params.split_mode = split_mode;
     model_params.tensor_buft_overrides = tensor_buft_overrides;
 
-    tensor_data_params tensor_params = { seed, stdev, sensitive_weights };
+    tensor_data_params tensor_params = { seed, stdev, sensitive_weights, LLM_ARCH_UNKNOWN };
+    if (gguf_ctx != nullptr) {
+        tensor_params.arch = llama_arch_from_string(gguf_get_val_str(gguf_ctx, gguf_find_key(gguf_ctx, "general.architecture")));
+    }
     llama_model_ptr model(gguf_ctx != nullptr ?
         llama_model_init_from_user(gguf_ctx, set_tensor_data, &tensor_params, model_params) :
         llama_model_load_from_file_ptr(file, model_params));
