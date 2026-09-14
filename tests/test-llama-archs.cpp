@@ -129,7 +129,8 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const enum llama_pooling_type pooling) {
+// iswa_only: gemma4 with interleaved sliding window attention but without per-layer embeddings or shared KV layers
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const enum llama_pooling_type pooling, const bool iswa_only = false) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -145,7 +146,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_embd = 128;
         n_head = 2;
         n_ff   = 192;
-        n_layer = 10; // two periods of 4 sliding window layers and 1 full attention layer, the second period shares KV
+        if (iswa_only) {
+            n_head  = 4;
+            n_layer = 12; // two periods of 5 sliding window layers and 1 full attention layer, as in the 12B layer types
+        } else {
+            n_layer = 10; // two periods of 4 sliding window layers and 1 full attention layer, the second period shares KV
+        }
     } else if (arch == LLM_ARCH_GEMMA3N) {
         n_embd = 64;
         n_head = 1;
@@ -224,6 +230,16 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         }
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_per_layer);
+    } else if (arch == LLM_ARCH_GEMMA4 && iswa_only) {
+        // full attention layers have a single KV head, sliding window layers one per head: with the wider full attention
+        // heads, the full attention KV rows are half as wide as the sliding window ones
+        std::vector<uint32_t> n_head_kv_per_layer;
+        n_head_kv_per_layer.reserve(n_layer);
+        for (uint32_t il = 0; il < n_layer; il++) {
+            n_head_kv_per_layer.push_back(il % 6 < 5 ? n_head : 1);
+        }
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv_per_layer);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(1) : n_head_kv);
@@ -278,9 +294,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,         n_ctx/8);
 
     if (arch == LLM_ARCH_GEMMA4) {
-        ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,      n_embd/2);
+        ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,      iswa_only ? uint32_t(0) : n_embd/2);
         // layers of the second period reuse the KV of the last sliding window and full attention layers of the first
-        ms.add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS,      n_layer/2);
+        ms.add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS,      iswa_only ? uint32_t(0) : n_layer/2);
         // full attention layers have wider heads than sliding window layers
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,            2*n_embd_head);
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,          2*n_embd_head);
@@ -288,11 +304,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,      n_embd_head);
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT_SWA,        n_embd_head);
         ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,              10000.0f);
-        // every 5th layer is full attention, as in the E2B layer types; a scalar would mark every layer sliding window
+        // every 5th (6th with iswa_only) layer is full attention, as in the E2B (12B) layer types; a scalar would mark
+        // every layer sliding window
+        const uint32_t period = iswa_only ? 6 : 5;
         std::vector<uint32_t> pattern;
         pattern.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
-            pattern.push_back(il % 5 < 4);
+            pattern.push_back(il % period < period - 1);
         }
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
     } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 ||
@@ -454,6 +472,16 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         model->cls_b     = nullptr;
         model->cls_out   = nullptr;
         model->cls_out_b = nullptr;
+    }
+    if (gguf_ctx != nullptr && model->arch == LLM_ARCH_GEMMA4 && model->hparams.n_embd_per_layer == 0) {
+        // without per-layer embeddings (the 12B), full attention layers have no V projection and use K as V
+        for (uint32_t il = 0; il < model->hparams.n_layer(); il++) {
+            if (!model->hparams.is_swa(il)) {
+                model->layers[il].wv      = nullptr;
+                model->layers[il].wv_s    = nullptr;
+                model->layers[il].wv_in_s = nullptr;
+            }
+        }
     }
     llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
     if (!lctx) {
@@ -836,7 +864,8 @@ struct model_config {
     std::string             name;
     std::string             file_suffix;
     bool                    moe;
-    enum llama_pooling_type pooling; // unspecified for models that return logits
+    enum llama_pooling_type pooling;           // unspecified for models that return logits
+    bool                    iswa_only = false; // see get_gguf_ctx
 };
 
 // encoder-only archs are generated as an embedding model and as a reranker
@@ -847,6 +876,9 @@ static std::vector<model_config> get_model_configs(const llm_arch arch) {
     std::vector<model_config> ret;
     if (!moe_mandatory(arch)) {
         ret.push_back({"Dense", "dense", false, LLAMA_POOLING_TYPE_UNSPECIFIED});
+    }
+    if (arch == LLM_ARCH_GEMMA4) {
+        ret.push_back({"ISWA", "dense-iswa-only", false, LLAMA_POOLING_TYPE_UNSPECIFIED, true});
     }
     if (moe_implemented(arch)) {
         ret.push_back({"MoE", "moe", true, LLAMA_POOLING_TYPE_UNSPECIFIED});
@@ -938,7 +970,7 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
                 LOG_INF("%s: %s model (%s) is unsupported, skipping\n", __func__, llm_arch_name(arch), cfg.name.c_str());
                 continue;
             }
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, cfg.moe, cfg.pooling);
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, cfg.moe, cfg.pooling, cfg.iswa_only);
             auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, cfg.pooling);
             const std::string path = dir + "/" + llm_arch_name(arch) + "-" + cfg.file_suffix + ".gguf";
             LOG_INF("%s: Saving %s model (%s) to %s...\n", __func__, llm_arch_name(arch), cfg.name.c_str(), path.c_str());
@@ -1045,7 +1077,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
         for (const model_config & cfg : get_model_configs(arch)) {
             const std::string & config_name = cfg.name;
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, cfg.moe, cfg.pooling);
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, cfg.moe, cfg.pooling, cfg.iswa_only);
             if (arch == LLM_ARCH_BAILINGMOE3) {
                 GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
             }
