@@ -12,6 +12,8 @@
 // llama_memory_recurrent
 //
 
+struct llama_memory_recurrent_cells;
+
 // TODO: extract the cache state used for graph computation into llama_memory_recurrent_context_i
 //       see the implementation of llama_kv_cache_context_i for an example how to do it
 class llama_memory_recurrent : public llama_memory_i {
@@ -52,6 +54,21 @@ public:
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
+
+    // The cells are shared by every sequence (a sequence's tail is stored in
+    // the cell at its seq_id index, and placing a ubatch swaps cells between
+    // sequences), so the snapshot covers the whole memory, like the snapshot
+    // of a unified KV cache covers every sequence of its single stream.
+    // seq_id is only range-checked.
+    llama_memory_cells_t cells_snapshot(llama_seq_id seq_id) const override;
+    void cells_restore(llama_seq_id seq_id, const llama_memory_cells_i * snap) override;
+
+    // Split out so the hybrid memory can snapshot and restore the recurrent
+    // part inside its own handle. cells_restore_from requires
+    // cells_can_restore(in).
+    void cells_snapshot_to(llama_memory_recurrent_cells & out) const;
+    bool cells_can_restore(const llama_memory_recurrent_cells & in) const;
+    void cells_restore_from(const llama_memory_recurrent_cells & in);
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
@@ -144,6 +161,21 @@ private:
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
 
     void state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count);
+};
+
+// Saved cell metadata of a recurrent memory: everything placing a ubatch
+// (find_slot), setting its inputs (s_copy consumes a pending rollback) and
+// tracking the rollback depth (the rs_max of each cell) changes. No state data.
+struct llama_memory_recurrent_cells : llama_memory_cells_i {
+    std::vector<llama_memory_recurrent::mem_cell> cells;
+
+    uint32_t head = 0;
+    uint32_t size = 0;
+    uint32_t used = 0;
+    uint32_t n    = 0;
+    int32_t  rs_z = -1;
+
+    std::vector<uint32_t> rs_idx;
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {
