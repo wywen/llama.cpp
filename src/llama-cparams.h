@@ -7,7 +7,8 @@
 
 #define LLAMA_MAX_SEQ 256
 
-struct llama_cparams {
+// Parameters shared by context construction and memory planning.
+struct llama_memory_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;
@@ -15,6 +16,18 @@ struct llama_cparams {
     uint32_t n_ubatch_reserve; // ubatch width graph reservations are sized for
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
+
+    bool causal_attn;
+    bool offload_kqv;
+    bool flash_attn;
+    bool auto_fa;
+    bool kv_unified;
+
+    enum llama_context_type ctx_type;
+    llama_context * ctx_other;
+};
+
+struct llama_cparams : llama_memory_cparams {
     uint32_t n_outputs_max;   // max outputs supported by the context
     uint32_t n_outputs_max_per_seq;
     int32_t  n_threads;       // number of threads to use for generation
@@ -36,10 +49,6 @@ struct llama_cparams {
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
-    bool causal_attn;
-    bool offload_kqv;
-    bool flash_attn;
-    bool auto_fa;
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;
@@ -52,18 +61,14 @@ struct llama_cparams {
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
-    bool kv_unified;
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
-    enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
     ggml_backend_sched_reserve_callback cb_reserve;
     void * cb_reserve_user_data;
-
-    llama_context * ctx_other;
 };

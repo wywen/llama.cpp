@@ -156,10 +156,10 @@ llama_context_params llama_context_params_resolve(const llama_model & model, lla
     return params;
 }
 
-llama_cparams llama_cparams_memory_shape(const llama_model & model, const llama_context_params & params) {
+llama_memory_cparams llama_cparams_memory_shape(const llama_model & model, const llama_context_params & params) {
     const auto & hparams = model.hparams;
 
-    llama_cparams cparams{};
+    llama_memory_cparams cparams{};
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -240,7 +240,7 @@ llama_cparams llama_cparams_memory_shape(const llama_model & model, const llama_
 llama_memory_i * llama_context_create_memory(
         const llama_model          & model,
         const llama_context_params & params,
-        const llama_cparams        & cparams) {
+        const llama_memory_cparams & cparams) {
     llama_memory_params params_mem = {
         /*.type_k    =*/ params.type_k,
         /*.type_v    =*/ params.type_v,
@@ -268,7 +268,7 @@ llama_context::llama_context(
 
     const auto & hparams = model.hparams;
 
-    cparams = llama_cparams_memory_shape(model, params);
+    static_cast<llama_memory_cparams &>(cparams) = llama_cparams_memory_shape(model, params);
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;

@@ -29,9 +29,15 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace {
+
+static_assert(std::is_same_v<decltype(&llama_cparams_memory_shape),
+        llama_memory_cparams (*)(const llama_model &, const llama_context_params &)>);
+static_assert(std::is_same_v<decltype(&llama_model::create_memory),
+        llama_memory_i * (llama_model::*)(const llama_memory_params &, const llama_memory_cparams &) const>);
 
 struct context_case {
     const char *          name;
