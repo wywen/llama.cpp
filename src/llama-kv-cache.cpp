@@ -2201,6 +2201,12 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
         io.write(&cell_count, sizeof(cell_count));
 
+        // the whole cache also records where its cells are and where the next search starts, so that a restore places
+        // later tokens in the same cells as the saved cache would
+        if (seq_id == -1) {
+            state_write_layout(io, cr);
+        }
+
         // skip empty streams
         if (cell_count == 0) {
             continue;
@@ -2255,6 +2261,21 @@ const slot_info_vec_t *   sinfos_in) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
 
+        cell_ranges_t layout { s, {} };
+        uint32_t      layout_head = 0;
+
+        if (seq_id == -1) {
+            if (!state_read_layout(io, cell_count, layout, layout_head)) {
+                clear(true);
+                throw std::runtime_error("failed to restore kv cache");
+            }
+
+            // an empty stream still resumes its search where the saved one would have
+            if (cell_count == 0 && layout_head <= v_cells[s].size()) {
+                v_heads[s] = layout_head;
+            }
+        }
+
         if (cell_count == 0) {
             // a mirrored cache must be empty here as well, or the two no longer agree cell for cell
             if (sinfos_in && !(*sinfos_in)[s].empty()) {
@@ -2268,7 +2289,7 @@ const slot_info_vec_t *   sinfos_in) {
         slot_info sinfo;
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr, &layout, layout_head);
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -2289,6 +2310,57 @@ const slot_info_vec_t *   sinfos_in) {
             (*sinfos_out)[s] = sinfo;
         }
     }
+}
+
+void llama_kv_cache::state_write_layout(llama_io_write_i & io, const cell_ranges_t & cr) const {
+    const uint32_t head     = v_heads[cr.strm];
+    const uint32_t n_ranges = cr.data.size();
+
+    io.write(&head,     sizeof(head));
+    io.write(&n_ranges, sizeof(n_ranges));
+
+    for (const auto & range : cr.data) {
+        io.write(&range.first,  sizeof(range.first));
+        io.write(&range.second, sizeof(range.second));
+    }
+}
+
+bool llama_kv_cache::state_read_layout(llama_io_read_i & io, uint32_t cell_count, cell_ranges_t & cr, uint32_t & head) const {
+    uint32_t n_ranges;
+
+    io.read(&head,     sizeof(head));
+    io.read(&n_ranges, sizeof(n_ranges));
+
+    if (n_ranges > cell_count) {
+        LLAMA_LOG_ERROR("%s: %u cell ranges cannot hold %u cells\n", __func__, n_ranges, cell_count);
+        return false;
+    }
+
+    cr.data.resize(n_ranges);
+
+    uint32_t n_cells = 0;
+
+    for (uint32_t i = 0; i < n_ranges; ++i) {
+        auto & range = cr.data[i];
+
+        io.read(&range.first,  sizeof(range.first));
+        io.read(&range.second, sizeof(range.second));
+
+        // the writer lists non-empty ranges in increasing cell order, with a cell outside every range between two of them
+        if (range.first >= range.second || (i > 0 && range.first <= cr.data[i - 1].second)) {
+            LLAMA_LOG_ERROR("%s: cell range %u [%u, %u) is empty or out of order\n", __func__, i, range.first, range.second);
+            return false;
+        }
+
+        n_cells += range.second - range.first;
+    }
+
+    if (n_cells != cell_count) {
+        LLAMA_LOG_ERROR("%s: cell ranges hold %u cells, the state holds %u\n", __func__, n_cells, cell_count);
+        return false;
+    }
+
+    return true;
 }
 
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
@@ -2423,7 +2495,8 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
+bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in,
+        const cell_ranges_t * layout, uint32_t layout_head) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
@@ -2523,32 +2596,59 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         }
     } else {
         // whole KV cache restore
+        GGML_ASSERT(layout);
 
         if (cell_count > cells.size()) {
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
             return false;
         }
 
-        // the cells go in from 0, so a mirrored cache lands on the same ones as long as it restores the same count. the layout itself carries no more information here
-        if (sinfo_in && (sinfo_in->empty() || sinfo_in->n_stream() != 1 || sinfo_in->idxs[0].size() != cell_count)) {
-            LLAMA_LOG_ERROR("%s: mirrored slot layout holds %d cells, this cache restores %d\n", __func__,
+        // the cells go back where they were saved, and the head with them: later decodes then place their tokens in the
+        // same cells as the saved cache would have, and attention reads the cells in the same order
+        // a cache too small for the saved layout takes the cells from cell 0 instead, in the saved order
+        const bool layout_fits = layout_head <= cells.size() && (layout->data.empty() || layout->data.back().second <= cells.size());
+
+        sinfo.s0 = strm;
+        sinfo.s1 = strm;
+        sinfo.resize(1);
+        sinfo.strm[0] = strm;
+        sinfo.idxs[0].resize(cell_count);
+
+        if (layout_fits) {
+            uint32_t i = 0;
+            for (const auto & range : layout->data) {
+                for (uint32_t idx = range.first; idx < range.second; ++idx) {
+                    sinfo.idxs[0][i++] = idx;
+                }
+            }
+        } else {
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                sinfo.idxs[0][i] = i;
+            }
+        }
+
+        // a mirrored cache restores the same layout, so the two lie on the same cells
+        if (sinfo_in && (sinfo_in->empty() || sinfo_in->n_stream() != 1 || sinfo_in->idxs[0] != sinfo.idxs[0])) {
+            LLAMA_LOG_ERROR("%s: mirrored slot layout holds %d cells, this cache restores %d in a different layout\n", __func__,
                     sinfo_in->empty() ? 0 : (int) sinfo_in->idxs[0].size(), cell_count);
             return false;
         }
 
         for (uint32_t i = 0; i < cell_count; ++i) {
+            const uint32_t idx = sinfo.idxs[0][i];
+
             llama_pos pos;
             uint32_t  n_seq_id;
 
             io.read(&pos,      sizeof(pos));
             io.read(&n_seq_id, sizeof(n_seq_id));
 
-            cells.pos_set(i, pos);
+            cells.pos_set(idx, pos);
 
             if (has_cell_ext()) {
                 llama_kv_cell_ext ext;
                 io.read(&ext, sizeof(ext));
-                cells.ext_set(i, ext);
+                cells.ext_set(idx, ext);
             }
 
             for (uint32_t j = 0; j < n_seq_id; ++j) {
@@ -2560,21 +2660,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                     return false;
                 }
 
-                cells.seq_add(i, seq_id);
+                cells.seq_add(idx, seq_id);
             }
         }
 
-        // Create contiguous slot_info for whole cache restore
-        sinfo.s0 = strm;
-        sinfo.s1 = strm;
-        sinfo.resize(1);
-        sinfo.strm[0] = strm;
-        sinfo.idxs[0].resize(cell_count);
-        for (uint32_t i = 0; i < cell_count; ++i) {
-            sinfo.idxs[0][i] = i;
-        }
-
-        head = 0;
+        head = layout_fits ? layout_head : (cell_count < cells.size() ? cell_count : 0);
     }
 
     return true;
