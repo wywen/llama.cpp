@@ -13,7 +13,7 @@ llama_memory_plan llama_model_memory_plan(const llama_model * model, const llama
     }
 
     const llama_context_params resolved = llama_context_params_resolve(*model, params);
-    const llama_cparams        cparams  = llama_cparams_memory_shape(*model, resolved);
+    const llama_memory_cparams cparams = llama_cparams_memory_shape(*model, resolved);
 
     llama_memory_plan plan;
     plan.n_ctx       = cparams.n_ctx;
