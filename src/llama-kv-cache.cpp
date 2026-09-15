@@ -2168,12 +2168,9 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
             add_cell = add_cell && !cells.is_empty(i);
             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
 
-            // check the cell is not SWA-masked
-            if (add_cell && seq_id != -1) {
-                const bool is_masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i), cells.seq_pos_max(seq_id));
-
-                add_cell = !is_masked;
-            }
+            // a sequence state also keeps the cells its sliding window has masked. they no longer feed attention, but they
+            // are still occupied, so they decide which cells the next tokens take. without them a restored sequence
+            // places those tokens in other cells, and attention then sums in a different order and rounds differently
 
             if (add_cell) {
                 ++cell_count;

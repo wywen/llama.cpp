@@ -284,7 +284,7 @@ static bool test_state_load(struct llama_model * model, const struct common_para
 // - load state from file
 // - replay the last prompt token
 // - migrate KV cache from seq 0 to seq 1 via the CPU path
-// - generate n_predict tokens on seq 1 and compare against expected result
+// - feed the baseline tokens on seq 1 and compare the logits of every step with the baseline, bitwise
 static bool test_seq_cp_host(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, const generation & expected_result) {
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_seq_max = 2;
@@ -335,14 +335,13 @@ static bool test_seq_cp_host(struct llama_model * model, const struct common_par
         LOG_TRC("%s: seq 1 restored, %zd bytes\n", __func__, nset);
     }
 
-    // Generate tokens on seq 1
-    auto result = generate_tokens(ctx.get(), smpl.get(), n_past, params.n_predict, 1);
+    // Generate the baseline tokens on seq 1
+    auto result = generate_tokens(ctx.get(), smpl.get(), n_past, params.n_predict, 1, &expected_result.tokens);
     if (result.tokens.empty()) {
         return false;
     }
 
-    if (result.tokens != expected_result.tokens) {
-        LOG_ERR("\n%s: error: generation differs from expected\n", __func__);
+    if (!matches_baseline(__func__, result, expected_result)) {
         return false;
     }
 
@@ -356,7 +355,7 @@ static bool test_seq_cp_host(struct llama_model * model, const struct common_par
 // - load state from file
 // - replay the last prompt token
 // - migrate KV cache from seq 0 to seq 1 via the on-device path
-// - generate n_predict tokens on seq 1 and compare against expected result
+// - feed the baseline tokens on seq 1 and compare the logits of every step with the baseline, bitwise
 static bool test_seq_cp_device(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, const generation & expected_result) {
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_seq_max = 2;
@@ -407,14 +406,13 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
         LOG_TRC("%s: seq 1 restored, %zd bytes\n", __func__, nset);
     }
 
-    // Generate tokens on seq 1
-    auto result = generate_tokens(ctx.get(), smpl.get(), n_past, params.n_predict, 1);
+    // Generate the baseline tokens on seq 1
+    auto result = generate_tokens(ctx.get(), smpl.get(), n_past, params.n_predict, 1, &expected_result.tokens);
     if (result.tokens.empty()) {
         return false;
     }
 
-    if (result.tokens != expected_result.tokens) {
-        LOG_ERR("\n%s: error: generation differs from expected\n", __func__);
+    if (!matches_baseline(__func__, result, expected_result)) {
         return false;
     }
 
@@ -638,7 +636,137 @@ static bool test_state_load_fragmented(struct llama_model * model, const struct 
     return true;
 }
 
-// Run the full save/load test suite (tests 1-8) for a single model.
+// Test 9: seq state file
+// - decode the prompt as one batch, then more tokens one at a time, so that a sliding window moves past the start
+// - after each of the first few single tokens, save sequence 0 to a file; record the logits of every single token
+// - in a second context, decode the prompt; then, for each saved file, clear the memory, load the file into sequence 0,
+//   check that the sequence serializes to the saved bytes, feed the tokens that followed the save and compare their
+//   logits with the recorded ones, bitwise
+// - the save points are consecutive, so the cells the window has passed differ in number from one save to the next
+static bool test_seq_state_file(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_seq_max = 2;
+
+    LOG("\n=== Test 9: seq state file ===\n");
+
+    const int32_t n_vocab   = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const size_t  n_save    = 4;
+    const size_t  n_predict = params.n_predict;
+    const size_t  n_stream  = n_save + n_predict;
+
+    // the tokens decoded one at a time after the prompt
+    const auto stream_token = [&](size_t i) { return tokens[i % tokens.size()]; };
+    const auto stream_pos   = [&](size_t i) { return (llama_pos) (tokens.size() + i); };
+    const auto save_path    = [&](size_t k) { return params.out_file + ".seq" + std::to_string(k); };
+
+    const auto decode = [&](llama_context * ctx, const llama_token * toks, size_t n, llama_pos pos0, std::vector<float> * logits) {
+        llama_batch_ptr batch(n, 0, 1);
+        for (size_t i = 0; i < n; ++i) {
+            common_batch_add(batch.get(), toks[i], pos0 + (llama_pos) i, { 0 }, i + 1 == n);
+        }
+        if (llama_decode(ctx, batch.get()) != 0) {
+            LOG_ERR("%s: failed to decode %zu tokens at position %d\n", __func__, n, pos0);
+            return false;
+        }
+        if (logits) {
+            const float * l = llama_get_logits_ith(ctx, -1);
+            logits->assign(l, l + n_vocab);
+        }
+        return true;
+    };
+
+    const auto get_seq_state = [&](llama_context * ctx) {
+        std::vector<uint8_t> state(llama_state_seq_get_size(ctx, 0));
+        state.resize(llama_state_seq_get_data(ctx, state.data(), state.size(), 0));
+        return state;
+    };
+
+    // states[k] and the file save_path(k) hold sequence 0 after k + 1 stream tokens
+    std::vector<std::vector<uint8_t>> states;
+    std::vector<std::vector<float>>   logits_stream(n_stream);
+    {
+        auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+        if (!ctx) {
+            return false;
+        }
+
+        // a context without memory saves an empty sequence, which the file loader reports as a failure
+        if (llama_get_memory(ctx.get()) == nullptr) {
+            LOG("\n%s: the context has no memory, skipped\n", __func__);
+            return true;
+        }
+
+        if (!decode(ctx.get(), tokens.data(), tokens.size(), 0, nullptr)) {
+            return false;
+        }
+
+        for (size_t i = 0; i < n_stream; ++i) {
+            const llama_token tok = stream_token(i);
+            if (!decode(ctx.get(), &tok, 1, stream_pos(i), &logits_stream[i])) {
+                return false;
+            }
+
+            if (i < n_save) {
+                states.push_back(get_seq_state(ctx.get()));
+
+                if (llama_state_seq_save_file(ctx.get(), save_path(i).c_str(), 0, tokens.data(), tokens.size()) == 0) {
+                    LOG_ERR("\n%s: failed to save sequence 0 to %s\n", __func__, save_path(i).c_str());
+                    return false;
+                }
+            }
+        }
+    }
+
+    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
+    if (!ctx || !decode(ctx.get(), tokens.data(), tokens.size(), 0, nullptr)) {
+        return false;
+    }
+
+    for (size_t k = 0; k < n_save; ++k) {
+        llama_memory_clear(llama_get_memory(ctx.get()), true);
+
+        llama_tokens tokens_loaded(tokens.size());
+        size_t n_token_count = 0;
+        const size_t n_read = llama_state_seq_load_file(ctx.get(), save_path(k).c_str(), 0, tokens_loaded.data(), tokens_loaded.size(), &n_token_count);
+        std::filesystem::remove(save_path(k));
+
+        if (n_read == 0 || n_token_count != tokens.size()) {
+            LOG_ERR("\n%s: failed to load sequence 0 from %s\n", __func__, save_path(k).c_str());
+            return false;
+        }
+
+        if (get_seq_state(ctx.get()) != states[k]) {
+            LOG_ERR("\n%s: error: the sequence loaded from %s does not serialize to the saved one\n", __func__, save_path(k).c_str());
+            return false;
+        }
+
+        generation expected;
+        generation result;
+        for (size_t i = k + 1; i < k + 1 + n_predict; ++i) {
+            const llama_token tok = stream_token(i);
+
+            std::vector<float> logits;
+            if (!decode(ctx.get(), &tok, 1, stream_pos(i), &logits)) {
+                return false;
+            }
+
+            expected.tokens.push_back(tok);
+            expected.logits.push_back(logits_stream[i]);
+            result.tokens.push_back(tok);
+            result.logits.push_back(std::move(logits));
+        }
+
+        if (!matches_baseline(__func__, result, expected)) {
+            LOG_ERR("%s: after the sequence saved at position %d\n", __func__, stream_pos(k));
+            return false;
+        }
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
+
+// Run the full save/load test suite (tests 1-9) for a single model.
 // Returns true if all tests pass, false otherwise.
 static bool run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
     struct common_params params = base_params;
@@ -717,6 +845,11 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
 
     // Test 8: state load (fragmented)
     if (!test_state_load_fragmented(model, params, tokens)) {
+        return false;
+    }
+
+    // Test 9: seq state file
+    if (!test_seq_state_file(model, params, tokens)) {
         return false;
     }
 
