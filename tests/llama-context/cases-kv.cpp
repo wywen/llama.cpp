@@ -124,7 +124,7 @@ struct case_state_load : ctx_test {
     const char * name() const override { return "state_load"; }
 
     const char * description() const override {
-        return "a saved session replays to the same logits as the run that saved it";
+        return "a saved session serializes to the saved bytes and replays bitwise to the logits of the run that saved it";
     }
 
     bool needs_baseline() const override { return true; }
@@ -140,11 +140,12 @@ struct case_state_load : ctx_test {
         }
 
         int n_past = 0;
-        if (!load_state_replay_last(ctx.get(), mr.params.out_file, mr.tokens, n_past)) {
+        if (!load_state_replay_last(ctx.get(), mr.params.out_file, mr.tokens, n_past, true)) {
             return case_result::fail();
         }
 
-        if (!generate_tokens_compare(ctx.get(), smpl.get(), n_past, mr.params.n_predict, 0, mr.baseline, NMSE_THRESHOLD)) {
+        // a restored state continues exactly like the run that saved it
+        if (!generate_tokens_compare(ctx.get(), smpl.get(), n_past, mr.params.n_predict, 0, mr.baseline, NMSE_BITWISE)) {
             return case_result::fail();
         }
 
@@ -201,7 +202,7 @@ struct case_seq_cp : ctx_test {
             TLOG_TRC("%s: seq 1 restored, %zu bytes\n", __func__, seq_store.size());
         }
 
-        if (!generate_tokens_compare(ctx.get(), smpl.get(), n_past, mr.params.n_predict, 1, mr.baseline, NMSE_THRESHOLD)) {
+        if (!generate_tokens_compare(ctx.get(), smpl.get(), n_past, mr.params.n_predict, 1, mr.baseline, NMSE_BITWISE)) {
             return case_result::fail();
         }
 
@@ -713,6 +714,217 @@ struct case_state_restore_fragmented : ctx_test {
     }
 };
 
+// - decode a prefix on two sequences of one cache, a token at a time, so that their cells interleave
+// - remove sequence 0, which frees a cell between every two cells of sequence 1
+// - decode a few more tokens on sequence 1, which go to the freed cells, and save the whole state
+// - feed n_predict tokens on sequence 1 and record the logits of every step
+// - restore the state into a new context, check that it serializes to the saved bytes, feed the same tokens and
+//   compare the logits of every step, bitwise
+// a whole-state restore puts every cell back where it was saved, and the head with it, so that later tokens take the
+// same cells as in the saved cache
+struct case_state_load_fragmented : ctx_test {
+    const char * name() const override { return "frag_load"; }
+
+    const char * description() const override {
+        return "a whole state saved from a fragmented cache restores its cell layout and continues bitwise";
+    }
+
+    case_result run(model_run & mr) const override {
+        ctx_opts opts;
+        opts.n_ctx      = 256;
+        opts.n_seq_max  = 2;
+        opts.kv_unified = 1;
+
+        const size_t n_prefix  = std::min<size_t>(mr.tokens.size(), 32);
+        const size_t n_refill  = 4;
+        const size_t n_predict = mr.params.n_predict;
+
+        if (mr.tokens.size() < n_prefix + n_refill || mr.tokens.size() < n_predict) {
+            return case_result::skip("the prompt is too short");
+        }
+
+        // the tokens fed after the state is saved; their positions follow the refill
+        const auto feed = [&](llama_context * ctx, generation_result & out) {
+            for (size_t i = 0; i < n_predict; ++i) {
+                std::vector<float> logits;
+                if (!decode_one(ctx, mr.tokens[i], (llama_pos) (n_prefix + n_refill + i), 1) ||
+                    !get_current_logits(ctx, logits)) {
+                    TLOG_ERR("%s: failed to decode step %zu\n", __func__, i);
+                    return false;
+                }
+                out.tokens.push_back(mr.tokens[i]);
+                out.logits.push_back(std::move(logits));
+            }
+            return true;
+        };
+
+        std::vector<uint8_t> state;
+        generation_result    expected;
+        {
+            auto ctx = mr.ctx(opts);
+            if (!ctx) {
+                return case_result::fail();
+            }
+
+            for (size_t i = 0; i < n_prefix; ++i) {
+                if (!decode_one(ctx.get(), mr.tokens[i], (llama_pos) i, 0) ||
+                    !decode_one(ctx.get(), mr.tokens[i], (llama_pos) i, 1)) {
+                    TLOG_ERR("%s: failed to decode the interleaved prefix\n", __func__);
+                    return case_result::fail();
+                }
+            }
+
+            if (!seq_rm(ctx.get(), 0)) {
+                return case_result::fail();
+            }
+
+            for (size_t i = 0; i < n_refill; ++i) {
+                if (!decode_one(ctx.get(), mr.tokens[n_prefix + i], (llama_pos) (n_prefix + i), 1)) {
+                    TLOG_ERR("%s: failed to decode the refill\n", __func__);
+                    return case_result::fail();
+                }
+            }
+
+            state.resize(llama_state_get_size(ctx.get()));
+            state.resize(llama_state_get_data(ctx.get(), state.data(), state.size()));
+
+            if (!feed(ctx.get(), expected)) {
+                return case_result::fail();
+            }
+        }
+
+        auto ctx = mr.ctx(opts);
+        if (!ctx) {
+            return case_result::fail();
+        }
+
+        CTX_REQUIRE(llama_state_set_data(ctx.get(), state.data(), state.size()) == state.size(), "failed to restore the state");
+
+        std::vector<uint8_t> state_restored(llama_state_get_size(ctx.get()));
+        state_restored.resize(llama_state_get_data(ctx.get(), state_restored.data(), state_restored.size()));
+
+        CTX_REQUIRE(blobs_equal(state, state_restored), "the restored state does not serialize to the saved state");
+
+        generation_result result;
+        if (!feed(ctx.get(), result)) {
+            return case_result::fail();
+        }
+
+        for (size_t i = 0; i < n_predict; ++i) {
+            const logits_diff diff = compare_logits(expected.logits[i].data(), result.logits[i].data(), result.logits[i].size());
+            CTX_REQUIRE(diff.nmse() <= NMSE_BITWISE,
+                    "the logits of step " + std::to_string(i) + " differ from the uninterrupted run: nmse " + std::to_string(diff.nmse()));
+        }
+
+        return case_result::pass();
+    }
+};
+
+// - decode the prompt as one batch, then more tokens one at a time, so that a sliding window moves past the start
+// - after each of the first few single tokens, save sequence 0 to a file; record the logits of every single token
+// - in a second context, decode the prompt; then, for each saved file, clear the memory, load the file into sequence 0,
+//   check that the sequence serializes to the saved bytes, feed the tokens that followed the save and compare their
+//   logits with the recorded ones, bitwise
+// the save points are consecutive, so the cells the window has passed differ in number from one save to the next; a
+// sequence state keeps those cells, since they still decide which cells the next tokens take
+struct case_seq_state_file : ctx_test {
+    const char * name() const override { return "seq_file"; }
+
+    const char * description() const override {
+        return "a sequence saved to a file after its sliding window moved continues bitwise";
+    }
+
+    case_result run(model_run & mr) const override {
+        ctx_opts opts;
+        opts.n_seq_max = 2;
+
+        const size_t n_save    = 4;
+        const size_t n_predict = mr.params.n_predict;
+        const size_t n_stream  = n_save + n_predict;
+
+        const llama_tokens & tokens = mr.tokens;
+
+        // the tokens decoded one at a time after the prompt
+        const auto stream_token = [&](size_t i) { return tokens[i % tokens.size()]; };
+        const auto stream_pos   = [&](size_t i) { return (llama_pos) (tokens.size() + i); };
+        // the cases share a working directory, so the state files are named after the model
+        const auto save_path    = [&](size_t k) { return "seq-state-file." + mr.name + ".seq" + std::to_string(k) + ".tmp.bin"; };
+
+        const auto get_state = [&](llama_context * ctx) {
+            std::vector<uint8_t> state(llama_state_seq_get_size(ctx, 0));
+            state.resize(llama_state_seq_get_data(ctx, state.data(), state.size(), 0));
+            return state;
+        };
+
+        // states[k] and the file save_path(k) hold sequence 0 after k + 1 stream tokens
+        std::vector<std::vector<uint8_t>> states;
+        std::vector<std::vector<float>>   logits_stream(n_stream);
+        {
+            auto ctx = mr.ctx(opts);
+            if (!ctx) {
+                return case_result::fail();
+            }
+
+            // a context without memory saves an empty sequence, which the file loader reports as a failure
+            if (llama_get_memory(ctx.get()) == nullptr) {
+                return case_result::skip("the context has no memory");
+            }
+
+            if (!decode_tokens(ctx.get(), tokens)) {
+                TLOG_ERR("%s: failed to decode the prompt\n", __func__);
+                return case_result::fail();
+            }
+
+            for (size_t i = 0; i < n_stream; ++i) {
+                if (!decode_one(ctx.get(), stream_token(i), stream_pos(i)) || !get_current_logits(ctx.get(), logits_stream[i])) {
+                    TLOG_ERR("%s: failed to decode stream token %zu\n", __func__, i);
+                    return case_result::fail();
+                }
+
+                if (i < n_save) {
+                    states.push_back(get_state(ctx.get()));
+
+                    CTX_REQUIRE(llama_state_seq_save_file(ctx.get(), save_path(i).c_str(), 0, tokens.data(), tokens.size()) > 0,
+                            "failed to save sequence 0 to a file");
+                }
+            }
+        }
+
+        auto ctx = mr.ctx(opts);
+        if (!ctx || !decode_tokens(ctx.get(), tokens)) {
+            return case_result::fail();
+        }
+
+        for (size_t k = 0; k < n_save; ++k) {
+            llama_memory_clear(llama_get_memory(ctx.get()), true);
+
+            llama_tokens tokens_loaded(tokens.size());
+            size_t n_token_count = 0;
+            const size_t n_read = llama_state_seq_load_file(ctx.get(), save_path(k).c_str(), 0, tokens_loaded.data(), tokens_loaded.size(), &n_token_count);
+            std::remove(save_path(k).c_str());
+
+            CTX_REQUIRE(n_read > 0 && n_token_count == tokens.size(), "failed to load sequence 0 from a file");
+            CTX_REQUIRE(blobs_equal(states[k], get_state(ctx.get())),
+                    "the sequence loaded from save " + std::to_string(k) + " does not serialize to the saved one");
+
+            for (size_t i = k + 1; i < k + 1 + n_predict; ++i) {
+                std::vector<float> logits;
+                if (!decode_one(ctx.get(), stream_token(i), stream_pos(i)) || !get_current_logits(ctx.get(), logits)) {
+                    TLOG_ERR("%s: failed to decode stream token %zu\n", __func__, i);
+                    return case_result::fail();
+                }
+
+                const logits_diff diff = compare_logits(logits_stream[i].data(), logits.data(), logits.size());
+                CTX_REQUIRE(diff.nmse() <= NMSE_BITWISE,
+                        "after save " + std::to_string(k) + ", the logits of stream token " + std::to_string(i) +
+                            " differ from the uninterrupted run: nmse " + std::to_string(diff.nmse()));
+            }
+        }
+
+        return case_result::pass();
+    }
+};
+
 //
 // no_alloc
 //
@@ -834,6 +1046,8 @@ std::vector<ctx_test_ptr> make_kv_cases() {
     cases.push_back(std::make_unique<case_state_restore_failure>());
     cases.push_back(std::make_unique<case_state_rotation>());
     cases.push_back(std::make_unique<case_state_restore_fragmented>());
+    cases.push_back(std::make_unique<case_state_load_fragmented>());
+    cases.push_back(std::make_unique<case_seq_state_file>());
     cases.push_back(std::make_unique<case_noalloc>());
     cases.push_back(std::make_unique<case_comp_padding>());
 

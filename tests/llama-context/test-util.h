@@ -15,6 +15,9 @@
 
 extern const double NMSE_THRESHOLD;
 
+// a restored state continues bitwise: any difference fails
+extern const double NMSE_BITWISE;
+
 //
 // comparison
 //
@@ -93,7 +96,9 @@ bool set_seq_state(llama_context * ctx, llama_seq_id seq_id, uint32_t flags, con
 bool seq_rm(llama_context * ctx, llama_seq_id seq_id);
 
 // load a saved session and replay its last token, leaving n_past ready for the next token
-bool load_state_replay_last(llama_context * ctx, const std::string & path, const llama_tokens & tokens, int & n_past);
+// check_bytes: also require that the loaded state serializes to exactly the bytes it was loaded from
+bool load_state_replay_last(llama_context * ctx, const std::string & path, const llama_tokens & tokens, int & n_past,
+                            bool check_bytes = false);
 
 // false when the sizes differ or any byte differs, the first difference is logged
 bool blobs_equal(const std::vector<uint8_t> & a, const std::vector<uint8_t> & b);

@@ -9,10 +9,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 
 const double NMSE_THRESHOLD = 1e-5;
+const double NMSE_BITWISE   = 0.0;
 
 //
 // comparison
@@ -244,7 +247,8 @@ bool seq_rm(llama_context * ctx, llama_seq_id seq_id) {
     return true;
 }
 
-bool load_state_replay_last(llama_context * ctx, const std::string & path, const llama_tokens & tokens, int & n_past) {
+bool load_state_replay_last(llama_context * ctx, const std::string & path, const llama_tokens & tokens, int & n_past,
+                            bool check_bytes) {
     llama_tokens unused_sts(tokens.size());
     size_t n_token_count_out = 0;
 
@@ -254,6 +258,26 @@ bool load_state_replay_last(llama_context * ctx, const std::string & path, const
     }
 
     TLOG_TRC("%s: loaded state with %zu tokens\n", __func__, n_token_count_out);
+
+    if (check_bytes) {
+        std::ifstream file(path, std::ios::binary);
+        const std::vector<uint8_t> file_bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+
+        // the state data follows the magic, the version, the token count and the tokens
+        const size_t offset = 3*sizeof(uint32_t) + n_token_count_out*sizeof(llama_token);
+        if (offset > file_bytes.size()) {
+            TLOG_ERR("%s: the session file is shorter than its header\n", __func__);
+            return false;
+        }
+
+        std::vector<uint8_t> state(llama_state_get_size(ctx));
+        state.resize(llama_state_get_data(ctx, state.data(), state.size()));
+
+        if (!blobs_equal(std::vector<uint8_t>(file_bytes.begin() + offset, file_bytes.end()), state)) {
+            TLOG_ERR("%s: the loaded state does not serialize to the saved state\n", __func__);
+            return false;
+        }
+    }
 
     // the session is saved before the last token, so replay it at the position it was saved at
     n_past = (int) n_token_count_out - 1;
