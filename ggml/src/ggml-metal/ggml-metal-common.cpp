@@ -4,7 +4,47 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <cstring>
 #include <vector>
+
+// the per-layer output tensors are named "l_out-<il>" by the graph builder, and that name
+//   is what a boundary-scheduling caller resolves its cut nodes and window endpoints by
+//
+// matching the name is not elegant, but at optimize time it is the only handle there is:
+//   the schedule that would otherwise name the cuts is installed later (see the header),
+//   and a tensor carries no field a caller could mark ahead of time without also owning
+//   the graph build. keeping the match here means there is exactly one string to change
+static const char GGML_GRAPH_BOUNDARY_MARKER_PREFIX[] = "l_out-";
+
+bool ggml_graph_node_is_boundary_marker(const struct ggml_tensor * node) {
+    if (node == nullptr) {
+        return false;
+    }
+
+    const size_t len = sizeof(GGML_GRAPH_BOUNDARY_MARKER_PREFIX) - 1;
+
+    const char * name = ggml_get_name(node);
+
+    if (strncmp(name, GGML_GRAPH_BOUNDARY_MARKER_PREFIX, len) != 0) {
+        return false;
+    }
+
+    // the suffix is the layer index: require at least one digit and nothing else, so that
+    //   only the generated per-layer names match
+    const char * suffix = name + len;
+
+    if (*suffix == '\0') {
+        return false;
+    }
+
+    for (const char * p = suffix; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+    }
+
+    return true;
+}
 
 bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     const int64_t ne00 = op->src[0]->ne[0];
@@ -223,7 +263,7 @@ struct node_info {
     }
 };
 
-static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node_info> & nodes) {
+static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node_info> & nodes, bool stop_at_boundary_markers) {
     // helper to add node src and dst ranges
     const auto & h_add = [](ggml_mem_ranges_t mrs, const node_info & node) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
@@ -307,6 +347,28 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
         }
     };
 
+    // helper to check if a node is a segment boundary that nothing may be moved across
+    //
+    // fusion never reorders anything by itself, but it does make a marker travel with the
+    //   group it was packed into, so a group is a barrier when ANY of its nodes is one
+    const auto & h_barrier = [stop_at_boundary_markers](const node_info & node) {
+        if (!stop_at_boundary_markers) {
+            return false;
+        }
+
+        if (ggml_graph_node_is_boundary_marker(node.node)) {
+            return true;
+        }
+
+        for (const auto * fused : node.fused) {
+            if (ggml_graph_node_is_boundary_marker(fused)) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
     const int n = nodes.size();
 
     std::vector<int> res;
@@ -342,12 +404,21 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             // that many nodes forward to search for a concurrent node
             constexpr int N_FORWARD = 64;
 
-            for (int i1 = i0 + 1; i1 < i0 + N_FORWARD && i1 < n; i1++) {
+            // every node this scan selects is emitted BEFORE node0, so when node0 is a
+            //   boundary marker there is nothing it may legally pick up
+            const int i1_end = h_barrier(node0) ? i0 + 1 : (i0 + N_FORWARD < n ? i0 + N_FORWARD : n);
+
+            for (int i1 = i0 + 1; i1 < i1_end; i1++) {
                 if (used[i1]) {
                     continue;
                 }
 
                 const auto & node1 = nodes[i1];
+
+                // never hoist a node from beyond a boundary marker, nor the marker itself
+                if (h_barrier(node1)) {
+                    break;
+                }
 
                 // disallow reordering of certain ops
                 if (!h_safe(node1.op())) {
@@ -389,7 +460,7 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
     return res;
 }
 
-void ggml_graph_optimize(ggml_cgraph * gf) {
+void ggml_graph_optimize(ggml_cgraph * gf, bool stop_at_boundary_markers) {
     constexpr int MAX_FUSE = 16;
 
     const int n = gf->n_nodes;
@@ -402,6 +473,11 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
     // fuse nodes:
     // we don't want to make reorders that break fusing, so we first pack all fusable tensors
     //   and perform the reorder over the fused nodes. after the reorder is done, we unfuse
+    //
+    // the packing itself moves nothing: a group is contiguous, and the unfuse below writes
+    //   its members back in their original relative order. so a group may straddle a
+    //   boundary marker without any work crossing it - all the marker has to do is make
+    //   the group it landed in immovable, which is what h_barrier above does
     for (int i = 0; i < n; i++) {
         node_info node = {
             /*.node =*/ gf->nodes[i],
@@ -450,7 +526,7 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
 
 #if 1
     // reorder to improve concurrency
-    const auto order = ggml_metal_graph_optimize_reorder(nodes);
+    const auto order = ggml_metal_graph_optimize_reorder(nodes, stop_at_boundary_markers);
 #else
     std::vector<int> order(nodes.size());
     for (size_t i = 0; i < nodes.size(); i++) {
