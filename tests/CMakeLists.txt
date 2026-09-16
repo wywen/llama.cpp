@@ -322,6 +322,14 @@ if (APPLE)
     llama_build(test-rset-release.cpp)
 endif()
 
+# the graph reorder lives in the Metal backend and is not part of the public API, so this
+# links the backend library directly and reaches for its internal header
+if (TARGET ggml-metal AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-metal-graph-optimize.cpp)
+    target_link_libraries(test-metal-graph-optimize PRIVATE ggml-metal)
+    target_include_directories(test-metal-graph-optimize PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
+endif()
+
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)

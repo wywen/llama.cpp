@@ -51,6 +51,9 @@ void ggml_metal_set_encode_window(
         size_t n_out_of_band, struct ggml_tensor * const * out_of_band);
 void ggml_metal_clear_encode_window(ggml_metal_t ctx);
 
+// See ggml_backend_metal_set_reorder_barriers.
+void ggml_metal_set_reorder_barriers(ggml_metal_t ctx, bool enable);
+
 void ggml_metal_set_n_cb            (ggml_metal_t ctx, int n_cb);
 void ggml_metal_set_abort_callback  (ggml_metal_t ctx, ggml_abort_callback abort_callback, void * user_data);
 bool ggml_metal_supports_family     (ggml_metal_t ctx, int family);

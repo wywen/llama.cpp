@@ -702,6 +702,14 @@ void ggml_backend_metal_clear_encode_window(ggml_backend_t backend) {
     ggml_metal_clear_encode_window(ctx);
 }
 
+void ggml_backend_metal_set_reorder_barriers(ggml_backend_t backend, bool enable) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    ggml_metal_set_reorder_barriers(ctx, enable);
+}
+
 bool ggml_backend_metal_supports_family(ggml_backend_t backend, int family) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
 
