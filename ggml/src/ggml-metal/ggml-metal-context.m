@@ -49,6 +49,9 @@ struct ggml_metal {
     bool use_concurrency;
     bool use_graph_optimize;
 
+    // stop the graph reorder at boundary marker nodes (see ggml_metal_set_reorder_barriers)
+    bool use_reorder_barriers;
+
     int debug_graph;
 
     struct ggml_metal_fusion_info * finfo;
@@ -224,6 +227,9 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
             ggml_metal_fusion_info_labels_init(res->finfo);
             res->n_cb = 0;
         }
+
+        // off unless a caller asks for it: the stock path must reorder exactly as before
+        res->use_reorder_barriers = false;
 
         GGML_LOG_INFO("%s: use fusion         = %s\n", __func__, ggml_metal_fusion_info_enabled(res->finfo) ? "true" : "false");
         GGML_LOG_INFO("%s: use concurrency    = %s\n", __func__, res->use_concurrency    ? "true" : "false");
@@ -786,6 +792,13 @@ static void ggml_metal_ewin_blit(id<MTLCommandBuffer> cmd_buf, const struct ggml
           destinationOffset:bid_dst.offs
                        size:ggml_nbytes(src)];
     [encoder endEncoding];
+}
+
+// Stop the graph reorder at boundary marker nodes. See
+// ggml_backend_metal_set_reorder_barriers for why a boundary-scheduling caller has to
+// set this, and ggml_graph_node_is_boundary_marker for what counts as a marker.
+void ggml_metal_set_reorder_barriers(ggml_metal_t ctx, bool enable) {
+    ctx->use_reorder_barriers = enable;
 }
 
 // The band invariant check: does this split encode ONLY in-band nodes?
@@ -1372,7 +1385,7 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     //const int64_t t_start = ggml_time_us();
 
     if (ctx->use_graph_optimize) {
-        ggml_graph_optimize(gf);
+        ggml_graph_optimize(gf, ctx->use_reorder_barriers);
     }
 
     //printf("%s: graph optimize took %.3f ms\n", __func__, (ggml_time_us() - t_start) / 1000.0);

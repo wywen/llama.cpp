@@ -116,6 +116,26 @@ GGML_BACKEND_API void ggml_backend_metal_set_encode_window(
         size_t n_out_of_band, struct ggml_tensor * const * out_of_band);
 GGML_BACKEND_API void ggml_backend_metal_clear_encode_window(ggml_backend_t backend);
 
+// Make the Metal graph reorder stop at boundary marker nodes -- the per-layer output
+// tensors a boundary-scheduling caller cuts the graph at. Off by default; a caller that
+// installs a boundary schedule and an encode window MUST turn it on.
+//
+// ggml_backend_sched optimizes each split while it is splitting the graph, and only
+// afterwards computes the splits -- which is where the schedule and the window are
+// installed. So the reorder always runs before any schedule exists and cannot see the
+// cuts, while the window is computed over the order the reorder has already produced.
+// Left to itself the reorder hoists memory-concurrent nodes up to 64 positions forward
+// across anything it considers safe, and a node anchored by nothing (a lookup into a
+// persistent cache, say) can land in an earlier segment than the one that is supposed to
+// produce it. The caller then sees a value produced outside its window and has to refuse
+// the encode, since re-running the producer inside the window is not sound when that same
+// segment also writes the cache.
+//
+// With this set, a marker node is a hard barrier: no node moves across one in either
+// direction, so segment membership is the same before and after the reorder. Nodes still
+// reorder freely within a segment. Off, the reorder is byte-for-byte what it always was.
+GGML_BACKEND_API void ggml_backend_metal_set_reorder_barriers(ggml_backend_t backend, bool enable);
+
 #ifdef __cplusplus
 }
 #endif
