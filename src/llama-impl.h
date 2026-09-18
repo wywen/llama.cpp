@@ -31,6 +31,23 @@ void llama_log_callback_default(ggml_log_level level, const char * text, void * 
 #define LLAMA_LOG_DEBUG(...) llama_log_internal(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
 #define LLAMA_LOG_CONT(...)  llama_log_internal(GGML_LOG_LEVEL_CONT , __VA_ARGS__)
 
+// Silence non-error logs on the current thread while a scope is alive. The
+// no-alloc memory plan (llama_model_memory_plan) scopes one around its
+// placeholder-buffer memory construction, whose constructors would otherwise
+// replay the construction log their real counterparts emit (and report
+// 0.00 MiB placeholder buffers).
+void llama_log_thread_quiet_push();
+void llama_log_thread_quiet_pop();
+
+class llama_log_thread_quiet {
+public:
+    llama_log_thread_quiet()  { llama_log_thread_quiet_push(); }
+    ~llama_log_thread_quiet() { llama_log_thread_quiet_pop(); }
+
+    llama_log_thread_quiet(const llama_log_thread_quiet &) = delete;
+    llama_log_thread_quiet & operator=(const llama_log_thread_quiet &) = delete;
+};
+
 //
 // helpers
 //

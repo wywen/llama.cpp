@@ -11,6 +11,11 @@ llama_memory_plan llama_model_memory_plan(const llama_model * model, const llama
     if (!model) {
         throw std::runtime_error("model cannot be NULL");
     }
+    // The plan sizes buffers by constructing placeholder-buffer memory, which
+    // replays the parameter-resolution and construction logs a real context
+    // construction emits; silence them on this thread so the real construction
+    // remains the single source of that log.
+    const llama_log_thread_quiet log_quiet;
 
     const llama_context_params resolved = llama_context_params_resolve(*model, params);
     const llama_memory_cparams cparams = llama_cparams_memory_shape(*model, resolved);
@@ -29,8 +34,6 @@ llama_memory_plan llama_model_memory_plan(const llama_model * model, const llama
     if (model->hparams.vocab_only) {
         return plan;
     }
-
-    LLAMA_LOG_INFO("%s: building the memory module with placeholder buffers, logged buffer sizes read zero\n", __func__);
 
     llama_memory_alloc_recorder recorder(llama_memory_alloc_mode::plan);
     {

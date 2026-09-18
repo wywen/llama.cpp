@@ -17,6 +17,16 @@ struct llama_logger_state {
 
 static llama_logger_state g_logger_state;
 
+static thread_local int g_log_thread_quiet_depth = 0;
+
+void llama_log_thread_quiet_push() {
+    ++g_log_thread_quiet_depth;
+}
+
+void llama_log_thread_quiet_pop() {
+    --g_log_thread_quiet_depth;
+}
+
 time_meas::time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
 
 time_meas::~time_meas() {
@@ -36,6 +46,9 @@ void llama_log_set(ggml_log_callback log_callback, void * user_data) {
 }
 
 static void llama_log_internal_v(ggml_log_level level, const char * format, va_list args) {
+    if (g_log_thread_quiet_depth > 0 && level != GGML_LOG_LEVEL_ERROR) {
+        return;
+    }
     va_list args_copy;
     va_copy(args_copy, args);
     char buffer[128];
