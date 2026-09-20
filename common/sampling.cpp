@@ -199,6 +199,8 @@ struct common_sampler * common_sampler_init(
         throw std::invalid_argument("penalty_present must be finite");
     }
     const llama_vocab * vocab = llama_model_get_vocab(model);
+    std::vector<llama_token_data> candidates;
+    candidates.reserve(llama_vocab_n_tokens(vocab));
     llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
 
     lparams.no_perf = params.no_perf;
@@ -430,11 +432,16 @@ struct common_sampler * common_sampler_init(
         /* .rbudget = */ rbudget,
         /* .chain   = */ chain,
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
-        /* .cur     = */ {},
+        /* .cur     = */ std::move(candidates),
         /* .cur_p   = */ {},
     };
 
     return result;
+}
+
+size_t common_sampler_buffer_size(const common_sampler * smpl) {
+    return smpl ? smpl->cur.capacity() * sizeof(llama_token_data) +
+                  smpl->prev.data.capacity() * sizeof(llama_token) : 0;
 }
 
 void common_sampler_free(struct common_sampler * gsmpl) {

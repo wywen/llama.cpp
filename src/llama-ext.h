@@ -18,6 +18,15 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// Constructor-phase reservation: call after final embedding/backend-sampler configuration and before decoding.
+// Rejects zero or rows beyond n_batch or n_outputs_max without changing the context.
+// A valid request returning false means allocation failed: discard the context, since its previous output
+// storage may have been released. Does not evaluate a graph or alter sequence state.
+LLAMA_API bool llama_output_reserve(struct llama_context * ctx, uint32_t n_outputs);
+
+// Borrowed output buffer for allocation accounting; invalidated by growth or context destruction.
+LLAMA_API ggml_backend_buffer_t llama_get_output_buffer(const struct llama_context * ctx);
+
 struct llama_fused_node_info {
     const struct ggml_tensor * tensor;
     int32_t layer;

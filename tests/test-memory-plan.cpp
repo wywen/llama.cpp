@@ -6,6 +6,9 @@
 
 #include "llama.h"
 #include "llama-cpp.h"
+#include "common.h"
+#include "sampling.h"
+#include "speculative.h"
 
 #include "../src/llama-context.h"
 #include "../src/llama-ext.h"
@@ -24,6 +27,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <optional>
 #include <stdexcept>
@@ -380,6 +384,74 @@ bool check_vocab_only(const std::string & path) {
     return true;
 }
 
+bool check_mtp_buffer_size_arithmetic() {
+    const size_t                              max = std::numeric_limits<size_t>::max();
+    const common_speculative_mtp_buffer_sizes ordinary{ 1, 2, 3, 4 };
+    const common_speculative_mtp_buffer_sizes exact{ max - 6, 1, 2, 3 };
+    const common_speculative_mtp_buffer_sizes saturated{ max - 5, 1, 2, 3 };
+
+    common_speculative_mtp_buffer_sizes unchanged{ 11, 12, 13, 14 };
+    const bool                          query_failed = !common_speculative_get_mtp_buffer_sizes(nullptr, unchanged);
+    const bool out_unchanged                         = unchanged.hidden_bytes == 11 && unchanged.batch_bytes == 12 &&
+                                                       unchanged.sampling_bytes == 13 && unchanged.sequence_bytes == 14;
+    const bool ok =
+        ordinary.total() == 10 && exact.total() == max && saturated.total() == max && query_failed && out_unchanged;
+    printf("MTP buffer size arithmetic: total=%d saturation=%d fail-closed=%d\n", ordinary.total() == 10,
+           exact.total() == max && saturated.total() == max, query_failed && out_unchanged);
+    return ok;
+}
+
+bool check_execution_buffer_reservation(const std::string & path) {
+    const llama_model_ptr model = load_cpu_model(path, model_load::allocated);
+    if (!model) {
+        return false;
+    }
+    auto params          = llama_context_default_params();
+    params.n_ctx         = 128;
+    params.n_batch       = 32;
+    params.n_ubatch      = 32;
+    params.n_outputs_max = 4;
+    const llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+    if (!ctx) {
+        return false;
+    }
+    auto * const initial      = llama_get_output_buffer(ctx.get());
+    const size_t initial_size = ggml_backend_buffer_get_size(initial);
+    const bool   invalid_unchanged =
+        !llama_output_reserve(nullptr, 4) && llama_get_output_buffer(nullptr) == nullptr &&
+        !llama_output_reserve(ctx.get(), 0) && !llama_output_reserve(ctx.get(), llama_n_batch(ctx.get()) + 1) &&
+        !llama_output_reserve(ctx.get(), 5) && llama_get_output_buffer(ctx.get()) == initial &&
+        ggml_backend_buffer_get_size(initial) == initial_size;
+    llama_set_embeddings_nextn(ctx.get(), true, false);
+    if (!llama_output_reserve(ctx.get(), 4)) {
+        fprintf(stderr, "FAIL output reservation: valid rows refused\n");
+        return false;
+    }
+    auto * const reserved      = llama_get_output_buffer(ctx.get());
+    const size_t reserved_size = ggml_backend_buffer_get_size(reserved);
+    const size_t required = sizeof(float) * ((size_t) llama_vocab_n_tokens(llama_model_get_vocab(model.get())) * 4 +
+                                             (size_t) llama_model_n_embd_out(model.get()) * llama_n_batch(ctx.get()));
+    const bool   stable   = llama_output_reserve(ctx.get(), 1) && llama_get_output_buffer(ctx.get()) == reserved &&
+                            ggml_backend_buffer_get_size(reserved) == reserved_size && reserved_size >= required &&
+                            llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 0) == -1;
+
+    common_params_sampling sampling;
+    sampling.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+    sampling.top_k    = 10;
+    const common_sampler_ptr sampler(common_sampler_init(model.get(), sampling));
+    const size_t             sampler_size = common_sampler_buffer_size(sampler.get());
+    const size_t             candidates =
+        (size_t) llama_vocab_n_tokens(llama_model_get_vocab(model.get())) * sizeof(llama_token_data);
+    common_sampler_reset(sampler.get());
+    const bool sampler_reserved = sampler_size >= candidates + 32 * sizeof(llama_token) &&
+                                  common_sampler_buffer_size(sampler.get()) == sampler_size &&
+                                  common_sampler_buffer_size(nullptr) == 0;
+    const bool ok               = invalid_unchanged && stable && sampler_reserved;
+    printf("execution buffer reservation: invalid=%d stable=%d sampler=%d\n", invalid_unchanged, stable,
+           sampler_reserved);
+    return ok;
+}
+
 bool check_null_model_throws() {
     try {
         llama_model_memory_plan(nullptr, llama_context_default_params());
@@ -518,7 +590,9 @@ int main(int argc, char ** argv) {
     ok = check_vocab_only(dense) && ok;
     ok = check_null_model_throws() && ok;
     ok = check_recorder_is_thread_local(dense) && ok;
+    ok = check_mtp_buffer_size_arithmetic() && ok;
     ok = check_plan_leaves_shared_cells_alone(dense) && ok;
+    ok = check_execution_buffer_reservation(dense) && ok;
 
     size_t models_loaded = 0;
     outcome out;

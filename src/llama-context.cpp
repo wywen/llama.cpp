@@ -2167,6 +2167,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 // output
 //
 
+bool llama_context::reserve_outputs(uint32_t n_outputs) {
+    if (n_outputs == 0 || n_outputs > cparams.n_batch || n_outputs > cparams.n_outputs_max || n_outputs > INT32_MAX) {
+        return false;
+    }
+    synchronize();
+    return output_reserve((int32_t) n_outputs) >= n_outputs;
+}
+
 uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
@@ -4418,4 +4426,12 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+bool llama_output_reserve(struct llama_context * ctx, uint32_t n_outputs) {
+    return ctx && ctx->reserve_outputs(n_outputs);
+}
+
+ggml_backend_buffer_t llama_get_output_buffer(const struct llama_context * ctx) {
+    return ctx ? ctx->get_output_buffer() : nullptr;
 }
