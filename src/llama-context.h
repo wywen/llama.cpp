@@ -205,6 +205,8 @@ struct llama_context {
     void perf_reset();
 
     llama_memory_breakdown memory_breakdown() const;
+    bool reserve_outputs(uint32_t n_outputs);
+    ggml_backend_buffer_t get_output_buffer() const { return buf_output.get(); }
 
     //
     // training

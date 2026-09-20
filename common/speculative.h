@@ -1,5 +1,7 @@
 #pragma once
 
+#include <limits>
+
 #include "llama.h"
 #include "common.h"
 
@@ -88,6 +90,30 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+
+// Owned MTP execution buffers on the host, excluding model/context buffers and control objects.
+struct common_speculative_mtp_buffer_sizes {
+    size_t hidden_bytes   = 0;
+    size_t batch_bytes    = 0;
+    size_t sampling_bytes = 0;
+    size_t sequence_bytes = 0;
+
+    // Saturates when the category sum cannot be represented.
+    size_t total() const {
+        size_t result = hidden_bytes;
+        for (const size_t bytes : { batch_bytes, sampling_bytes, sequence_bytes }) {
+            if (bytes > std::numeric_limits<size_t>::max() - result) {
+                return std::numeric_limits<size_t>::max();
+            }
+            result += bytes;
+        }
+        return result;
+    }
+};
+
+// False for non-MTP compositions or unrepresentable category totals; out is unchanged on failure.
+bool common_speculative_get_mtp_buffer_sizes(const common_speculative *            spec,
+                                             common_speculative_mtp_buffer_sizes & out);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);

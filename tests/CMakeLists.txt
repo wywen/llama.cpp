@@ -256,6 +256,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --models "${MODEL_DIR}"
     )
     set_tests_properties(test-memory-plan PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    # Requires caller-supplied staged MTP models; build it without registering a CTest.
+    llama_build(test-mtp-workspace.cpp)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
