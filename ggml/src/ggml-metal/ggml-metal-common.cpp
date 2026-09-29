@@ -1,11 +1,170 @@
 #include "ggml-metal-common.h"
 
-#include "ggml.h"
-#include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "ggml-impl.h"
+#include "ggml-metal.h"
+#include "ggml.h"
 
+#include <algorithm>
+#include <climits>
+#include <condition_variable>
 #include <cstring>
+#include <exception>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <new>
 #include <vector>
+
+void ggml_metal_projection_free(struct ggml_metal_projection * projection) {
+    if (!projection) {
+        return;
+    }
+    free(projection->segments);
+    free(projection->node_scratch);
+    *projection = {};
+}
+
+enum ggml_status ggml_metal_project_segments(const struct ggml_cgraph *                  graph,
+                                             const struct ggml_metal_projection_config * config,
+                                             struct ggml_metal_projection *              out) {
+    if (!out) {
+        return GGML_STATUS_FAILED;
+    }
+    out->n_segments = 0;
+    if (!graph || !config || config->n_cuts < 0 || config->n_waits < 0 || (config->n_cuts && !config->cut_nodes) ||
+        (config->n_waits && !config->wait_nodes) || (config->n_out_of_band && !config->out_of_band)) {
+        return GGML_STATUS_FAILED;
+    }
+    const int n_nodes = graph->n_nodes;
+    if (n_nodes <= 0 || !graph->nodes || graph->size < 0 || (graph->size > 0 && n_nodes > graph->size) ||
+        n_nodes > (INT_MAX - 2) / 2 || (size_t) n_nodes > SIZE_MAX / sizeof(*out->segments)) {
+        return GGML_STATUS_FAILED;
+    }
+    for (int i = 0; i < config->n_cuts; ++i) {
+        if (!config->cut_nodes[i]) {
+            return GGML_STATUS_FAILED;
+        }
+    }
+    for (int i = 0; i < config->n_waits; ++i) {
+        if (!config->wait_nodes[i]) {
+            return GGML_STATUS_FAILED;
+        }
+    }
+    for (size_t i = 0; i < config->n_out_of_band; ++i) {
+        if (!config->out_of_band[i]) {
+            return GGML_STATUS_FAILED;
+        }
+    }
+
+    int first = -1;
+    int last  = -1;
+    if (n_nodes > out->capacity_nodes) {
+        if ((size_t) n_nodes > SIZE_MAX / sizeof(*out->node_scratch)) {
+            return GGML_STATUS_FAILED;
+        }
+        void * scratch = realloc(out->node_scratch, (size_t) n_nodes * sizeof(*out->node_scratch));
+        if (!scratch) {
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+        out->node_scratch   = (const struct ggml_tensor **) scratch;
+        out->capacity_nodes = n_nodes;
+    }
+    for (int i = 0; i < n_nodes; ++i) {
+        const struct ggml_tensor * node = graph->nodes[i];
+        if (!node) {
+            return GGML_STATUS_FAILED;
+        }
+        out->node_scratch[i] = node;
+        if (node == config->first_node) {
+            first = i;
+        }
+        if (node == config->last_node) {
+            last = i;
+        }
+    }
+    std::sort(out->node_scratch, out->node_scratch + n_nodes, std::less<const struct ggml_tensor *>());
+    if (std::adjacent_find(out->node_scratch, out->node_scratch + n_nodes) != out->node_scratch + n_nodes) {
+        return GGML_STATUS_FAILED;
+    }
+    if (first >= 0 && last >= 0 && last <= first) {
+        return GGML_STATUS_FAILED;
+    }
+
+    if (n_nodes > out->capacity_segments) {
+        void * segments = realloc(out->segments, (size_t) n_nodes * sizeof(*out->segments));
+        if (!segments) {
+            return GGML_STATUS_ALLOC_FAILED;
+        }
+        out->segments          = (struct ggml_metal_segment *) segments;
+        out->capacity_segments = n_nodes;
+    }
+    struct ggml_metal_segment * segments       = out->segments;
+    const bool                  window_applies = config->window_active && (first >= 0 || last >= 0) &&
+                                                 (config->first_node != nullptr || config->last_node != nullptr);
+    const int                   window_lo      = first >= 0 ? first + 1 : 0;
+    const int                   window_hi      = last >= 0 ? last : n_nodes - 1;
+    int                         start          = 0;
+    int                         count          = 0;
+    bool                        previous_cut   = false;
+    for (int i = 0; i <= n_nodes; ++i) {
+        bool wait = false;
+        bool cut  = false;
+        if (i < n_nodes) {
+            const struct ggml_tensor * node = graph->nodes[i];
+            for (int w = 0; w < config->n_waits; ++w) {
+                if (config->wait_nodes[w] == node) {
+                    wait = true;
+                    break;
+                }
+            }
+            for (int c = 0; c < config->n_cuts; ++c) {
+                if (config->cut_nodes[c] == node) {
+                    cut = true;
+                    break;
+                }
+            }
+        }
+        if (i > start && (i == n_nodes || previous_cut || wait)) {
+            segments[count]       = {};
+            segments[count].start = start;
+            segments[count].end   = i;
+            ++count;
+            start = i;
+        }
+        previous_cut = cut;
+    }
+    bool entered = false;
+    for (int s = 0; s < count; ++s) {
+        struct ggml_metal_segment * seg = &segments[s];
+        seg->skipped                    = window_applies && (seg->end <= window_lo || seg->start > window_hi);
+        if (seg->skipped) {
+            continue;
+        }
+        seg->window_first               = window_applies && !entered;
+        seg->window_last                = window_applies && seg->start <= window_hi && seg->end > window_hi;
+        seg->ingress_here               = seg->window_first && first >= 0;
+        seg->egress_here                = seg->window_last && last >= 0;
+        entered                         = true;
+        const struct ggml_tensor * head = graph->nodes[seg->start];
+        for (int w = 0; w < config->n_waits; ++w) {
+            if (config->wait_nodes[w] == head) {
+                seg->wait_at_start = true;
+                break;
+            }
+        }
+        for (int i = seg->start; i < seg->end; ++i) {
+            const struct ggml_tensor * node = graph->nodes[i];
+            for (size_t k = 0; k < config->n_out_of_band; ++k) {
+                if (config->out_of_band[k] == node) {
+                    return GGML_STATUS_FAILED;
+                }
+            }
+        }
+    }
+    out->n_segments = count;
+    return GGML_STATUS_SUCCESS;
+}
 
 // the per-layer output tensors are named "l_out-<il>" by the graph builder, and that name
 //   is what a boundary-scheduling caller resolves its cut nodes and window endpoints by
@@ -547,4 +706,480 @@ void ggml_graph_optimize(ggml_cgraph * gf, bool stop_at_boundary_markers) {
             }
         }
     }
+}
+
+struct ggml_metal_completion {
+    struct slot {
+        uint64_t identity;
+        bool     done;
+        size_t   generation_index;
+        uint32_t split;
+        uint32_t first_ordinal;
+        uint32_t end_ordinal;
+    };
+
+    struct receipt_node {
+        ggml_metal_receipt_node entry;
+        bool                    registered;
+    };
+
+    struct receipt_generation {
+        uint64_t                          generation;
+        std::vector<receipt_node>         nodes;
+        ggml_metal_terminal_receipt_fn    terminal;
+        ggml_metal_generation_quiesced_fn quiesced;
+        void *                            cookie;
+        size_t                            pending;
+        bool                              closed;
+        bool                              notified;
+    };
+
+    struct cut {
+        ggml_metal_completion_cut entry;
+    };
+
+    std::mutex                      mutex;
+    std::condition_variable         quiescent;
+    std::vector<slot>               slots;
+    std::vector<cut>                cuts;
+    std::vector<receipt_generation> generations;
+    uint64_t                        next_generation = 1;
+    bool                            receipt_mode    = false;
+    size_t                          pending         = 0;
+    uint64_t                        next_identity   = 1;
+    bool                            batch_open      = false;
+    bool                            failed          = false;
+    ggml_metal_completion_publish   publish;
+    ggml_metal_completion_latch     latch;
+    ggml_metal_completion_event_ref retain_event;
+    ggml_metal_completion_event_ref release_event;
+    void *                          user;
+};
+
+static ggml_metal_completion::receipt_node * ggml_metal_receipt_find(ggml_metal_completion::receipt_generation & gen,
+                                                                     const ggml_tensor *                         node) {
+    auto it = std::lower_bound(gen.nodes.begin(), gen.nodes.end(), node,
+                               [](const ggml_metal_completion::receipt_node & entry, const ggml_tensor * key) {
+                                   return std::less<const ggml_tensor *>{}(entry.entry.node, key);
+                               });
+    return it != gen.nodes.end() && it->entry.node == node ? &*it : nullptr;
+}
+
+static void ggml_metal_receipt_notify(ggml_metal_completion::receipt_generation & gen) {
+    if (gen.closed && !gen.pending && !gen.notified) {
+        gen.notified = true;
+        gen.quiesced(gen.cookie, gen.generation);
+    }
+}
+
+static void ggml_metal_completion_fail_locked(ggml_metal_completion * tracker) {
+    if (tracker->failed) {
+        return;
+    }
+    tracker->failed = true;
+    tracker->latch(tracker->user);
+    for (size_t i = 0; i < tracker->cuts.size(); ++i) {
+        void * event = tracker->cuts[i].entry.event;
+        if (!event) {
+            continue;
+        }
+        bool already_woken = false;
+        for (size_t j = 0; j < i; ++j) {
+            already_woken |= tracker->cuts[j].entry.event == event;
+        }
+        if (!already_woken) {
+            tracker->publish(tracker->user, event, UINT64_MAX);
+        }
+    }
+}
+
+ggml_metal_completion * ggml_metal_completion_new(ggml_metal_completion_publish   publish,
+                                                  ggml_metal_completion_latch     latch,
+                                                  ggml_metal_completion_event_ref retain_event,
+                                                  ggml_metal_completion_event_ref release_event,
+                                                  void *                          user) {
+    if (!publish || !latch || (retain_event == nullptr) != (release_event == nullptr)) {
+        return nullptr;
+    }
+    auto * tracker = new (std::nothrow) ggml_metal_completion;
+    if (tracker) {
+        tracker->publish       = publish;
+        tracker->latch         = latch;
+        tracker->retain_event  = retain_event;
+        tracker->release_event = release_event;
+        tracker->user          = user;
+    }
+    return tracker;
+}
+
+void ggml_metal_completion_free(ggml_metal_completion * tracker) {
+    if (!tracker) {
+        return;
+    }
+    ggml_metal_completion_wait(tracker);
+    if (tracker->release_event) {
+        for (const auto & cut : tracker->cuts) {
+            tracker->release_event(cut.entry.event);
+        }
+    }
+    delete tracker;
+}
+
+bool ggml_metal_completion_reserve_additional(ggml_metal_completion * tracker, size_t n) {
+    std::lock_guard<std::mutex> lock(tracker->mutex);
+    if (tracker->failed || !tracker->batch_open || n > SIZE_MAX - tracker->slots.size()) {
+        return false;
+    }
+    const size_t required = tracker->slots.size() + n;
+    if (required <= tracker->slots.capacity()) {
+        return true;
+    }
+    const size_t capacity = tracker->slots.capacity();
+    const size_t target   = std::max(required, capacity <= SIZE_MAX / 2 ? capacity * 2 : required);
+    try {
+        tracker->slots.reserve(target);
+    } catch (const std::exception &) {
+        return false;
+    }
+    return true;
+}
+
+enum ggml_status ggml_metal_receipts_begin(ggml_metal_completion *                tracker,
+                                           const ggml_metal_receipt_node *        expected,
+                                           size_t                                 n_expected,
+                                           const ggml_metal_receipt_binding_cut * cuts,
+                                           size_t                                 n_cuts,
+                                           ggml_metal_terminal_receipt_fn         terminal,
+                                           ggml_metal_generation_quiesced_fn      quiesced,
+                                           void *                                 cookie,
+                                           uint64_t *                             generation) {
+    if (!tracker || !expected || !n_expected || n_expected > INT_MAX || !cuts || !n_cuts || !terminal || !quiesced ||
+        !generation) {
+        return GGML_STATUS_FAILED;
+    }
+    std::lock_guard<std::mutex> lock(tracker->mutex);
+    if (tracker->failed || tracker->batch_open || tracker->next_generation == UINT64_MAX) {
+        return GGML_STATUS_FAILED;
+    }
+    ggml_metal_completion::receipt_generation gen = {
+        tracker->next_generation, {}, terminal, quiesced, cookie, 0, false, false
+    };
+    const bool   recycle  = tracker->pending == 0;
+    const size_t old_size = recycle ? 0 : tracker->cuts.size();
+    if (n_cuts > SIZE_MAX - old_size) {
+        return GGML_STATUS_FAILED;
+    }
+    try {
+        for (size_t i = 0; i < n_expected; ++i) {
+            const auto & node = expected[i];
+            if (!node.node || (node.flags != GGML_METAL_RECEIPT_SELECTED && node.flags != GGML_METAL_RECEIPT_SKIPPED) ||
+                (i && (node.split < expected[i - 1].split ||
+                       (node.split == expected[i - 1].split && node.ordinal != expected[i - 1].ordinal + 1))) ||
+                ((!i || node.split != expected[i - 1].split) && node.ordinal != 0)) {
+                return GGML_STATUS_FAILED;
+            }
+        }
+        for (size_t i = 0; i < n_cuts; ++i) {
+            const auto &                    cut  = cuts[i];
+            const ggml_metal_receipt_node * node = nullptr;
+            for (size_t j = 0; j < n_expected; ++j) {
+                if (expected[j].node == cut.native.node) {
+                    node = &expected[j];
+                    break;
+                }
+            }
+            if (!node || node->split != cut.split || node->ordinal != cut.ordinal ||
+                node->flags != GGML_METAL_RECEIPT_SELECTED || !cut.native.event || cut.native.value == UINT64_MAX) {
+                return GGML_STATUS_FAILED;
+            }
+            for (size_t j = 0; j < i; ++j) {
+                if (cuts[j].native.event == cut.native.event && cuts[j].native.value >= cut.native.value) {
+                    return GGML_STATUS_FAILED;
+                }
+            }
+            if (!recycle) {
+                for (const auto & old : tracker->cuts) {
+                    if (old.entry.event == cut.native.event && old.entry.value >= cut.native.value) {
+                        return GGML_STATUS_FAILED;
+                    }
+                }
+            }
+        }
+        tracker->generations.reserve((recycle ? 0 : tracker->generations.size()) + 1);
+        tracker->cuts.reserve(old_size + n_cuts);
+        const size_t slot_base = recycle ? 0 : tracker->slots.size();
+        if (n_expected > SIZE_MAX - slot_base) {
+            return GGML_STATUS_FAILED;
+        }
+        const size_t required_slots = slot_base + n_expected;
+        if (required_slots > tracker->slots.capacity()) {
+            const size_t capacity = tracker->slots.capacity();
+            tracker->slots.reserve(std::max(required_slots, capacity <= SIZE_MAX / 2 ? capacity * 2 : required_slots));
+        }
+        if (recycle && !tracker->generations.empty()) {
+            gen.nodes.swap(tracker->generations.back().nodes);
+        }
+        gen.nodes.clear();
+        gen.nodes.reserve(n_expected);
+        for (size_t i = 0; i < n_expected; ++i) {
+            gen.nodes.push_back({ expected[i], false });
+        }
+        std::sort(gen.nodes.begin(), gen.nodes.end(),
+                  [](const ggml_metal_completion::receipt_node & a, const ggml_metal_completion::receipt_node & b) {
+                      return std::less<const ggml_tensor *>{}(a.entry.node, b.entry.node);
+                  });
+        for (size_t i = 1; i < gen.nodes.size(); ++i) {
+            if (gen.nodes[i - 1].entry.node == gen.nodes[i].entry.node) {
+                if (recycle && !tracker->generations.empty()) {
+                    gen.nodes.swap(tracker->generations.back().nodes);
+                }
+                return GGML_STATUS_FAILED;
+            }
+        }
+        if (recycle) {
+            if (tracker->release_event) {
+                for (const auto & old : tracker->cuts) {
+                    tracker->release_event(old.entry.event);
+                }
+            }
+            tracker->cuts.clear();
+            tracker->generations.clear();
+            tracker->slots.clear();
+        }
+        tracker->generations.push_back(std::move(gen));
+        for (size_t i = 0; i < n_cuts; ++i) {
+            tracker->cuts.push_back({ cuts[i].native });
+            if (tracker->retain_event) {
+                tracker->retain_event(cuts[i].native.event);
+            }
+        }
+    } catch (const std::exception &) {
+        if (recycle && !tracker->generations.empty() && gen.nodes.capacity() != 0) {
+            gen.nodes.swap(tracker->generations.back().nodes);
+        }
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+    tracker->batch_open   = true;
+    tracker->receipt_mode = true;
+    *generation           = tracker->next_generation++;
+    return GGML_STATUS_SUCCESS;
+}
+
+const void * ggml_metal_receipts_node_storage(ggml_metal_completion * tracker, size_t * capacity) {
+    if (!tracker || !capacity) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(tracker->mutex);
+    if (tracker->generations.empty()) {
+        *capacity = 0;
+        return nullptr;
+    }
+    const auto & nodes = tracker->generations.back().nodes;
+    *capacity          = nodes.capacity();
+    return nodes.data();
+}
+
+bool ggml_metal_receipts_active(ggml_metal_completion * tracker) {
+    std::lock_guard<std::mutex> lock(tracker->mutex);
+    return tracker->receipt_mode && tracker->batch_open && !tracker->failed;
+}
+
+bool ggml_metal_receipts_validate_view(ggml_metal_completion *       tracker,
+                                       const ggml_cgraph *           graph,
+                                       const ggml_metal_projection * projection,
+                                       uint32_t *                    split) {
+    if (!tracker || !graph || graph->n_nodes <= 0 || !graph->nodes || !projection || !split) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(tracker->mutex);
+    if (!tracker->receipt_mode || !tracker->batch_open || tracker->failed || !projection->n_segments) {
+        return false;
+    }
+    auto &                                      gen      = tracker->generations.back();
+    const ggml_metal_completion::receipt_node * previous = nullptr;
+    int                                         cursor   = 0;
+    for (int s = 0; s < projection->n_segments; ++s) {
+        const auto & seg = projection->segments[s];
+        if (seg.start != cursor || seg.end <= cursor || seg.end > graph->n_nodes) {
+            return false;
+        }
+        for (int i = seg.start; i < seg.end; ++i) {
+            const auto * node = ggml_metal_receipt_find(gen, graph->nodes[i]);
+            if (!node || node->registered ||
+                node->entry.flags != (seg.skipped ? GGML_METAL_RECEIPT_SKIPPED : GGML_METAL_RECEIPT_SELECTED) ||
+                (previous &&
+                 (node->entry.split != previous->entry.split || node->entry.ordinal != previous->entry.ordinal + 1))) {
+                return false;
+            }
+            previous = node;
+        }
+        cursor = seg.end;
+    }
+    if (cursor != graph->n_nodes) {
+        return false;
+    }
+    for (int s = 0; s < projection->n_segments; ++s) {
+        const auto & seg = projection->segments[s];
+        if (seg.skipped) {
+            for (int i = seg.start; i < seg.end; ++i) {
+                ggml_metal_receipt_find(gen, graph->nodes[i])->registered = true;
+            }
+        }
+    }
+    *split = previous->entry.split;
+    return true;
+}
+
+bool ggml_metal_receipts_register(ggml_metal_completion * tracker,
+                                  uint32_t                split,
+                                  ggml_tensor * const *   nodes,
+                                  int                     start,
+                                  int                     end,
+                                  uint64_t *              physical_id) {
+    if (!tracker || !nodes || start < 0 || end <= start || !physical_id) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(tracker->mutex);
+    if (!tracker->receipt_mode || !tracker->batch_open || tracker->failed ||
+        tracker->slots.size() == tracker->slots.capacity() || tracker->next_identity == UINT64_MAX) {
+        return false;
+    }
+    auto &   gen   = tracker->generations.back();
+    uint32_t first = 0;
+    for (int i = start; i < end; ++i) {
+        const auto * node = ggml_metal_receipt_find(gen, nodes[i]);
+        if (!node || node->registered || node->entry.flags != GGML_METAL_RECEIPT_SELECTED ||
+            node->entry.split != split || (i != start && node->entry.ordinal != first + (uint32_t) (i - start))) {
+            return false;
+        }
+        if (i == start) {
+            first = node->entry.ordinal;
+        }
+    }
+    if ((uint64_t) first + (uint64_t) (end - start) > UINT32_MAX) {
+        return false;
+    }
+    *physical_id = tracker->next_identity++;
+    tracker->slots.push_back(
+        { *physical_id, false, tracker->generations.size() - 1, split, first, first + (uint32_t) (end - start) });
+    for (int i = start; i < end; ++i) {
+        ggml_metal_receipt_find(gen, nodes[i])->registered = true;
+    }
+    ++gen.pending;
+    ++tracker->pending;
+    return true;
+}
+
+enum ggml_status ggml_metal_receipts_finish(ggml_metal_completion * tracker,
+                                            uint64_t                generation,
+                                            enum ggml_status        submission_status) {
+    if (!tracker) {
+        return GGML_STATUS_FAILED;
+    }
+    std::lock_guard<std::mutex> lock(tracker->mutex);
+    if (!tracker->receipt_mode || !tracker->batch_open || tracker->generations.back().generation != generation) {
+        ggml_metal_completion_fail_locked(tracker);
+        return GGML_STATUS_FAILED;
+    }
+    tracker->batch_open = false;
+    auto & gen          = tracker->generations.back();
+    gen.closed          = true;
+    bool covered        = submission_status == GGML_STATUS_SUCCESS;
+    for (const auto & node : gen.nodes) {
+        if (node.entry.flags == GGML_METAL_RECEIPT_SELECTED && !node.registered) {
+            covered = false;
+        }
+    }
+    if (!covered) {
+        ggml_metal_completion_fail_locked(tracker);
+    }
+    ggml_metal_receipt_notify(gen);
+    return submission_status != GGML_STATUS_SUCCESS ? submission_status :
+           tracker->failed                          ? GGML_STATUS_FAILED :
+                                                      GGML_STATUS_SUCCESS;
+}
+
+bool ggml_metal_completion_complete(ggml_metal_completion * tracker, uint64_t identity, bool success) {
+    std::lock_guard<std::mutex> lock(tracker->mutex);
+    for (auto & slot : tracker->slots) {
+        if (slot.identity != identity) {
+            continue;
+        }
+        if (slot.done) {
+            return false;
+        }
+        slot.done = true;
+        if (!success) {
+            ggml_metal_completion_fail_locked(tracker);
+        }
+        auto & gen = tracker->generations[slot.generation_index];
+        gen.terminal(gen.cookie, gen.generation, slot.identity, slot.split, slot.first_ordinal, slot.end_ordinal,
+                     success ? GGML_METAL_TERMINAL_COMPLETED : GGML_METAL_TERMINAL_FAILED);
+        --gen.pending;
+        --tracker->pending;
+        ggml_metal_receipt_notify(gen);
+        tracker->quiescent.notify_all();
+        return true;
+    }
+    return false;
+}
+
+void ggml_metal_completion_fail(ggml_metal_completion * tracker) {
+    std::lock_guard<std::mutex> lock(tracker->mutex);
+    ggml_metal_completion_fail_locked(tracker);
+}
+
+void ggml_metal_completion_wait(ggml_metal_completion * tracker) {
+    std::unique_lock<std::mutex> lock(tracker->mutex);
+    tracker->quiescent.wait(lock, [tracker] { return tracker->pending == 0; });
+}
+
+bool ggml_metal_completion_failed(ggml_metal_completion * tracker) {
+    std::lock_guard<std::mutex> lock(tracker->mutex);
+    return tracker->failed;
+}
+
+struct ggml_metal_result_storage {
+    std::vector<std::unique_ptr<ggml_metal_seg_result[]>> slabs;
+    std::vector<ggml_metal_seg_result *>                  slots;
+};
+
+ggml_metal_result_storage * ggml_metal_result_storage_new(void) {
+    return new (std::nothrow) ggml_metal_result_storage;
+}
+
+void ggml_metal_result_storage_free(ggml_metal_result_storage * storage) {
+    delete storage;
+}
+
+bool ggml_metal_result_storage_reserve(ggml_metal_result_storage * storage, size_t n) {
+    if (!storage || n > INT_MAX || n > SIZE_MAX / sizeof(ggml_metal_seg_result)) {
+        return false;
+    }
+    const size_t count = storage->slots.size();
+    if (n <= count) {
+        return true;
+    }
+    const size_t target     = std::min((size_t) INT_MAX, std::max(n, count <= INT_MAX / 2 ? count * 2 : n));
+    const size_t additional = target - count;
+    std::unique_ptr<ggml_metal_seg_result[]> slab(new (std::nothrow) ggml_metal_seg_result[additional]);
+    if (!slab) {
+        return false;
+    }
+    try {
+        storage->slots.reserve(target);
+        storage->slabs.reserve(storage->slabs.size() + 1);
+    } catch (const std::exception &) {
+        return false;
+    }
+    ggml_metal_seg_result * ptr = slab.get();
+    storage->slabs.push_back(std::move(slab));
+    for (size_t i = 0; i < additional; ++i) {
+        storage->slots.push_back(ptr + i);
+    }
+    return true;
+}
+
+ggml_metal_seg_result * ggml_metal_result_storage_at(ggml_metal_result_storage * storage, size_t i) {
+    return storage && i < storage->slots.size() ? storage->slots[i] : nullptr;
 }

@@ -83,6 +83,12 @@ GGML_BACKEND_API void ggml_backend_metal_set_boundary_schedule(
         int n_cuts,  struct ggml_tensor * const * cut_nodes,  ggml_metal_event_t * sig_ev,  const uint64_t * sig_val,
         int n_waits, struct ggml_tensor * const * wait_nodes, ggml_metal_event_t * wait_ev, const uint64_t * wait_val);
 
+// Install a nonblocking, thread-safe pager failure latch before beginning a batch.
+// The latch must remain valid until all Metal buffers are drained and this hook is cleared.
+GGML_BACKEND_API void ggml_backend_metal_set_boundary_failure_callback(ggml_backend_t backend,
+                                                                       void (*latch_failure)(void *),
+                                                                       void * user);
+
 // Restrict the boundary-scheduled (paged) compute path to the node range
 // (first_node, last_node] -- lower boundary EXCLUSIVE (pass the band-entry
 // residual node itself), upper INCLUSIVE, either NULL for an open edge --
@@ -115,6 +121,98 @@ GGML_BACKEND_API void ggml_backend_metal_set_encode_window(
         size_t n_egress,      const struct ggml_metal_tensor_copy_pair * egress,
         size_t n_out_of_band, struct ggml_tensor * const * out_of_band);
 GGML_BACKEND_API void ggml_backend_metal_clear_encode_window(ggml_backend_t backend);
+
+// Caller-owned reusable projection workspace. Zero-initialize before first use and
+// free once at the end of its lifetime. Each call reuses/grows both buffers without
+// requiring an intervening free; on failure n_segments is zero and storage is retained.
+// Segment metadata is valid until the next projection/free, graph reset, or graph
+// lifetime end. Storage may persist across graphs after logical reset. The caller
+// must serialize projection, configuration changes and encoding.
+struct ggml_metal_segment {
+    int  start;
+    int  end;
+    bool skipped;
+    bool wait_at_start;
+    bool window_first;
+    bool window_last;
+    bool ingress_here;
+    bool egress_here;
+};
+
+struct ggml_metal_projection {
+    struct ggml_metal_segment * segments;
+    int                         n_segments;
+    int                         capacity_segments;
+    const struct ggml_tensor ** node_scratch;
+    int                         capacity_nodes;
+};
+GGML_BACKEND_API enum ggml_status ggml_backend_metal_project_graph(ggml_backend_t                 backend,
+                                                                   const struct ggml_cgraph *     graph,
+                                                                   struct ggml_metal_projection * out);
+GGML_BACKEND_API void             ggml_metal_projection_free(struct ggml_metal_projection * projection);
+
+// A receipt covers one actual selected Metal command buffer. Nodes are indexed by
+// their optimized scheduler split; globally repeated tensor pointers are refused.
+enum ggml_metal_receipt_node_flags {
+    GGML_METAL_RECEIPT_SELECTED = 1,
+    GGML_METAL_RECEIPT_SKIPPED  = 2,
+};
+
+struct ggml_metal_receipt_node {
+    uint32_t                   split;
+    uint32_t                   ordinal;
+    const struct ggml_tensor * node;
+    uint32_t                   flags;
+};
+
+struct ggml_metal_receipt_cut {
+    uint32_t                   split;
+    uint32_t                   ordinal;
+    const struct ggml_tensor * node;
+    ggml_metal_event_t         event;
+    uint64_t                   value;
+};
+
+enum ggml_metal_terminal_status {
+    GGML_METAL_TERMINAL_COMPLETED,
+    GGML_METAL_TERMINAL_FAILED,
+};
+
+// Hooks run under the completion mutex: no allocation, blocking, throwing or reentry.
+// Quiesced runs after finish and every terminal hook for that generation has returned.
+typedef void (*ggml_metal_terminal_receipt_fn)(void *                          cookie,
+                                               uint64_t                        generation,
+                                               uint64_t                        physical_id,
+                                               uint32_t                        split,
+                                               uint32_t                        first_ordinal,
+                                               uint32_t                        end_ordinal,
+                                               enum ggml_metal_terminal_status status);
+typedef void (*ggml_metal_generation_quiesced_fn)(void * cookie, uint64_t generation);
+// Begin after the schedule and window are installed, before any backend enqueue.
+// Expected nodes are split-ordered with contiguous ordinals starting at zero per split;
+// cuts name its selected producers and must exactly match the installed event schedule.
+// Arrays are copied. Tensor/graph metadata and wait-event wrappers remain caller-owned,
+// immutable and live through submission and all-buffer drain. Different callback_eval
+// partitions are allowed only when each actual projected view matches this table.
+// Neither an unbegun paged compute nor an invalid span may enqueue GPU work.
+// The engine owns dependency resolution and all success-event publication.
+GGML_BACKEND_API enum ggml_status ggml_backend_metal_receipts_begin(ggml_backend_t                         backend,
+                                                                    const struct ggml_metal_receipt_node * expected,
+                                                                    size_t                                 n_expected,
+                                                                    const struct ggml_metal_receipt_cut *  cuts,
+                                                                    size_t                                 n_cuts,
+                                                                    ggml_metal_terminal_receipt_fn         terminal,
+                                                                    ggml_metal_generation_quiesced_fn      quiesced,
+                                                                    void *                                 cookie,
+                                                                    uint64_t *                             generation);
+// Close once after all attempted scheduler calls (including failures), before sync.
+// Exact selected-node coverage is required. This does not drain outstanding buffers;
+// terminal receipts may arrive before or after finish and in any physical order.
+// Retain cookie storage until quiesced, including when a newer generation begins.
+// Graph-done additionally requires successful closure and all required terminal work.
+GGML_BACKEND_API enum ggml_status ggml_backend_metal_receipts_finish(ggml_backend_t   backend,
+                                                                     uint64_t         generation,
+                                                                     enum ggml_status submission_status);
 
 // Make the Metal graph reorder stop at boundary marker nodes -- the per-layer output
 // tensors a boundary-scheduling caller cuts the graph at. Off by default; a caller that

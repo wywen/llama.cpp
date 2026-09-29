@@ -836,7 +836,11 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_graph_submit_callback callback_graph_submit;
     void * callback_graph_submit_user_data;
-
+    ggml_backend_sched_preflight_callback           callback_preflight;
+    void *                                          callback_preflight_user_data;
+    ggml_backend_sched_submission_finished_callback callback_finished;
+    void *                                          callback_finished_user_data;
+    bool                                            in_preflight;
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -1674,7 +1678,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         sched->callback_graph(sched, sched->callback_graph_user_data);
     }
 
-    bool split_submitted = false;
+    if (sched->callback_preflight) {
+        sched->in_preflight              = true;
+        const enum ggml_status preflight = sched->callback_preflight(sched, sched->callback_preflight_user_data);
+        sched->in_preflight              = false;
+        if (preflight != GGML_STATUS_SUCCESS) {
+            if (sched->callback_graph_submit) {
+                sched->callback_graph_submit(sched, preflight, sched->callback_graph_submit_user_data);
+            }
+            if (sched->callback_finished) {
+                sched->callback_finished(sched, preflight, 0, sched->callback_finished_user_data);
+            }
+            return preflight;
+        }
+    }
+
+    bool split_submitted            = false;
+    int  n_successful_backend_calls = 0;
+    auto finished                   = [&](enum ggml_status status) {
+        if (sched->callback_finished) {
+            sched->callback_finished(sched, status, n_successful_backend_calls, sched->callback_finished_user_data);
+        }
+        return status;
+    };
     auto graph_submitted = [&](enum ggml_status status) {
         if (sched->callback_graph_submit) {
             sched->callback_graph_submit(sched, status, sched->callback_graph_submit_user_data);
@@ -1833,8 +1859,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (!split_submitted) {
                     graph_submitted(ec);
                 }
-                return ec;
+                return finished(ec);
             }
+            ++n_successful_backend_calls;
             if (!split_submitted) {
                 split_submitted = true;
                 graph_submitted(GGML_STATUS_SUCCESS);
@@ -1862,8 +1889,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (!split_submitted) {
                         graph_submitted(ec);
                     }
-                    return ec;
+                    return finished(ec);
                 }
+                ++n_successful_backend_calls;
                 if (!split_submitted) {
                     split_submitted = true;
                     graph_submitted(GGML_STATUS_SUCCESS);
@@ -1888,7 +1916,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
-    return GGML_STATUS_SUCCESS;
+    return finished(GGML_STATUS_SUCCESS);
 }
 
 ggml_backend_sched_t ggml_backend_sched_new(
@@ -2068,6 +2096,9 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
 
     if (!sched->is_alloc) {
         if (!ggml_backend_sched_alloc_graph(sched, graph)) {
+            if (sched->callback_finished) {
+                sched->callback_finished(sched, GGML_STATUS_ALLOC_FAILED, 0, sched->callback_finished_user_data);
+            }
             return GGML_STATUS_ALLOC_FAILED;
         }
     }
@@ -2122,6 +2153,71 @@ void ggml_backend_sched_set_graph_submit_callback(ggml_backend_sched_t sched, gg
     GGML_ASSERT(sched);
     sched->callback_graph_submit = callback;
     sched->callback_graph_submit_user_data = user_data;
+}
+
+void ggml_backend_sched_set_preflight_callback(ggml_backend_sched_t                  sched,
+                                               ggml_backend_sched_preflight_callback callback,
+                                               void *                                user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_preflight           = callback;
+    sched->callback_preflight_user_data = user_data;
+}
+
+void ggml_backend_sched_set_submission_finished_callback(ggml_backend_sched_t                            sched,
+                                                         ggml_backend_sched_submission_finished_callback callback,
+                                                         void *                                          user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_finished           = callback;
+    sched->callback_finished_user_data = user_data;
+}
+
+int ggml_backend_sched_preflight_n_splits(ggml_backend_sched_t sched) {
+    return sched && sched->in_preflight ? sched->n_splits : -1;
+}
+
+bool ggml_backend_sched_preflight_split(ggml_backend_sched_t                       sched,
+                                        int                                        split_id,
+                                        struct ggml_backend_sched_split_manifest * out) {
+    if (!sched || !sched->in_preflight || !out || split_id < 0 || split_id >= sched->n_splits) {
+        return false;
+    }
+    const ggml_backend_sched_split & split = sched->splits[split_id];
+    *out                                   = { sched->backends[split.backend_id], split.graph.n_nodes, split.n_inputs };
+    return true;
+}
+
+const struct ggml_tensor * ggml_backend_sched_preflight_node(ggml_backend_sched_t sched, int split_id, int node_id) {
+    if (!sched || !sched->in_preflight || split_id < 0 || split_id >= sched->n_splits) {
+        return nullptr;
+    }
+    const ggml_cgraph & graph = sched->splits[split_id].graph;
+    return node_id >= 0 && node_id < graph.n_nodes ? graph.nodes[node_id] : nullptr;
+}
+
+bool ggml_backend_sched_preflight_input(ggml_backend_sched_t                       sched,
+                                        int                                        split_id,
+                                        int                                        input_id,
+                                        struct ggml_backend_sched_input_manifest * out) {
+    if (!sched || !sched->in_preflight || !out || split_id < 0 || split_id >= sched->n_splits) {
+        return false;
+    }
+    const ggml_backend_sched_split & split = sched->splits[split_id];
+    if (input_id < 0 || input_id >= split.n_inputs) {
+        return false;
+    }
+    ggml_tensor *                         input = split.inputs[input_id];
+    ggml_tensor *                         copy  = tensor_copy(input, split.backend_id, sched->cur_copy);
+    enum ggml_backend_sched_transfer_kind kind  = GGML_BACKEND_SCHED_TRANSFER_ASYNC_OR_SYNC;
+    if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+        kind = GGML_BACKEND_SCHED_TRANSFER_INPUT_SYNC;
+    } else if (split.graph.n_nodes > 0 &&
+               ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+               ggml_backend_buffer_is_host(input->buffer) && split.graph.nodes[0]->src[0] == copy &&
+               split.graph.nodes[0]->op == GGML_OP_MUL_MAT_ID) {
+        kind = GGML_BACKEND_SCHED_TRANSFER_EXPERTS_OR_SYNC;
+    }
+    *out = { input, copy, kind };
+    return true;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

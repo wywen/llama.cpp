@@ -681,12 +681,60 @@ void ggml_backend_metal_set_boundary_schedule(
     ggml_metal_set_boundary_schedule(ctx, n_cuts, cut_nodes, sig_ev, sig_val, n_waits, wait_nodes, wait_ev, wait_val);
 }
 
-void ggml_backend_metal_set_encode_window(
-        ggml_backend_t backend,
-        struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
-        size_t n_ingress,     const struct ggml_metal_tensor_copy_pair * ingress,
-        size_t n_egress,      const struct ggml_metal_tensor_copy_pair * egress,
-        size_t n_out_of_band, struct ggml_tensor * const * out_of_band) {
+void ggml_backend_metal_set_boundary_failure_callback(ggml_backend_t backend,
+                                                      void (*latch_failure)(void *),
+                                                      void * user) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+    ggml_metal_set_boundary_failure_callback((ggml_metal_t) backend->context, latch_failure, user);
+}
+
+enum ggml_status ggml_backend_metal_receipts_begin(ggml_backend_t                    backend,
+                                                   const ggml_metal_receipt_node *   expected,
+                                                   size_t                            n_expected,
+                                                   const ggml_metal_receipt_cut *    cuts,
+                                                   size_t                            n_cuts,
+                                                   ggml_metal_terminal_receipt_fn    terminal,
+                                                   ggml_metal_generation_quiesced_fn quiesced,
+                                                   void *                            cookie,
+                                                   uint64_t *                        generation) {
+    if (!backend || !ggml_backend_is_metal(backend)) {
+        return GGML_STATUS_FAILED;
+    }
+    return ggml_metal_receipts_context_begin((ggml_metal_t) backend->context, expected, n_expected, cuts, n_cuts,
+                                             terminal, quiesced, cookie, generation);
+}
+
+enum ggml_status ggml_backend_metal_receipts_finish(ggml_backend_t   backend,
+                                                    uint64_t         generation,
+                                                    enum ggml_status submission_status) {
+    if (!backend || !ggml_backend_is_metal(backend)) {
+        return GGML_STATUS_FAILED;
+    }
+    return ggml_metal_receipts_context_finish((ggml_metal_t) backend->context, generation, submission_status);
+}
+
+enum ggml_status ggml_backend_metal_project_graph(ggml_backend_t                 backend,
+                                                  const struct ggml_cgraph *     graph,
+                                                  struct ggml_metal_projection * out) {
+    if (!out) {
+        return GGML_STATUS_FAILED;
+    }
+    out->n_segments = 0;
+    if (!backend || !ggml_backend_is_metal(backend)) {
+        return GGML_STATUS_FAILED;
+    }
+    return ggml_metal_project_graph((ggml_metal_t) backend->context, graph, out);
+}
+
+void ggml_backend_metal_set_encode_window(ggml_backend_t                             backend,
+                                          struct ggml_tensor *                       first_node,
+                                          struct ggml_tensor *                       last_node,
+                                          size_t                                     n_ingress,
+                                          const struct ggml_metal_tensor_copy_pair * ingress,
+                                          size_t                                     n_egress,
+                                          const struct ggml_metal_tensor_copy_pair * egress,
+                                          size_t                                     n_out_of_band,
+                                          struct ggml_tensor * const *               out_of_band) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
 
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
