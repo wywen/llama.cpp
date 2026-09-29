@@ -1,7 +1,6 @@
 #pragma once
 
 #include "ggml-metal-device.h"
-#include "ggml-metal.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -13,7 +12,6 @@ extern "C" {
 
 typedef struct ggml_metal * ggml_metal_t;
 struct ggml_metal_tensor_copy_pair;
-struct ggml_metal_projection;
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev);
 void ggml_metal_free(ggml_metal_t ctx);
@@ -40,42 +38,18 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx);
 
 ggml_metal_device_t ggml_metal_get_device(ggml_metal_t ctx);
 
-void             ggml_metal_set_boundary_schedule(ggml_metal_t                 ctx,
-                                                  int                          n_cuts,
-                                                  struct ggml_tensor * const * cut_nodes,
-                                                  ggml_metal_event_t *         sig_ev,
-                                                  const uint64_t *             sig_val,
-                                                  int                          n_waits,
-                                                  struct ggml_tensor * const * wait_nodes,
-                                                  ggml_metal_event_t *         wait_ev,
-                                                  const uint64_t *             wait_val);
-enum ggml_status ggml_metal_receipts_context_begin(ggml_metal_t                           ctx,
-                                                   const struct ggml_metal_receipt_node * expected,
-                                                   size_t                                 n_expected,
-                                                   const struct ggml_metal_receipt_cut *  cuts,
-                                                   size_t                                 n_cuts,
-                                                   ggml_metal_terminal_receipt_fn         terminal,
-                                                   ggml_metal_generation_quiesced_fn      quiesced,
-                                                   void *                                 cookie,
-                                                   uint64_t *                             generation);
-enum ggml_status ggml_metal_receipts_context_finish(ggml_metal_t     ctx,
-                                                    uint64_t         generation,
-                                                    enum ggml_status submission_status);
-void             ggml_metal_set_boundary_failure_callback(ggml_metal_t ctx, void (*latch_failure)(void *), void * user);
+void ggml_metal_set_boundary_schedule(
+        ggml_metal_t ctx,
+        int n_cuts,  struct ggml_tensor * const * cut_nodes,  ggml_metal_event_t * sig_ev, const uint64_t * sig_val,
+        int n_waits, struct ggml_tensor * const * wait_nodes, ggml_metal_event_t * wait_ev, const uint64_t * wait_val);
 
-void             ggml_metal_set_encode_window(ggml_metal_t                               ctx,
-                                              struct ggml_tensor *                       first_node,
-                                              struct ggml_tensor *                       last_node,
-                                              size_t                                     n_ingress,
-                                              const struct ggml_metal_tensor_copy_pair * ingress,
-                                              size_t                                     n_egress,
-                                              const struct ggml_metal_tensor_copy_pair * egress,
-                                              size_t                                     n_out_of_band,
-                                              struct ggml_tensor * const *               out_of_band);
-void             ggml_metal_clear_encode_window(ggml_metal_t ctx);
-enum ggml_status ggml_metal_project_graph(ggml_metal_t                   ctx,
-                                          const struct ggml_cgraph *     graph,
-                                          struct ggml_metal_projection * out);
+void ggml_metal_set_encode_window(
+        ggml_metal_t ctx,
+        struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
+        size_t n_ingress,     const struct ggml_metal_tensor_copy_pair * ingress,
+        size_t n_egress,      const struct ggml_metal_tensor_copy_pair * egress,
+        size_t n_out_of_band, struct ggml_tensor * const * out_of_band);
+void ggml_metal_clear_encode_window(ggml_metal_t ctx);
 
 // See ggml_backend_metal_set_reorder_barriers.
 void ggml_metal_set_reorder_barriers(ggml_metal_t ctx, bool enable);
