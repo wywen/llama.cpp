@@ -339,6 +339,37 @@ extern "C" {
     // submission fails before any split was submitted.
     typedef void (*ggml_backend_sched_graph_submit_callback)(ggml_backend_sched_t sched, enum ggml_status status, void * user_data);
 
+    // Checked preflight runs after callback_graph, before copies and split enqueues.
+    // Getters return borrowed tensor identities and immutable metadata only during preflight.
+    // Do not read tensor bytes or dereference borrowed pointers after the callback.
+    // Transfer kinds are possibilities; runtime fallback and skipped nodes need separate proof.
+    enum ggml_backend_sched_transfer_kind {
+        GGML_BACKEND_SCHED_TRANSFER_INPUT_SYNC,
+        GGML_BACKEND_SCHED_TRANSFER_EXPERTS_OR_SYNC,
+        GGML_BACKEND_SCHED_TRANSFER_ASYNC_OR_SYNC,
+    };
+
+    struct ggml_backend_sched_split_manifest {
+        ggml_backend_t backend;
+        int            n_nodes;
+        int            n_inputs;
+    };
+
+    struct ggml_backend_sched_input_manifest {
+        const struct ggml_tensor *            source;
+        const struct ggml_tensor *            copy;
+        enum ggml_backend_sched_transfer_kind kind;
+    };
+    typedef enum ggml_status (*ggml_backend_sched_preflight_callback)(ggml_backend_sched_t sched, void * user_data);
+    // Callbacks must not reenter scheduler compute/reset or throw.
+    // Once after all attempted split graph calls, before the caller's scheduler drain.
+    // Internal copy/event waits and callback_eval synchronization may happen earlier.
+    // The count excludes failed calls, which may already have enqueued work internally.
+    typedef void (*ggml_backend_sched_submission_finished_callback)(ggml_backend_sched_t sched,
+                                                                    enum ggml_status     status,
+                                                                    int                  n_successful_backend_calls,
+                                                                    void *               user_data);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
@@ -381,6 +412,24 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_reserve_callback(ggml_backend_sched_t sched, ggml_backend_sched_reserve_callback callback, void * user_data);
     GGML_API void                 ggml_backend_sched_set_graph_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_compute_callback callback, void * user_data);
     GGML_API void                 ggml_backend_sched_set_graph_submit_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_submit_callback callback, void * user_data);
+    GGML_API void ggml_backend_sched_set_preflight_callback(ggml_backend_sched_t                  sched,
+                                                            ggml_backend_sched_preflight_callback callback,
+                                                            void *                                user_data);
+    GGML_API void ggml_backend_sched_set_submission_finished_callback(
+        ggml_backend_sched_t                            sched,
+        ggml_backend_sched_submission_finished_callback callback,
+        void *                                          user_data);
+    GGML_API int  ggml_backend_sched_preflight_n_splits(ggml_backend_sched_t sched);
+    GGML_API bool ggml_backend_sched_preflight_split(ggml_backend_sched_t                       sched,
+                                                     int                                        split_id,
+                                                     struct ggml_backend_sched_split_manifest * out);
+    GGML_API const struct ggml_tensor * ggml_backend_sched_preflight_node(ggml_backend_sched_t sched,
+                                                                          int                  split_id,
+                                                                          int                  node_id);
+    GGML_API bool ggml_backend_sched_preflight_input(ggml_backend_sched_t                       sched,
+                                                     int                                        split_id,
+                                                     int                                        input_id,
+                                                     struct ggml_backend_sched_input_manifest * out);
 
     //
     // Meta backend

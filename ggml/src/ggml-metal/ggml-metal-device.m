@@ -1359,6 +1359,10 @@ struct ggml_metal_event {
     atomic_int value;
 };
 
+void * ggml_metal_event_get_obj(ggml_metal_event_t ev) {
+    return ev->obj;
+}
+
 void ggml_metal_event_encode_signal(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw) {
     id<MTLSharedEvent> event = (id<MTLSharedEvent>)ev->obj;
 
