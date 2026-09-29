@@ -291,7 +291,6 @@ struct ggml_metal_device_props {
 };
 
 typedef struct ggml_metal_event * ggml_metal_event_t;
-void * ggml_metal_event_get_obj(ggml_metal_event_t ev);
 
 void ggml_metal_event_encode_signal(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf);
 void ggml_metal_event_encode_wait  (ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf);

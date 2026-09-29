@@ -2,35 +2,14 @@
 
 #pragma once
 
-#include "ggml-metal.h"
-#include "ggml.h"
-
 #include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 struct ggml_tensor;
 struct ggml_cgraph;
-
-struct ggml_metal_projection;
-
-struct ggml_metal_projection_config {
-    int                          n_cuts;
-    struct ggml_tensor * const * cut_nodes;
-    int                          n_waits;
-    struct ggml_tensor * const * wait_nodes;
-    bool                         window_active;
-    const struct ggml_tensor *   first_node;
-    const struct ggml_tensor *   last_node;
-    size_t                       n_out_of_band;
-    struct ggml_tensor * const * out_of_band;
-};
-enum ggml_status ggml_metal_project_segments(const struct ggml_cgraph *                  graph,
-                                             const struct ggml_metal_projection_config * config,
-                                             struct ggml_metal_projection *              out);
 
 enum ggml_mem_range_type {
     MEM_RANGE_TYPE_SRC = 0,
@@ -97,81 +76,6 @@ void ggml_graph_optimize(struct ggml_cgraph * gf, bool stop_at_boundary_markers)
 // mat-mat vs mat-vec dispatch; used by both supports_op and ggml_metal_op_mul_mat*
 bool ggml_metal_op_mul_mat_use_mm   (const struct ggml_tensor * op, bool has_simdgroup_mm);
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
-
-// Terminal receipts and failure wakes are serialized by the tracker mutex.
-// Hooks must not allocate, block, throw or reenter; latch precedes wake.
-struct ggml_metal_completion;
-
-struct ggml_metal_completion_cut {
-    const struct ggml_tensor * node;
-    void *                     event;
-    uint64_t                   value;
-};
-
-typedef void (*ggml_metal_completion_publish)(void * user, void * event, uint64_t value);
-typedef void (*ggml_metal_completion_latch)(void * user);
-typedef void (*ggml_metal_completion_event_ref)(void * event);
-
-struct ggml_metal_completion * ggml_metal_completion_new(ggml_metal_completion_publish   publish,
-                                                         ggml_metal_completion_latch     latch,
-                                                         ggml_metal_completion_event_ref retain_event,
-                                                         ggml_metal_completion_event_ref release_event,
-                                                         void *                          user);
-void                           ggml_metal_completion_free(struct ggml_metal_completion * tracker);
-// Reserve additional slots without recycling live identities or waiting for callbacks.
-// A false return leaves existing in-flight slots usable; the caller latches failure before waking waiters.
-bool ggml_metal_completion_reserve_additional(struct ggml_metal_completion * tracker, size_t n);
-bool ggml_metal_completion_complete(struct ggml_metal_completion * tracker, uint64_t identity, bool success);
-void ggml_metal_completion_fail(struct ggml_metal_completion * tracker);
-void ggml_metal_completion_wait(struct ggml_metal_completion * tracker);
-bool ggml_metal_completion_failed(struct ggml_metal_completion * tracker);
-
-// Native cut events remain retained through pending callbacks; success is engine-owned.
-struct ggml_metal_receipt_binding_cut {
-    uint32_t                         split;
-    uint32_t                         ordinal;
-    struct ggml_metal_completion_cut native;
-};
-enum ggml_status ggml_metal_receipts_begin(struct ggml_metal_completion *                tracker,
-                                           const struct ggml_metal_receipt_node *        expected,
-                                           size_t                                        n_expected,
-                                           const struct ggml_metal_receipt_binding_cut * cuts,
-                                           size_t                                        n_cuts,
-                                           ggml_metal_terminal_receipt_fn                terminal,
-                                           ggml_metal_generation_quiesced_fn             quiesced,
-                                           void *                                        cookie,
-                                           uint64_t *                                    generation);
-enum ggml_status ggml_metal_receipts_finish(struct ggml_metal_completion * tracker,
-                                            uint64_t                       generation,
-                                            enum ggml_status               submission_status);
-// Validates every view node and its selected/skipped projection classification before enqueue.
-// Bounded view data is borrowed only for this synchronous call.
-bool             ggml_metal_receipts_validate_view(struct ggml_metal_completion *       tracker,
-                                                   const struct ggml_cgraph *           graph,
-                                                   const struct ggml_metal_projection * projection,
-                                                   uint32_t *                           split);
-bool             ggml_metal_receipts_register(struct ggml_metal_completion * tracker,
-                                              uint32_t                       split,
-                                              struct ggml_tensor * const *   nodes,
-                                              int                            start,
-                                              int                            end,
-                                              uint64_t *                     physical_id);
-bool             ggml_metal_receipts_active(struct ggml_metal_completion * tracker);
-
-// Diagnostics for the reusable expected-node slab; borrowed until the next begin.
-const void * ggml_metal_receipts_node_storage(struct ggml_metal_completion * tracker, size_t * capacity);
-
-// Only the submitting thread reserves/reads the pointer table. Each callback writes its
-// status before the terminal hook; command buffers stay retained through synchronize.
-struct ggml_metal_seg_result {
-    int    status;
-    void * buffer;
-};
-struct ggml_metal_result_storage;
-struct ggml_metal_result_storage * ggml_metal_result_storage_new(void);
-void                               ggml_metal_result_storage_free(struct ggml_metal_result_storage * storage);
-bool                           ggml_metal_result_storage_reserve(struct ggml_metal_result_storage * storage, size_t n);
-struct ggml_metal_seg_result * ggml_metal_result_storage_at(struct ggml_metal_result_storage * storage, size_t i);
 
 #ifdef __cplusplus
 }
