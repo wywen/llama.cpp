@@ -1696,6 +1696,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
+                const auto & dp_step = dparams[seq_id];
+                if (dp_step.on_step != nullptr) {
+                    dp_step.on_step(dp_step.on_step_user, ctx_dft, i_last[seq_id], i);
+                }
+
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
