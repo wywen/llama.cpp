@@ -55,6 +55,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
 void common_speculative_free(common_speculative * spec);
 
+typedef void (*common_speculative_draft_step_cb)(void * user, llama_context * ctx_dft, int32_t i_out, int32_t step);
+
 struct common_speculative_draft_params {
     // this flag is used to chain the drafts through all the available implementations
     // after the first successful draft from an implementation, we set it
@@ -81,6 +83,12 @@ struct common_speculative_draft_params {
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+
+    // optional observer of each draft step, called after the step's decode and before its token is
+    // sampled, with the draft context, the output row holding the step's logits and the step index;
+    // only the MTP draft calls it
+    common_speculative_draft_step_cb on_step      = nullptr;
+    void *                           on_step_user = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
