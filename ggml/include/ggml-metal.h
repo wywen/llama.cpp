@@ -63,6 +63,18 @@ struct ggml_metal_tensor_copy_pair {
     struct ggml_tensor * dst;
 };
 
+// A device-side copy of `size` bytes from byte `src_offs` of src's data to byte `dst_offs` of
+// dst's data. Offsets are relative to each tensor's own data, not to its backing buffer. Unlike
+// a ggml view, a range needs no tensor of its own, so it also works on buffer types whose views
+// cannot be resolved to a device buffer.
+struct ggml_metal_tensor_range_copy {
+    struct ggml_tensor * src;
+    struct ggml_tensor * dst;
+    size_t               src_offs;
+    size_t               dst_offs;
+    size_t               size;
+};
+
 GGML_BACKEND_API ggml_metal_event_t ggml_backend_metal_event_init(ggml_backend_t backend);
 GGML_BACKEND_API void               ggml_backend_metal_event_free(ggml_backend_t backend, ggml_metal_event_t ev);
 
@@ -113,6 +125,35 @@ GGML_BACKEND_API void ggml_backend_metal_set_encode_window(
         struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
         size_t n_ingress,     const struct ggml_metal_tensor_copy_pair * ingress,
         size_t n_egress,      const struct ggml_metal_tensor_copy_pair * egress,
+        size_t n_out_of_band, struct ggml_tensor * const * out_of_band);
+
+// The same encode window, with byte-range copies in place of whole-tensor pairs. A caller that
+// saves and restores a sub-range of a cache tensor around a windowed graph names that sub-range
+// here; several ranges may name the same tensors.
+//
+// Every range must satisfy, or the call fails:
+//   - src and dst are non-NULL and size > 0;
+//   - src_offs + size <= ggml_nbytes(src) and dst_offs + size <= ggml_nbytes(dst);
+//   - src_offs, dst_offs and size are multiples of 4 bytes (the macOS requirement of
+//     MTLBlitCommandEncoder's buffer-to-buffer copy);
+//   - when src and dst share storage (the same tensor, or views of one tensor), the source and
+//     destination byte ranges do not overlap, since Metal leaves an overlapping copy within one
+//     buffer undefined.
+// Each list must be non-NULL when its count is non-zero.
+//
+// Copies in each list run in list order: each is its own blit pass, and a later pass that touches
+// bytes an earlier pass wrote sees that write. A range may therefore read what an earlier range
+// in the same list produced.
+//
+// Returns false, logs the first violation, and leaves any previously installed window in place
+// when the arguments are invalid. Returns true once the window is installed. The whole-tensor
+// call above is equivalent to this one with src_offs = dst_offs = 0 and size = ggml_nbytes(src),
+// except that it applies no alignment rule.
+GGML_BACKEND_API bool ggml_backend_metal_set_encode_window_ranged(
+        ggml_backend_t backend,
+        struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
+        size_t n_ingress,     const struct ggml_metal_tensor_range_copy * ingress,
+        size_t n_egress,      const struct ggml_metal_tensor_range_copy * egress,
         size_t n_out_of_band, struct ggml_tensor * const * out_of_band);
 GGML_BACKEND_API void ggml_backend_metal_clear_encode_window(ggml_backend_t backend);
 

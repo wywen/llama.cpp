@@ -694,6 +694,19 @@ void ggml_backend_metal_set_encode_window(
     ggml_metal_set_encode_window(ctx, first_node, last_node, n_ingress, ingress, n_egress, egress, n_out_of_band, out_of_band);
 }
 
+bool ggml_backend_metal_set_encode_window_ranged(
+        ggml_backend_t backend,
+        struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
+        size_t n_ingress,     const struct ggml_metal_tensor_range_copy * ingress,
+        size_t n_egress,      const struct ggml_metal_tensor_range_copy * egress,
+        size_t n_out_of_band, struct ggml_tensor * const * out_of_band) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    return ggml_metal_set_encode_window_ranged(ctx, first_node, last_node, n_ingress, ingress, n_egress, egress, n_out_of_band, out_of_band);
+}
+
 void ggml_backend_metal_clear_encode_window(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
 

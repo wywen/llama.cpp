@@ -128,7 +128,9 @@ struct ggml_metal {
     // ggml_metal_graph_compute_paged encodes only the segments intersecting
     // [first_node, last_node] and moves boundary tensors through ordered ingress
     // copies before the first encoded segment and egress copies after the last.
-    // Pair arrays are owned copies; the tensors remain caller-owned.
+    // Copy arrays are owned copies; the tensors remain caller-owned. Every
+    // copy is stored as a byte range, a whole-tensor pair as the range
+    // [0, ggml_nbytes(src)) on both sides.
     //
     // ewin_out_of_band is the caller's assertion of which FULL-GRAPH nodes lie
     // outside the active band. It is not used to select what to encode -- it is
@@ -140,9 +142,9 @@ struct ggml_metal {
     struct ggml_tensor                 *  ewin_first_node;
     struct ggml_tensor                 *  ewin_last_node;
     size_t                                ewin_n_ingress;
-    struct ggml_metal_tensor_copy_pair *  ewin_ingress;
+    struct ggml_metal_tensor_range_copy * ewin_ingress;
     size_t                                ewin_n_egress;
-    struct ggml_metal_tensor_copy_pair *  ewin_egress;
+    struct ggml_metal_tensor_range_copy * ewin_egress;
     size_t                                ewin_n_out_of_band;
     struct ggml_tensor                 ** ewin_out_of_band;
 };
@@ -638,6 +640,52 @@ void ggml_metal_set_boundary_schedule(
     }
 }
 
+// Owned whole-tensor ranges for a list of pairs: [0, ggml_nbytes(src)) on both sides.
+static struct ggml_metal_tensor_range_copy * ggml_metal_ewin_whole_ranges(size_t n, const struct ggml_metal_tensor_copy_pair * pairs) {
+    if (n == 0) {
+        return NULL;
+    }
+    struct ggml_metal_tensor_range_copy * res = malloc(sizeof(*res) * n);
+    GGML_ASSERT(res != NULL);
+    for (size_t i = 0; i < n; ++i) {
+        res[i] = (struct ggml_metal_tensor_range_copy) {
+            /*.src      =*/ pairs[i].src,
+            /*.dst      =*/ pairs[i].dst,
+            /*.src_offs =*/ 0,
+            /*.dst_offs =*/ 0,
+            /*.size     =*/ ggml_nbytes(pairs[i].src),
+        };
+    }
+    return res;
+}
+
+// Replaces the installed window. Takes ownership of `ingress` and `egress`, which must already
+// be validated; copies `out_of_band`.
+static void ggml_metal_ewin_install(
+        ggml_metal_t ctx,
+        struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
+        size_t n_ingress,     struct ggml_metal_tensor_range_copy * ingress,
+        size_t n_egress,      struct ggml_metal_tensor_range_copy * egress,
+        size_t n_out_of_band, struct ggml_tensor * const * out_of_band) {
+    struct ggml_tensor ** out_of_band_copy = NULL;
+    if (n_out_of_band > 0) {
+        out_of_band_copy = malloc(sizeof(*out_of_band_copy) * n_out_of_band);
+        GGML_ASSERT(out_of_band_copy != NULL);
+        memcpy(out_of_band_copy, out_of_band, sizeof(*out_of_band_copy) * n_out_of_band);
+    }
+
+    ggml_metal_clear_encode_window(ctx);
+    ctx->ewin_active        = true;
+    ctx->ewin_first_node    = first_node;
+    ctx->ewin_last_node     = last_node;
+    ctx->ewin_n_ingress     = n_ingress;
+    ctx->ewin_ingress       = ingress;
+    ctx->ewin_n_egress      = n_egress;
+    ctx->ewin_egress        = egress;
+    ctx->ewin_n_out_of_band = n_out_of_band;
+    ctx->ewin_out_of_band   = out_of_band_copy;
+}
+
 // The banded-prefill encode window. `first_node` is the EXCLUSIVE lower
 // boundary (the band-entry residual -- its own segment is outside the
 // window) and `last_node` the INCLUSIVE upper boundary; either may be NULL
@@ -650,7 +698,8 @@ void ggml_metal_set_boundary_schedule(
 // recomputed every tile). Ordered ingress and egress copies fire only in the
 // split where their boundary node matched. Every pair must contain two tensors
 // of equal byte size because each blit copies the src's full extent onto the
-// dst's allocation. The context owns copies of the pair arrays, not the tensors.
+// dst's allocation; ggml_metal_set_encode_window_ranged is the byte-range form.
+// The context owns copies of the pair arrays, not the tensors.
 //
 // `out_of_band` closes the hole that per-split projection leaves open. Because
 // the window is resolved per split, a split holding NEITHER non-NULL endpoint
@@ -677,8 +726,8 @@ void ggml_metal_set_encode_window(
     GGML_ASSERT(n_ingress     == 0 || ingress     != NULL);
     GGML_ASSERT(n_egress      == 0 || egress      != NULL);
     GGML_ASSERT(n_out_of_band == 0 || out_of_band != NULL);
-    GGML_ASSERT(n_ingress     <= SIZE_MAX / sizeof(*ingress));
-    GGML_ASSERT(n_egress      <= SIZE_MAX / sizeof(*egress));
+    GGML_ASSERT(n_ingress     <= SIZE_MAX / sizeof(struct ggml_metal_tensor_range_copy));
+    GGML_ASSERT(n_egress      <= SIZE_MAX / sizeof(struct ggml_metal_tensor_range_copy));
     GGML_ASSERT(n_out_of_band <= SIZE_MAX / sizeof(*out_of_band));
     for (size_t i = 0; i < n_ingress; ++i) {
         GGML_ASSERT(ingress[i].src != NULL);
@@ -696,9 +745,110 @@ void ggml_metal_set_encode_window(
         GGML_ASSERT(out_of_band[i] != NULL);
     }
 
-    struct ggml_metal_tensor_copy_pair * ingress_copy     = NULL;
-    struct ggml_metal_tensor_copy_pair * egress_copy      = NULL;
-    struct ggml_tensor                ** out_of_band_copy = NULL;
+    struct ggml_metal_tensor_range_copy * ingress_copy = ggml_metal_ewin_whole_ranges(n_ingress, ingress);
+    struct ggml_metal_tensor_range_copy * egress_copy  = ggml_metal_ewin_whole_ranges(n_egress,  egress);
+
+    ggml_metal_ewin_install(ctx, first_node, last_node, n_ingress, ingress_copy, n_egress, egress_copy, n_out_of_band, out_of_band);
+}
+
+// The tensor whose allocation backs `t`, and the byte offset of `t`'s data within it. A view
+// records its root directly (ggml folds view-of-view chains at creation), so one step suffices.
+static const struct ggml_tensor * ggml_metal_ewin_storage(const struct ggml_tensor * t, size_t * offs) {
+    if (t->view_src != NULL) {
+        *offs = t->view_offs;
+        return t->view_src;
+    }
+    *offs = 0;
+    return t;
+}
+
+// Checks one byte-range copy against the rules documented on
+// ggml_backend_metal_set_encode_window_ranged. Logs and returns false on the first violation.
+static bool ggml_metal_ewin_range_is_valid(const char * list, size_t i, const struct ggml_metal_tensor_range_copy * r) {
+    if (r->src == NULL || r->dst == NULL) {
+        GGML_LOG_ERROR("%s: %s[%zu]: src and dst must be non-NULL\n", __func__, list, i);
+        return false;
+    }
+    if (r->size == 0) {
+        GGML_LOG_ERROR("%s: %s[%zu]: size must be non-zero\n", __func__, list, i);
+        return false;
+    }
+
+    const size_t src_nbytes = ggml_nbytes(r->src);
+    const size_t dst_nbytes = ggml_nbytes(r->dst);
+    // Written as two comparisons each so that offs + size cannot wrap.
+    if (r->src_offs > src_nbytes || r->size > src_nbytes - r->src_offs) {
+        GGML_LOG_ERROR("%s: %s[%zu]: source range [%zu, +%zu) exceeds '%s' (%zu bytes)\n",
+                __func__, list, i, r->src_offs, r->size, ggml_get_name(r->src), src_nbytes);
+        return false;
+    }
+    if (r->dst_offs > dst_nbytes || r->size > dst_nbytes - r->dst_offs) {
+        GGML_LOG_ERROR("%s: %s[%zu]: destination range [%zu, +%zu) exceeds '%s' (%zu bytes)\n",
+                __func__, list, i, r->dst_offs, r->size, ggml_get_name(r->dst), dst_nbytes);
+        return false;
+    }
+
+    // MTLBlitCommandEncoder copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size: requires
+    // both offsets and the size to be multiples of 4 on macOS.
+    if (r->src_offs % 4 != 0 || r->dst_offs % 4 != 0 || r->size % 4 != 0) {
+        GGML_LOG_ERROR("%s: %s[%zu]: src_offs (%zu), dst_offs (%zu) and size (%zu) must be multiples of 4\n",
+                __func__, list, i, r->src_offs, r->dst_offs, r->size);
+        return false;
+    }
+
+    // Metal leaves a copy between overlapping regions of one buffer undefined.
+    size_t src_base = 0;
+    size_t dst_base = 0;
+    const struct ggml_tensor * src_root = ggml_metal_ewin_storage(r->src, &src_base);
+    const struct ggml_tensor * dst_root = ggml_metal_ewin_storage(r->dst, &dst_base);
+    if (src_root == dst_root) {
+        const size_t s0 = src_base + r->src_offs;
+        const size_t d0 = dst_base + r->dst_offs;
+        if (s0 < d0 + r->size && d0 < s0 + r->size) {
+            GGML_LOG_ERROR("%s: %s[%zu]: source and destination ranges overlap in the storage of '%s'\n",
+                    __func__, list, i, ggml_get_name(src_root));
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool ggml_metal_set_encode_window_ranged(
+        ggml_metal_t ctx,
+        struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
+        size_t n_ingress,     const struct ggml_metal_tensor_range_copy * ingress,
+        size_t n_egress,      const struct ggml_metal_tensor_range_copy * egress,
+        size_t n_out_of_band, struct ggml_tensor * const * out_of_band) {
+    if ((n_ingress > 0 && ingress == NULL) || (n_egress > 0 && egress == NULL) || (n_out_of_band > 0 && out_of_band == NULL)) {
+        GGML_LOG_ERROR("%s: a list with a non-zero count must be non-NULL\n", __func__);
+        return false;
+    }
+    if (n_ingress     > SIZE_MAX / sizeof(*ingress) ||
+        n_egress      > SIZE_MAX / sizeof(*egress)  ||
+        n_out_of_band > SIZE_MAX / sizeof(*out_of_band)) {
+        GGML_LOG_ERROR("%s: list too long\n", __func__);
+        return false;
+    }
+    for (size_t i = 0; i < n_ingress; ++i) {
+        if (!ggml_metal_ewin_range_is_valid("ingress", i, &ingress[i])) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < n_egress; ++i) {
+        if (!ggml_metal_ewin_range_is_valid("egress", i, &egress[i])) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < n_out_of_band; ++i) {
+        if (out_of_band[i] == NULL) {
+            GGML_LOG_ERROR("%s: out_of_band[%zu] is NULL\n", __func__, i);
+            return false;
+        }
+    }
+
+    struct ggml_metal_tensor_range_copy * ingress_copy = NULL;
+    struct ggml_metal_tensor_range_copy * egress_copy  = NULL;
     if (n_ingress > 0) {
         ingress_copy = malloc(sizeof(*ingress_copy) * n_ingress);
         GGML_ASSERT(ingress_copy != NULL);
@@ -709,22 +859,10 @@ void ggml_metal_set_encode_window(
         GGML_ASSERT(egress_copy != NULL);
         memcpy(egress_copy, egress, sizeof(*egress_copy) * n_egress);
     }
-    if (n_out_of_band > 0) {
-        out_of_band_copy = malloc(sizeof(*out_of_band_copy) * n_out_of_band);
-        GGML_ASSERT(out_of_band_copy != NULL);
-        memcpy(out_of_band_copy, out_of_band, sizeof(*out_of_band_copy) * n_out_of_band);
-    }
 
-    ggml_metal_clear_encode_window(ctx);
-    ctx->ewin_active        = true;
-    ctx->ewin_first_node    = first_node;
-    ctx->ewin_last_node     = last_node;
-    ctx->ewin_n_ingress     = n_ingress;
-    ctx->ewin_ingress       = ingress_copy;
-    ctx->ewin_n_egress      = n_egress;
-    ctx->ewin_egress        = egress_copy;
-    ctx->ewin_n_out_of_band = n_out_of_band;
-    ctx->ewin_out_of_band   = out_of_band_copy;
+    ggml_metal_ewin_install(ctx, first_node, last_node, n_ingress, ingress_copy, n_egress, egress_copy, n_out_of_band, out_of_band);
+
+    return true;
 }
 
 void ggml_metal_clear_encode_window(ggml_metal_t ctx) {
@@ -742,21 +880,34 @@ void ggml_metal_clear_encode_window(ggml_metal_t ctx) {
     ctx->ewin_out_of_band   = NULL;
 }
 
-// One full-tensor blit between two resident tensors, encoded into the given
+// One byte-range blit between two resident tensors, encoded into the given
 // command buffer -- the transport for the encode window's boundary
 // activation (device-side copy, no host round trip).
-static void ggml_metal_ewin_blit(id<MTLCommandBuffer> cmd_buf, const struct ggml_tensor * src, const struct ggml_tensor * dst) {
-    struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(src);
-    struct ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(dst);
+//
+// Each copy gets its own blit encoder. Metal does not order commands within one
+// blit pass, but it does order passes that touch the same tracked resource (the
+// default for the buffers this backend allocates): a pass that reads or writes
+// bytes an earlier pass wrote waits for that write. One pass per copy is what
+// makes a list of copies run in list order.
+static void ggml_metal_ewin_blit(id<MTLCommandBuffer> cmd_buf, const struct ggml_metal_tensor_range_copy * r) {
+    struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(r->src);
+    struct ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(r->dst);
     GGML_ASSERT(bid_src.metal != nil);
     GGML_ASSERT(bid_dst.metal != nil);
 
+    const size_t src_offs = bid_src.offs + r->src_offs;
+    const size_t dst_offs = bid_dst.offs + r->dst_offs;
+
+    // Validation rejected overlap between views of one tensor; this catches two
+    // distinct tensors that resolve to overlapping bytes of one device buffer.
+    GGML_ASSERT(bid_src.metal != bid_dst.metal || src_offs + r->size <= dst_offs || dst_offs + r->size <= src_offs);
+
     id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
     [encoder copyFromBuffer:bid_src.metal
-               sourceOffset:bid_src.offs
+               sourceOffset:src_offs
                    toBuffer:bid_dst.metal
-          destinationOffset:bid_dst.offs
-                       size:ggml_nbytes(src)];
+          destinationOffset:dst_offs
+                       size:r->size];
     [encoder endEncoding];
 }
 
@@ -1045,7 +1196,7 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             // admit gate) and before the compute encoder.
             if (window_first && blit_in_here) {
                 for (size_t i = 0; i < ctx->ewin_n_ingress; ++i) {
-                    ggml_metal_ewin_blit(cmd_buf, ctx->ewin_ingress[i].src, ctx->ewin_ingress[i].dst);
+                    ggml_metal_ewin_blit(cmd_buf, &ctx->ewin_ingress[i]);
                 }
             }
 
@@ -1079,7 +1230,7 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             // blits it back in.
             if (window_last && blit_out_here) {
                 for (size_t i = 0; i < ctx->ewin_n_egress; ++i) {
-                    ggml_metal_ewin_blit(cmd_buf, ctx->ewin_egress[i].src, ctx->ewin_egress[i].dst);
+                    ggml_metal_ewin_blit(cmd_buf, &ctx->ewin_egress[i]);
                 }
             }
 

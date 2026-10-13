@@ -12,6 +12,7 @@ extern "C" {
 
 typedef struct ggml_metal * ggml_metal_t;
 struct ggml_metal_tensor_copy_pair;
+struct ggml_metal_tensor_range_copy;
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev);
 void ggml_metal_free(ggml_metal_t ctx);
@@ -48,6 +49,12 @@ void ggml_metal_set_encode_window(
         struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
         size_t n_ingress,     const struct ggml_metal_tensor_copy_pair * ingress,
         size_t n_egress,      const struct ggml_metal_tensor_copy_pair * egress,
+        size_t n_out_of_band, struct ggml_tensor * const * out_of_band);
+bool ggml_metal_set_encode_window_ranged(
+        ggml_metal_t ctx,
+        struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
+        size_t n_ingress,     const struct ggml_metal_tensor_range_copy * ingress,
+        size_t n_egress,      const struct ggml_metal_tensor_range_copy * egress,
         size_t n_out_of_band, struct ggml_tensor * const * out_of_band);
 void ggml_metal_clear_encode_window(ggml_metal_t ctx);
 
