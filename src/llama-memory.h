@@ -124,6 +124,9 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    // see llama_memory_seq_swa_placement; all zero for a memory without a sliding-window cache
+    virtual llama_memory_swa_placement swa_placement(llama_seq_id /*seq_id*/) const { return {}; }
+
     // Snapshot / restore a sequence's CELL METADATA (positions, sequence
     // membership and the slot-search cursor) without touching cell DATA.
     //

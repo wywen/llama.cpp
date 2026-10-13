@@ -4177,6 +4177,16 @@ llama_pos llama_memory_seq_pos_max(
     return mem->seq_pos_max(seq_id);
 }
 
+llama_memory_swa_placement llama_memory_seq_swa_placement(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (!mem) {
+        return {};
+    }
+
+    return mem->swa_placement(seq_id);
+}
+
 llama_memory_cells_t llama_memory_cells_snapshot(
         llama_memory_t mem,
           llama_seq_id seq_id) {

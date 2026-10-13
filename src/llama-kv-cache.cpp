@@ -81,7 +81,8 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+                   bool   place_by_position) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -360,6 +361,18 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    // position p goes to cell p % kv_size only where no other sequence can want that cell: every sequence owns
+    // its stream, and a position has one component (M-RoPE tokens of an image share theirs)
+    if (place_by_position && swa_type != LLAMA_SWA_TYPE_NONE && n_stream == n_seq_max && hparams.n_pos_per_embd() == 1) {
+        const char * LLAMA_KV_SWA_POS_PLACEMENT_DISABLE = getenv("LLAMA_KV_SWA_POS_PLACEMENT_DISABLE");
+        const bool disable = LLAMA_KV_SWA_POS_PLACEMENT_DISABLE ? atoi(LLAMA_KV_SWA_POS_PLACEMENT_DISABLE) : false;
+        if (disable) {
+            LLAMA_LOG_WARN("%s: position placement of the SWA cache disabled (LLAMA_KV_SWA_POS_PLACEMENT_DISABLE)\n", __func__);
+        }
+
+        pos_placement = !disable;
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -705,6 +718,23 @@ void llama_kv_cache::cells_restore_at(llama_seq_id seq_id, const llama_kv_cache_
     v_heads[stream] = e.head;
 }
 
+llama_memory_swa_placement llama_kv_cache::swa_placement(llama_seq_id seq_id) const {
+    if (swa_type == LLAMA_SWA_TYPE_NONE) {
+        return {};
+    }
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    llama_memory_swa_placement res = {};
+
+    res.n_cells          = get_size();
+    res.n_swa            = n_swa;
+    res.position_modular = pos_placement;
+    res.in_force         = pos_placement && pos_placement_holds(seq_to_stream[seq_id]);
+
+    return res;
+}
+
 llama_memory_cells_t llama_kv_cache::cells_snapshot(llama_seq_id seq_id) const {
     auto * res = new llama_kv_cache_cells();
     cells_snapshot_append(seq_id, *res);
@@ -940,7 +970,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     return updated;
 }
 
-llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
+llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont, bool by_position) const {
 
     if (debug > 0) {
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
@@ -1043,17 +1073,25 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
+        if (n_tokens > cells.size()) {
+            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
+            return { };
+        }
+
+        if (by_position && pos_placement && pos_placement_holds(seq_to_stream[seq_id])) {
+            if (!find_slot_by_position(ubatch, s, n_tokens, cont, res.idxs[s])) {
+                return { };
+            }
+
+            continue;
+        }
+
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
         // if we have enough unused cells before the current head ->
         //   better to start searching from the beginning of the cache, hoping to fill it
         if (head_cur > cells.get_used() + 2*n_tokens) {
             head_cur = 0;
-        }
-
-        if (n_tokens > cells.size()) {
-            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
-            return { };
         }
 
         uint32_t n_tested = 0;
@@ -1137,6 +1175,54 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     assert(res.s1 >= res.s0);
 
     return res;
+}
+
+bool llama_kv_cache::pos_placement_holds(uint32_t strm) const {
+    const auto & cells = v_cells[strm];
+
+    const llama_pos size = cells.size();
+
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) && (uint32_t) (((cells.pos_get(i) % size) + size) % size) != i) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool llama_kv_cache::find_slot_by_position(const llama_ubatch & ubatch, uint32_t s, uint32_t n_tokens, bool cont, slot_info::idx_vec_t & idxs) const {
+    const auto & cells = v_cells[seq_to_stream[ubatch.seq_id_unq[s]]];
+
+    const llama_pos size = cells.size();
+
+    // two tokens of the ubatch whose positions differ by a multiple of size would share a cell
+    std::vector<bool> taken(size, false);
+
+    for (uint32_t ii = 0; ii < n_tokens; ++ii) {
+        const llama_pos pos = ubatch.pos[s*n_tokens + ii];
+        const uint32_t  idx = ((pos % size) + size) % size;
+
+        // the cell is free, or it holds one sequence's position that the window of that sequence has left
+        // a position the window still attends to, or a cell shared by several sequences, is still needed
+        bool can_use = !taken[idx] && (!cont || ii == 0 || idx == idxs[0] + ii);
+
+        if (can_use && !cells.is_empty(idx)) {
+            can_use = cells.seq_count(idx) == 1 &&
+                llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(idx), cells.seq_pos_max(cells.seq_get(idx)) + 1);
+        }
+
+        if (!can_use) {
+            LLAMA_LOG_DEBUG("%s: position %d of sequence %d cannot take cell %u: the cell is still needed\n",
+                    __func__, pos, ubatch.seq_id_unq[s], idx);
+            return false;
+        }
+
+        taken[idx] = true;
+        idxs.push_back(idx);
+    }
+
+    return true;
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
@@ -2570,6 +2656,13 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             }
         } else {
             sinfo = find_slot(ubatch, false);
+
+            // a state saved by a cache that did not place by position can hold two positions for one cell
+            // it then restores off the placement, which swa_placement() reports
+            if (sinfo.empty() && pos_placement) {
+                sinfo = find_slot(ubatch, false, false);
+            }
+
             if (sinfo.empty()) {
                 LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache\n", __func__,  cell_count);
                 return false;

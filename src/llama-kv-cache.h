@@ -125,7 +125,9 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // a sliding-window cache asked to place position p at cell p % size (see swa_placement())
+                       bool   place_by_position = false);
 
     ~llama_kv_cache() = default;
 
@@ -154,6 +156,8 @@ public:
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
+
+    llama_memory_swa_placement swa_placement(llama_seq_id seq_id) const override;
 
     llama_memory_cells_t cells_snapshot(llama_seq_id seq_id) const override;
     void cells_restore(llama_seq_id seq_id, const llama_memory_cells_i * snap) override;
@@ -226,8 +230,11 @@ public:
 
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
+    // a stream whose cells hold every position p at cell p % size keeps that placement: each token goes to its
+    //   position's cell, and the search fails when that cell is still needed, instead of looking elsewhere
+    //   by_position == false searches for free cells in every stream
     // return empty slot_info on failure
-    slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
+    slot_info find_slot(const llama_ubatch & ubatch, bool cont, bool by_position = true) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
@@ -291,6 +298,9 @@ private:
     // SWA
     const uint32_t n_swa = 0;
 
+    // place position p at cell p % size: asked for at construction, and possible here (see swa_placement())
+    bool pos_placement = false;
+
     // env: LLAMA_ATTN_ROT_DISABLE
     bool attn_rot_k = false;
     bool attn_rot_v = false;
@@ -333,6 +343,13 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    // true if every occupied cell i of stream strm holds a position p with p % size == i
+    bool pos_placement_holds(uint32_t strm) const;
+
+    // place the n_tokens tokens of the s-th sequence of the ubatch at their positions' cells
+    // return false, leaving idxs partly filled, when one of those cells is still needed
+    bool find_slot_by_position(const llama_ubatch & ubatch, uint32_t s, uint32_t n_tokens, bool cont, slot_info::idx_vec_t & idxs) const;
 
     size_t total_size() const;
 

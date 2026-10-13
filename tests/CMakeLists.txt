@@ -257,6 +257,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-memory-plan PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    llama_build(test-swa-ring-placement.cpp)
+    llama_test(
+        test-swa-ring-placement
+        LABEL main
+        ARGS --models "${MODEL_DIR}"
+    )
+    set_tests_properties(test-swa-ring-placement PROPERTIES FIXTURES_REQUIRED generate-models)
+
     # Requires caller-supplied staged MTP models; build it without registering a CTest.
     llama_build(test-mtp-workspace.cpp)
 endif()
