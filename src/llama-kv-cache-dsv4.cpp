@@ -1570,6 +1570,10 @@ llama_pos llama_kv_cache_dsv4::seq_pos_max(llama_seq_id seq_id) const {
     return kv_raw->seq_pos_max(seq_id);
 }
 
+llama_memory_swa_placement llama_kv_cache_dsv4::swa_placement(llama_seq_id seq_id) const {
+    return kv_raw->swa_placement(seq_id);
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = kv_raw->memory_breakdown();
     for (const auto & buft_size : kv_csa->memory_breakdown()) {

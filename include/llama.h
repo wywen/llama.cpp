@@ -812,6 +812,41 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
+    // Where the sliding-window cache of a memory places a sequence's positions in its ring of cells.
+    //
+    // With position_modular, a decode writes position p of the sequence to cell p % n_cells. When that cell
+    // still holds a position the window attends to, or a ubatch needs it for two of its tokens, the decode
+    // fails (llama_decode returns 1) instead of using another cell. Removing positions (llama_memory_seq_rm)
+    // frees their cells, and the next write of a position still goes to its own cell. A caller that saves
+    // and restores a sub-range of the ring can then find any position's cell from the position alone.
+    // With a standard or chunked window, a ubatch of n_ubatch tokens that follows its sequence never needs
+    // a cell the window still needs while n_swa + n_ubatch <= n_cells + 1, which the cache size guarantees
+    // unless the context is smaller than the window.
+    //
+    // position_modular is fixed when the memory is built. It is set for the sliding-window cache of an
+    // interleaved sliding-window memory whose sequences each own a stream of cells (n_seq_max == 1, or
+    // kv_unified == false), for positions of one component. Sequences sharing one unified stream would
+    // want the same cells for the same positions, so such a cache keeps its former placement. Setting
+    // LLAMA_KV_SWA_POS_PLACEMENT_DISABLE=1 when the context is created turns it off.
+    //
+    // in_force is position_modular and, at the time of the call, every cell of the sequence's stream holds
+    // a position p at cell p % n_cells. llama_memory_seq_add and llama_memory_seq_div move positions
+    // without moving cells, and a sequence state saved by a cache that did not place by position may
+    // restore off the placement. While in_force is false the cache searches for free cells as it does
+    // without position_modular; in_force returns once every cell off the placement has been removed.
+    //
+    // All zero when the memory has no sliding-window cache.
+    struct llama_memory_swa_placement {
+        uint32_t n_cells;           // C, the cells in the ring of the sequence's stream
+        uint32_t n_swa;             // the sliding window the ring serves
+        bool     position_modular;  // the cache places position p at cell p % n_cells
+        bool     in_force;          // position_modular, and every cell of the stream is at its position's cell
+    };
+
+    LLAMA_API struct llama_memory_swa_placement llama_memory_seq_swa_placement(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
     // Snapshot / restore a sequence's CELL METADATA (positions, sequence
     // membership, slot-search cursor) without touching cell DATA.
     //
