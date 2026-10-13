@@ -333,6 +333,12 @@ if (TARGET ggml-metal AND NOT GGML_BACKEND_DL)
     target_include_directories(test-metal-graph-optimize PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
 endif()
 
+# drives the encode window through the public Metal API on a real device; skips without one
+if (TARGET ggml-metal AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-metal-encode-window.cpp)
+    target_link_libraries(test-metal-encode-window PRIVATE ggml-metal)
+endif()
+
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)
