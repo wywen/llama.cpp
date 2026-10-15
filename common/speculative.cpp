@@ -2951,6 +2951,13 @@ void common_speculative_draft(common_speculative * spec) {
     }
 
     for (auto & impl : spec->impls) {
+        // a maximum draft length of zero disables drafting for the implementation:
+        // the target context reserves outputs for at most n_max drafted tokens per
+        // sequence, and the draft loops sample a token before checking their limit
+        if (impl->n_max <= 0) {
+            continue;
+        }
+
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
