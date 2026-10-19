@@ -256,8 +256,9 @@ GGML_BACKEND_API bool     ggml_backend_metal_frame_pool_wait     (ggml_metal_fra
 
 // The driver re-prepares an allocation no command buffer referenced for a while before the next
 // command buffer that binds it can run. This commits one command buffer that references the heap
-// and every live region buffer without accessing them; calling it more often than that idle
-// threshold keeps them prepared.
+// and every region bound to the pool and runs an empty kernel (an encoder that dispatches nothing
+// does not count as a reference); calling it more often than that idle threshold keeps them
+// prepared.
 GGML_BACKEND_API void ggml_backend_metal_frame_pool_keep_prepared(ggml_metal_frame_pool_t pool);
 
 #ifdef __cplusplus

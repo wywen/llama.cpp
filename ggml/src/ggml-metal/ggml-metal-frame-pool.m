@@ -64,6 +64,9 @@ struct ggml_metal_frame_pool {
     id<MTLCommandQueue>  compute_queue; // ggml's queue, not owned
     id<MTLResidencySet>  rset;
 
+    // an empty kernel: the driver skips an encoder that dispatches nothing, references included
+    id<MTLComputePipelineState> nop;
+
     // the residency set is attached to the queues
     bool resident;
 
@@ -178,10 +181,22 @@ ggml_metal_frame_pool_t ggml_metal_frame_pool_init(ggml_metal_device_t dev, size
         if (error) {
             GGML_LOG_ERROR("%s: residency set: %s\n", __func__, [[error description] UTF8String]);
         }
+
+        error = nil;
+        id<MTLLibrary> lib = [device newLibraryWithSource:@"kernel void ggml_metal_frame_pool_nop() {}" options:nil error:&error];
+        id<MTLFunction> fn = [lib newFunctionWithName:@"ggml_metal_frame_pool_nop"];
+        if (fn != nil) {
+            pool->nop = [device newComputePipelineStateWithFunction:fn error:&error];
+        }
+        if (error) {
+            GGML_LOG_ERROR("%s: keep-prepared kernel: %s\n", __func__, [[error description] UTF8String]);
+        }
+        [fn release];
+        [lib release];
     }
 
     if (pool->heap == nil || pool->stage == nil || pool->map_queue == nil || pool->blit_queue == nil ||
-        pool->map.event == nil || pool->blit.event == nil || pool->rset == nil || pool->compute_queue == nil) {
+        pool->map.event == nil || pool->blit.event == nil || pool->rset == nil || pool->compute_queue == nil || pool->nop == nil) {
         GGML_LOG_ERROR("%s: failed to create a pool of %zu tiles (%.2f MiB) with %.2f MiB of staging\n", __func__,
                 n_slots, n_slots*pool->tile_bytes/1024.0/1024.0, stage_bytes/1024.0/1024.0);
         ggml_metal_frame_pool_free(pool);
@@ -272,6 +287,7 @@ void ggml_metal_frame_pool_free(ggml_metal_frame_pool_t pool) {
         [pool->rset commit];
     }
 
+    [pool->nop        release];
     [pool->rset       release];
     [pool->blit.event release];
     [pool->map.event  release];
@@ -781,6 +797,9 @@ void ggml_metal_frame_pool_keep_prepared(ggml_metal_frame_pool_t pool) {
                 [encoder useResources:resources count:n usage:MTLResourceUsageRead];
             }
             free(resources);
+
+            [encoder setComputePipelineState:pool->nop];
+            [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
 
             [encoder endEncoding];
 
