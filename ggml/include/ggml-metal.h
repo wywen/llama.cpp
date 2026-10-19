@@ -279,6 +279,15 @@ GGML_BACKEND_API uint64_t ggml_backend_metal_blit_fill(ggml_metal_blit_queue_t q
         ggml_backend_buffer_t dst, size_t offs, size_t size, uint8_t byte,
         const struct ggml_metal_wait * waits, size_t n_waits);
 
+// The driver re-prepares an allocation no command buffer referenced for a while before the next
+// command buffer that binds it can run, at a cost that grows with its size. This commits one
+// command buffer, on a queue of the heap's own, that references the heap and `buffers` and runs an
+// empty one-thread kernel: an encoder that dispatches nothing does not count as a reference.
+// Calling it more often than the driver's idle threshold keeps them prepared. It does not wait for
+// the command buffer; a queue holds at most 64 uncompleted command buffers, so a caller that outruns
+// the device blocks in the next call.
+GGML_BACKEND_API bool ggml_backend_metal_keep_prepared(ggml_metal_placement_heap_t heap, ggml_backend_buffer_t const * buffers, size_t n_buffers);
+
 #ifdef __cplusplus
 }
 #endif

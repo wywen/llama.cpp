@@ -10,6 +10,7 @@
 #include "ggml-metal-tuning.h"
 
 #include <mutex>
+#include <vector>
 #include <string>
 
 #define GGML_METAL_NAME "MTL"
@@ -1217,6 +1218,21 @@ uint64_t ggml_backend_metal_blit_fill(ggml_metal_blit_queue_t queue,
         return 0;
     }
     return ggml_metal_blit_fill(queue, to, offs, size, byte, waits, n_waits);
+}
+
+bool ggml_backend_metal_keep_prepared(ggml_metal_placement_heap_t heap, ggml_backend_buffer_t const * buffers, size_t n_buffers) {
+    if (heap == NULL) {
+        return false;
+    }
+
+    std::vector<ggml_metal_buffer_t> bufs(n_buffers);
+    for (size_t i = 0; i < n_buffers; ++i) {
+        bufs[i] = ggml_backend_metal_buffer_of(buffers[i]);
+        if (bufs[i] == NULL) {
+            return false;
+        }
+    }
+    return ggml_metal_keep_prepared(heap, bufs.data(), bufs.size());
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_metal_reg)

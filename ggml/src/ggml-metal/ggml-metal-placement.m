@@ -62,6 +62,11 @@ struct ggml_metal_placement_heap {
     id<MTLCommandQueue> compute_queue; // ggml's queue, not owned
 
     size_t n_tiles;
+
+    // keep-prepared: an empty kernel on a queue of its own, so that it never waits behind a blit or a
+    // compute command buffer parked on an event
+    id<MTLCommandQueue>         keep_queue;
+    id<MTLComputePipelineState> nop;
 };
 
 ggml_metal_placement_heap_t ggml_metal_placement_heap_init(ggml_metal_device_t dev, size_t n_tiles) {
@@ -104,11 +109,30 @@ ggml_metal_placement_heap_t ggml_metal_placement_heap_init(ggml_metal_device_t d
             GGML_LOG_ERROR("%s: residency set: %s\n", __func__, [[error description] UTF8String]);
         }
 
+        res->keep_queue = [device newCommandQueue];
+
+        error = nil;
+        id<MTLLibrary> lib = [device newLibraryWithSource:@"kernel void ggml_metal_placement_nop() {}" options:nil error:&error];
+        id<MTLFunction> fn = [lib newFunctionWithName:@"ggml_metal_placement_nop"];
+        if (error != nil && lib != nil) {
+            GGML_LOG_WARN("%s: keep-prepared kernel: %s\n", __func__, [[error description] UTF8String]);
+            error = nil;
+        }
+        if (fn != nil) {
+            res->nop = [device newComputePipelineStateWithFunction:fn error:&error];
+        }
+        if (error != nil) {
+            GGML_LOG_ERROR("%s: keep-prepared kernel: %s\n", __func__, [[error description] UTF8String]);
+        }
+        [fn release];
+        [lib release];
     }
 
-    if (res->heap == nil || res->rset == nil || res->compute_queue == nil) {
+    if (res->heap == nil || res->rset == nil || res->compute_queue == nil || res->keep_queue == nil || res->nop == nil) {
         GGML_LOG_ERROR("%s: failed to create a heap of %zu tiles (%.2f MiB)\n", __func__,
                 n_tiles, n_tiles*GGML_METAL_PLACEMENT_TILE_BYTES/1024.0/1024.0);
+        [res->nop        release];
+        [res->keep_queue release];
         [res->rset       release];
         [res->heap       release];
         free(res);
@@ -120,6 +144,7 @@ ggml_metal_placement_heap_t ggml_metal_placement_heap_init(ggml_metal_device_t d
     [res->rset requestResidency];
 
     [res->compute_queue addResidencySet:res->rset];
+    [res->keep_queue    addResidencySet:res->rset];
 
     return res;
 }
@@ -129,11 +154,14 @@ void ggml_metal_placement_heap_free(ggml_metal_placement_heap_t heap) {
         return;
     }
 
+    [heap->keep_queue    removeResidencySet:heap->rset];
     [heap->compute_queue removeResidencySet:heap->rset];
     [heap->rset endResidency];
     [heap->rset removeAllAllocations];
     [heap->rset commit];
 
+    [heap->nop        release];
+    [heap->keep_queue release];
     [heap->rset       release];
     [heap->heap       release];
 
@@ -541,3 +569,52 @@ uint64_t ggml_metal_blit_fill(ggml_metal_blit_queue_t queue, ggml_metal_buffer_t
     });
 }
 
+//
+// keep-prepared
+//
+
+#if defined(GGML_METAL_HAS_PLACEMENT_SPARSE)
+
+bool ggml_metal_keep_prepared(ggml_metal_placement_heap_t heap, ggml_metal_buffer_t const * bufs, size_t n_bufs) {
+    size_t n_objs = 0;
+    for (size_t i = 0; i < n_bufs; ++i) {
+        n_objs += (size_t) ggml_metal_buffer_get_n_objs(bufs[i]);
+    }
+
+    id<MTLResource> * objs = malloc((n_objs > 0 ? n_objs : 1)*sizeof(id<MTLResource>));
+    size_t k = 0;
+    for (size_t i = 0; i < n_bufs; ++i) {
+        for (int j = 0; j < ggml_metal_buffer_get_n_objs(bufs[i]); ++j) {
+            objs[k++] = (id<MTLResource>) ggml_metal_buffer_get_obj(bufs[i], j);
+        }
+    }
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd_buf = [heap->keep_queue commandBuffer];
+
+        id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
+
+        [encoder useHeap:heap->heap];
+        if (n_objs > 0) {
+            [encoder useResources:objs count:n_objs usage:MTLResourceUsageRead];
+        }
+        [encoder setComputePipelineState:heap->nop];
+        [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder endEncoding];
+
+        [cmd_buf commit];
+    }
+
+    free(objs);
+
+    return true;
+}
+
+#else
+
+bool ggml_metal_keep_prepared(ggml_metal_placement_heap_t heap, ggml_metal_buffer_t const * bufs, size_t n_bufs) {
+    GGML_UNUSED(heap); GGML_UNUSED(bufs); GGML_UNUSED(n_bufs);
+    return false;
+}
+
+#endif

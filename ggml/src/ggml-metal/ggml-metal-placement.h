@@ -34,6 +34,8 @@ uint64_t ggml_metal_blit_copy(ggml_metal_blit_queue_t queue, ggml_metal_buffer_t
 uint64_t ggml_metal_blit_fill(ggml_metal_blit_queue_t queue, ggml_metal_buffer_t dst, size_t offs, size_t size, uint8_t byte,
         const struct ggml_metal_wait * waits, size_t n_waits);
 
+bool ggml_metal_keep_prepared(ggml_metal_placement_heap_t heap, ggml_metal_buffer_t const * bufs, size_t n_bufs);
+
 #ifdef __cplusplus
 }
 #endif

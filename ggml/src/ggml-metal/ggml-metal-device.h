@@ -348,6 +348,10 @@ bool   ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf);
 // the placement sparse Metal buffer behind buf (id<MTLBuffer>), or NULL
 void * ggml_metal_buffer_get_sparse(ggml_metal_buffer_t buf);
 
+// the Metal buffers behind buf (id<MTLBuffer>)
+int    ggml_metal_buffer_get_n_objs(ggml_metal_buffer_t buf);
+void * ggml_metal_buffer_get_obj   (ggml_metal_buffer_t buf, int i);
+
 // the Metal buffer that holds bytes [offs, offs + size) of buf and the offset of the range in it;
 // metal is nil when no single Metal buffer holds the range
 struct ggml_metal_buffer_id ggml_metal_buffer_get_range(ggml_metal_buffer_t buf, size_t offs, size_t size);

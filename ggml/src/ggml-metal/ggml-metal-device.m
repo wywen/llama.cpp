@@ -2267,6 +2267,14 @@ void * ggml_metal_buffer_get_sparse(ggml_metal_buffer_t buf) {
     return buf->is_sparse ? buf->buffers[0].metal : NULL;
 }
 
+int ggml_metal_buffer_get_n_objs(ggml_metal_buffer_t buf) {
+    return buf->n_buffers;
+}
+
+void * ggml_metal_buffer_get_obj(ggml_metal_buffer_t buf, int i) {
+    return buf->buffers[i].metal;
+}
+
 struct ggml_metal_buffer_id ggml_metal_buffer_get_range(ggml_metal_buffer_t buf, size_t offs, size_t size) {
     struct ggml_metal_buffer_id res = { nil, 0 };
 
