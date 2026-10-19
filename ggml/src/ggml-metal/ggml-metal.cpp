@@ -5,6 +5,7 @@
 
 #include "ggml-metal-device.h"
 #include "ggml-metal-context.h"
+#include "ggml-metal-frame-pool.h"
 #include "ggml-metal-ops.h"
 #include "ggml-metal-tuning.h"
 
@@ -1093,6 +1094,96 @@ ggml_backend_reg_t ggml_backend_metal_reg(void) {
     }
 
     return &reg;
+}
+
+//
+// frame pool
+//
+
+ggml_metal_frame_pool_t ggml_backend_metal_frame_pool_init(ggml_backend_t backend, size_t n_slots, size_t stage_bytes) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    return ggml_metal_frame_pool_init((ggml_metal_device_t) backend->device->context, n_slots, stage_bytes);
+}
+
+void ggml_backend_metal_frame_pool_free(ggml_metal_frame_pool_t pool) {
+    ggml_metal_frame_pool_free(pool);
+}
+
+size_t ggml_backend_metal_frame_pool_tile_bytes(ggml_metal_frame_pool_t pool) {
+    return ggml_metal_frame_pool_get_tile_bytes(pool);
+}
+
+void * ggml_backend_metal_frame_pool_stage(ggml_metal_frame_pool_t pool) {
+    return ggml_metal_frame_pool_get_stage(pool);
+}
+
+ggml_backend_buffer_t ggml_backend_metal_frame_region_new(ggml_backend_dev_t dev, void * va_base, size_t size) {
+    GGML_ASSERT(dev != NULL && dev->reg == ggml_backend_metal_reg());
+
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t) dev->context;
+
+    ggml_metal_buffer_t res = ggml_metal_frame_region_init(ctx_dev, va_base, size);
+    if (res == NULL) {
+        return NULL;
+    }
+
+    const int device = ggml_metal_device_get_props(ctx_dev)->device;
+
+    return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_private(device), ggml_backend_metal_buffer_private_i, res, ggml_metal_buffer_get_size(res));
+}
+
+// the frame region behind a buffer, or NULL when the buffer is not a region
+static ggml_metal_frame_region * ggml_backend_metal_frame_region_of(ggml_backend_buffer_t buffer) {
+    ggml_metal_frame_region * region = NULL;
+
+    if (buffer != NULL && ggml_backend_buffer_is_metal(buffer)) {
+        region = ggml_metal_buffer_get_region((ggml_metal_buffer_t) buffer->context);
+    }
+
+    if (region == NULL) {
+        GGML_LOG_ERROR("%s: the buffer is not a frame region\n", __func__);
+    }
+
+    return region;
+}
+
+uint64_t ggml_backend_metal_frame_pool_map(ggml_metal_frame_pool_t pool, ggml_backend_buffer_t region, const ggml_metal_tile_run * runs, size_t n_runs) {
+    ggml_metal_frame_region * r = ggml_backend_metal_frame_region_of(region);
+    return r ? ggml_metal_frame_pool_map(pool, r, runs, n_runs) : 0;
+}
+
+uint64_t ggml_backend_metal_frame_pool_unmap(ggml_metal_frame_pool_t pool, ggml_backend_buffer_t region, const ggml_metal_tile_run * runs, size_t n_runs) {
+    ggml_metal_frame_region * r = ggml_backend_metal_frame_region_of(region);
+    return r ? ggml_metal_frame_pool_unmap(pool, r, runs, n_runs) : 0;
+}
+
+uint64_t ggml_backend_metal_frame_pool_fill(ggml_metal_frame_pool_t pool, ggml_backend_buffer_t region, size_t offs, size_t stage_offs, size_t size, uint64_t after_map) {
+    ggml_metal_frame_region * r = ggml_backend_metal_frame_region_of(region);
+    return r ? ggml_metal_frame_pool_fill(pool, r, offs, stage_offs, size, after_map) : 0;
+}
+
+uint64_t ggml_backend_metal_frame_pool_clear(ggml_metal_frame_pool_t pool, ggml_backend_buffer_t region, size_t offs, size_t size, uint8_t value, uint64_t after_map) {
+    ggml_metal_frame_region * r = ggml_backend_metal_frame_region_of(region);
+    return r ? ggml_metal_frame_pool_clear(pool, r, offs, size, value, after_map) : 0;
+}
+
+uint64_t ggml_backend_metal_frame_pool_spill(ggml_metal_frame_pool_t pool, ggml_backend_buffer_t region, size_t offs, size_t stage_offs, size_t size, uint64_t after_map,
+        ggml_metal_event_t wait_ev, uint64_t wait_value) {
+    ggml_metal_frame_region * r = ggml_backend_metal_frame_region_of(region);
+    return r ? ggml_metal_frame_pool_spill(pool, r, offs, stage_offs, size, after_map, wait_ev, wait_value) : 0;
+}
+
+uint64_t ggml_backend_metal_frame_pool_completed(ggml_metal_frame_pool_t pool, ggml_metal_frame_pool_queue q) {
+    return ggml_metal_frame_pool_completed(pool, q);
+}
+
+bool ggml_backend_metal_frame_pool_wait(ggml_metal_frame_pool_t pool, ggml_metal_frame_pool_queue q, uint64_t value, uint64_t timeout_ms) {
+    return ggml_metal_frame_pool_wait(pool, q, value, timeout_ms);
+}
+
+void ggml_backend_metal_frame_pool_keep_prepared(ggml_metal_frame_pool_t pool) {
+    ggml_metal_frame_pool_keep_prepared(pool);
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_metal_reg)

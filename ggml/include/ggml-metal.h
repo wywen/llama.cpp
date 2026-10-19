@@ -177,6 +177,89 @@ GGML_BACKEND_API void ggml_backend_metal_clear_encode_window(ggml_backend_t back
 // reorder freely within a segment. Off, the reorder is byte-for-byte what it always was.
 GGML_BACKEND_API void ggml_backend_metal_set_reorder_barriers(ggml_backend_t backend, bool enable);
 
+//
+// frame pool
+//
+// A fixed pool of device memory that region buffers borrow tiles from. The pool is one placement
+// heap of n_slots tiles; a region buffer is a placement sparse buffer with a fixed address range
+// whose tiles are mapped to pool slots and unmapped again, so tensors in a region never move while
+// the memory behind them does. A tile is one 16 KiB sparse page.
+//
+// Work runs on two device timelines, each with values assigned by a host counter in submission
+// order: the mapping queue applies map and unmap operations, and the blit queue copies bytes
+// between a host-visible staging buffer and region tiles. A timeline call returns the value that
+// signals once its work completed, or 0 when it was refused or the pool is in its error state.
+//
+// The pool checks the queued state of every tile and slot: a map needs an unmapped tile and a free
+// slot, an unmap needs a mapped tile, and a blit needs every tile it touches mapped by a map whose
+// value it waits for. A refused call logs the reason and queues nothing.
+//
+// A device error (a failed blit command buffer) puts the pool into a sticky error state: the
+// error is logged, waits return false, the failed value never reports complete, and every later
+// timeline call returns 0.
+//
+// Region buffers are GPU-private: host access goes through staging (fill and spill) or through
+// ggml_backend_tensor_get/set, which blit through a temporary buffer.
+//
+// A region does not belong to a pool: it binds to the first pool that maps one of its tiles and stays
+// bound until the region or the pool is freed. Freeing a pool unmaps the tiles of every region bound
+// to it. A region and the pool it is bound to must not be freed concurrently.
+//
+// Submissions on each queue are serialized internally, so map and unmap, blits, and teardown may run
+// on different threads; timeline values follow submission order.
+
+typedef struct ggml_metal_frame_pool * ggml_metal_frame_pool_t;
+
+// NULL when the device lacks placement sparse support or allocation fails.
+GGML_BACKEND_API ggml_metal_frame_pool_t ggml_backend_metal_frame_pool_init(ggml_backend_t backend, size_t n_slots, size_t stage_bytes);
+GGML_BACKEND_API void   ggml_backend_metal_frame_pool_free     (ggml_metal_frame_pool_t pool);
+GGML_BACKEND_API size_t ggml_backend_metal_frame_pool_tile_bytes(ggml_metal_frame_pool_t pool);
+GGML_BACKEND_API void * ggml_backend_metal_frame_pool_stage     (ggml_metal_frame_pool_t pool);
+
+// A buffer of the Metal backend's private kind holding `size` bytes rounded up to tiles, at the
+// caller's address range from va_base: tensors in it get addresses in that range, which the caller
+// reserves (and keeps reserved) for at least the rounded size so no other allocation can alias it.
+// va_base is aligned to a tile. The buffer owns no memory and every tile starts unmapped. NULL when
+// the device lacks placement sparse support.
+GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_metal_frame_region_new(ggml_backend_dev_t dev, void * va_base, size_t size);
+
+// n_tiles consecutive tiles of a region from `tile`, bound to consecutive pool slots from `slot`.
+struct ggml_metal_tile_run {
+    uint32_t tile;
+    uint32_t slot;
+    uint32_t n_tiles;
+};
+
+// All runs go to the mapping queue in one batch and apply in submission order. Unmap ignores `slot`.
+GGML_BACKEND_API uint64_t ggml_backend_metal_frame_pool_map  (ggml_metal_frame_pool_t pool, ggml_backend_buffer_t region, const struct ggml_metal_tile_run * runs, size_t n_runs);
+GGML_BACKEND_API uint64_t ggml_backend_metal_frame_pool_unmap(ggml_metal_frame_pool_t pool, ggml_backend_buffer_t region, const struct ggml_metal_tile_run * runs, size_t n_runs);
+
+// Blits on the blit queue, in submission order, each after mapping value `after_map` (0: none).
+// offs, stage_offs and size are multiples of 4 bytes.
+//   fill:  staging[stage_offs, +size) -> region[offs, +size)
+//   clear: region[offs, +size) = value
+//   spill: region[offs, +size) -> staging[stage_offs, +size), also after wait_ev reaches wait_value
+//          when wait_ev is not NULL (a read-done event of the compute queue, say)
+GGML_BACKEND_API uint64_t ggml_backend_metal_frame_pool_fill (ggml_metal_frame_pool_t pool, ggml_backend_buffer_t region, size_t offs, size_t stage_offs, size_t size, uint64_t after_map);
+GGML_BACKEND_API uint64_t ggml_backend_metal_frame_pool_clear(ggml_metal_frame_pool_t pool, ggml_backend_buffer_t region, size_t offs, size_t size, uint8_t value, uint64_t after_map);
+GGML_BACKEND_API uint64_t ggml_backend_metal_frame_pool_spill(ggml_metal_frame_pool_t pool, ggml_backend_buffer_t region, size_t offs, size_t stage_offs, size_t size, uint64_t after_map,
+        ggml_metal_event_t wait_ev, uint64_t wait_value);
+
+enum ggml_metal_frame_pool_queue {
+    GGML_METAL_FRAME_POOL_MAP,
+    GGML_METAL_FRAME_POOL_BLIT,
+};
+
+GGML_BACKEND_API uint64_t ggml_backend_metal_frame_pool_completed(ggml_metal_frame_pool_t pool, enum ggml_metal_frame_pool_queue q);
+// False on timeout or once the pool is in its error state.
+GGML_BACKEND_API bool     ggml_backend_metal_frame_pool_wait     (ggml_metal_frame_pool_t pool, enum ggml_metal_frame_pool_queue q, uint64_t value, uint64_t timeout_ms);
+
+// The driver re-prepares an allocation no command buffer referenced for a while before the next
+// command buffer that binds it can run. This commits one command buffer that references the heap
+// and every live region buffer without accessing them; calling it more often than that idle
+// threshold keeps them prepared.
+GGML_BACKEND_API void ggml_backend_metal_frame_pool_keep_prepared(ggml_metal_frame_pool_t pool);
+
 #ifdef __cplusplus
 }
 #endif
