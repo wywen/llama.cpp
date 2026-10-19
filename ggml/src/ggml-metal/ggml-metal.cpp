@@ -1116,6 +1116,15 @@ bool ggml_backend_metal_placement_supported(ggml_backend_t backend) {
     return ggml_metal_placement_is_supported((ggml_metal_device_t) backend->device->context);
 }
 
+// the Metal buffer behind a backend buffer, or NULL when it is not a Metal buffer
+static ggml_metal_buffer_t ggml_backend_metal_buffer_of(ggml_backend_buffer_t buffer) {
+    if (buffer == NULL || !ggml_backend_buffer_is_metal(buffer)) {
+        GGML_LOG_ERROR("%s: not a Metal buffer\n", __func__);
+        return NULL;
+    }
+    return (ggml_metal_buffer_t) buffer->context;
+}
+
 ggml_metal_placement_heap_t ggml_backend_metal_placement_heap_new(ggml_backend_t backend, size_t n_tiles) {
     ggml_metal_device_t dev = ggml_backend_metal_device_of(backend);
     return dev != NULL ? ggml_metal_placement_heap_init(dev, n_tiles) : NULL;
@@ -1143,6 +1152,71 @@ ggml_backend_buffer_t ggml_backend_metal_sparse_buffer_new(ggml_backend_t backen
     const int device = ggml_metal_device_get_props(dev)->device;
 
     return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_private(device), ggml_backend_metal_buffer_private_i, res, ggml_metal_buffer_get_size(res));
+}
+
+ggml_metal_mapping_queue_t ggml_backend_metal_mapping_queue_new(ggml_backend_t backend) {
+    ggml_metal_device_t dev = ggml_backend_metal_device_of(backend);
+    return dev != NULL ? ggml_metal_mapping_queue_init(dev) : NULL;
+}
+
+void ggml_backend_metal_mapping_queue_free(ggml_metal_mapping_queue_t queue) {
+    ggml_metal_mapping_queue_free(queue);
+}
+
+bool ggml_backend_metal_map_tiles(ggml_metal_mapping_queue_t queue, ggml_metal_placement_heap_t heap, ggml_backend_buffer_t buffer,
+        const ggml_metal_tile_run * runs, size_t n_runs, ggml_metal_event_t signal, uint64_t value) {
+    ggml_metal_buffer_t buf = ggml_backend_metal_buffer_of(buffer);
+    if (buf == NULL || heap == NULL) {
+        return false;
+    }
+    return ggml_metal_update_tiles(queue, heap, buf, runs, n_runs, signal, value);
+}
+
+bool ggml_backend_metal_unmap_tiles(ggml_metal_mapping_queue_t queue, ggml_backend_buffer_t buffer,
+        const ggml_metal_tile_run * runs, size_t n_runs, ggml_metal_event_t signal, uint64_t value) {
+    ggml_metal_buffer_t buf = ggml_backend_metal_buffer_of(buffer);
+    if (buf == NULL) {
+        return false;
+    }
+    return ggml_metal_update_tiles(queue, NULL, buf, runs, n_runs, signal, value);
+}
+
+ggml_metal_blit_queue_t ggml_backend_metal_blit_queue_new(ggml_backend_t backend, ggml_metal_placement_heap_t heap) {
+    ggml_metal_device_t dev = ggml_backend_metal_device_of(backend);
+    return dev != NULL ? ggml_metal_blit_queue_init(dev, heap) : NULL;
+}
+
+void ggml_backend_metal_blit_queue_free(ggml_metal_blit_queue_t queue) {
+    ggml_metal_blit_queue_free(queue);
+}
+
+const char * ggml_backend_metal_blit_queue_error(ggml_metal_blit_queue_t queue) {
+    return ggml_metal_blit_queue_error(queue);
+}
+
+ggml_metal_event_t ggml_backend_metal_blit_queue_event(ggml_metal_blit_queue_t queue) {
+    return ggml_metal_blit_queue_event(queue);
+}
+
+uint64_t ggml_backend_metal_blit_copy(ggml_metal_blit_queue_t queue,
+        ggml_backend_buffer_t src, size_t src_offs, ggml_backend_buffer_t dst, size_t dst_offs, size_t size,
+        const ggml_metal_wait * waits, size_t n_waits) {
+    ggml_metal_buffer_t from = ggml_backend_metal_buffer_of(src);
+    ggml_metal_buffer_t to   = ggml_backend_metal_buffer_of(dst);
+    if (from == NULL || to == NULL) {
+        return 0;
+    }
+    return ggml_metal_blit_copy(queue, from, src_offs, to, dst_offs, size, waits, n_waits);
+}
+
+uint64_t ggml_backend_metal_blit_fill(ggml_metal_blit_queue_t queue,
+        ggml_backend_buffer_t dst, size_t offs, size_t size, uint8_t byte,
+        const ggml_metal_wait * waits, size_t n_waits) {
+    ggml_metal_buffer_t to = ggml_backend_metal_buffer_of(dst);
+    if (to == NULL) {
+        return 0;
+    }
+    return ggml_metal_blit_fill(queue, to, offs, size, byte, waits, n_waits);
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_metal_reg)

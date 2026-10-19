@@ -1414,6 +1414,10 @@ uint64_t ggml_metal_event_host_value(ggml_metal_event_t ev) {
     return event.signaledValue;
 }
 
+void * ggml_metal_event_get_obj(ggml_metal_event_t ev) {
+    return ev->obj;
+}
+
 ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev) {
     id<MTLSharedEvent> event = [dev->mtl_device newSharedEvent];
 
@@ -2261,6 +2265,27 @@ size_t ggml_metal_buffer_get_size(ggml_metal_buffer_t buf) {
 
 void * ggml_metal_buffer_get_sparse(ggml_metal_buffer_t buf) {
     return buf->is_sparse ? buf->buffers[0].metal : NULL;
+}
+
+struct ggml_metal_buffer_id ggml_metal_buffer_get_range(ggml_metal_buffer_t buf, size_t offs, size_t size) {
+    struct ggml_metal_buffer_id res = { nil, 0 };
+
+    if (offs > buf->all_size || size > buf->all_size - offs) {
+        return res;
+    }
+
+    const char * begin = (const char *) buf->all_data + offs;
+
+    for (int i = 0; i < buf->n_buffers; ++i) {
+        const char * data = (const char *) buf->buffers[i].data;
+        if (begin >= data && (size_t) (begin - data) + size <= buf->buffers[i].size) {
+            res.metal = buf->buffers[i].metal;
+            res.offs  = (size_t) (begin - data);
+            return res;
+        }
+    }
+
+    return res;
 }
 
 void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {

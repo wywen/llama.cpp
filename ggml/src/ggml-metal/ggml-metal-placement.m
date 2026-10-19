@@ -6,6 +6,7 @@
 
 #include <Metal/Metal.h>
 
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,7 +20,7 @@
 
 #if defined(GGML_METAL_HAS_PLACEMENT_SPARSE)
 
-// every heap and sparse buffer is created behind an availability check, so nothing
+// every heap, sparse buffer and mapping queue is created behind an availability check, so nothing
 // below runs on an older OS
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunguarded-availability-new"
@@ -183,9 +184,106 @@ ggml_metal_buffer_t ggml_metal_sparse_buffer_init(ggml_metal_device_t dev, void 
     return ggml_metal_buffer_init_sparse(dev, metal, va_base, bytes);
 }
 
+//
+// mapping
+//
+
+struct ggml_metal_mapping_queue {
+    id<MTL4CommandQueue> queue;
+};
+
+ggml_metal_mapping_queue_t ggml_metal_mapping_queue_init(ggml_metal_device_t dev) {
+    id<MTLDevice> device = (id<MTLDevice>) ggml_metal_device_get_obj(dev);
+
+    if (!ggml_metal_placement_supported(device, __func__)) {
+        return NULL;
+    }
+
+    id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
+    if (queue == nil) {
+        GGML_LOG_ERROR("%s: failed to create a Metal 4 command queue\n", __func__);
+        return NULL;
+    }
+
+    ggml_metal_mapping_queue_t res = calloc(1, sizeof(struct ggml_metal_mapping_queue));
+    res->queue = queue;
+
+    return res;
+}
+
+void ggml_metal_mapping_queue_free(ggml_metal_mapping_queue_t queue) {
+    if (queue == NULL) {
+        return;
+    }
+
+    [queue->queue release];
+    free(queue);
+}
+
+static bool ggml_metal_tile_runs_valid(const struct ggml_metal_tile_run * runs, size_t n_runs, size_t buf_tiles, size_t heap_tiles) {
+    if (n_runs == 0 || runs == NULL) {
+        GGML_LOG_ERROR("%s: no runs\n", __func__);
+        return false;
+    }
+    for (size_t r = 0; r < n_runs; ++r) {
+        const struct ggml_metal_tile_run * run = &runs[r];
+        if (run->n_tiles == 0 || (size_t) run->tile + run->n_tiles > buf_tiles) {
+            GGML_LOG_ERROR("%s: tiles [%u, +%u) outside a buffer of %zu tiles\n", __func__, run->tile, run->n_tiles, buf_tiles);
+            return false;
+        }
+        if (heap_tiles > 0 && (size_t) run->heap_tile + run->n_tiles > heap_tiles) {
+            GGML_LOG_ERROR("%s: heap tiles [%u, +%u) outside a heap of %zu tiles\n", __func__, run->heap_tile, run->n_tiles, heap_tiles);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ggml_metal_update_tiles(ggml_metal_mapping_queue_t queue, ggml_metal_placement_heap_t heap, ggml_metal_buffer_t buf,
+        const struct ggml_metal_tile_run * runs, size_t n_runs, ggml_metal_event_t signal, uint64_t value) {
+    id<MTLBuffer> sparse = (id<MTLBuffer>) ggml_metal_buffer_get_sparse(buf);
+    if (sparse == nil) {
+        GGML_LOG_ERROR("%s: the buffer is not a sparse buffer\n", __func__);
+        return false;
+    }
+
+    const bool   map        = heap != NULL;
+    const size_t buf_tiles  = ggml_metal_buffer_get_size(buf)/GGML_METAL_PLACEMENT_TILE_BYTES;
+    const size_t heap_tiles = map ? heap->n_tiles : 0;
+
+    if (!ggml_metal_tile_runs_valid(runs, n_runs, buf_tiles, heap_tiles)) {
+        return false;
+    }
+
+    @autoreleasepool {
+        MTL4UpdateSparseBufferMappingOperation * ops = malloc(n_runs*sizeof(MTL4UpdateSparseBufferMappingOperation));
+        for (size_t r = 0; r < n_runs; ++r) {
+            ops[r] = (MTL4UpdateSparseBufferMappingOperation) {
+                .mode        = map ? MTLSparseTextureMappingModeMap : MTLSparseTextureMappingModeUnmap,
+                .bufferRange = NSMakeRange(runs[r].tile, runs[r].n_tiles),
+                .heapOffset  = map ? runs[r].heap_tile : 0,
+            };
+        }
+
+        [queue->queue updateBufferMappings:sparse heap:(map ? heap->heap : nil) operations:ops count:n_runs];
+        if (signal != NULL) {
+            [queue->queue signalEvent:(id<MTLSharedEvent>) ggml_metal_event_get_obj(signal) value:value];
+        }
+
+        free(ops);
+    }
+
+    return true;
+}
+
 #pragma clang diagnostic pop
 
 #else
+
+bool ggml_metal_placement_is_supported(ggml_metal_device_t dev) {
+    GGML_UNUSED(dev);
+    return false;
+}
 
 size_t ggml_metal_placement_tile_bytes(void) {
     return GGML_METAL_PLACEMENT_TILE_BYTES;
@@ -206,9 +304,240 @@ ggml_metal_buffer_t ggml_metal_sparse_buffer_init(ggml_metal_device_t dev, void 
     return NULL;
 }
 
-// without the SDK no heap exists, so nothing below is reachable
+ggml_metal_mapping_queue_t ggml_metal_mapping_queue_init(ggml_metal_device_t dev) {
+    GGML_LOG_ERROR("%s: placement sparse buffers need the macOS 26.4 SDK\n", __func__);
+    GGML_UNUSED(dev);
+    return NULL;
+}
+
+// without the SDK no heap, sparse buffer or mapping queue exists, so nothing below is reachable
 
 void ggml_metal_placement_heap_free(ggml_metal_placement_heap_t heap) { GGML_UNUSED(heap); }
+void ggml_metal_mapping_queue_free (ggml_metal_mapping_queue_t queue) { GGML_UNUSED(queue); }
+
+bool ggml_metal_update_tiles(ggml_metal_mapping_queue_t queue, ggml_metal_placement_heap_t heap, ggml_metal_buffer_t buf,
+        const struct ggml_metal_tile_run * runs, size_t n_runs, ggml_metal_event_t signal, uint64_t value) {
+    GGML_UNUSED(queue); GGML_UNUSED(heap); GGML_UNUSED(buf); GGML_UNUSED(runs); GGML_UNUSED(n_runs); GGML_UNUSED(signal); GGML_UNUSED(value);
+    return false;
+}
 
 #endif
+
+//
+// blits
+//
+
+// what a queue's completion handlers share with it; whichever of them and the queue lets go last frees it
+struct ggml_metal_blit_state {
+    _Atomic int refs;
+
+    // the first failed command buffer's error, owned
+    _Atomic(char *) error;
+};
+
+static void ggml_metal_blit_state_release(struct ggml_metal_blit_state * state) {
+    if (atomic_fetch_sub(&state->refs, 1) == 1) {
+        free(atomic_load(&state->error));
+        free(state);
+    }
+}
+
+struct ggml_metal_blit_queue {
+    ggml_metal_device_t dev;
+
+    id<MTLCommandQueue> queue;
+
+    // the queue's timeline: blit value v signals it to v
+    ggml_metal_event_t ev;
+    id<MTLSharedEvent> event;
+
+    // the residency set of the heap whose tiles the blits touch, or nil
+    id<MTLResidencySet> rset;
+
+    // the last value handed out; the lock is held from assigning a value until its blit is committed,
+    // so commit order is value order
+    uint64_t        issued;
+    pthread_mutex_t lock;
+
+    struct ggml_metal_blit_state * state;
+};
+
+ggml_metal_blit_queue_t ggml_metal_blit_queue_init(ggml_metal_device_t dev, ggml_metal_placement_heap_t heap) {
+    id<MTLDevice> device = (id<MTLDevice>) ggml_metal_device_get_obj(dev);
+
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    ggml_metal_event_t ev = ggml_metal_device_event_init(dev);
+    if (queue == nil || ev == NULL) {
+        GGML_LOG_ERROR("%s: failed to create a command queue and its event\n", __func__);
+        [queue release];
+        if (ev != NULL) {
+            ggml_metal_device_event_free(dev, ev);
+        }
+        return NULL;
+    }
+
+    ggml_metal_blit_queue_t res = calloc(1, sizeof(struct ggml_metal_blit_queue));
+    res->dev   = dev;
+    res->queue = queue;
+    res->ev    = ev;
+    res->event = (id<MTLSharedEvent>) ggml_metal_event_get_obj(ev);
+    pthread_mutex_init(&res->lock, NULL);
+
+    res->state = calloc(1, sizeof(struct ggml_metal_blit_state));
+    atomic_init(&res->state->refs, 1);
+    atomic_init(&res->state->error, NULL);
+
+#if defined(GGML_METAL_HAS_PLACEMENT_SPARSE)
+    if (heap != NULL) {
+        if (@available(macOS 26.4, *)) {
+            res->rset = [heap->rset retain];
+            [res->queue addResidencySet:res->rset];
+        }
+    }
+#else
+    GGML_UNUSED(heap);
+#endif
+
+    return res;
+}
+
+void ggml_metal_blit_queue_free(ggml_metal_blit_queue_t queue) {
+    if (queue == NULL) {
+        return;
+    }
+
+    // a failed blit stops the timeline, so only a queue without an error drains; blits parked behind
+    // a failure stay parked, and their handlers keep the shared state alive
+    const uint64_t drain_ms = 10000;
+    if (atomic_load(&queue->state->error) == NULL && queue->issued > 0 &&
+        ![queue->event waitUntilSignaledValue:queue->issued timeoutMS:drain_ms]) {
+        GGML_LOG_ERROR("%s: blits up to %llu did not complete in %llu ms\n", __func__,
+                (unsigned long long) queue->issued, (unsigned long long) drain_ms);
+    }
+
+#if defined(GGML_METAL_HAS_PLACEMENT_SPARSE)
+    if (queue->rset != nil) {
+        if (@available(macOS 26.4, *)) {
+            [queue->queue removeResidencySet:queue->rset];
+        }
+        [queue->rset release];
+    }
+#endif
+
+    ggml_metal_blit_state_release(queue->state);
+    ggml_metal_device_event_free(queue->dev, queue->ev);
+    pthread_mutex_destroy(&queue->lock);
+    [queue->queue release];
+    free(queue);
+}
+
+const char * ggml_metal_blit_queue_error(ggml_metal_blit_queue_t queue) {
+    return atomic_load(&queue->state->error);
+}
+
+ggml_metal_event_t ggml_metal_blit_queue_event(ggml_metal_blit_queue_t queue) {
+    return queue->ev;
+}
+
+static bool ggml_metal_blit_args_valid(size_t offs, size_t size, const char * caller) {
+    if (size == 0 || offs % 4 != 0 || size % 4 != 0) {
+        GGML_LOG_ERROR("%s: [%zu, +%zu): offset and size must be multiples of 4 and the size non-zero\n", caller, offs, size);
+        return false;
+    }
+    return true;
+}
+
+static struct ggml_metal_buffer_id ggml_metal_blit_resolve(ggml_metal_buffer_t buf, size_t offs, size_t size, const char * caller) {
+    const struct ggml_metal_buffer_id id = ggml_metal_buffer_get_range(buf, offs, size);
+    if (id.metal == nil) {
+        GGML_LOG_ERROR("%s: [%zu, +%zu) is not in one Metal buffer of a %zu byte buffer\n", caller, offs, size, ggml_metal_buffer_get_size(buf));
+    }
+    return id;
+}
+
+// A blit with the queue lock held: it waits for the previous blit's value, so that blits complete
+// as an in-order prefix and a failed one stops every later one, then for the caller's waits.
+// `encode` adds the blit encoder's work. The value signals from the completion handler, which sees
+// the command buffer's status first, so a failed blit never signals.
+static uint64_t ggml_metal_blit_submit(ggml_metal_blit_queue_t queue, const struct ggml_metal_wait * waits, size_t n_waits,
+        void (^encode)(id<MTLBlitCommandEncoder> encoder)) {
+    pthread_mutex_lock(&queue->lock);
+
+    const uint64_t value = queue->issued + 1;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd_buf = [queue->queue commandBuffer];
+
+        [cmd_buf encodeWaitForEvent:queue->event value:value - 1];
+        for (size_t i = 0; i < n_waits; ++i) {
+            ggml_metal_event_encode_wait_value(waits[i].event, cmd_buf, waits[i].value);
+        }
+
+        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+        encode(encoder);
+        [encoder endEncoding];
+
+        id<MTLSharedEvent> event = queue->event;
+        struct ggml_metal_blit_state * state = queue->state;
+        atomic_fetch_add(&state->refs, 1);
+
+        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            if (cb.status == MTLCommandBufferStatusCompleted) {
+                event.signaledValue = value;
+            } else {
+                const char * desc = cb.error ? [[cb.error description] UTF8String] : "no error";
+                GGML_LOG_ERROR("ggml_metal_blit_queue: blit %llu failed with status %d: %s\n",
+                        (unsigned long long) value, (int) cb.status, desc);
+
+                char * mine = strdup(desc);
+                char * none = NULL;
+                if (!atomic_compare_exchange_strong(&state->error, &none, mine)) {
+                    free(mine);
+                }
+            }
+            ggml_metal_blit_state_release(state);
+        }];
+
+        [cmd_buf commit];
+    }
+
+    queue->issued = value;
+
+    pthread_mutex_unlock(&queue->lock);
+
+    return value;
+}
+
+uint64_t ggml_metal_blit_copy(ggml_metal_blit_queue_t queue, ggml_metal_buffer_t src, size_t src_offs, ggml_metal_buffer_t dst, size_t dst_offs, size_t size,
+        const struct ggml_metal_wait * waits, size_t n_waits) {
+    if (!ggml_metal_blit_args_valid(src_offs, size, __func__) || !ggml_metal_blit_args_valid(dst_offs, size, __func__)) {
+        return 0;
+    }
+
+    const struct ggml_metal_buffer_id from = ggml_metal_blit_resolve(src, src_offs, size, __func__);
+    const struct ggml_metal_buffer_id to   = ggml_metal_blit_resolve(dst, dst_offs, size, __func__);
+    if (from.metal == nil || to.metal == nil) {
+        return 0;
+    }
+
+    return ggml_metal_blit_submit(queue, waits, n_waits, ^(id<MTLBlitCommandEncoder> encoder) {
+        [encoder copyFromBuffer:(id<MTLBuffer>) from.metal sourceOffset:from.offs toBuffer:(id<MTLBuffer>) to.metal destinationOffset:to.offs size:size];
+    });
+}
+
+uint64_t ggml_metal_blit_fill(ggml_metal_blit_queue_t queue, ggml_metal_buffer_t dst, size_t offs, size_t size, uint8_t byte,
+        const struct ggml_metal_wait * waits, size_t n_waits) {
+    if (!ggml_metal_blit_args_valid(offs, size, __func__)) {
+        return 0;
+    }
+
+    const struct ggml_metal_buffer_id to = ggml_metal_blit_resolve(dst, offs, size, __func__);
+    if (to.metal == nil) {
+        return 0;
+    }
+
+    return ggml_metal_blit_submit(queue, waits, n_waits, ^(id<MTLBlitCommandEncoder> encoder) {
+        [encoder fillBuffer:(id<MTLBuffer>) to.metal range:NSMakeRange(to.offs, size) value:byte];
+    });
+}
 
