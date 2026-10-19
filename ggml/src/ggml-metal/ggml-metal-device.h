@@ -335,9 +335,17 @@ typedef struct ggml_metal_buffer * ggml_metal_buffer_t;
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared);
 ggml_metal_buffer_t ggml_metal_buffer_map (ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size);
 
+// a private buffer at the caller's address va_base over a placement sparse Metal buffer, which it
+// takes ownership of
+ggml_metal_buffer_t ggml_metal_buffer_init_sparse(ggml_metal_device_t dev, void * metal, void * va_base, size_t size);
+
 void   ggml_metal_buffer_free     (ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_base (ggml_metal_buffer_t buf);
+size_t ggml_metal_buffer_get_size (ggml_metal_buffer_t buf);
 bool   ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf);
+
+// the placement sparse Metal buffer behind buf (id<MTLBuffer>), or NULL
+void * ggml_metal_buffer_get_sparse(ggml_metal_buffer_t buf);
 
 void   ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size);
 void   ggml_metal_buffer_set_tensor   (ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);

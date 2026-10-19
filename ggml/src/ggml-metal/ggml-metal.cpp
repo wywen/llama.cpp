@@ -6,6 +6,7 @@
 #include "ggml-metal-device.h"
 #include "ggml-metal-context.h"
 #include "ggml-metal-ops.h"
+#include "ggml-metal-placement.h"
 #include "ggml-metal-tuning.h"
 
 #include <mutex>
@@ -1093,6 +1094,55 @@ ggml_backend_reg_t ggml_backend_metal_reg(void) {
     }
 
     return &reg;
+}
+
+//
+// placement sparse memory
+//
+
+// the Metal device behind a backend, or NULL when it is not a Metal backend
+static ggml_metal_device_t ggml_backend_metal_device_of(ggml_backend_t backend) {
+    if (backend == NULL || !ggml_backend_is_metal(backend)) {
+        GGML_LOG_ERROR("%s: not a Metal backend\n", __func__);
+        return NULL;
+    }
+    return (ggml_metal_device_t) backend->device->context;
+}
+
+bool ggml_backend_metal_placement_supported(ggml_backend_t backend) {
+    if (backend == NULL || !ggml_backend_is_metal(backend)) {
+        return false;
+    }
+    return ggml_metal_placement_is_supported((ggml_metal_device_t) backend->device->context);
+}
+
+ggml_metal_placement_heap_t ggml_backend_metal_placement_heap_new(ggml_backend_t backend, size_t n_tiles) {
+    ggml_metal_device_t dev = ggml_backend_metal_device_of(backend);
+    return dev != NULL ? ggml_metal_placement_heap_init(dev, n_tiles) : NULL;
+}
+
+void ggml_backend_metal_placement_heap_free(ggml_metal_placement_heap_t heap) {
+    ggml_metal_placement_heap_free(heap);
+}
+
+size_t ggml_backend_metal_placement_tile_bytes(void) {
+    return ggml_metal_placement_tile_bytes();
+}
+
+ggml_backend_buffer_t ggml_backend_metal_sparse_buffer_new(ggml_backend_t backend, void * va_base, size_t size) {
+    ggml_metal_device_t dev = ggml_backend_metal_device_of(backend);
+    if (dev == NULL) {
+        return NULL;
+    }
+
+    ggml_metal_buffer_t res = ggml_metal_sparse_buffer_init(dev, va_base, size);
+    if (res == NULL) {
+        return NULL;
+    }
+
+    const int device = ggml_metal_device_get_props(dev)->device;
+
+    return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_private(device), ggml_backend_metal_buffer_private_i, res, ggml_metal_buffer_get_size(res));
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_metal_reg)

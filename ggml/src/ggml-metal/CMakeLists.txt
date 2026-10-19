@@ -11,6 +11,7 @@ ggml_add_backend_library(ggml-metal
                          ggml-metal-common.cpp
                          ggml-metal-context.m
                          ggml-metal-ops.cpp
+                         ggml-metal-placement.m
                          ggml-metal-tuning.cpp
                         )
 

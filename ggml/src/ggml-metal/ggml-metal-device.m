@@ -1935,6 +1935,9 @@ struct ggml_metal_buffer {
 
     // pointers to global device
     ggml_metal_device_t dev;
+
+    // buffers[0].metal is a placement sparse buffer
+    bool is_sparse;
 };
 
 static void ggml_metal_log_allocated_size(id<MTLDevice> device, size_t size_aligned) {
@@ -2106,6 +2109,29 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
     return res;
 }
 
+ggml_metal_buffer_t ggml_metal_buffer_init_sparse(ggml_metal_device_t dev, void * metal, void * va_base, size_t size) {
+    ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
+
+    res->dev       = dev;
+    res->is_sparse = true;
+
+    res->all_data  = va_base;
+    res->all_size  = size;
+    res->is_shared = false;
+    res->owned     = true;
+
+    res->n_buffers = 1;
+    res->buffers[0].data  = va_base;
+    res->buffers[0].size  = size;
+    res->buffers[0].metal = (id<MTLBuffer>) metal;
+
+    // the memory behind the buffer is the heaps', which carry their own residency
+    res->use_residency_sets = false;
+    res->rset = nil;
+
+    return res;
+}
+
 ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
 
@@ -2227,6 +2253,14 @@ void * ggml_metal_buffer_get_base(ggml_metal_buffer_t buf) {
 
 bool ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf) {
     return buf->is_shared;
+}
+
+size_t ggml_metal_buffer_get_size(ggml_metal_buffer_t buf) {
+    return buf->all_size;
+}
+
+void * ggml_metal_buffer_get_sparse(ggml_metal_buffer_t buf) {
+    return buf->is_sparse ? buf->buffers[0].metal : NULL;
 }
 
 void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {

@@ -177,6 +177,45 @@ GGML_BACKEND_API void ggml_backend_metal_clear_encode_window(ggml_backend_t back
 // reorder freely within a segment. Off, the reorder is byte-for-byte what it always was.
 GGML_BACKEND_API void ggml_backend_metal_set_reorder_barriers(ggml_backend_t backend, bool enable);
 
+//
+// placement sparse memory
+//
+// Primitives for paging device memory under fixed tensor addresses. A placement heap is device
+// memory in 16 KiB tiles; a sparse buffer is an address range whose tiles map onto heap tiles and
+// unmap again, so tensors in it never move while the memory behind them does. Each call does one
+// Metal operation and keeps no record of what is mapped where: the caller owns that bookkeeping.
+//
+// Metal does not check what these calls leave to the caller. A blit into an unmapped tile
+// completes without an error: it is dropped, or, on a queue that wrote the tile before its unmap,
+// it lands in the heap tile the tile last mapped onto. A read of an unmapped tile returns zeros.
+//
+// Placement sparse memory needs macOS 26.4 and a device that supports it; the constructors return
+// NULL otherwise.
+
+typedef struct ggml_metal_placement_heap * ggml_metal_placement_heap_t;
+
+// Whether the backend's device and OS support placement sparse memory with 16 KiB tiles; false for
+// a backend that is not Metal.
+GGML_BACKEND_API bool ggml_backend_metal_placement_supported(ggml_backend_t backend);
+
+// A heap of n_tiles tiles of private storage, resident for its life through its own residency set,
+// which is attached to the backend's compute queue. NULL for a backend that is not Metal.
+GGML_BACKEND_API ggml_metal_placement_heap_t ggml_backend_metal_placement_heap_new (ggml_backend_t backend, size_t n_tiles);
+// The heap must have no tile mapped by any sparse buffer and no work in flight that touches it;
+// nothing here tracks either, so the caller drains and unmaps first.
+GGML_BACKEND_API void                        ggml_backend_metal_placement_heap_free(ggml_metal_placement_heap_t heap);
+
+// The bytes of one tile of a heap or a sparse buffer.
+GGML_BACKEND_API size_t ggml_backend_metal_placement_tile_bytes(void);
+
+// A buffer of the backend's private kind over a placement sparse buffer of `size` bytes, rounded
+// up to tiles, at the caller's address range from va_base: tensors in it get addresses in that
+// range, which the caller reserves for at least the rounded size and keeps reserved until the
+// buffer is freed. va_base is tile aligned. The buffer owns no memory and every tile starts
+// unmapped; freeing it drops its mappings. Metal tracks no hazards on it: the caller orders every
+// access with events. NULL for a backend that is not Metal.
+GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_metal_sparse_buffer_new(ggml_backend_t backend, void * va_base, size_t size);
+
 #ifdef __cplusplus
 }
 #endif
