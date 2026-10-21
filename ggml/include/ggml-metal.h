@@ -95,6 +95,16 @@ GGML_BACKEND_API void ggml_backend_metal_set_boundary_schedule(
         int n_cuts,  struct ggml_tensor * const * cut_nodes,  ggml_metal_event_t * sig_ev,  const uint64_t * sig_val,
         int n_waits, struct ggml_tensor * const * wait_nodes, ggml_metal_event_t * wait_ev, const uint64_t * wait_val);
 
+// Signal `ev` to `value` at the encode window's entry: in the split where the window's first_node
+// matches (where its ingress copies fire), the paged path commits a command buffer holding no
+// ops and no waits ahead of the window's first segment, and sets the event to `value` when that
+// buffer completes. The value is set after everything enqueued before the window, every earlier
+// split of the graph included, and never waits on the window's own schedule waits. Persistent
+// like the boundary schedule and cleared with it by every set_boundary_schedule call; set it
+// after the schedule it belongs to. A NULL `ev` clears it.
+GGML_BACKEND_API void ggml_backend_metal_set_boundary_entry_signal(
+        ggml_backend_t backend, ggml_metal_event_t ev, uint64_t value);
+
 // Restrict the boundary-scheduled (paged) compute path to the node range
 // (first_node, last_node] -- lower boundary EXCLUSIVE (pass the band-entry
 // residual node itself), upper INCLUSIVE, either NULL for an open edge --

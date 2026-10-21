@@ -683,6 +683,14 @@ void ggml_backend_metal_set_boundary_schedule(
     ggml_metal_set_boundary_schedule(ctx, n_cuts, cut_nodes, sig_ev, sig_val, n_waits, wait_nodes, wait_ev, wait_val);
 }
 
+void ggml_backend_metal_set_boundary_entry_signal(ggml_backend_t backend, ggml_metal_event_t ev, uint64_t value) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    ggml_metal_set_boundary_entry_signal(ctx, ev, value);
+}
+
 void ggml_backend_metal_set_encode_window(
         ggml_backend_t backend,
         struct ggml_tensor * first_node,  struct ggml_tensor * last_node,

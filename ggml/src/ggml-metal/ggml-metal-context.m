@@ -122,6 +122,10 @@ struct ggml_metal {
     struct ggml_tensor  ** bsched_wait_nodes; // node ptrs; segment starts (wait before)
     ggml_metal_event_t  *  bsched_wait_ev;
     uint64_t *             bsched_wait_val;
+    // Signalled on completion of an empty command buffer committed ahead of the
+    // encode window's first segment; NULL for none.
+    ggml_metal_event_t     bsched_entry_ev;
+    uint64_t               bsched_entry_val;
 
     // Encode window over the paged path (PERSISTENT + pointer-keyed, like the
     // boundary schedule above; see ggml_metal_set_encode_window). While set,
@@ -610,6 +614,13 @@ static void ggml_metal_bsched_clear(ggml_metal_t ctx) {
     ctx->bsched_wait_val   = NULL;
     ctx->bsched_n_cuts     = 0;
     ctx->bsched_n_waits    = 0;
+    ctx->bsched_entry_ev   = NULL;
+    ctx->bsched_entry_val  = 0;
+}
+
+void ggml_metal_set_boundary_entry_signal(ggml_metal_t ctx, ggml_metal_event_t ev, uint64_t value) {
+    ctx->bsched_entry_ev  = ev;
+    ctx->bsched_entry_val = ev != NULL ? value : 0;
 }
 
 void ggml_metal_set_boundary_schedule(
@@ -1147,6 +1158,20 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             const bool window_first = window_applies && !window_entered;
             const bool window_last  = window_applies && seg_start <= window_hi && seg_end > window_hi;
             window_entered = true;
+
+            // Window entry signal: its own buffer, committed before the window's first
+            // segment is enqueued, so it completes after everything ahead of the window
+            // and depends on none of the window's waits -- nor on the host wait below,
+            // which may itself wait for the gates this signal lets the caller open.
+            if (window_first && blit_in_here && ctx->bsched_entry_ev != NULL) {
+                id<MTLCommandBuffer> entry_buf = [queue commandBufferWithUnretainedReferences];
+                [entry_buf retain];
+                [entry_buf enqueue];
+                ggml_metal_event_signal_on_complete(ctx->bsched_entry_ev, (ggml_metal_cmd_buf_t) entry_buf, ctx->bsched_entry_val);
+                [entry_buf commit];
+                [ctx->cmd_bufs_ext addObject:entry_buf];
+                ctx->cmd_buf_last = entry_buf;
+            }
 
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
