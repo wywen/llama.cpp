@@ -219,8 +219,10 @@ GGML_BACKEND_API size_t ggml_backend_metal_placement_tile_bytes(void);
 // up to tiles, at the caller's address range from va_base: tensors in it get addresses in that
 // range, which the caller reserves for at least the rounded size and keeps reserved until the
 // buffer is freed. va_base is tile aligned. The buffer owns no memory and every tile starts
-// unmapped; freeing it drops its mappings. Metal tracks no hazards on it: the caller orders every
-// access with events. NULL for a backend that is not Metal.
+// unmapped; freeing it drops its mappings. Metal tracks hazards on it, so command buffers that
+// write and read it run in submission order, as with any tracked buffer; mapping operations and
+// host access through a heap are the caller's to order with events. NULL for a backend that is not
+// Metal.
 GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_metal_sparse_buffer_new(ggml_backend_t backend, void * va_base, size_t size);
 
 // n_tiles consecutive tiles of a sparse buffer from `tile`, and the consecutive heap tiles from

@@ -187,7 +187,7 @@ ggml_metal_buffer_t ggml_metal_sparse_buffer_init(ggml_metal_device_t dev, void 
     }
 
     id<MTLBuffer> metal = [device newBufferWithLength:bytes
-                                              options:MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeUntracked
+                                              options:MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeTracked
                               placementSparsePageSize:GGML_METAL_PLACEMENT_PAGE];
     if (metal == nil) {
         GGML_LOG_ERROR("%s: failed to create a placement sparse buffer of %zu tiles (%.2f MiB)\n", __func__,
