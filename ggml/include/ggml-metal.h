@@ -208,13 +208,19 @@ typedef struct ggml_metal_placement_heap * ggml_metal_placement_heap_t;
 // a backend that is not Metal.
 GGML_BACKEND_API bool ggml_backend_metal_placement_supported(ggml_backend_t backend);
 
-// A heap of n_tiles tiles of private storage, resident for its life through its own residency set,
-// which is attached to the backend's compute queue. NULL for a backend that is not Metal.
+// A heap of n_tiles tiles of shared storage, with a shared buffer placed over all of it through
+// which the host reads and writes every tile. No residency set: a command buffer that binds a sparse
+// buffer mapped onto the heap, or declares the heap, makes it resident. NULL for a backend that is
+// not Metal, or when the device refuses the heap.
 GGML_BACKEND_API ggml_metal_placement_heap_t ggml_backend_metal_placement_heap_new (ggml_backend_t backend, size_t n_tiles);
 // The heap must have no tile mapped by any sparse buffer, no work in flight that touches it, and no
 // blit queue still attached to it; nothing here tracks any of these, so the caller drains, unmaps
 // and frees those queues first.
 GGML_BACKEND_API void                        ggml_backend_metal_placement_heap_free(ggml_metal_placement_heap_t heap);
+// The host address of the heap's first tile; tile t is at t tiles from it. A host write is what a
+// kernel reading a sparse buffer tile mapped onto t sees once the write completed, and a GPU write
+// through such a tile is what the host reads once the command buffer completed.
+GGML_BACKEND_API void *                      ggml_backend_metal_placement_heap_contents(ggml_metal_placement_heap_t heap);
 
 // The bytes of one tile of a heap or a sparse buffer.
 GGML_BACKEND_API size_t ggml_backend_metal_placement_tile_bytes(void);
@@ -223,8 +229,10 @@ GGML_BACKEND_API size_t ggml_backend_metal_placement_tile_bytes(void);
 // up to tiles, at the caller's address range from va_base: tensors in it get addresses in that
 // range, which the caller reserves for at least the rounded size and keeps reserved until the
 // buffer is freed. va_base is tile aligned. The buffer owns no memory and every tile starts
-// unmapped; freeing it drops its mappings. Metal tracks no hazards on it: the caller orders every
-// access with events. NULL for a backend that is not Metal.
+// unmapped; freeing it drops its mappings. Metal tracks hazards on it, so command buffers that
+// write and read it run in submission order, as with any tracked buffer; mapping operations and
+// host access through a heap are the caller's to order with events. NULL for a backend that is not
+// Metal.
 GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_metal_sparse_buffer_new(ggml_backend_t backend, void * va_base, size_t size);
 
 // n_tiles consecutive tiles of a sparse buffer from `tile`, and the consecutive heap tiles from
@@ -262,8 +270,7 @@ GGML_BACKEND_API bool ggml_backend_metal_unmap_tiles(ggml_metal_mapping_queue_t 
 // the host, or it abandons the queue. Freeing the queue waits a bounded time for blits in flight;
 // blits parked behind a failure stay parked. Submissions on one queue are serialized internally.
 //
-// `heap`, when not NULL, is the heap whose tiles the blits touch: its residency set is attached to
-// the queue, and it must outlive the queue.
+// `heap` is unused; a blit makes the sparse buffers it names resident.
 typedef struct ggml_metal_blit_queue * ggml_metal_blit_queue_t;
 
 struct ggml_metal_wait {
@@ -291,12 +298,12 @@ GGML_BACKEND_API uint64_t ggml_backend_metal_blit_fill(ggml_metal_blit_queue_t q
 
 // The driver re-prepares an allocation no command buffer referenced for a while before the next
 // command buffer that binds it can run, at a cost that grows with its size. This commits one
-// command buffer, on a queue of the heap's own, that references the heap and `buffers` and runs an
-// empty one-thread kernel: an encoder that dispatches nothing does not count as a reference.
+// command buffer, on the first heap's own queue, that references every heap and `buffers` and runs
+// an empty one-thread kernel: an encoder that dispatches nothing does not count as a reference.
 // Calling it more often than the driver's idle threshold keeps them prepared. It does not wait for
 // the command buffer; a queue holds at most 64 uncompleted command buffers, so a caller that outruns
 // the device blocks in the next call.
-GGML_BACKEND_API bool ggml_backend_metal_keep_prepared(ggml_metal_placement_heap_t heap, ggml_backend_buffer_t const * buffers, size_t n_buffers);
+GGML_BACKEND_API bool ggml_backend_metal_keep_prepared(ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_backend_buffer_t const * buffers, size_t n_buffers);
 
 #ifdef __cplusplus
 }

@@ -1143,6 +1143,10 @@ void ggml_backend_metal_placement_heap_free(ggml_metal_placement_heap_t heap) {
     ggml_metal_placement_heap_free(heap);
 }
 
+void * ggml_backend_metal_placement_heap_contents(ggml_metal_placement_heap_t heap) {
+    return ggml_metal_placement_heap_contents(heap);
+}
+
 size_t ggml_backend_metal_placement_tile_bytes(void) {
     return ggml_metal_placement_tile_bytes();
 }
@@ -1228,9 +1232,14 @@ uint64_t ggml_backend_metal_blit_fill(ggml_metal_blit_queue_t queue,
     return ggml_metal_blit_fill(queue, to, offs, size, byte, waits, n_waits);
 }
 
-bool ggml_backend_metal_keep_prepared(ggml_metal_placement_heap_t heap, ggml_backend_buffer_t const * buffers, size_t n_buffers) {
-    if (heap == NULL) {
+bool ggml_backend_metal_keep_prepared(ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_backend_buffer_t const * buffers, size_t n_buffers) {
+    if (heaps == NULL || n_heaps == 0) {
         return false;
+    }
+    for (size_t i = 0; i < n_heaps; ++i) {
+        if (heaps[i] == NULL) {
+            return false;
+        }
     }
 
     std::vector<ggml_metal_buffer_t> bufs(n_buffers);
@@ -1240,7 +1249,7 @@ bool ggml_backend_metal_keep_prepared(ggml_metal_placement_heap_t heap, ggml_bac
             return false;
         }
     }
-    return ggml_metal_keep_prepared(heap, bufs.data(), bufs.size());
+    return ggml_metal_keep_prepared(heaps, n_heaps, bufs.data(), bufs.size());
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_metal_reg)
