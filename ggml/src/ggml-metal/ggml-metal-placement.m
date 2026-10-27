@@ -572,12 +572,13 @@ enum ggml_metal_keep_prepared_drain_result ggml_metal_keep_prepared_drain(
     if (deadline == DISPATCH_TIME_FOREVER) {
         return GGML_METAL_KEEP_PREPARED_DRAIN_FAILED;
     }
-    // The handler publishes failure before leaving; no handler uses heap state after leaving.
+    // A command buffer whose completion handler has run is finished on the device whether it
+    // succeeded or failed, so an empty group means nothing references the resources any more.
+    // Failure stays recorded in keep_failed to refuse new submissions, not to block release.
     if (dispatch_group_wait(queue_owner->keep_pending, deadline) != 0) {
         return GGML_METAL_KEEP_PREPARED_DRAIN_TIMED_OUT;
     }
-    return atomic_load(&queue_owner->keep_failed) ? GGML_METAL_KEEP_PREPARED_DRAIN_FAILED
-                                                : GGML_METAL_KEEP_PREPARED_DRAIN_COMPLETED;
+    return GGML_METAL_KEEP_PREPARED_DRAIN_COMPLETED;
 }
 
 bool ggml_metal_keep_prepared(ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_metal_buffer_t const * bufs, size_t n_bufs) {

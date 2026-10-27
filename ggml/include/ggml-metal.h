@@ -316,8 +316,11 @@ enum ggml_metal_keep_prepared_drain_result {
 // Drain every keep-prepared submission made with queue_owner as heaps[0], including references
 // to other heaps and buffers. Serialize submissions, drain and resource destruction externally.
 // Before freeing ANY referenced resource, drain each queue that referenced it. Heap free drains
-// only its own queue and aborts on failure. Command failures are sticky; timeout preserves ownership.
-// Invalid queue_owner or a timeout that cannot form a finite dispatch deadline returns FAILED.
+// only its own queue and aborts unless the drain completes. COMPLETED means every submitted command
+// buffer has finished, including one that ended in error: the device no longer references anything,
+// so release is safe. A command error is sticky and makes later submissions on that heap return
+// false. TIMED_OUT preserves ownership. FAILED means the arguments were invalid (null queue_owner or
+// a timeout that cannot form a finite dispatch deadline) or the backend has no sparse placement.
 GGML_BACKEND_API enum ggml_metal_keep_prepared_drain_result ggml_backend_metal_keep_prepared_drain(
         ggml_metal_placement_heap_t queue_owner, uint64_t timeout_ms);
 
