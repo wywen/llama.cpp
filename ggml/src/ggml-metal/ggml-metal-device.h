@@ -348,6 +348,10 @@ bool   ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf);
 // the placement sparse Metal buffer behind buf (id<MTLBuffer>), or NULL
 void * ggml_metal_buffer_get_sparse(ggml_metal_buffer_t buf);
 
+// puts the placement sparse Metal buffer `metal` behind a sparse buf, taking ownership of it, and
+// releases the one it replaces; false, with nothing changed, when buf is not a sparse buffer
+bool ggml_metal_buffer_set_sparse(ggml_metal_buffer_t buf, void * metal);
+
 // the Metal buffers behind buf (id<MTLBuffer>)
 int    ggml_metal_buffer_get_n_objs(ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_obj   (ggml_metal_buffer_t buf, int i);
