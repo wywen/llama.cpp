@@ -198,6 +198,27 @@ ggml_metal_buffer_t ggml_metal_sparse_buffer_init(ggml_metal_device_t dev, void 
     return ggml_metal_buffer_init_sparse(dev, metal, va_base, bytes);
 }
 
+bool ggml_metal_sparse_buffer_renew(ggml_metal_device_t dev, ggml_metal_buffer_t buf) {
+    id<MTLDevice> device = (id<MTLDevice>) ggml_metal_device_get_obj(dev);
+
+    id<MTLBuffer> old = (id<MTLBuffer>) ggml_metal_buffer_get_sparse(buf);
+    if (old == nil) {
+        GGML_LOG_ERROR("%s: the buffer is not a sparse buffer\n", __func__);
+        return false;
+    }
+
+    id<MTLBuffer> metal = [device newBufferWithLength:old.length
+                                              options:old.resourceOptions
+                              placementSparsePageSize:GGML_METAL_PLACEMENT_PAGE];
+    if (metal == nil) {
+        GGML_LOG_ERROR("%s: failed to create a placement sparse buffer of %.2f MiB\n", __func__,
+                old.length/1024.0/1024.0);
+        return false;
+    }
+
+    return ggml_metal_buffer_set_sparse(buf, metal);
+}
+
 //
 // mapping
 //
@@ -321,6 +342,12 @@ ggml_metal_buffer_t ggml_metal_sparse_buffer_init(ggml_metal_device_t dev, void 
     GGML_UNUSED(va_base);
     GGML_UNUSED(size);
     return NULL;
+}
+
+bool ggml_metal_sparse_buffer_renew(ggml_metal_device_t dev, ggml_metal_buffer_t buf) {
+    GGML_UNUSED(dev);
+    GGML_UNUSED(buf);
+    return false;
 }
 
 ggml_metal_mapping_queue_t ggml_metal_mapping_queue_init(ggml_metal_device_t dev) {
