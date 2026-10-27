@@ -1261,4 +1261,9 @@ bool ggml_backend_metal_keep_prepared(ggml_metal_placement_heap_t const * heaps,
     return ggml_metal_keep_prepared(heaps, n_heaps, bufs.data(), bufs.size());
 }
 
+enum ggml_metal_keep_prepared_drain_result ggml_backend_metal_keep_prepared_drain(
+        ggml_metal_placement_heap_t queue_owner, uint64_t timeout_ms) {
+    return ggml_metal_keep_prepared_drain(queue_owner, timeout_ms);
+}
+
 GGML_BACKEND_DL_IMPL(ggml_backend_metal_reg)
