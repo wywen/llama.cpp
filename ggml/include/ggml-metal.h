@@ -216,6 +216,8 @@ GGML_BACKEND_API ggml_metal_placement_heap_t ggml_backend_metal_placement_heap_n
 // The heap must have no tile mapped by any sparse buffer, no work in flight that touches it, and no
 // blit queue still attached to it; nothing here tracks any of these, so the caller drains, unmaps
 // and frees those queues first.
+// Drains this heap's own keep-prepared queue for up to 10000 ms, aborting on failure. The caller
+// must first drain other heaps' keep-prepared queues that reference this heap.
 GGML_BACKEND_API void                        ggml_backend_metal_placement_heap_free(ggml_metal_placement_heap_t heap);
 // The host address of the heap's first tile; tile t is at t tiles from it. A host write is what a
 // kernel reading a sparse buffer tile mapped onto t sees once the write completed, and a GPU write
@@ -304,6 +306,20 @@ GGML_BACKEND_API uint64_t ggml_backend_metal_blit_fill(ggml_metal_blit_queue_t q
 // the command buffer; a queue holds at most 64 uncompleted command buffers, so a caller that outruns
 // the device blocks in the next call.
 GGML_BACKEND_API bool ggml_backend_metal_keep_prepared(ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_backend_buffer_t const * buffers, size_t n_buffers);
+
+enum ggml_metal_keep_prepared_drain_result {
+    GGML_METAL_KEEP_PREPARED_DRAIN_COMPLETED,
+    GGML_METAL_KEEP_PREPARED_DRAIN_TIMED_OUT,
+    GGML_METAL_KEEP_PREPARED_DRAIN_FAILED,
+};
+
+// Drain every keep-prepared submission made with queue_owner as heaps[0], including references
+// to other heaps and buffers. Serialize submissions, drain and resource destruction externally.
+// Before freeing ANY referenced resource, drain each queue that referenced it. Heap free drains
+// only its own queue and aborts on failure. Command failures are sticky; timeout preserves ownership.
+// Invalid queue_owner or a timeout that cannot form a finite dispatch deadline returns FAILED.
+GGML_BACKEND_API enum ggml_metal_keep_prepared_drain_result ggml_backend_metal_keep_prepared_drain(
+        ggml_metal_placement_heap_t queue_owner, uint64_t timeout_ms);
 
 #ifdef __cplusplus
 }

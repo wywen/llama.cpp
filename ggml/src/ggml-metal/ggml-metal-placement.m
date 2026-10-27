@@ -6,6 +6,7 @@
 
 #include <Metal/Metal.h>
 
+#include <dispatch/dispatch.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -67,6 +68,8 @@ struct ggml_metal_placement_heap {
     // compute command buffer parked on an event
     id<MTLCommandQueue>         keep_queue;
     id<MTLComputePipelineState> nop;
+    dispatch_group_t keep_pending;
+    atomic_bool keep_failed;
 };
 
 ggml_metal_placement_heap_t ggml_metal_placement_heap_init(ggml_metal_device_t dev, size_t n_tiles) {
@@ -85,6 +88,15 @@ ggml_metal_placement_heap_t ggml_metal_placement_heap_init(ggml_metal_device_t d
     }
 
     ggml_metal_placement_heap_t res = calloc(1, sizeof(struct ggml_metal_placement_heap));
+    if (res == NULL) {
+        return NULL;
+    }
+    res->keep_pending = dispatch_group_create();
+    if (res->keep_pending == NULL) {
+        free(res);
+        return NULL;
+    }
+    atomic_init(&res->keep_failed, false);
 
     res->n_tiles = n_tiles;
 
@@ -130,6 +142,7 @@ ggml_metal_placement_heap_t ggml_metal_placement_heap_init(ggml_metal_device_t d
         [res->keep_queue release];
         [res->alias      release];
         [res->heap       release];
+        dispatch_release(res->keep_pending);
         free(res);
         return NULL;
     }
@@ -141,6 +154,11 @@ void ggml_metal_placement_heap_free(ggml_metal_placement_heap_t heap) {
     if (heap == NULL) {
         return;
     }
+    if (ggml_metal_keep_prepared_drain(heap, 10000) != GGML_METAL_KEEP_PREPARED_DRAIN_COMPLETED) {
+        GGML_LOG_ERROR("%s: keep-prepared queue did not drain successfully; aborting before resource release\n", __func__);
+        abort();
+    }
+    dispatch_release(heap->keep_pending);
 
     [heap->nop        release];
     [heap->keep_queue release];
@@ -545,8 +563,25 @@ uint64_t ggml_metal_blit_fill(ggml_metal_blit_queue_t queue, ggml_metal_buffer_t
 
 #if defined(GGML_METAL_HAS_PLACEMENT_SPARSE)
 
+enum ggml_metal_keep_prepared_drain_result ggml_metal_keep_prepared_drain(
+        ggml_metal_placement_heap_t queue_owner, uint64_t timeout_ms) {
+    if (queue_owner == NULL || timeout_ms > INT64_MAX / NSEC_PER_MSEC) {
+        return GGML_METAL_KEEP_PREPARED_DRAIN_FAILED;
+    }
+    const dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, (int64_t) timeout_ms * NSEC_PER_MSEC);
+    if (deadline == DISPATCH_TIME_FOREVER) {
+        return GGML_METAL_KEEP_PREPARED_DRAIN_FAILED;
+    }
+    // The handler publishes failure before leaving; no handler uses heap state after leaving.
+    if (dispatch_group_wait(queue_owner->keep_pending, deadline) != 0) {
+        return GGML_METAL_KEEP_PREPARED_DRAIN_TIMED_OUT;
+    }
+    return atomic_load(&queue_owner->keep_failed) ? GGML_METAL_KEEP_PREPARED_DRAIN_FAILED
+                                                : GGML_METAL_KEEP_PREPARED_DRAIN_COMPLETED;
+}
+
 bool ggml_metal_keep_prepared(ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_metal_buffer_t const * bufs, size_t n_bufs) {
-    if (n_heaps == 0) {
+    if (heaps == NULL || n_heaps == 0 || heaps[0] == NULL || atomic_load(&heaps[0]->keep_failed)) {
         return false;
     }
     size_t n_objs = 0;
@@ -555,6 +590,9 @@ bool ggml_metal_keep_prepared(ggml_metal_placement_heap_t const * heaps, size_t 
     }
 
     id<MTLResource> * objs = malloc((n_objs > 0 ? n_objs : 1)*sizeof(id<MTLResource>));
+    if (objs == NULL) {
+        return false;
+    }
     size_t k = 0;
     for (size_t i = 0; i < n_bufs; ++i) {
         for (int j = 0; j < ggml_metal_buffer_get_n_objs(bufs[i]); ++j) {
@@ -564,8 +602,16 @@ bool ggml_metal_keep_prepared(ggml_metal_placement_heap_t const * heaps, size_t 
 
     @autoreleasepool {
         id<MTLCommandBuffer> cmd_buf = [heaps[0]->keep_queue commandBuffer];
+        if (cmd_buf == nil) {
+            free(objs);
+            return false;
+        }
 
         id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
+        if (encoder == nil) {
+            free(objs);
+            return false;
+        }
 
         for (size_t i = 0; i < n_heaps; ++i) {
             [encoder useHeap:heaps[i]->heap];
@@ -577,6 +623,17 @@ bool ggml_metal_keep_prepared(ggml_metal_placement_heap_t const * heaps, size_t 
         [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         [encoder endEncoding];
 
+        ggml_metal_placement_heap_t owner = heaps[0];
+        dispatch_group_t pending = owner->keep_pending;
+        dispatch_group_enter(pending);
+        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            if (cb.status != MTLCommandBufferStatusCompleted) {
+                atomic_store(&owner->keep_failed, true);
+                GGML_LOG_ERROR("ggml_metal_keep_prepared: command failed with status %d: %s\n",
+                        (int) cb.status, cb.error ? [[cb.error description] UTF8String] : "no error");
+            }
+            dispatch_group_leave(pending);
+        }];
         [cmd_buf commit];
     }
 
@@ -590,6 +647,12 @@ bool ggml_metal_keep_prepared(ggml_metal_placement_heap_t const * heaps, size_t 
 bool ggml_metal_keep_prepared(ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_metal_buffer_t const * bufs, size_t n_bufs) {
     GGML_UNUSED(heaps); GGML_UNUSED(n_heaps); GGML_UNUSED(bufs); GGML_UNUSED(n_bufs);
     return false;
+}
+
+enum ggml_metal_keep_prepared_drain_result ggml_metal_keep_prepared_drain(
+        ggml_metal_placement_heap_t queue_owner, uint64_t timeout_ms) {
+    GGML_UNUSED(queue_owner); GGML_UNUSED(timeout_ms);
+    return GGML_METAL_KEEP_PREPARED_DRAIN_FAILED;
 }
 
 #endif

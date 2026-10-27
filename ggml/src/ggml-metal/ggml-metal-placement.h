@@ -36,6 +36,8 @@ uint64_t ggml_metal_blit_fill(ggml_metal_blit_queue_t queue, ggml_metal_buffer_t
         const struct ggml_metal_wait * waits, size_t n_waits);
 
 bool ggml_metal_keep_prepared(ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_metal_buffer_t const * bufs, size_t n_bufs);
+enum ggml_metal_keep_prepared_drain_result ggml_metal_keep_prepared_drain(
+        ggml_metal_placement_heap_t queue_owner, uint64_t timeout_ms);
 
 #ifdef __cplusplus
 }
