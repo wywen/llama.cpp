@@ -1183,10 +1183,9 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     }
                 }
 
-                dev->props.use_residency_sets = true;
-#if defined(GGML_METAL_HAS_RESIDENCY_SETS)
-                dev->props.use_residency_sets = getenv("GGML_METAL_NO_RESIDENCY") == nil;
-#endif
+                // ggml's residency sets are disconnected whatever GGML_METAL_NO_RESIDENCY says: the
+                // owner of the placement heaps keeps device memory prepared
+                dev->props.use_residency_sets = false;
 
                 dev->props.use_shared_buffers = dev->props.has_unified_memory;
 #if TARGET_OS_OSX
@@ -2265,6 +2264,18 @@ size_t ggml_metal_buffer_get_size(ggml_metal_buffer_t buf) {
 
 void * ggml_metal_buffer_get_sparse(ggml_metal_buffer_t buf) {
     return buf->is_sparse ? buf->buffers[0].metal : NULL;
+}
+
+bool ggml_metal_buffer_set_sparse(ggml_metal_buffer_t buf, void * metal) {
+    if (!buf->is_sparse || metal == NULL) {
+        return false;
+    }
+
+    id<MTLBuffer> old = buf->buffers[0].metal;
+    buf->buffers[0].metal = (id<MTLBuffer>) metal;
+    [old release];
+
+    return true;
 }
 
 int ggml_metal_buffer_get_n_objs(ggml_metal_buffer_t buf) {

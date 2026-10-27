@@ -17,6 +17,11 @@ size_t ggml_metal_placement_tile_bytes(void);
 // a device buffer at va_base over a new placement sparse buffer of `size` bytes rounded up to tiles, or NULL
 ggml_metal_buffer_t ggml_metal_sparse_buffer_init(ggml_metal_device_t dev, void * va_base, size_t size);
 
+// replaces the placement sparse buffer behind buf by a new one of the same size, every tile
+// unmapped, releasing the old one with its mappings; false, with nothing changed, when buf is not
+// a sparse buffer or the device refuses the new one
+bool ggml_metal_sparse_buffer_renew(ggml_metal_device_t dev, ggml_metal_buffer_t buf);
+
 ggml_metal_mapping_queue_t ggml_metal_mapping_queue_init(ggml_metal_device_t dev);
 void                       ggml_metal_mapping_queue_free(ggml_metal_mapping_queue_t queue);
 

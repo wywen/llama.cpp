@@ -1167,6 +1167,15 @@ ggml_backend_buffer_t ggml_backend_metal_sparse_buffer_new(ggml_backend_t backen
     return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_private(device), ggml_backend_metal_buffer_private_i, res, ggml_metal_buffer_get_size(res));
 }
 
+bool ggml_backend_metal_sparse_buffer_renew(ggml_backend_t backend, ggml_backend_buffer_t buffer) {
+    ggml_metal_device_t dev = ggml_backend_metal_device_of(backend);
+    ggml_metal_buffer_t buf = ggml_backend_metal_buffer_of(buffer);
+    if (dev == NULL || buf == NULL) {
+        return false;
+    }
+    return ggml_metal_sparse_buffer_renew(dev, buf);
+}
+
 ggml_metal_mapping_queue_t ggml_backend_metal_mapping_queue_new(ggml_backend_t backend) {
     ggml_metal_device_t dev = ggml_backend_metal_device_of(backend);
     return dev != NULL ? ggml_metal_mapping_queue_init(dev) : NULL;

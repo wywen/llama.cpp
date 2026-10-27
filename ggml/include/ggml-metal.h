@@ -235,6 +235,18 @@ GGML_BACKEND_API size_t ggml_backend_metal_placement_tile_bytes(void);
 // Metal.
 GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_metal_sparse_buffer_new(ggml_backend_t backend, void * va_base, size_t size);
 
+// Replaces the placement sparse buffer behind a buffer from sparse_buffer_new by a new one of the
+// same size at the same va_base, every tile unmapped, and releases the old one with all its
+// mappings at once. The backend buffer, its base and the tensors in it are unchanged; kernels
+// encoded from then on bind the new one. The caller makes sure no command buffer that binds the
+// buffer is still encoding or in flight and no mapping operation naming it is queued; command
+// buffers and mapping operations submitted afterwards see the new, unmapped buffer. A buffer a
+// command buffer referenced within about the last second is released at once; one the driver no
+// longer keeps prepared may leave deferred work that delays later releases of heaps and queues, so
+// renew a buffer while something still references it. False, with nothing changed, when the
+// buffer is not a sparse buffer or the device refuses the new one.
+GGML_BACKEND_API bool ggml_backend_metal_sparse_buffer_renew(ggml_backend_t backend, ggml_backend_buffer_t buffer);
+
 // n_tiles consecutive tiles of a sparse buffer from `tile`, and the consecutive heap tiles from
 // `heap_tile` they map onto.
 struct ggml_metal_tile_run {
