@@ -29,8 +29,12 @@ void                       ggml_metal_mapping_queue_free(ggml_metal_mapping_queu
 bool ggml_metal_update_tiles(ggml_metal_mapping_queue_t queue, ggml_metal_placement_heap_t heap, ggml_metal_buffer_t buf,
         const struct ggml_metal_tile_run * runs, size_t n_runs, ggml_metal_event_t signal, uint64_t value);
 
-bool ggml_metal_mapping_queue_warm(ggml_metal_mapping_queue_t queue, ggml_metal_placement_heap_t const * heaps, size_t n_heaps,
-        ggml_metal_buffer_t const * bufs, size_t n_bufs, ggml_metal_event_t signal, uint64_t value);
+ggml_metal_warm_t ggml_metal_warm_init(ggml_metal_device_t dev);
+void              ggml_metal_warm_free(ggml_metal_warm_t warm);
+
+bool ggml_metal_mapping_queue_warm(ggml_metal_mapping_queue_t queue, ggml_metal_warm_t warm,
+        ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_metal_buffer_t const * bufs, size_t n_bufs,
+        ggml_metal_event_t signal, uint64_t value);
 
 ggml_metal_blit_queue_t ggml_metal_blit_queue_init (ggml_metal_device_t dev, ggml_metal_placement_heap_t heap);
 void                    ggml_metal_blit_queue_free (ggml_metal_blit_queue_t queue);
