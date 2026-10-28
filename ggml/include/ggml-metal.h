@@ -275,6 +275,19 @@ GGML_BACKEND_API bool ggml_backend_metal_map_tiles(ggml_metal_mapping_queue_t qu
 GGML_BACKEND_API bool ggml_backend_metal_unmap_tiles(ggml_metal_mapping_queue_t queue, ggml_backend_buffer_t buffer,
         const struct ggml_metal_tile_run * runs, size_t n_runs, ggml_metal_event_t signal, uint64_t value);
 
+// Commits on the queue a command buffer that declares every heap and `buffers` and runs an empty
+// one-thread kernel, then signals `signal` to `value` once it completed (no signal when `signal` is
+// NULL). Mapping operations queued after the call start only after that command buffer completed,
+// so they find the declared allocations prepared, however late the queue reaches the warm.
+// Preparation is per allocation: it prepares exactly the declared heaps and buffers, and a buffer
+// on a declared heap that is not declared stays as it was. The residency set goes on this command
+// buffer only, not on the queue. It waits on the host only when the warm 4 calls earlier on the
+// queue has not completed. False, with nothing queued, when n_heaps is 0, a buffer is not a Metal buffer
+// or the device refuses an object.
+GGML_BACKEND_API bool ggml_backend_metal_mapping_queue_warm(ggml_metal_mapping_queue_t queue,
+        ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_backend_buffer_t const * buffers, size_t n_buffers,
+        ggml_metal_event_t signal, uint64_t value);
+
 // A command queue for blits with one event as its timeline: the queue numbers its blits 1, 2, ...
 // in submission order, and blit v signals the event to v once it completed. Each blit waits for
 // the one before it, so blits complete as an in-order prefix. A blit whose command buffer fails
