@@ -258,7 +258,8 @@ struct ggml_metal_tile_run {
 };
 
 // A Metal 4 command queue for mapping operations, which apply in submission order. Calls on one
-// queue from several threads are each atomic; their order is the caller's.
+// queue from several threads are each atomic; their order is the caller's. The caller frees the
+// queue only once its events show that everything queued on it completed.
 typedef struct ggml_metal_mapping_queue * ggml_metal_mapping_queue_t;
 
 GGML_BACKEND_API ggml_metal_mapping_queue_t ggml_backend_metal_mapping_queue_new (ggml_backend_t backend);
@@ -274,6 +275,26 @@ GGML_BACKEND_API bool ggml_backend_metal_map_tiles(ggml_metal_mapping_queue_t qu
 // As map_tiles, unmapping the runs; heap_tile is ignored.
 GGML_BACKEND_API bool ggml_backend_metal_unmap_tiles(ggml_metal_mapping_queue_t queue, ggml_backend_buffer_t buffer,
         const struct ggml_metal_tile_run * runs, size_t n_runs, ggml_metal_event_t signal, uint64_t value);
+
+// The objects one warm needs: a Metal 4 command allocator, command buffer and residency set. NULL
+// for a backend that is not Metal or when the device refuses an object.
+typedef struct ggml_metal_warm * ggml_metal_warm_t;
+
+GGML_BACKEND_API ggml_metal_warm_t ggml_backend_metal_warm_new (ggml_backend_t backend);
+GGML_BACKEND_API void              ggml_backend_metal_warm_free(ggml_metal_warm_t warm);
+
+// Commits on the queue, with `warm`'s objects, a command buffer that declares the heaps and
+// `buffers` through a residency set on that command buffer only and runs an empty one-thread
+// kernel, then signals `signal` to `value` and makes the queue wait for `value`, so mapping
+// operations queued after the call apply only once the warm completed and find the declared
+// allocations prepared. Preparation is per allocation: it prepares exactly the declared heaps and
+// buffers, and a buffer on a declared heap that is not declared stays as it was. The caller reuses
+// or frees `warm` only once `signal` reached `value`, and does not make this call concurrently with
+// another call on the same queue. Never waits on the host. False, with nothing queued, when an
+// argument is NULL, n_heaps is 0, a buffer is not a Metal buffer or the encoder is refused.
+GGML_BACKEND_API bool ggml_backend_metal_mapping_queue_warm(ggml_metal_mapping_queue_t queue, ggml_metal_warm_t warm,
+        ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_backend_buffer_t const * buffers, size_t n_buffers,
+        ggml_metal_event_t signal, uint64_t value);
 
 // A command queue for blits with one event as its timeline: the queue numbers its blits 1, 2, ...
 // in submission order, and blit v signals the event to v once it completed. Each blit waits for
