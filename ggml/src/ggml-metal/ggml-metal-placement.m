@@ -329,6 +329,119 @@ bool ggml_metal_update_tiles(ggml_metal_mapping_queue_t queue, ggml_metal_placem
     return true;
 }
 
+//
+// warms
+//
+
+struct ggml_metal_warm {
+    id<MTL4CommandAllocator> alloc;
+    id<MTL4CommandBuffer>    cmd_buf;
+    id<MTLResidencySet>      rset;
+};
+
+ggml_metal_warm_t ggml_metal_warm_init(ggml_metal_device_t dev) {
+    id<MTLDevice> device = (id<MTLDevice>) ggml_metal_device_get_obj(dev);
+
+    if (!ggml_metal_placement_supported(device, __func__)) {
+        return NULL;
+    }
+
+    ggml_metal_warm_t res = calloc(1, sizeof(struct ggml_metal_warm));
+
+    res->alloc   = [device newCommandAllocator];
+    res->cmd_buf = [device newCommandBuffer];
+
+    NSError * error = nil;
+    MTLResidencySetDescriptor * desc = [[MTLResidencySetDescriptor alloc] init];
+    res->rset = [device newResidencySetWithDescriptor:desc error:&error];
+    [desc release];
+
+    if (res->alloc == nil || res->cmd_buf == nil || res->rset == nil) {
+        GGML_LOG_ERROR("%s: failed to create a command allocator, command buffer or residency set: %s\n", __func__,
+                error ? [[error description] UTF8String] : "nil");
+        ggml_metal_warm_free(res);
+        return NULL;
+    }
+
+    return res;
+}
+
+void ggml_metal_warm_free(ggml_metal_warm_t warm) {
+    if (warm == NULL) {
+        return;
+    }
+
+    [warm->rset    release];
+    [warm->cmd_buf release];
+    [warm->alloc   release];
+    free(warm);
+}
+
+bool ggml_metal_mapping_queue_warm(ggml_metal_mapping_queue_t queue, ggml_metal_warm_t warm,
+        ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_metal_buffer_t const * bufs, size_t n_bufs,
+        ggml_metal_event_t signal, uint64_t value) {
+    if (queue == NULL || warm == NULL || heaps == NULL || n_heaps == 0 || (bufs == NULL && n_bufs > 0) || signal == NULL) {
+        GGML_LOG_ERROR("%s: a warm needs a queue, warm objects, at least one heap and a signal\n", __func__);
+        return false;
+    }
+    for (size_t i = 0; i < n_heaps; ++i) {
+        if (heaps[i] == NULL) {
+            GGML_LOG_ERROR("%s: heap %zu is NULL\n", __func__, i);
+            return false;
+        }
+    }
+    for (size_t i = 0; i < n_bufs; ++i) {
+        for (int j = 0; j < ggml_metal_buffer_get_n_objs(bufs[i]); ++j) {
+            if (ggml_metal_buffer_get_obj(bufs[i], j) == NULL) {
+                GGML_LOG_ERROR("%s: buffer %zu has no Metal buffer %d\n", __func__, i, j);
+                return false;
+            }
+        }
+    }
+
+    @autoreleasepool {
+        // the caller's signal says the GPU is done with the command buffer the allocator holds
+        [warm->alloc reset];
+
+        [warm->rset removeAllAllocations];
+        for (size_t i = 0; i < n_heaps; ++i) {
+            [warm->rset addAllocation:heaps[i]->heap];
+        }
+        for (size_t i = 0; i < n_bufs; ++i) {
+            for (int j = 0; j < ggml_metal_buffer_get_n_objs(bufs[i]); ++j) {
+                [warm->rset addAllocation:(id<MTLBuffer>) ggml_metal_buffer_get_obj(bufs[i], j)];
+            }
+        }
+        [warm->rset commit];
+
+        // the set goes on this command buffer only: a set on the queue would keep everything resident
+        id<MTL4CommandBuffer> cmd_buf = warm->cmd_buf;
+        [cmd_buf beginCommandBufferWithAllocator:warm->alloc];
+        [cmd_buf useResidencySet:warm->rset];
+
+        id<MTL4ComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
+        if (encoder == nil) {
+            GGML_LOG_ERROR("%s: failed to create a compute encoder\n", __func__);
+            [cmd_buf endCommandBuffer];
+            return false;
+        }
+        // an encoder that dispatches nothing does not count as a reference
+        [encoder setComputePipelineState:heaps[0]->nop];
+        [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder endEncoding];
+        [cmd_buf endCommandBuffer];
+
+        // the queue does not hold a mapping operation back until an earlier command buffer
+        // completed, so it waits for the warm's own signal before what comes next
+        id<MTLSharedEvent> event = (id<MTLSharedEvent>) ggml_metal_event_get_obj(signal);
+        [queue->queue commit:&cmd_buf count:1];
+        [queue->queue signalEvent:event value:value];
+        [queue->queue waitForEvent:event value:value];
+    }
+
+    return true;
+}
+
 #pragma clang diagnostic pop
 
 #else
@@ -382,6 +495,21 @@ void ggml_metal_mapping_queue_free (ggml_metal_mapping_queue_t queue) { GGML_UNU
 bool ggml_metal_update_tiles(ggml_metal_mapping_queue_t queue, ggml_metal_placement_heap_t heap, ggml_metal_buffer_t buf,
         const struct ggml_metal_tile_run * runs, size_t n_runs, ggml_metal_event_t signal, uint64_t value) {
     GGML_UNUSED(queue); GGML_UNUSED(heap); GGML_UNUSED(buf); GGML_UNUSED(runs); GGML_UNUSED(n_runs); GGML_UNUSED(signal); GGML_UNUSED(value);
+    return false;
+}
+
+ggml_metal_warm_t ggml_metal_warm_init(ggml_metal_device_t dev) {
+    GGML_LOG_ERROR("%s: placement sparse buffers need the macOS 26.4 SDK\n", __func__);
+    GGML_UNUSED(dev);
+    return NULL;
+}
+
+void ggml_metal_warm_free(ggml_metal_warm_t warm) { GGML_UNUSED(warm); }
+
+bool ggml_metal_mapping_queue_warm(ggml_metal_mapping_queue_t queue, ggml_metal_warm_t warm,
+        ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_metal_buffer_t const * bufs, size_t n_bufs,
+        ggml_metal_event_t signal, uint64_t value) {
+    GGML_UNUSED(queue); GGML_UNUSED(warm); GGML_UNUSED(heaps); GGML_UNUSED(n_heaps); GGML_UNUSED(bufs); GGML_UNUSED(n_bufs); GGML_UNUSED(signal); GGML_UNUSED(value);
     return false;
 }
 

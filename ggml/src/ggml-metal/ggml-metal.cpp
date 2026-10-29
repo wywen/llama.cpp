@@ -1203,6 +1203,32 @@ bool ggml_backend_metal_unmap_tiles(ggml_metal_mapping_queue_t queue, ggml_backe
     return ggml_metal_update_tiles(queue, NULL, buf, runs, n_runs, signal, value);
 }
 
+ggml_metal_warm_t ggml_backend_metal_warm_new(ggml_backend_t backend) {
+    ggml_metal_device_t dev = ggml_backend_metal_device_of(backend);
+    return dev != NULL ? ggml_metal_warm_init(dev) : NULL;
+}
+
+void ggml_backend_metal_warm_free(ggml_metal_warm_t warm) {
+    ggml_metal_warm_free(warm);
+}
+
+bool ggml_backend_metal_mapping_queue_warm(ggml_metal_mapping_queue_t queue, ggml_metal_warm_t warm,
+        ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_backend_buffer_t const * buffers, size_t n_buffers,
+        ggml_metal_event_t signal, uint64_t value) {
+    if (queue == NULL || warm == NULL || heaps == NULL || n_heaps == 0 || (buffers == NULL && n_buffers > 0) || signal == NULL) {
+        return false;
+    }
+
+    std::vector<ggml_metal_buffer_t> bufs(n_buffers);
+    for (size_t i = 0; i < n_buffers; ++i) {
+        bufs[i] = ggml_backend_metal_buffer_of(buffers[i]);
+        if (bufs[i] == NULL) {
+            return false;
+        }
+    }
+    return ggml_metal_mapping_queue_warm(queue, warm, heaps, n_heaps, bufs.data(), bufs.size(), signal, value);
+}
+
 ggml_metal_blit_queue_t ggml_backend_metal_blit_queue_new(ggml_backend_t backend, ggml_metal_placement_heap_t heap) {
     ggml_metal_device_t dev = ggml_backend_metal_device_of(backend);
     return dev != NULL ? ggml_metal_blit_queue_init(dev, heap) : NULL;
