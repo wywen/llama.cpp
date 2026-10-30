@@ -11,6 +11,11 @@ ggml_metal_placement_heap_t ggml_metal_placement_heap_init(ggml_metal_device_t d
 void                        ggml_metal_placement_heap_free(ggml_metal_placement_heap_t heap);
 void *                      ggml_metal_placement_heap_contents(ggml_metal_placement_heap_t heap);
 
+// the heap's residency set on the mapping queues and the device's compute queue; see ggml-metal.h
+bool ggml_metal_placement_heap_attach_residency (ggml_metal_placement_heap_t heap, ggml_metal_mapping_queue_t const * queues, size_t n_queues);
+void ggml_metal_placement_heap_detach_residency (ggml_metal_placement_heap_t heap);
+void ggml_metal_placement_heap_request_residency(ggml_metal_placement_heap_t heap);
+
 bool   ggml_metal_placement_is_supported(ggml_metal_device_t dev);
 size_t ggml_metal_placement_tile_bytes(void);
 

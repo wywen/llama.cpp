@@ -7,6 +7,7 @@
 #include <Metal/Metal.h>
 
 #include <dispatch/dispatch.h>
+#include <os/lock.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -53,19 +54,70 @@ size_t ggml_metal_placement_tile_bytes(void) {
     return GGML_METAL_PLACEMENT_TILE_BYTES;
 }
 
+// an empty one-thread kernel: a command buffer that dispatches it references what it declares,
+// where an encoder that dispatches nothing does not
+static id<MTLComputePipelineState> ggml_metal_placement_nop_new(id<MTLDevice> device, const char * caller) {
+    id<MTLComputePipelineState> res = nil;
+
+    @autoreleasepool {
+        NSError * error = nil;
+        id<MTLLibrary> lib = [device newLibraryWithSource:@"kernel void ggml_metal_placement_nop() {}" options:nil error:&error];
+        id<MTLFunction> fn = [lib newFunctionWithName:@"ggml_metal_placement_nop"];
+        if (error != nil && lib != nil) {
+            GGML_LOG_WARN("%s: empty kernel: %s\n", caller, [[error description] UTF8String]);
+            error = nil;
+        }
+        if (fn != nil) {
+            res = [device newComputePipelineStateWithFunction:fn error:&error];
+        }
+        if (res == nil) {
+            GGML_LOG_ERROR("%s: failed to create the empty kernel: %s\n", caller,
+                    error ? [[error description] UTF8String] : "no function");
+        }
+        [fn release];
+        [lib release];
+    }
+
+    return res;
+}
+
+// a heap's residency set attaches to mapping queues, so the queue comes first
+struct ggml_metal_mapping_queue {
+    id<MTL4CommandQueue> queue;
+
+    // the kernel a warm on this queue dispatches
+    id<MTLComputePipelineState> nop;
+};
+
 //
 // heaps
 //
 
+// the most mapping queues one heap's residency set is attached to at once
+#define GGML_METAL_PLACEMENT_MAX_RESIDENCY_QUEUES 4
+
 struct ggml_metal_placement_heap {
+    id<MTLDevice> device;
+
     id<MTLHeap>   heap;
     // a shared buffer placed over the whole heap: the host's view of every tile
     id<MTLBuffer> alias;
 
     size_t n_tiles;
 
+    // a residency set holding this heap alone, and the queues it is attached to: the device's
+    // compute queue and up to GGML_METAL_PLACEMENT_MAX_RESIDENCY_QUEUES mapping queues, each
+    // retained while attached; the lock serializes the calls that change or request it
+    id<MTLResidencySet>  rset;
+    id<MTLCommandQueue>  compute_queue;
+    bool                 compute_attached;
+    id<MTL4CommandQueue> attached[GGML_METAL_PLACEMENT_MAX_RESIDENCY_QUEUES];
+    size_t               n_attached;
+    os_unfair_lock       residency_lock;
+
     // keep-prepared: an empty kernel on a queue of its own, so that it never waits behind a blit or a
-    // compute command buffer parked on an event
+    // compute command buffer parked on an event; both are made by the first keep-prepared call
+    // naming this heap first
     id<MTLCommandQueue>         keep_queue;
     id<MTLComputePipelineState> nop;
     dispatch_group_t keep_pending;
@@ -99,6 +151,7 @@ ggml_metal_placement_heap_t ggml_metal_placement_heap_init(ggml_metal_device_t d
     atomic_init(&res->keep_failed, false);
 
     res->n_tiles = n_tiles;
+    res->residency_lock = OS_UNFAIR_LOCK_INIT;
 
     @autoreleasepool {
         const size_t bytes = n_tiles*GGML_METAL_PLACEMENT_TILE_BYTES;
@@ -114,40 +167,126 @@ ggml_metal_placement_heap_t ggml_metal_placement_heap_init(ggml_metal_device_t d
 
         if (res->heap != nil) {
             res->alias = [res->heap newBufferWithLength:bytes options:MTLResourceStorageModeShared offset:0];
-        }
 
-        res->keep_queue = [device newCommandQueue];
-
-        NSError * error = nil;
-        id<MTLLibrary> lib = [device newLibraryWithSource:@"kernel void ggml_metal_placement_nop() {}" options:nil error:&error];
-        id<MTLFunction> fn = [lib newFunctionWithName:@"ggml_metal_placement_nop"];
-        if (error != nil && lib != nil) {
-            GGML_LOG_WARN("%s: keep-prepared kernel: %s\n", __func__, [[error description] UTF8String]);
-            error = nil;
+            NSError * error = nil;
+            MTLResidencySetDescriptor * rdesc = [[MTLResidencySetDescriptor alloc] init];
+            rdesc.initialCapacity = 1;
+            res->rset = [device newResidencySetWithDescriptor:rdesc error:&error];
+            [rdesc release];
+            if (res->rset != nil) {
+                [res->rset addAllocation:res->heap];
+                [res->rset commit];
+            } else {
+                GGML_LOG_ERROR("%s: failed to create a residency set: %s\n", __func__,
+                        error ? [[error description] UTF8String] : "nil");
+            }
         }
-        if (fn != nil) {
-            res->nop = [device newComputePipelineStateWithFunction:fn error:&error];
-        }
-        if (error != nil) {
-            GGML_LOG_ERROR("%s: keep-prepared kernel: %s\n", __func__, [[error description] UTF8String]);
-        }
-        [fn release];
-        [lib release];
     }
 
-    if (res->heap == nil || res->alias == nil || res->alias.contents == NULL || res->keep_queue == nil || res->nop == nil) {
+    res->device        = [device retain];
+    res->compute_queue = [(id<MTLCommandQueue>) ggml_metal_device_get_queue(dev) retain];
+
+    if (res->heap == nil || res->alias == nil || res->alias.contents == NULL || res->rset == nil || res->compute_queue == nil) {
         GGML_LOG_ERROR("%s: failed to create a shared heap of %zu tiles (%.2f MiB)\n", __func__,
                 n_tiles, n_tiles*GGML_METAL_PLACEMENT_TILE_BYTES/1024.0/1024.0);
-        [res->nop        release];
-        [res->keep_queue release];
-        [res->alias      release];
-        [res->heap       release];
+        [res->compute_queue release];
+        [res->device        release];
+        [res->rset          release];
+        [res->alias         release];
+        [res->heap          release];
         dispatch_release(res->keep_pending);
         free(res);
         return NULL;
     }
 
     return res;
+}
+
+// with the heap's residency lock held
+static void ggml_metal_placement_heap_detach_locked(ggml_metal_placement_heap_t heap) {
+    for (size_t i = 0; i < heap->n_attached; ++i) {
+        [heap->attached[i] removeResidencySet:heap->rset];
+        [heap->attached[i] release];
+        heap->attached[i] = nil;
+    }
+    heap->n_attached = 0;
+    if (heap->compute_attached) {
+        [heap->compute_queue removeResidencySet:heap->rset];
+        heap->compute_attached = false;
+    }
+}
+
+bool ggml_metal_placement_heap_attach_residency(ggml_metal_placement_heap_t heap, ggml_metal_mapping_queue_t const * queues, size_t n_queues) {
+    if (heap == NULL || (queues == NULL && n_queues > 0)) {
+        GGML_LOG_ERROR("%s: attaching residency needs a heap and its queues\n", __func__);
+        return false;
+    }
+    for (size_t i = 0; i < n_queues; ++i) {
+        if (queues[i] == NULL) {
+            GGML_LOG_ERROR("%s: mapping queue %zu is NULL\n", __func__, i);
+            return false;
+        }
+    }
+
+    bool res = true;
+
+    os_unfair_lock_lock(&heap->residency_lock);
+
+    // count the queues not yet attached first, so a refusal attaches nothing
+    size_t n_new = 0;
+    for (size_t i = 0; i < n_queues; ++i) {
+        bool seen = false;
+        for (size_t j = 0; j < heap->n_attached && !seen; ++j) {
+            seen = heap->attached[j] == queues[i]->queue;
+        }
+        for (size_t j = 0; j < i && !seen; ++j) {
+            seen = queues[j]->queue == queues[i]->queue;
+        }
+        n_new += seen ? 0 : 1;
+    }
+    if (heap->n_attached + n_new > GGML_METAL_PLACEMENT_MAX_RESIDENCY_QUEUES) {
+        GGML_LOG_ERROR("%s: a heap's residency set is attached to at most %d mapping queues\n", __func__,
+                GGML_METAL_PLACEMENT_MAX_RESIDENCY_QUEUES);
+        res = false;
+    } else {
+        for (size_t i = 0; i < n_queues; ++i) {
+            id<MTL4CommandQueue> queue = queues[i]->queue;
+            bool seen = false;
+            for (size_t j = 0; j < heap->n_attached && !seen; ++j) {
+                seen = heap->attached[j] == queue;
+            }
+            if (!seen) {
+                [queue addResidencySet:heap->rset];
+                heap->attached[heap->n_attached++] = [queue retain];
+            }
+        }
+        if (!heap->compute_attached) {
+            [heap->compute_queue addResidencySet:heap->rset];
+            heap->compute_attached = true;
+        }
+    }
+
+    os_unfair_lock_unlock(&heap->residency_lock);
+
+    return res;
+}
+
+void ggml_metal_placement_heap_detach_residency(ggml_metal_placement_heap_t heap) {
+    if (heap == NULL) {
+        return;
+    }
+    os_unfair_lock_lock(&heap->residency_lock);
+    ggml_metal_placement_heap_detach_locked(heap);
+    os_unfair_lock_unlock(&heap->residency_lock);
+}
+
+void ggml_metal_placement_heap_request_residency(ggml_metal_placement_heap_t heap) {
+    if (heap == NULL) {
+        return;
+    }
+    os_unfair_lock_lock(&heap->residency_lock);
+    [heap->rset requestResidency];
+    os_unfair_lock_unlock(&heap->residency_lock);
 }
 
 void ggml_metal_placement_heap_free(ggml_metal_placement_heap_t heap) {
@@ -160,10 +299,18 @@ void ggml_metal_placement_heap_free(ggml_metal_placement_heap_t heap) {
     }
     dispatch_release(heap->keep_pending);
 
-    [heap->nop        release];
-    [heap->keep_queue release];
-    [heap->alias      release];
-    [heap->heap       release];
+    os_unfair_lock_lock(&heap->residency_lock);
+    ggml_metal_placement_heap_detach_locked(heap);
+    [heap->rset endResidency];
+    os_unfair_lock_unlock(&heap->residency_lock);
+
+    [heap->nop           release];
+    [heap->keep_queue    release];
+    [heap->rset          release];
+    [heap->compute_queue release];
+    [heap->alias         release];
+    [heap->heap          release];
+    [heap->device        release];
 
     free(heap);
 }
@@ -241,10 +388,6 @@ bool ggml_metal_sparse_buffer_renew(ggml_metal_device_t dev, ggml_metal_buffer_t
 // mapping
 //
 
-struct ggml_metal_mapping_queue {
-    id<MTL4CommandQueue> queue;
-};
-
 ggml_metal_mapping_queue_t ggml_metal_mapping_queue_init(ggml_metal_device_t dev) {
     id<MTLDevice> device = (id<MTLDevice>) ggml_metal_device_get_obj(dev);
 
@@ -258,8 +401,20 @@ ggml_metal_mapping_queue_t ggml_metal_mapping_queue_init(ggml_metal_device_t dev
         return NULL;
     }
 
+    id<MTLComputePipelineState> nop = ggml_metal_placement_nop_new(device, __func__);
+    if (nop == nil) {
+        [queue release];
+        return NULL;
+    }
+
     ggml_metal_mapping_queue_t res = calloc(1, sizeof(struct ggml_metal_mapping_queue));
+    if (res == NULL) {
+        [nop release];
+        [queue release];
+        return NULL;
+    }
     res->queue = queue;
+    res->nop   = nop;
 
     return res;
 }
@@ -269,6 +424,7 @@ void ggml_metal_mapping_queue_free(ggml_metal_mapping_queue_t queue) {
         return;
     }
 
+    [queue->nop   release];
     [queue->queue release];
     free(queue);
 }
@@ -380,8 +536,8 @@ void ggml_metal_warm_free(ggml_metal_warm_t warm) {
 bool ggml_metal_mapping_queue_warm(ggml_metal_mapping_queue_t queue, ggml_metal_warm_t warm,
         ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_metal_buffer_t const * bufs, size_t n_bufs,
         ggml_metal_event_t signal, uint64_t value) {
-    if (queue == NULL || warm == NULL || heaps == NULL || n_heaps == 0 || (bufs == NULL && n_bufs > 0) || signal == NULL) {
-        GGML_LOG_ERROR("%s: a warm needs a queue, warm objects, at least one heap and a signal\n", __func__);
+    if (queue == NULL || warm == NULL || (heaps == NULL && n_heaps > 0) || (bufs == NULL && n_bufs > 0) || signal == NULL) {
+        GGML_LOG_ERROR("%s: a warm needs a queue, warm objects and a signal\n", __func__);
         return false;
     }
     for (size_t i = 0; i < n_heaps; ++i) {
@@ -426,7 +582,7 @@ bool ggml_metal_mapping_queue_warm(ggml_metal_mapping_queue_t queue, ggml_metal_
             return false;
         }
         // an encoder that dispatches nothing does not count as a reference
-        [encoder setComputePipelineState:heaps[0]->nop];
+        [encoder setComputePipelineState:queue->nop];
         [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         [encoder endEncoding];
         [cmd_buf endCommandBuffer];
@@ -491,6 +647,14 @@ ggml_metal_mapping_queue_t ggml_metal_mapping_queue_init(ggml_metal_device_t dev
 
 void ggml_metal_placement_heap_free(ggml_metal_placement_heap_t heap) { GGML_UNUSED(heap); }
 void ggml_metal_mapping_queue_free (ggml_metal_mapping_queue_t queue) { GGML_UNUSED(queue); }
+
+bool ggml_metal_placement_heap_attach_residency(ggml_metal_placement_heap_t heap, ggml_metal_mapping_queue_t const * queues, size_t n_queues) {
+    GGML_UNUSED(heap); GGML_UNUSED(queues); GGML_UNUSED(n_queues);
+    return false;
+}
+
+void ggml_metal_placement_heap_detach_residency (ggml_metal_placement_heap_t heap) { GGML_UNUSED(heap); }
+void ggml_metal_placement_heap_request_residency(ggml_metal_placement_heap_t heap) { GGML_UNUSED(heap); }
 
 bool ggml_metal_update_tiles(ggml_metal_mapping_queue_t queue, ggml_metal_placement_heap_t heap, ggml_metal_buffer_t buf,
         const struct ggml_metal_tile_run * runs, size_t n_runs, ggml_metal_event_t signal, uint64_t value) {
@@ -756,8 +920,22 @@ bool ggml_metal_keep_prepared(ggml_metal_placement_heap_t const * heaps, size_t 
         }
     }
 
+    ggml_metal_placement_heap_t owner = heaps[0];
+    if (owner->keep_queue == nil) {
+        id<MTLComputePipelineState> nop   = ggml_metal_placement_nop_new(owner->device, __func__);
+        id<MTLCommandQueue>         queue = nop != nil ? [owner->device newCommandQueue] : nil;
+        if (queue == nil) {
+            GGML_LOG_ERROR("%s: failed to create the keep-prepared queue\n", __func__);
+            [nop release];
+            free(objs);
+            return false;
+        }
+        owner->nop        = nop;
+        owner->keep_queue = queue;
+    }
+
     @autoreleasepool {
-        id<MTLCommandBuffer> cmd_buf = [heaps[0]->keep_queue commandBuffer];
+        id<MTLCommandBuffer> cmd_buf = [owner->keep_queue commandBuffer];
         if (cmd_buf == nil) {
             free(objs);
             return false;
@@ -775,11 +953,10 @@ bool ggml_metal_keep_prepared(ggml_metal_placement_heap_t const * heaps, size_t 
         if (n_objs > 0) {
             [encoder useResources:objs count:n_objs usage:MTLResourceUsageRead];
         }
-        [encoder setComputePipelineState:heaps[0]->nop];
+        [encoder setComputePipelineState:owner->nop];
         [encoder dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         [encoder endEncoding];
 
-        ggml_metal_placement_heap_t owner = heaps[0];
         dispatch_group_t pending = owner->keep_pending;
         dispatch_group_enter(pending);
         [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {

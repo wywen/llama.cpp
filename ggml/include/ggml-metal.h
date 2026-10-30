@@ -209,15 +209,17 @@ typedef struct ggml_metal_placement_heap * ggml_metal_placement_heap_t;
 GGML_BACKEND_API bool ggml_backend_metal_placement_supported(ggml_backend_t backend);
 
 // A heap of n_tiles tiles of shared storage, with a shared buffer placed over all of it through
-// which the host reads and writes every tile. No residency set: a command buffer that binds a sparse
-// buffer mapped onto the heap, or declares the heap, makes it resident. NULL for a backend that is
-// not Metal, or when the device refuses the heap.
+// which the host reads and writes every tile, and a residency set holding the heap alone, committed
+// and attached to no queue (see heap residency below). A command buffer that binds a sparse buffer
+// mapped onto the heap, or declares the heap, makes it resident. NULL for a backend that is not
+// Metal, or when the device refuses the heap or its residency set.
 GGML_BACKEND_API ggml_metal_placement_heap_t ggml_backend_metal_placement_heap_new (ggml_backend_t backend, size_t n_tiles);
 // The heap must have no tile mapped by any sparse buffer, no work in flight that touches it, and no
 // blit queue still attached to it; nothing here tracks any of these, so the caller drains, unmaps
 // and frees those queues first.
 // Drains this heap's own keep-prepared queue for up to 10000 ms, aborting on failure. The caller
-// must first drain other heaps' keep-prepared queues that reference this heap.
+// must first drain other heaps' keep-prepared queues that reference this heap. Detaches the heap's
+// residency set from every queue it is still attached to, ends its residency and releases it.
 GGML_BACKEND_API void                        ggml_backend_metal_placement_heap_free(ggml_metal_placement_heap_t heap);
 // The host address of the heap's first tile; tile t is at t tiles from it. A host write is what a
 // kernel reading a sparse buffer tile mapped onto t sees once the write completed, and a GPU write
@@ -284,17 +286,49 @@ GGML_BACKEND_API ggml_metal_warm_t ggml_backend_metal_warm_new (ggml_backend_t b
 GGML_BACKEND_API void              ggml_backend_metal_warm_free(ggml_metal_warm_t warm);
 
 // Commits on the queue, with `warm`'s objects, a command buffer that declares the heaps and
-// `buffers` through a residency set on that command buffer only and runs an empty one-thread
-// kernel, then signals `signal` to `value` and makes the queue wait for `value`, so mapping
-// operations queued after the call apply only once the warm completed and find the declared
-// allocations prepared. Preparation is per allocation: it prepares exactly the declared heaps and
+// `buffers` through a residency set on that command buffer only and runs the queue's empty
+// one-thread kernel, then signals `signal` to `value` and makes the queue wait for `value`, so
+// mapping operations queued after the call apply only once the warm completed and find the
+// declared allocations prepared. Preparation is per allocation: it prepares exactly the declared heaps and
 // buffers, and a buffer on a declared heap that is not declared stays as it was. The caller reuses
 // or frees `warm` only once `signal` reached `value`, and does not make this call concurrently with
-// another call on the same queue. Never waits on the host. False, with nothing queued, when an
-// argument is NULL, n_heaps is 0, a buffer is not a Metal buffer or the encoder is refused.
+// another call on the same queue. Never waits on the host. A warm may name no heap and only
+// buffers: a buffer mapped onto a heap is prepared without declaring the heap. False, with nothing
+// queued, when the queue, `warm` or `signal` is NULL, a count is non-zero with a NULL array, a
+// buffer is not a Metal buffer or the encoder is refused.
 GGML_BACKEND_API bool ggml_backend_metal_mapping_queue_warm(ggml_metal_mapping_queue_t queue, ggml_metal_warm_t warm,
         ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_backend_buffer_t const * buffers, size_t n_buffers,
         ggml_metal_event_t signal, uint64_t value);
+
+// Heap residency. A heap's residency set keeps the heap wired while it is requested; it prepares
+// nothing, and a command buffer that binds or declares the heap still makes it resident without it.
+//
+// attach_residency adds the heap's set to each of `queues` and to the device's compute queue, the
+// one ggml commits its graphs on, skipping a queue it is already attached to: Metal makes every set
+// attached to a queue resident for each command buffer committed on it, and a command buffer
+// already committed or scheduled keeps the sets it had. False, with nothing attached, when the heap
+// is NULL, a queue is NULL, or the set would be attached to more than 4 mapping queues.
+// detach_residency removes the set from every queue it is attached to; it does nothing for a heap
+// that is not attached. request_residency asks Metal to make the set resident ahead of the next
+// commit that uses it; Metal may postpone part of that work while other processes compete for
+// memory. Ending residency is heap_free's.
+//
+// Apple's documentation states that a command queue and a command buffer each keep a list of up to
+// 32 residency sets, and that committing a command buffer attaches its queue's current sets to it.
+// It does not say whether the sets a command buffer declares itself, such as a warm's, count
+// against the same 32 as the sets the queue attaches at commit. Nothing here counts sets: the
+// caller keeps every queue, the device's compute queue included, within the limit, across every
+// heap it attaches.
+//
+// Calls on one heap are serialized internally, and may run on any thread. They take no lock that
+// ggml's commits on the compute queue take, since those take none, and no lock of the mapping
+// queues. Apple documents command queues as thread-safe but does not say specifically whether a
+// queue's residency sets may change while another thread commits on it; these calls rely on that
+// thread safety. The heap holds a reference to each mapping queue it is attached to, so a mapping
+// queue freed while attached stays alive until the heap is detached or freed.
+GGML_BACKEND_API bool ggml_backend_metal_placement_heap_attach_residency (ggml_metal_placement_heap_t heap, ggml_metal_mapping_queue_t const * queues, size_t n_queues);
+GGML_BACKEND_API void ggml_backend_metal_placement_heap_detach_residency (ggml_metal_placement_heap_t heap);
+GGML_BACKEND_API void ggml_backend_metal_placement_heap_request_residency(ggml_metal_placement_heap_t heap);
 
 // A command queue for blits with one event as its timeline: the queue numbers its blits 1, 2, ...
 // in submission order, and blit v signals the event to v once it completed. Each blit waits for
@@ -335,8 +369,9 @@ GGML_BACKEND_API uint64_t ggml_backend_metal_blit_fill(ggml_metal_blit_queue_t q
 // command buffer that binds it can run, at a cost that grows with its size. This commits one
 // command buffer, on the first heap's own queue, that references every heap and `buffers` and runs
 // an empty one-thread kernel: an encoder that dispatches nothing does not count as a reference.
-// Calling it more often than the driver's idle threshold keeps them prepared. It does not wait for
-// the command buffer; a queue holds at most 64 uncompleted command buffers, so a caller that outruns
+// Calling it more often than the driver's idle threshold keeps them prepared. The first heap's
+// queue and kernel are made by the first call that names it first. It does not wait for the
+// command buffer; a queue holds at most 64 uncompleted command buffers, so a caller that outruns
 // the device blocks in the next call.
 GGML_BACKEND_API bool ggml_backend_metal_keep_prepared(ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_backend_buffer_t const * buffers, size_t n_buffers);
 

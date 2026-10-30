@@ -1147,6 +1147,18 @@ void * ggml_backend_metal_placement_heap_contents(ggml_metal_placement_heap_t he
     return ggml_metal_placement_heap_contents(heap);
 }
 
+bool ggml_backend_metal_placement_heap_attach_residency(ggml_metal_placement_heap_t heap, ggml_metal_mapping_queue_t const * queues, size_t n_queues) {
+    return ggml_metal_placement_heap_attach_residency(heap, queues, n_queues);
+}
+
+void ggml_backend_metal_placement_heap_detach_residency(ggml_metal_placement_heap_t heap) {
+    ggml_metal_placement_heap_detach_residency(heap);
+}
+
+void ggml_backend_metal_placement_heap_request_residency(ggml_metal_placement_heap_t heap) {
+    ggml_metal_placement_heap_request_residency(heap);
+}
+
 size_t ggml_backend_metal_placement_tile_bytes(void) {
     return ggml_metal_placement_tile_bytes();
 }
@@ -1215,7 +1227,7 @@ void ggml_backend_metal_warm_free(ggml_metal_warm_t warm) {
 bool ggml_backend_metal_mapping_queue_warm(ggml_metal_mapping_queue_t queue, ggml_metal_warm_t warm,
         ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_backend_buffer_t const * buffers, size_t n_buffers,
         ggml_metal_event_t signal, uint64_t value) {
-    if (queue == NULL || warm == NULL || heaps == NULL || n_heaps == 0 || (buffers == NULL && n_buffers > 0) || signal == NULL) {
+    if (queue == NULL || warm == NULL || (heaps == NULL && n_heaps > 0) || (buffers == NULL && n_buffers > 0) || signal == NULL) {
         return false;
     }
 
