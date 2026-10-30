@@ -356,6 +356,12 @@ bool ggml_metal_buffer_set_sparse(ggml_metal_buffer_t buf, void * metal);
 int    ggml_metal_buffer_get_n_objs(ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_obj   (ggml_metal_buffer_t buf, int i);
 
+// a buffer over host memory (from ggml_metal_buffer_map): see ggml_backend_metal_buffer_unwrap
+bool ggml_metal_buffer_unwrap            (ggml_metal_buffer_t buf);
+bool ggml_metal_buffer_rewrap            (ggml_metal_buffer_t buf);
+bool ggml_metal_buffer_request_residency (ggml_metal_buffer_t buf);
+bool ggml_metal_buffer_end_residency     (ggml_metal_buffer_t buf);
+
 // the Metal buffer that holds bytes [offs, offs + size) of buf and the offset of the range in it;
 // metal is nil when no single Metal buffer holds the range
 struct ggml_metal_buffer_id ggml_metal_buffer_get_range(ggml_metal_buffer_t buf, size_t offs, size_t size);
