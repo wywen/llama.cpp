@@ -105,6 +105,12 @@ GGML_BACKEND_API void ggml_backend_metal_set_boundary_schedule(
 GGML_BACKEND_API void ggml_backend_metal_set_boundary_entry_signal(
         ggml_backend_t backend, ggml_metal_event_t ev, uint64_t value);
 
+// Set how long, in milliseconds, the paged compute path waits for one segment's gate event before
+// failing the graph with the backend error state set. While waiting it logs a warning every 10
+// seconds naming the node, the elapsed time and the awaited event value. 0 waits without limit.
+// Default 300000. Applies to subsequent computes on this backend.
+GGML_BACKEND_API void ggml_backend_metal_set_paged_gate_abort_ms(ggml_backend_t backend, uint32_t ms);
+
 // Restrict the boundary-scheduled (paged) compute path to the node range
 // (first_node, last_node] -- lower boundary EXCLUSIVE (pass the band-entry
 // residual node itself), upper INCLUSIVE, either NULL for an open edge --

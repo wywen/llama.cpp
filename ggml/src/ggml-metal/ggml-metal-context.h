@@ -44,6 +44,8 @@ void ggml_metal_set_boundary_schedule(
         int n_cuts,  struct ggml_tensor * const * cut_nodes,  ggml_metal_event_t * sig_ev, const uint64_t * sig_val,
         int n_waits, struct ggml_tensor * const * wait_nodes, ggml_metal_event_t * wait_ev, const uint64_t * wait_val);
 
+void ggml_metal_set_paged_gate_abort_ms(ggml_metal_t ctx, uint32_t ms);
+
 void ggml_metal_set_boundary_entry_signal(ggml_metal_t ctx, ggml_metal_event_t ev, uint64_t value);
 
 void ggml_metal_set_encode_window(

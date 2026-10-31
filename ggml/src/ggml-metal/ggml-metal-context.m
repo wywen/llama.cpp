@@ -1,3 +1,7 @@
+// The encode waits for a segment's gate in slices, warning after each one. Exceeding the abort
+// limit fails the graph: encoding resolves each tensor's Metal buffer, and a buffer the caller
+// has not yet made (or is about to release) for this segment must not be bound by a command
+// buffer committed ahead of its gate.
 #import "ggml-metal-context.h"
 
 #import "ggml-impl.h"
@@ -30,6 +34,10 @@ struct ggml_metal_seg_result {
 struct ggml_metal_command_buffer {
     id<MTLCommandBuffer> obj;
 };
+
+// Paged compute gate wait: warning slice and default abort limit.
+#define GGML_METAL_PAGED_GATE_SLICE_MS 10000
+#define GGML_METAL_PAGED_GATE_ABORT_MS_DEFAULT 300000
 
 struct ggml_metal {
     char name[128];
@@ -106,6 +114,10 @@ struct ggml_metal {
     // into `has_error`, or an explicit note when the queue was abandoned without one. Owned
     // copy: the command buffers it came from are released immediately after.
     char last_error[256];
+
+    // Paged compute: total time a segment may wait for its gate before the graph fails
+    // (0 = no limit). See ggml_backend_metal_set_paged_gate_abort_ms.
+    uint32_t paged_gate_abort_ms;
 
     // Paged-decode boundary-event schedule (PERSISTENT + pointer-keyed;
     // see ggml_metal_set_boundary_schedule). Owned copies, replaced on each set
@@ -251,6 +263,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
         res->has_error = false;
         res->last_error[0] = '\0';
+        res->paged_gate_abort_ms = GGML_METAL_PAGED_GATE_ABORT_MS_DEFAULT;
 
         res->gf = nil;
         res->encode_async = nil;
@@ -616,6 +629,10 @@ static void ggml_metal_bsched_clear(ggml_metal_t ctx) {
     ctx->bsched_n_waits    = 0;
     ctx->bsched_entry_ev   = NULL;
     ctx->bsched_entry_val  = 0;
+}
+
+void ggml_metal_set_paged_gate_abort_ms(ggml_metal_t ctx, uint32_t ms) {
+    ctx->paged_gate_abort_ms = ms;
 }
 
 void ggml_metal_set_boundary_entry_signal(ggml_metal_t ctx, ggml_metal_event_t ev, uint64_t value) {
@@ -1203,15 +1220,31 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
                 struct ggml_tensor * wnode = gf->nodes[seg_start];
                 for (int w = 0; w < n_waits && !gate_timed_out; ++w) {
                     if (wait_nodes[w] == wnode && wait_ev[w] != NULL) {
-                        gate_timed_out = !ggml_metal_event_host_wait(wait_ev[w], wait_val[w],
-                                GGML_METAL_PAGED_GATE_WAIT_MS);
+                        uint64_t waited_ms = 0;
+                        while (true) {
+                            uint64_t slice_ms = GGML_METAL_PAGED_GATE_SLICE_MS;
+                            if (ctx->paged_gate_abort_ms != 0 && ctx->paged_gate_abort_ms - waited_ms < slice_ms) {
+                                slice_ms = ctx->paged_gate_abort_ms - waited_ms;
+                            }
+                            if (ggml_metal_event_host_wait(wait_ev[w], wait_val[w], slice_ms)) {
+                                break;
+                            }
+                            waited_ms += slice_ms;
+                            if (ctx->paged_gate_abort_ms != 0 && waited_ms >= ctx->paged_gate_abort_ms) {
+                                gate_timed_out = true;
+                                break;
+                            }
+                            GGML_LOG_WARN("%s: paged segment at node '%s' still waiting for its gate after %llu s (event value %llu)\n",
+                                    __func__, ggml_get_name(wnode), (unsigned long long) (waited_ms / 1000),
+                                    (unsigned long long) wait_val[w]);
+                        }
                     }
                 }
             }
             if (gate_timed_out) {
                 snprintf(ctx->last_error, sizeof(ctx->last_error),
-                        "paged segment at node '%s': its gate stayed closed for %d ms",
-                        ggml_get_name(gf->nodes[seg_start]), GGML_METAL_PAGED_GATE_WAIT_MS);
+                        "paged segment at node '%s': its gate stayed closed for %u ms",
+                        ggml_get_name(gf->nodes[seg_start]), ctx->paged_gate_abort_ms);
                 GGML_LOG_ERROR("%s: %s\n", __func__, ctx->last_error);
                 ctx->has_error = true;
 
