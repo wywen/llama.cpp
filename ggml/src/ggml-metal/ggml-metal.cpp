@@ -683,6 +683,12 @@ void ggml_backend_metal_set_boundary_schedule(
     ggml_metal_set_boundary_schedule(ctx, n_cuts, cut_nodes, sig_ev, sig_val, n_waits, wait_nodes, wait_ev, wait_val);
 }
 
+void ggml_backend_metal_set_paged_gate_abort_ms(ggml_backend_t backend, uint32_t ms) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_set_paged_gate_abort_ms((ggml_metal_t)backend->context, ms);
+}
+
 void ggml_backend_metal_set_boundary_entry_signal(ggml_backend_t backend, ggml_metal_event_t ev, uint64_t value) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
 
