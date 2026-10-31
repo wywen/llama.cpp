@@ -1188,6 +1188,26 @@ bool ggml_backend_metal_sparse_buffer_renew(ggml_backend_t backend, ggml_backend
     return ggml_metal_sparse_buffer_renew(dev, buf);
 }
 
+bool ggml_backend_metal_buffer_unwrap(ggml_backend_buffer_t buffer) {
+    ggml_metal_buffer_t buf = ggml_backend_metal_buffer_of(buffer);
+    return buf != NULL && ggml_metal_buffer_unwrap(buf);
+}
+
+bool ggml_backend_metal_buffer_rewrap(ggml_backend_buffer_t buffer) {
+    ggml_metal_buffer_t buf = ggml_backend_metal_buffer_of(buffer);
+    return buf != NULL && ggml_metal_buffer_rewrap(buf);
+}
+
+bool ggml_backend_metal_buffer_request_residency(ggml_backend_buffer_t buffer) {
+    ggml_metal_buffer_t buf = ggml_backend_metal_buffer_of(buffer);
+    return buf != NULL && ggml_metal_buffer_request_residency(buf);
+}
+
+bool ggml_backend_metal_buffer_end_residency(ggml_backend_buffer_t buffer) {
+    ggml_metal_buffer_t buf = ggml_backend_metal_buffer_of(buffer);
+    return buf != NULL && ggml_metal_buffer_end_residency(buf);
+}
+
 ggml_metal_mapping_queue_t ggml_backend_metal_mapping_queue_new(ggml_backend_t backend) {
     ggml_metal_device_t dev = ggml_backend_metal_device_of(backend);
     return dev != NULL ? ggml_metal_mapping_queue_init(dev) : NULL;

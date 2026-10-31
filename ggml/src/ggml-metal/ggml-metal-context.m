@@ -996,9 +996,10 @@ static bool ggml_metal_ewin_split_is_in_band(
 // is what makes the cross-command-buffer event signals monotonic and the waits
 // land on the right segment. Async like the stock path -- failures surface at
 // the next ggml_metal_synchronize (which drains cmd_bufs_ext), not here.
-// How long the encode will wait for a segment's gate before committing anyway.
-// Generous: exceeding it is not an error, only a return to committing ahead of
-// the data for that one segment.
+// How long the encode waits for a segment's gate. Exceeding it fails the graph:
+// encoding resolves each tensor's Metal buffer, and a buffer the caller has not
+// yet made (or is about to release) for this segment must not be bound by a
+// command buffer committed ahead of its gate.
 #define GGML_METAL_PAGED_GATE_WAIT_MS 30000
 
 static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct ggml_cgraph * gf) {
@@ -1193,17 +1194,36 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             // satisfied means the buffer runs rather than waits, so a segment
             // holds device resources only while it is executing.
             //
-            // On timeout this proceeds and commits anyway: the encoded wait below
-            // is still correct, so the fallback is the old behaviour for that one
-            // segment rather than a failure.
+            // On timeout the graph fails with this segment unencoded: its slot,
+            // already enqueued, is committed empty so the queue moves on, and the
+            // backend enters its error state, since the schedule's later signals
+            // will never fire.
+            bool gate_timed_out = false;
             if (is_wait[seg_start]) {
                 struct ggml_tensor * wnode = gf->nodes[seg_start];
-                for (int w = 0; w < n_waits; ++w) {
+                for (int w = 0; w < n_waits && !gate_timed_out; ++w) {
                     if (wait_nodes[w] == wnode && wait_ev[w] != NULL) {
-                        (void) ggml_metal_event_host_wait(wait_ev[w], wait_val[w],
+                        gate_timed_out = !ggml_metal_event_host_wait(wait_ev[w], wait_val[w],
                                 GGML_METAL_PAGED_GATE_WAIT_MS);
                     }
                 }
+            }
+            if (gate_timed_out) {
+                snprintf(ctx->last_error, sizeof(ctx->last_error),
+                        "paged segment at node '%s': its gate stayed closed for %d ms",
+                        ggml_get_name(gf->nodes[seg_start]), GGML_METAL_PAGED_GATE_WAIT_MS);
+                GGML_LOG_ERROR("%s: %s\n", __func__, ctx->last_error);
+                ctx->has_error = true;
+
+                [cmd_buf commit];
+                [ctx->cmd_bufs_ext addObject:cmd_buf];
+                ctx->cmd_buf_last = cmd_buf;
+
+                free(starts);
+                free(is_cut);
+                free(is_wait);
+
+                return GGML_STATUS_FAILED;
             }
 
             if (is_wait[seg_start]) {
