@@ -188,6 +188,43 @@ GGML_BACKEND_API void ggml_backend_metal_clear_encode_window(ggml_backend_t back
 GGML_BACKEND_API void ggml_backend_metal_set_reorder_barriers(ggml_backend_t backend, bool enable);
 
 //
+// buffers over host memory, released and recreated
+//
+// A buffer from the device's buffer_from_host_ptr wraps the caller's memory in no-copy Metal
+// buffers. While one of them exists, the GPU reads and writes the physical pages it captured:
+// pages the caller replaces under it (an eviction by mmap MAP_FIXED, say) are pages the GPU never
+// sees. These calls let the caller release the Metal buffers so that it may replace the pages, and
+// recreate them over the same memory afterwards. The backend buffer, its base and the tensors in it
+// are unchanged throughout; kernels encoded after a rewrap bind the new Metal buffers.
+//
+// The first of these calls on a buffer hands its residency set to the caller: the set leaves the
+// device's keep-alive collection, its residency ends, and from then on it is requested only by
+// request_residency. A buffer whose device keeps no residency sets gets one of its own.
+//
+// unwrap releases every Metal buffer of the buffer. The caller ends its residency first and makes
+// sure no command buffer that binds it is still encoding or in flight; until rewrap, encoding a
+// kernel that uses a tensor in the buffer aborts. Host reads and writes of the buffer's tensors
+// keep working, since they go to the memory directly. False, with nothing changed, when the buffer
+// is not a Metal buffer over host memory or is already unwrapped.
+//
+// rewrap makes new Metal buffers over the same ranges as before and puts them in the buffer's
+// residency set. The memory may be partly or wholly unpopulated: a page the host writes after the
+// rewrap is what the GPU reads, and a page never written reads zeros. False, with the buffer still
+// unwrapped, when the buffer is not unwrapped or the device refuses a Metal buffer.
+//
+// request_residency asks Metal to keep the buffer's memory resident, and may be repeated: a set
+// requested again after its memory went idle is prepared ahead of the next command buffer instead
+// of during it. end_residency ends that request. Both return false when the buffer is not a Metal
+// buffer over host memory or the OS has no residency sets; request_residency also when the buffer
+// is unwrapped. The set is attached to no queue.
+//
+// Calls on one buffer are serialized internally and may run on any thread.
+GGML_BACKEND_API bool ggml_backend_metal_buffer_unwrap            (ggml_backend_buffer_t buffer);
+GGML_BACKEND_API bool ggml_backend_metal_buffer_rewrap            (ggml_backend_buffer_t buffer);
+GGML_BACKEND_API bool ggml_backend_metal_buffer_request_residency (ggml_backend_buffer_t buffer);
+GGML_BACKEND_API bool ggml_backend_metal_buffer_end_residency     (ggml_backend_buffer_t buffer);
+
+//
 // placement sparse memory
 //
 // Primitives for paging device memory under fixed tensor addresses. A placement heap is device
