@@ -418,6 +418,13 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_graph_prepare_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_prepare_callback callback, void * user_data);
     GGML_API void                 ggml_backend_sched_set_synchronize_callback(ggml_backend_sched_t sched, ggml_backend_sched_synchronize_callback callback, void * user_data);
 
+    // When set, allocating a graph whose tensors are smaller than the previous plan plans the placement again
+    // (default: false, the previous placement is kept while every tensor still fits). The new placement starts at
+    // offset 0 of chunk 0, so chunks the graph does not need stay untouched. Existing compute buffers are never
+    // shrunk or reallocated by a plan that fits them; the reserve callback and the synchronize callback still fire
+    // as for any plan, and the reserve callback sees the current chunk sizes for a plan that needs no growth.
+    GGML_API void                 ggml_backend_sched_set_replan_on_shrink(ggml_backend_sched_t sched, bool replan);
+
     // Bytes of chunk `chunk` of the compute buffer of backend `backend_index` that the current graph's allocation uses,
     // which is at most the chunk's buffer size. The chunk's backend buffer is stored in *chunk_buffer (NULL if none).
     // Returns 0 and NULL past the last chunk, and for a backend that shares its allocator with an earlier backend

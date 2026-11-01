@@ -13,6 +13,9 @@ extern "C" {
     typedef bool (*ggml_gallocr_reserve_callback)(const struct ggml_backend_sched_buffer_reservation * reservations, size_t n_reservations, void * user_data);
     GGML_API void ggml_gallocr_set_reserve_callback(ggml_gallocr_t galloc, ggml_gallocr_reserve_callback callback, void * user_data);
 
+    // when set, ggml_gallocr_alloc_graph plans again if any tensor size differs from the recorded plan (default: only if one grew)
+    GGML_API void ggml_gallocr_set_replan_on_shrink(ggml_gallocr_t galloc, bool replan);
+
     // bytes of chunk `chunk` of buffer `buffer_id` addressed by the graph last allocated with ggml_gallocr_alloc_graph;
     // stores the chunk's backend buffer in *chunk_buffer. Returns 0 (and NULL) past the last chunk or for a buffer id
     // that shares its allocator with an earlier one.
