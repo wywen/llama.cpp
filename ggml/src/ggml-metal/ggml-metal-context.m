@@ -1249,10 +1249,16 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             // already enqueued, is committed empty so the queue moves on, and the
             // backend enters its error state, since the schedule's later signals
             // will never fire.
+            //
+            // A wait event signaled to UINT64_MAX (while the awaited value is
+            // lower) satisfies every wait but means the producer abandoned the
+            // schedule rather than delivered the data; that fails the graph the
+            // same way, with the segment unencoded.
             bool gate_timed_out = false;
+            bool gate_abandoned = false;
             if (is_wait[seg_start]) {
                 struct ggml_tensor * wnode = gf->nodes[seg_start];
-                for (int w = 0; w < n_waits && !gate_timed_out; ++w) {
+                for (int w = 0; w < n_waits && !gate_timed_out && !gate_abandoned; ++w) {
                     if (wait_nodes[w] == wnode && wait_ev[w] != NULL) {
                         uint64_t waited_ms = 0;
                         while (true) {
@@ -1261,6 +1267,8 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
                                 slice_ms = ctx->paged_gate_abort_ms - waited_ms;
                             }
                             if (ggml_metal_event_host_wait(wait_ev[w], wait_val[w], slice_ms)) {
+                                gate_abandoned = wait_val[w] != UINT64_MAX &&
+                                        ggml_metal_event_host_value(wait_ev[w]) == UINT64_MAX;
                                 break;
                             }
                             waited_ms += slice_ms;
@@ -1275,10 +1283,16 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
                     }
                 }
             }
-            if (gate_timed_out) {
-                snprintf(ctx->last_error, sizeof(ctx->last_error),
-                        "paged segment at node '%s': its gate stayed closed for %u ms",
-                        ggml_get_name(gf->nodes[seg_start]), ctx->paged_gate_abort_ms);
+            if (gate_timed_out || gate_abandoned) {
+                if (gate_abandoned) {
+                    snprintf(ctx->last_error, sizeof(ctx->last_error),
+                            "paged segment at node '%s': its gate was abandoned (event value saturated)",
+                            ggml_get_name(gf->nodes[seg_start]));
+                } else {
+                    snprintf(ctx->last_error, sizeof(ctx->last_error),
+                            "paged segment at node '%s': its gate stayed closed for %u ms",
+                            ggml_get_name(gf->nodes[seg_start]), ctx->paged_gate_abort_ms);
+                }
                 GGML_LOG_ERROR("%s: %s\n", __func__, ctx->last_error);
                 ctx->has_error = true;
 

@@ -109,6 +109,12 @@ GGML_BACKEND_API void ggml_backend_metal_set_boundary_entry_signal(
 // failing the graph with the backend error state set. While waiting it logs a warning every 10
 // seconds naming the node, the elapsed time and the awaited event value. 0 waits without limit.
 // Default 300000. Applies to subsequent computes on this backend.
+//
+// A wait event signaled to UINT64_MAX means the producer abandoned the schedule: Metal waits are
+// satisfied by any signaled value >= the awaited one, so a saturated event would otherwise let the
+// segment run on data that was never delivered. When a segment's wait event reads UINT64_MAX and the
+// awaited value is lower, the paged path fails the graph instead of encoding the segment: the
+// backend enters its error state and ggml_backend_metal_last_error names the node.
 GGML_BACKEND_API void ggml_backend_metal_set_paged_gate_abort_ms(ggml_backend_t backend, uint32_t ms);
 
 // Restrict the boundary-scheduled (paged) compute path to the node range
