@@ -361,6 +361,18 @@ extern "C" {
     // submission fails before any split was submitted.
     typedef void (*ggml_backend_sched_graph_submit_callback)(ggml_backend_sched_t sched, enum ggml_status status, void * user_data);
 
+    // Graph-prepare callback (set with ggml_backend_sched_set_graph_prepare_callback).
+    // Fired once per allocated graph, after every tensor of the graph has its final address
+    // and before the caller writes inputs. Returning false makes ggml_backend_sched_alloc_graph
+    // fail. A caller that runs a graph without ggml_backend_sched_alloc_graph (graph reuse)
+    // calls ggml_backend_sched_prepare_graph itself before writing inputs.
+    typedef bool (*ggml_backend_sched_graph_prepare_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * user_data);
+
+    // Synchronize callback (set with ggml_backend_sched_set_synchronize_callback).
+    // Fired after every backend of the scheduler has been synchronized. When it fires, no work
+    // submitted through this scheduler is pending, including async tensor copies queued on its backends.
+    typedef void (*ggml_backend_sched_synchronize_callback)(ggml_backend_sched_t sched, void * user_data);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
@@ -403,6 +415,11 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_reserve_callback(ggml_backend_sched_t sched, ggml_backend_sched_reserve_callback callback, void * user_data);
     GGML_API void                 ggml_backend_sched_set_graph_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_compute_callback callback, void * user_data);
     GGML_API void                 ggml_backend_sched_set_graph_submit_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_submit_callback callback, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_graph_prepare_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_prepare_callback callback, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_synchronize_callback(ggml_backend_sched_t sched, ggml_backend_sched_synchronize_callback callback, void * user_data);
+
+    // Invoke the graph-prepare callback for a graph that already has addresses (returns true if none is set)
+    GGML_API bool                 ggml_backend_sched_prepare_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
