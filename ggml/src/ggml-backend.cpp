@@ -837,6 +837,12 @@ struct ggml_backend_sched {
     ggml_backend_sched_graph_submit_callback callback_graph_submit;
     void * callback_graph_submit_user_data;
 
+    ggml_backend_sched_graph_prepare_callback callback_graph_prepare;
+    void * callback_graph_prepare_user_data;
+
+    ggml_backend_sched_synchronize_callback callback_synchronize;
+    void * callback_synchronize_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -1651,6 +1657,9 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         for (int i = 0; i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
+        if (sched->callback_synchronize != NULL) {
+            sched->callback_synchronize(sched, sched->callback_synchronize_user_data);
+        }
 
         if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
             return false;
@@ -2051,7 +2060,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     sched->is_alloc = true;
 
-    return true;
+    return ggml_backend_sched_prepare_graph(sched, graph);
 }
 
 enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
@@ -2079,6 +2088,9 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
+    }
+    if (sched->callback_synchronize != NULL) {
+        sched->callback_synchronize(sched, sched->callback_synchronize_user_data);
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
@@ -2116,6 +2128,26 @@ void ggml_backend_sched_set_graph_compute_callback(ggml_backend_sched_t sched, g
     GGML_ASSERT(sched);
     sched->callback_graph = callback;
     sched->callback_graph_user_data = user_data;
+}
+
+void ggml_backend_sched_set_graph_prepare_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_prepare_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_graph_prepare = callback;
+    sched->callback_graph_prepare_user_data = user_data;
+}
+
+void ggml_backend_sched_set_synchronize_callback(ggml_backend_sched_t sched, ggml_backend_sched_synchronize_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_synchronize = callback;
+    sched->callback_synchronize_user_data = user_data;
+}
+
+bool ggml_backend_sched_prepare_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    GGML_ASSERT(sched);
+    if (sched->callback_graph_prepare == NULL) {
+        return true;
+    }
+    return sched->callback_graph_prepare(sched, graph, sched->callback_graph_prepare_user_data);
 }
 
 void ggml_backend_sched_set_graph_submit_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_submit_callback callback, void * user_data) {

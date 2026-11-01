@@ -1,6 +1,7 @@
 #include "ggml-alloc.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "ggml-cpp.h"
+#include "ggml-cpu.h"
 #include "../ggml/src/ggml-impl.h"
 #include "ggml.h"
 
@@ -630,6 +631,84 @@ static void test_reserve_refusal_preserves_published_layout() {
     check_all_allocated(new_graph);
 }
 
+struct sched_callback_state {
+    int  n_prepare     = 0;
+    int  n_synchronize = 0;
+    bool accept        = true;
+    bool all_addressed = true;
+};
+
+static bool sched_prepare_callback(ggml_backend_sched_t /*sched*/, ggml_cgraph * graph, void * user_data) {
+    auto * state = static_cast<sched_callback_state *>(user_data);
+    state->n_prepare++;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        if (ggml_graph_node(graph, i)->data == nullptr) {
+            state->all_addressed = false;
+        }
+    }
+    return state->accept;
+}
+
+static void sched_synchronize_callback(ggml_backend_sched_t /*sched*/, void * user_data) {
+    static_cast<sched_callback_state *>(user_data)->n_synchronize++;
+}
+
+static void test_sched_prepare_and_synchronize_callbacks() {
+    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    GGML_ASSERT(backend);
+
+    ggml_backend_t             backends[1] = { backend.get() };
+    ggml_backend_buffer_type_t bufts[1]    = { ggml_backend_get_default_buffer_type(backend.get()) };
+    ggml_backend_sched_ptr     sched(ggml_backend_sched_new(backends, bufts, 1, 16, false, false));
+
+    auto [ctx, graph, ctx_ptr] = make_context();
+    ggml_tensor * x   = make_input_1d(ctx, 8);
+    ggml_tensor * out = ggml_scale(ctx, x, 2.0f);
+    ggml_set_output(out);
+    ggml_build_forward_expand(graph, out);
+
+    // without callbacks both entry points succeed
+    GGML_ASSERT(ggml_backend_sched_prepare_graph(sched.get(), graph));
+
+    sched_callback_state state;
+    ggml_backend_sched_set_graph_prepare_callback(sched.get(), sched_prepare_callback, &state);
+    ggml_backend_sched_set_synchronize_callback(sched.get(), sched_synchronize_callback, &state);
+
+    // fires once per allocation, after the tensors have addresses
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+    GGML_ASSERT(state.n_prepare == 1);
+    GGML_ASSERT(state.all_addressed);
+
+    // fires on demand for a graph that is not allocated again
+    GGML_ASSERT(ggml_backend_sched_prepare_graph(sched.get(), graph));
+    GGML_ASSERT(state.n_prepare == 2);
+
+    // computing an allocated graph does not fire it again
+    GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched.get(), graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(state.n_prepare == 2);
+
+    // fires after the backends synchronized
+    GGML_ASSERT(state.n_synchronize == 0);
+    ggml_backend_sched_synchronize(sched.get());
+    GGML_ASSERT(state.n_synchronize == 1);
+
+    // a refusal fails the allocation
+    state.accept = false;
+    ggml_backend_sched_reset(sched.get());
+    GGML_ASSERT(!ggml_backend_sched_alloc_graph(sched.get(), graph));
+    GGML_ASSERT(state.n_prepare == 3);
+    GGML_ASSERT(!ggml_backend_sched_prepare_graph(sched.get(), graph));
+    GGML_ASSERT(state.n_prepare == 4);
+
+    // cleared callbacks are no longer invoked
+    ggml_backend_sched_set_graph_prepare_callback(sched.get(), nullptr, nullptr);
+    ggml_backend_sched_set_synchronize_callback(sched.get(), nullptr, nullptr);
+    GGML_ASSERT(ggml_backend_sched_prepare_graph(sched.get(), graph));
+    ggml_backend_sched_synchronize(sched.get());
+    GGML_ASSERT(state.n_prepare == 4);
+    GGML_ASSERT(state.n_synchronize == 1);
+}
+
 // Test re-using gallocr for a different graph. The new graph has the same
 // total size, but one of the chunks is larger, so reallocation is required.
 static void test_reallocation() {
@@ -721,6 +800,7 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reserve_refusal_preserves_published_layout", test_reserve_refusal_preserves_published_layout);
+    run("test_sched_prepare_and_synchronize_callbacks", test_sched_prepare_and_synchronize_callbacks);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     return 0;
