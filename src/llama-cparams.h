@@ -71,4 +71,10 @@ struct llama_cparams : llama_memory_cparams {
     void * cb_eval_user_data;
     ggml_backend_sched_reserve_callback cb_reserve;
     void * cb_reserve_user_data;
+    ggml_backend_buffer_type_t (*cb_compute_buft)(ggml_backend_t backend, ggml_backend_buffer_type_t buft, void * user_data);
+    void * cb_compute_buft_user_data;
+    ggml_backend_sched_graph_prepare_callback cb_graph_prepare;
+    void * cb_graph_prepare_user_data;
+    ggml_backend_sched_synchronize_callback cb_synchronize;
+    void * cb_synchronize_user_data;
 };
