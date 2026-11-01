@@ -2142,6 +2142,12 @@ void ggml_backend_sched_set_synchronize_callback(ggml_backend_sched_t sched, ggm
     sched->callback_synchronize_user_data = user_data;
 }
 
+size_t ggml_backend_sched_get_compute_extent(ggml_backend_sched_t sched, int backend_index, int chunk, ggml_backend_buffer_t * chunk_buffer) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+    return ggml_gallocr_get_chunk_extent(sched->galloc, backend_index, chunk, chunk_buffer);
+}
+
 bool ggml_backend_sched_prepare_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
     if (sched->callback_graph_prepare == NULL) {

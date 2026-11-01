@@ -496,6 +496,9 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // bytes of each chunk addressed by the tensors of the last graph allocated with ggml_gallocr_alloc_graph
+    size_t * chunk_extents; // [n_buffers * GGML_VBUFFER_MAX_CHUNKS]
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -530,6 +533,9 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
         }
     }
     galloc->n_buffers = n_bufs;
+
+    galloc->chunk_extents = calloc((size_t) n_bufs * GGML_VBUFFER_MAX_CHUNKS, sizeof(size_t));
+    GGML_ASSERT(galloc->chunk_extents != NULL);
 
     return galloc;
 }
@@ -583,6 +589,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->bufts);
     free(galloc->buffers);
     free(galloc->buf_tallocs);
+    free(galloc->chunk_extents);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
     free(galloc);
@@ -1044,6 +1051,17 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
             assert(tensor_alloc->addr.offset != SIZE_MAX);
             assert(ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
             ggml_vbuffer_tensor_alloc(galloc->buffers[buffer_id], tensor, tensor_alloc->addr);
+
+            // account the extent under the first buffer id that shares this allocator
+            int owner = buffer_id;
+            for (int j = 0; j < buffer_id; j++) {
+                if (galloc->buf_tallocs[j] == galloc->buf_tallocs[buffer_id]) {
+                    owner = j;
+                    break;
+                }
+            }
+            size_t * extent = &galloc->chunk_extents[(size_t) owner * GGML_VBUFFER_MAX_CHUNKS + tensor_alloc->addr.chunk];
+            *extent = MAX(*extent, tensor_alloc->addr.offset + ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor));
         } else {
             if (tensor->buffer == NULL) {
                 // this tensor was allocated without ggml-backend
@@ -1131,6 +1149,8 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
             ggml_vbuffer_reset(galloc->buffers[i]);
         }
     }
+
+    memset(galloc->chunk_extents, 0, (size_t) galloc->n_buffers * GGML_VBUFFER_MAX_CHUNKS * sizeof(size_t));
 
     // allocate the graph tensors from the previous assignments
     // leafs
@@ -1305,4 +1325,32 @@ ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft(struct ggml_conte
 
 ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors(struct ggml_context * ctx, ggml_backend_t backend) {
     return ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(backend));
+}
+
+size_t ggml_gallocr_get_chunk_extent(ggml_gallocr_t galloc, int buffer_id, int chunk, ggml_backend_buffer_t * chunk_buffer) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+
+    if (chunk_buffer != NULL) {
+        *chunk_buffer = NULL;
+    }
+
+    if (chunk < 0 || chunk >= GGML_VBUFFER_MAX_CHUNKS || galloc->buffers[buffer_id] == NULL) {
+        return 0;
+    }
+
+    for (int i = 0; i < buffer_id; i++) {
+        if (galloc->buf_tallocs[i] == galloc->buf_tallocs[buffer_id]) {
+            // reported under the first buffer id that shares this allocator
+            return 0;
+        }
+    }
+
+    ggml_backend_buffer_t buffer = galloc->buffers[buffer_id]->chunks[chunk];
+    if (buffer == NULL) {
+        return 0;
+    }
+    if (chunk_buffer != NULL) {
+        *chunk_buffer = buffer;
+    }
+    return galloc->chunk_extents[(size_t) buffer_id * GGML_VBUFFER_MAX_CHUNKS + chunk];
 }
