@@ -650,6 +650,93 @@ bool check_rot_buft_contents(const std::string & path) {
     return log.empty();
 }
 
+// a rotation-set callback receives every rotation matrix, with exactly the values llama writes by default, and llama
+// leaves the matrices to it
+bool check_rot_set_callback(const std::string & path) {
+    const llama_model_ptr model = load_cpu_model(path, model_load::allocated);
+    if (!model) {
+        fprintf(stderr, "FAIL %s: could not load\n", path.c_str());
+        return false;
+    }
+
+    struct received_matrix {
+        const ggml_tensor *  tensor;
+        std::vector<uint8_t> data;
+    };
+    std::vector<received_matrix> received;
+    const auto receive = [](ggml_tensor * tensor, const void * data, size_t size, void * user_data) {
+        const auto * bytes = static_cast<const uint8_t *>(data);
+        static_cast<std::vector<received_matrix> *>(user_data)->push_back({ tensor, std::vector<uint8_t>(bytes, bytes + size) });
+    };
+
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx  = 256;
+    params.type_k = GGML_TYPE_Q8_0;
+    params.type_v = GGML_TYPE_Q8_0;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    const llama_context_ptr ctx_default(llama_init_from_model(model.get(), params));
+    params.cb_kv_rot_set           = receive;
+    params.cb_kv_rot_set_user_data = &received;
+    const llama_context_ptr ctx_received(llama_init_from_model(model.get(), params));
+
+    const auto * cache_default  = ctx_default  ? dynamic_cast<const llama_kv_cache *>(llama_get_memory(ctx_default.get()))  : nullptr;
+    const auto * cache_received = ctx_received ? dynamic_cast<const llama_kv_cache *>(llama_get_memory(ctx_received.get())) : nullptr;
+    if (cache_default == nullptr || cache_received == nullptr) {
+        fprintf(stderr, "FAIL rotation callback: %s did not build plain KV caches\n", path.c_str());
+        return false;
+    }
+
+    mismatch_log log("rotation callback");
+
+    size_t n_expected = 0;
+    const auto compare = [&](const std::vector<ggml_tensor *> & rot_default, const std::vector<ggml_tensor *> & rot_received) {
+        if (rot_default.size() != rot_received.size()) {
+            log.add("%zu rotation matrices by default, %zu with the callback", rot_default.size(), rot_received.size());
+            return;
+        }
+        for (size_t il = 0; il < rot_default.size(); ++il) {
+            const ggml_tensor * a = rot_default[il];
+            const ggml_tensor * b = rot_received[il];
+            if ((a == nullptr) != (b == nullptr)) {
+                log.add("layer %zu: rotation matrix present by default = %d, with the callback = %d", il, a != nullptr, b != nullptr);
+                continue;
+            }
+            if (a == nullptr) {
+                continue;
+            }
+            n_expected++;
+            const auto match = std::find_if(received.begin(), received.end(), [b](const received_matrix & m) { return m.tensor == b; });
+            if (match == received.end()) {
+                log.add("%s: the callback never received it", b->name);
+                continue;
+            }
+            std::vector<uint8_t> data_a(ggml_nbytes(a));
+            ggml_backend_tensor_get(a, data_a.data(), 0, data_a.size());
+            if (match->data != data_a) {
+                log.add("%s: the callback received values that differ from the matrix llama writes", b->name);
+            }
+            std::vector<uint8_t> data_b(ggml_nbytes(b));
+            ggml_backend_tensor_get(b, data_b.data(), 0, data_b.size());
+            if (data_b == data_a) {
+                log.add("%s: llama wrote the matrix although the callback received it", b->name);
+            }
+        }
+    };
+    compare(cache_default->get_k_rot(), cache_received->get_k_rot());
+    compare(cache_default->get_v_rot(), cache_received->get_v_rot());
+
+    printf("rotation callback: %zu matrices received, %zu expected\n", received.size(), n_expected);
+    if (n_expected == 0) {
+        log.add("no rotation matrix expected");
+    }
+    if (received.size() != n_expected) {
+        log.add("the callback received %zu matrices, the caches hold %zu", received.size(), n_expected);
+    }
+
+    log.print();
+    return log.empty();
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -697,6 +784,7 @@ int main(int argc, char ** argv) {
     ok = check_plan_leaves_shared_cells_alone(dense) && ok;
     ok = check_execution_buffer_reservation(dense) && ok;
     ok = check_rot_buft_contents(dense) && ok;
+    ok = check_rot_set_callback(dense) && ok;
 
     size_t models_loaded = 0;
     outcome out;

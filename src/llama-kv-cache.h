@@ -17,23 +17,30 @@ struct llama_context;
 // llama_kv_cache
 //
 
-// Places the attention rotation matrices of every llama_kv_cache constructed on this thread while in scope in buffers
-// of type `buft`, instead of the buffer type of each layer's cache tensor; nullptr keeps the cache's buffer type.
+// How every llama_kv_cache constructed on this thread while in scope places and fills its attention rotation matrices.
 // A context opens one around building its memory, so the caches nested in every memory type follow the context's
-// setting. Scopes nest: the innermost one applies.
-class llama_kv_cache_rot_buft_scope {
+// settings. Scopes nest: the innermost one applies.
+struct llama_kv_cache_rot_params {
+    // buffer type of the matrices, nullptr keeps the buffer type of each layer's cache tensor
+    ggml_backend_buffer_type_t buft = nullptr;
+    // receives each matrix's contents in place of the host write into it, nullptr writes them
+    llama_kv_rot_set_callback set = nullptr;
+    void * set_user_data = nullptr;
+};
+
+class llama_kv_cache_rot_scope {
 public:
-    explicit llama_kv_cache_rot_buft_scope(ggml_backend_buffer_type_t buft);
-    ~llama_kv_cache_rot_buft_scope();
+    explicit llama_kv_cache_rot_scope(const llama_kv_cache_rot_params & params);
+    ~llama_kv_cache_rot_scope();
 
-    llama_kv_cache_rot_buft_scope(const llama_kv_cache_rot_buft_scope &) = delete;
-    llama_kv_cache_rot_buft_scope & operator=(const llama_kv_cache_rot_buft_scope &) = delete;
+    llama_kv_cache_rot_scope(const llama_kv_cache_rot_scope &) = delete;
+    llama_kv_cache_rot_scope & operator=(const llama_kv_cache_rot_scope &) = delete;
 
-    // the buffer type of the innermost scope on this thread, nullptr outside any scope
-    static ggml_backend_buffer_type_t current();
+    // the params of the innermost scope on this thread, the defaults outside any scope
+    static const llama_kv_cache_rot_params & current();
 
 private:
-    ggml_backend_buffer_type_t outer;
+    llama_kv_cache_rot_params outer;
 };
 
 // Saved cell metadata for one or more KV caches: one entry per cache, in the

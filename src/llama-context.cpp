@@ -345,7 +345,11 @@ llama_memory_i * llama_context_create_memory(
         /*.no_alloc  =*/ model.no_alloc(),
     };
 
-    const llama_kv_cache_rot_buft_scope rot_buft_scope(params.kv_rot_buft);
+    const llama_kv_cache_rot_scope rot_scope({
+        /*.buft          =*/ params.kv_rot_buft,
+        /*.set           =*/ params.cb_kv_rot_set,
+        /*.set_user_data =*/ params.cb_kv_rot_set_user_data,
+    });
 
     return model.create_memory(params_mem, cparams);
 }
@@ -4222,6 +4226,8 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.kv_rot_buft                 =*/ nullptr,
+        /*.cb_kv_rot_set               =*/ nullptr,
+        /*.cb_kv_rot_set_user_data     =*/ nullptr,
         /*.moe_cache_size              =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
