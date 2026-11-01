@@ -828,6 +828,7 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
 void llama_context::sched_new(size_t max_nodes, bool parallel) {
     sched.reset(ggml_backend_sched_new(
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
+    sched_max_nodes = max_nodes;
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
@@ -860,7 +861,11 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
-    sched_new(max_nodes, cparams.pipeline_parallel);
+    // a scheduler that already fits the graph is reserved again in place, so that the callbacks
+    // and the scheduler handle a caller holds (llama_get_sched) stay valid across a re-reserve
+    if (!sched || sched_max_nodes < max_nodes) {
+        sched_new(max_nodes, cparams.pipeline_parallel);
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
