@@ -8,6 +8,7 @@
 #include "common.h"
 
 #include "../../src/llama-ext.h" // llama_model_set_attn_rot, llama_arch_from_string
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -602,6 +603,92 @@ struct case_state_rotation : ctx_test {
     }
 };
 
+// rotation matrices placed in a buffer type the caller chose produce bitwise the same generation as
+// the default placement, in the cache's buffer type
+// note: rotation is only active for quantized KV caches with a head size that is a multiple of 64,
+//       the case skips models whose plan has no rotation buffer
+// note: the CPU backend computes a Hadamard-hinted product without reading the matrix, so this checks
+//       the placement and the graph around it; test-memory-plan checks the matrix values
+struct case_rotation_buft : ctx_test {
+    const char * name() const override { return "rot_buft"; }
+
+    const char * description() const override {
+        return "rotation matrices in a chosen buffer type generate bitwise as in the cache's buffer type";
+    }
+
+    case_result run(model_run & mr) const override {
+        ctx_opts opts;
+        opts.n_ctx   = 256;
+        opts.type_k  = GGML_TYPE_Q8_0;
+        opts.type_v  = GGML_TYPE_Q8_0;
+        opts.fa      = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        opts.quiet   = true; // probing whether this KV type is supported is expected to fail for some models
+
+        auto ctx_default = mr.ctx(opts);
+        if (!ctx_default) {
+            return case_result::skip("quantized KV cache not supported");
+        }
+
+        // a host rotation buffer next to a cache on a device moves the Hadamard products to the CPU
+        //   backend, which rounds differently from the device - only a CPU cache can expect bitwise
+        for (const auto & [buft, data] : llama_get_memory_breakdown(ctx_default.get())) {
+            if (data.context > 0 && buft != ggml_backend_cpu_buffer_type()) {
+                return case_result::skip("the cache is not in the CPU buffer type");
+            }
+        }
+
+        size_t rot_bytes = 0;
+        for (const auto & buf : llama_model_memory_plan(mr.model, make_cparams(mr.params, opts)).buffers) {
+            if (buf.kind == LLAMA_MEMORY_PLAN_BUFFER_KV_ROT) {
+                rot_bytes += buf.size;
+            }
+        }
+        if (rot_bytes == 0) {
+            return case_result::skip("the model does not use attention rotation");
+        }
+
+        opts.kv_rot_buft = cpu_alias_buft();
+        opts.quiet       = false;
+
+        auto ctx_chosen = mr.ctx(opts);
+        if (!ctx_chosen) {
+            return case_result::fail();
+        }
+
+        size_t chosen_bytes = 0;
+        for (const auto & [buft, data] : llama_get_memory_breakdown(ctx_chosen.get())) {
+            if (buft == opts.kv_rot_buft) {
+                chosen_bytes += data.context;
+            }
+        }
+        CTX_REQUIRE(chosen_bytes == rot_bytes, "the chosen buffer type holds " + std::to_string(chosen_bytes) +
+                " context bytes instead of the " + std::to_string(rot_bytes) + " planned for the rotation matrices");
+
+        const llama_pos n_prompt = (llama_pos) std::min<size_t>(mr.tokens.size(), 64);
+        for (auto * ctx : { ctx_default.get(), ctx_chosen.get() }) {
+            if (!decode_seq(ctx, mr.tokens, 0, n_prompt, 0, true)) {
+                TLOG_ERR("%s: failed to decode the prompt\n", __func__);
+                return case_result::fail();
+            }
+        }
+
+        generation_result expected;
+        int n_past_default = n_prompt;
+        auto smpl_default = mr.sampler();
+        if (!generate_tokens(ctx_default.get(), smpl_default.get(), n_past_default, mr.params.n_predict, 0, expected)) {
+            return case_result::fail();
+        }
+
+        int n_past_chosen = n_prompt;
+        auto smpl_chosen = mr.sampler();
+        CTX_REQUIRE(generate_tokens_compare(ctx_chosen.get(), smpl_chosen.get(), n_past_chosen, mr.params.n_predict, 0,
+                    expected, NMSE_BITWISE),
+                "the generation with the rotation matrices in the chosen buffer type differs");
+
+        return case_result::pass();
+    }
+};
+
 // restore a sequence into a fragmented cache: the slots freed by the removed sequence are
 // scattered between live cells of the other sequences, so the restore cannot claim one
 // contiguous block
@@ -1045,6 +1132,7 @@ std::vector<ctx_test_ptr> make_kv_cases() {
     cases.push_back(std::make_unique<case_state_partial_size>());
     cases.push_back(std::make_unique<case_state_restore_failure>());
     cases.push_back(std::make_unique<case_state_rotation>());
+    cases.push_back(std::make_unique<case_rotation_buft>());
     cases.push_back(std::make_unique<case_state_restore_fragmented>());
     cases.push_back(std::make_unique<case_state_load_fragmented>());
     cases.push_back(std::make_unique<case_seq_state_file>());

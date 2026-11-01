@@ -3,6 +3,8 @@
 #include "test-log.h"
 
 #include "../../src/llama-ext.h" // llama_memory_get_buffers, llama_arch_from_string
+#include "../../ggml/src/ggml-backend-impl.h" // ggml_backend_buffer_type, for cpu_alias_buft
+#include "ggml-cpu.h"
 
 #include "common.h"
 
@@ -348,7 +350,7 @@ llama_context_ptr init_ctx(llama_model * model, llama_context_params cparams, ui
     return ctx;
 }
 
-llama_context_ptr make_ctx(llama_model * model, const common_params & params, const ctx_opts & opts) {
+llama_context_params make_cparams(const common_params & params, const ctx_opts & opts) {
     auto cparams = common_context_params_to_llama(params);
 
     if (opts.n_ctx) {
@@ -380,8 +382,24 @@ llama_context_ptr make_ctx(llama_model * model, const common_params & params, co
     if (opts.type_v != GGML_TYPE_COUNT) {
         cparams.type_v = opts.type_v;
     }
+    if (opts.kv_rot_buft != nullptr) {
+        cparams.kv_rot_buft = opts.kv_rot_buft;
+    }
 
-    return init_ctx(model, cparams, opts.fill);
+    return cparams;
+}
+
+llama_context_ptr make_ctx(llama_model * model, const common_params & params, const ctx_opts & opts) {
+    return init_ctx(model, make_cparams(params, opts), opts.fill);
+}
+
+ggml_backend_buffer_type_t cpu_alias_buft() {
+    static ggml_backend_buffer_type buft = [] {
+        ggml_backend_buffer_type res = *ggml_backend_cpu_buffer_type();
+        res.iface.get_name = [](ggml_backend_buffer_type_t) { return "CPU_ALIAS"; };
+        return res;
+    }();
+    return &buft;
 }
 
 llama_sampler_ptr make_dist_sampler(uint32_t seed) {

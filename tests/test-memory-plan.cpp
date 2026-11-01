@@ -15,6 +15,9 @@
 #include "../src/llama-kv-cache.h"
 #include "../src/llama-memory-alloc.h"
 #include "../src/llama-model.h"
+#include "../ggml/src/ggml-backend-impl.h"
+
+#include "ggml-cpu.h"
 
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -79,6 +82,17 @@ llama_context_params make_context_params(const context_case & c) {
     params.n_threads       = 2;
     params.n_threads_batch = 2;
     return params;
+}
+
+// a host buffer type that allocates as the CPU one does, under an identity of its own, so a placement
+// that chose it is told apart from the CPU buffer type the caches use
+ggml_backend_buffer_type_t cpu_alias_buft() {
+    static ggml_backend_buffer_type buft = [] {
+        ggml_backend_buffer_type res = *ggml_backend_cpu_buffer_type();
+        res.iface.get_name = [](ggml_backend_buffer_type_t) { return "CPU_ALIAS"; };
+        return res;
+    }();
+    return &buft;
 }
 
 enum class model_load {
@@ -241,7 +255,21 @@ struct outcome {
     size_t shared_kv_compared = 0; // compared cases whose model has layers reusing another layer's KV
     size_t ple_iswa_compared  = 0; // compared cases whose model has per-layer embeddings and both a full and a sliding window KV buffer
     size_t iswa_widths_compared = 0; // compared cases with full and sliding window KV rows of different widths, without per-layer embeddings or shared KV
+    size_t rot_buft_compared  = 0; // rotation buffers compared in cases that choose their buffer type
 };
+
+// with a chosen rotation buffer type, the rotation buffers and only they are of that type, planned and built alike
+void check_rot_buft(mismatch_log & log, const char * what, const std::vector<llama_memory_plan_buffer> & buffers,
+        ggml_backend_buffer_type_t rot_buft) {
+    for (size_t ib = 0; ib < buffers.size(); ++ib) {
+        const auto & buf = buffers[ib];
+        const bool is_rot = buf.kind == LLAMA_MEMORY_PLAN_BUFFER_KV_ROT;
+        if (is_rot != (buf.buft == rot_buft)) {
+            log.add("%s buffer %zu: kind %d of type %s with rotation buffer type %s", what, ib, buf.kind,
+                    ggml_backend_buft_name(buf.buft), ggml_backend_buft_name(rot_buft));
+        }
+    }
+}
 
 std::optional<llama_memory_plan> try_plan(const llama_model * model, const llama_context_params & params, std::string & error) {
     try {
@@ -310,6 +338,12 @@ void check_case(outcome & out, const std::string & subject, llama_model * model,
         const int64_t width_kv_swa = k_row_width(LLAMA_MEMORY_PLAN_BUFFER_KV_SWA);
         if (model->hparams.n_embd_per_layer == 0 && !shared_kv && width_kv > 0 && width_kv_swa > 0 && width_kv != width_kv_swa) {
             out.iswa_widths_compared++;
+        }
+        if (params.kv_rot_buft != nullptr) {
+            out.rot_buft_compared += std::count_if(plan->buffers.begin(), plan->buffers.end(),
+                    [](const llama_memory_plan_buffer & buf) { return buf.kind == LLAMA_MEMORY_PLAN_BUFFER_KV_ROT; });
+            check_rot_buft(log, "planned", plan->buffers, params.kv_rot_buft);
+            check_rot_buft(log, "built", built, params.kv_rot_buft);
         }
         compare_shape(log, *plan, ctx.get());
         compare_buffers(log, plan->buffers, built);
@@ -547,6 +581,75 @@ bool check_plan_leaves_shared_cells_alone(const std::string & path) {
     return log.empty();
 }
 
+// rotation matrices in a chosen buffer type hold exactly the values of the default placement
+// note: the CPU backend computes a Hadamard-hinted product without reading the matrix, so generation
+//       alone cannot tell whether the matrices were written
+bool check_rot_buft_contents(const std::string & path) {
+    const llama_model_ptr model = load_cpu_model(path, model_load::allocated);
+    if (!model) {
+        fprintf(stderr, "FAIL %s: could not load\n", path.c_str());
+        return false;
+    }
+
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx  = 256;
+    params.type_k = GGML_TYPE_Q8_0;
+    params.type_v = GGML_TYPE_Q8_0;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    const llama_context_ptr ctx_default(llama_init_from_model(model.get(), params));
+    params.kv_rot_buft = cpu_alias_buft();
+    const llama_context_ptr ctx_chosen(llama_init_from_model(model.get(), params));
+
+    const auto * cache_default = ctx_default ? dynamic_cast<const llama_kv_cache *>(llama_get_memory(ctx_default.get())) : nullptr;
+    const auto * cache_chosen  = ctx_chosen  ? dynamic_cast<const llama_kv_cache *>(llama_get_memory(ctx_chosen.get()))  : nullptr;
+    if (cache_default == nullptr || cache_chosen == nullptr) {
+        fprintf(stderr, "FAIL rotation contents: %s did not build plain KV caches\n", path.c_str());
+        return false;
+    }
+
+    mismatch_log log("rotation contents");
+
+    size_t n_compared = 0;
+    const auto compare = [&](const std::vector<ggml_tensor *> & rot_default, const std::vector<ggml_tensor *> & rot_chosen) {
+        if (rot_default.size() != rot_chosen.size()) {
+            log.add("%zu rotation matrices by default, %zu in the chosen buffer type", rot_default.size(), rot_chosen.size());
+            return;
+        }
+        for (size_t il = 0; il < rot_default.size(); ++il) {
+            const ggml_tensor * a = rot_default[il];
+            const ggml_tensor * b = rot_chosen[il];
+            if ((a == nullptr) != (b == nullptr)) {
+                log.add("layer %zu: rotation matrix present by default = %d, in the chosen buffer type = %d", il, a != nullptr, b != nullptr);
+                continue;
+            }
+            if (a == nullptr) {
+                continue;
+            }
+            if (ggml_backend_buffer_get_type(b->buffer) != cpu_alias_buft()) {
+                log.add("%s: placed in %s", b->name, ggml_backend_buffer_name(b->buffer));
+            }
+            std::vector<uint8_t> data_a(ggml_nbytes(a));
+            std::vector<uint8_t> data_b(ggml_nbytes(b));
+            ggml_backend_tensor_get(a, data_a.data(), 0, data_a.size());
+            ggml_backend_tensor_get(b, data_b.data(), 0, data_b.size());
+            if (data_a != data_b) {
+                log.add("%s: values differ from the default placement", b->name);
+            }
+            n_compared++;
+        }
+    };
+    compare(cache_default->get_k_rot(), cache_chosen->get_k_rot());
+    compare(cache_default->get_v_rot(), cache_chosen->get_v_rot());
+
+    printf("rotation contents: %zu matrices compared\n", n_compared);
+    if (n_compared == 0) {
+        log.add("no rotation matrix compared");
+    }
+
+    log.print();
+    return log.empty();
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -593,6 +696,7 @@ int main(int argc, char ** argv) {
     ok = check_mtp_buffer_size_arithmetic() && ok;
     ok = check_plan_leaves_shared_cells_alone(dense) && ok;
     ok = check_execution_buffer_reservation(dense) && ok;
+    ok = check_rot_buft_contents(dense) && ok;
 
     size_t models_loaded = 0;
     outcome out;
@@ -608,9 +712,12 @@ int main(int argc, char ** argv) {
             }
             models_loaded++;
             for (const auto & c : context_cases) {
-                const llama_context_params params = make_context_params(c);
+                llama_context_params params = make_context_params(c);
                 const std::string subject = file + (load == model_load::no_alloc ? " no_alloc " : " ") + c.name;
                 check_case(out, subject, model.get(), params);
+
+                params.kv_rot_buft = cpu_alias_buft();
+                check_case(out, subject + " rot-buft", model.get(), params);
             }
         }
     }
@@ -622,7 +729,8 @@ int main(int argc, char ** argv) {
     printf("compared cases with shared KV layers: %zu\n", out.shared_kv_compared);
     printf("compared cases with per-layer embeddings and interleaved sliding window KV: %zu\n", out.ple_iswa_compared);
     printf("compared cases with full and sliding window KV rows of different widths, without per-layer embeddings or shared KV: %zu\n", out.iswa_widths_compared);
-    printf("%zu model loads x %zu context cases: %zu compared, %zu refused by both, %zu failed\n",
+    printf("compared rotation buffers in a chosen buffer type: %zu\n", out.rot_buft_compared);
+    printf("%zu model loads x %zu context cases x 2 rotation buffer types: %zu compared, %zu refused by both, %zu failed\n",
             models_loaded, std::size(context_cases), out.compared, out.refused, out.failed);
 
     ok = ok && out.failed == 0;
@@ -644,6 +752,10 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "FAIL no %s buffer was compared\n", name);
             ok = false;
         }
+    }
+    if (out.rot_buft_compared == 0) {
+        fprintf(stderr, "FAIL no rotation buffer in a chosen buffer type was compared\n");
+        ok = false;
     }
     if (out.no_memory == 0) {
         fprintf(stderr, "FAIL no model without memory was compared\n");

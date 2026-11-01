@@ -17,6 +17,25 @@ struct llama_context;
 // llama_kv_cache
 //
 
+// Places the attention rotation matrices of every llama_kv_cache constructed on this thread while in scope in buffers
+// of type `buft`, instead of the buffer type of each layer's cache tensor; nullptr keeps the cache's buffer type.
+// A context opens one around building its memory, so the caches nested in every memory type follow the context's
+// setting. Scopes nest: the innermost one applies.
+class llama_kv_cache_rot_buft_scope {
+public:
+    explicit llama_kv_cache_rot_buft_scope(ggml_backend_buffer_type_t buft);
+    ~llama_kv_cache_rot_buft_scope();
+
+    llama_kv_cache_rot_buft_scope(const llama_kv_cache_rot_buft_scope &) = delete;
+    llama_kv_cache_rot_buft_scope & operator=(const llama_kv_cache_rot_buft_scope &) = delete;
+
+    // the buffer type of the innermost scope on this thread, nullptr outside any scope
+    static ggml_backend_buffer_type_t current();
+
+private:
+    ggml_backend_buffer_type_t outer;
+};
+
 // Saved cell metadata for one or more KV caches: one entry per cache, in the
 // order the owner snapshotted them.
 struct llama_kv_cache_cells : llama_memory_cells_i {

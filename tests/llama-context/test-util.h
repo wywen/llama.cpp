@@ -124,6 +124,8 @@ struct ctx_opts {
     ggml_type type_k = GGML_TYPE_COUNT; // COUNT = from params
     ggml_type type_v = GGML_TYPE_COUNT; // COUNT = from params
 
+    ggml_backend_buffer_type_t kv_rot_buft = nullptr; // nullptr = from params
+
     uint8_t fill = 0; // fill the cache buffers with this byte, 0 = disabled
 
     // a probe that expects the context to be refused should not report it as an error
@@ -131,7 +133,12 @@ struct ctx_opts {
 };
 
 llama_context_ptr init_ctx(llama_model * model, llama_context_params cparams, uint8_t fill);
+llama_context_params make_cparams(const common_params & params, const ctx_opts & opts);
 llama_context_ptr make_ctx(llama_model * model, const common_params & params, const ctx_opts & opts);
+
+// a host buffer type that allocates as the CPU one does, under an identity of its own, so that a
+// placement that chose it is told apart from the CPU buffer type
+ggml_backend_buffer_type_t cpu_alias_buft();
 
 llama_sampler_ptr make_dist_sampler(uint32_t seed);
 

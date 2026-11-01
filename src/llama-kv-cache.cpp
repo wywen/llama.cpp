@@ -60,6 +60,24 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 }
 
 //
+// llama_kv_cache_rot_buft_scope
+//
+
+static thread_local ggml_backend_buffer_type_t kv_cache_rot_buft = nullptr;
+
+llama_kv_cache_rot_buft_scope::llama_kv_cache_rot_buft_scope(ggml_backend_buffer_type_t buft) : outer(kv_cache_rot_buft) {
+    kv_cache_rot_buft = buft;
+}
+
+llama_kv_cache_rot_buft_scope::~llama_kv_cache_rot_buft_scope() {
+    kv_cache_rot_buft = outer;
+}
+
+ggml_backend_buffer_type_t llama_kv_cache_rot_buft_scope::current() {
+    return kv_cache_rot_buft;
+}
+
+//
 // llama_kv_cache
 //
 
@@ -396,6 +414,8 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
         return;
     }
 
+    const ggml_backend_buffer_type_t rot_buft = llama_kv_cache_rot_buft_scope::current();
+
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr> ctx_map;
     for (auto & layer : layers) {
         for (bool is_k : { true, false }) {
@@ -405,7 +425,7 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
                 continue;
             }
 
-            const auto buft = ggml_backend_buffer_get_type(cache->buffer);
+            const auto buft = rot_buft ? rot_buft : ggml_backend_buffer_get_type(cache->buffer);
             auto & ctx = ctx_map[buft];
             if (!ctx) {
                 ggml_init_params params = { 2*layers.size()*ggml_tensor_overhead(), nullptr, true };

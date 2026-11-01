@@ -401,6 +401,10 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
+        // buffer type for the KV cache attention rotation matrices, NULL = the buffer type of each layer's cache [EXPERIMENTAL]
+        // for a cache buffer type that cannot take host writes, or that should hold only cache cells
+        ggml_backend_buffer_type_t kv_rot_buft;
+
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
 
         // Abort callback
