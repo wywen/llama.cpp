@@ -418,6 +418,13 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_graph_prepare_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_prepare_callback callback, void * user_data);
     GGML_API void                 ggml_backend_sched_set_synchronize_callback(ggml_backend_sched_t sched, ggml_backend_sched_synchronize_callback callback, void * user_data);
 
+    // Bytes of chunk `chunk` of the compute buffer of backend `backend_index` that the current graph's allocation uses,
+    // which is at most the chunk's buffer size. The chunk's backend buffer is stored in *chunk_buffer (NULL if none).
+    // Returns 0 and NULL past the last chunk, and for a backend that shares its allocator with an earlier backend
+    // (the chunks are reported under the first index). Valid after ggml_backend_sched_alloc_graph, including inside
+    // the graph-prepare callback.
+    GGML_API size_t               ggml_backend_sched_get_compute_extent(ggml_backend_sched_t sched, int backend_index, int chunk, ggml_backend_buffer_t * chunk_buffer);
+
     // Invoke the graph-prepare callback for a graph that already has addresses (returns true if none is set)
     GGML_API bool                 ggml_backend_sched_prepare_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
