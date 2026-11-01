@@ -404,6 +404,12 @@ llama_context::llama_context(
     cparams.cb_eval_user_data    = params.cb_eval_user_data;
     cparams.cb_reserve           = params.cb_reserve;
     cparams.cb_reserve_user_data = params.cb_reserve_user_data;
+    cparams.cb_compute_buft            = params.cb_compute_buft;
+    cparams.cb_compute_buft_user_data  = params.cb_compute_buft_user_data;
+    cparams.cb_graph_prepare           = params.cb_graph_prepare;
+    cparams.cb_graph_prepare_user_data = params.cb_graph_prepare_user_data;
+    cparams.cb_synchronize             = params.cb_synchronize;
+    cparams.cb_synchronize_user_data   = params.cb_synchronize_user_data;
 
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         cparams.rope_scaling_type = hparams.rope_scaling_type_train;
@@ -624,6 +630,10 @@ llama_context::llama_context(
                 }
             }
 
+            if (cparams.cb_compute_buft) {
+                buft = cparams.cb_compute_buft(backend.get(), buft, cparams.cb_compute_buft_user_data);
+            }
+
             backend_buft.push_back(buft);
             backend_ptrs.push_back(backend.get());
             backend_buf_exp_size.push_back(0);
@@ -837,6 +847,8 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
     ggml_backend_sched_set_reserve_callback(sched.get(), cparams.cb_reserve, cparams.cb_reserve_user_data);
+    ggml_backend_sched_set_graph_prepare_callback(sched.get(), cparams.cb_graph_prepare, cparams.cb_graph_prepare_user_data);
+    ggml_backend_sched_set_synchronize_callback(sched.get(), cparams.cb_synchronize, cparams.cb_synchronize_user_data);
 }
 
 void llama_context::sched_reserve() {
@@ -1682,6 +1694,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // that the previous compute is still reading.
         if (cparams.pipeline_parallel) {
             ggml_backend_sched_synchronize(sched.get());
+        }
+
+        // the reused graph keeps its tensor addresses, the prepare callback still sees it before the inputs are written
+        if (!ggml_backend_sched_prepare_graph(sched.get(), gf)) {
+            LLAMA_LOG_ERROR("%s: failed to prepare graph\n", __func__);
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
         }
 
         n_reused++;
@@ -4223,6 +4242,12 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.cb_reserve                  =*/ nullptr,
         /*.cb_reserve_user_data        =*/ nullptr,
+        /*.cb_compute_buft             =*/ nullptr,
+        /*.cb_compute_buft_user_data   =*/ nullptr,
+        /*.cb_graph_prepare            =*/ nullptr,
+        /*.cb_graph_prepare_user_data  =*/ nullptr,
+        /*.cb_synchronize              =*/ nullptr,
+        /*.cb_synchronize_user_data    =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.kv_rot_buft                 =*/ nullptr,
