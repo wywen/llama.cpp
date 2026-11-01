@@ -560,6 +560,91 @@ static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_mapped(int devi
     return &bufts[device];
 }
 
+// delegated compute buffer type
+
+struct ggml_backend_metal_compute_buft_context {
+    std::string name;
+    ggml_backend_buffer_t (*alloc_buffer)(ggml_backend_buffer_type_t buft, size_t size, void * user_data);
+    size_t max_size;
+    void * user_data;
+};
+
+static const char * ggml_backend_metal_buffer_type_compute_get_name(ggml_backend_buffer_type_t buft) {
+    return ((ggml_backend_metal_compute_buft_context *)buft->context)->name.c_str();
+}
+
+static ggml_backend_buffer_t ggml_backend_metal_buffer_type_compute_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    auto * ctx = (ggml_backend_metal_compute_buft_context *)buft->context;
+
+    return ctx->alloc_buffer(buft, size, ctx->user_data);
+}
+
+static size_t ggml_backend_metal_buffer_type_compute_get_alignment(ggml_backend_buffer_type_t buft) {
+    return ggml_backend_metal_buffer_type_mapped_get_alignment(buft);
+}
+
+static size_t ggml_backend_metal_buffer_type_compute_get_max_size(ggml_backend_buffer_type_t buft) {
+    return ((ggml_backend_metal_compute_buft_context *)buft->context)->max_size;
+}
+
+static size_t ggml_backend_metal_buffer_type_compute_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    return ggml_backend_metal_buffer_type_mapped_get_alloc_size(buft, tensor);
+}
+
+static bool ggml_backend_metal_buffer_type_compute_is_host(ggml_backend_buffer_type_t buft) {
+    return false;
+
+    GGML_UNUSED(buft);
+}
+
+ggml_backend_buffer_type_t ggml_backend_metal_compute_buft_new(
+        ggml_backend_dev_t dev,
+        const char * name,
+        ggml_backend_buffer_t (*alloc_buffer)(ggml_backend_buffer_type_t buft, size_t size, void * user_data),
+        size_t max_size,
+        void * user_data) {
+    GGML_ASSERT(dev != nullptr && name != nullptr && alloc_buffer != nullptr);
+
+    auto * ctx = new ggml_backend_metal_compute_buft_context{
+        /* .name         = */ name,
+        /* .alloc_buffer = */ alloc_buffer,
+        /* .max_size     = */ max_size,
+        /* .user_data    = */ user_data,
+    };
+
+    return new ggml_backend_buffer_type{
+        /* .iface = */ {
+            /* .get_name            = */ ggml_backend_metal_buffer_type_compute_get_name,
+            /* .alloc_buffer        = */ ggml_backend_metal_buffer_type_compute_alloc_buffer,
+            /* .alloc_buffer_n      = */ NULL,
+            /* .get_alignment       = */ ggml_backend_metal_buffer_type_compute_get_alignment,
+            /* .get_max_size        = */ ggml_backend_metal_buffer_type_compute_get_max_size,
+            /* .get_alloc_size      = */ ggml_backend_metal_buffer_type_compute_get_alloc_size,
+            /* .get_alloc_size_n    = */ NULL,
+            /* .is_host             = */ ggml_backend_metal_buffer_type_compute_is_host,
+        },
+        /* .device  = */ dev,
+        /* .context = */ ctx,
+    };
+}
+
+void ggml_backend_metal_compute_buft_free(ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr) {
+        return;
+    }
+
+    GGML_ASSERT(buft->iface.get_name == ggml_backend_metal_buffer_type_compute_get_name);
+
+    delete (ggml_backend_metal_compute_buft_context *)buft->context;
+    delete buft;
+}
+
+void * ggml_backend_metal_compute_buft_user_data(ggml_backend_buffer_type_t buft) {
+    GGML_ASSERT(buft->iface.get_name == ggml_backend_metal_buffer_type_compute_get_name);
+
+    return ((ggml_backend_metal_compute_buft_context *)buft->context)->user_data;
+}
+
 // backend
 
 static const char * ggml_backend_metal_name(ggml_backend_t backend) {
@@ -939,7 +1024,8 @@ static bool ggml_backend_metal_device_supports_buft(ggml_backend_dev_t dev, ggml
         buft->device == dev && (
         buft->iface.get_name == ggml_backend_metal_buffer_type_shared_get_name ||
         buft->iface.get_name == ggml_backend_metal_buffer_type_private_get_name ||
-        buft->iface.get_name == ggml_backend_metal_buffer_type_mapped_get_name);
+        buft->iface.get_name == ggml_backend_metal_buffer_type_mapped_get_name ||
+        buft->iface.get_name == ggml_backend_metal_buffer_type_compute_get_name);
 
     GGML_UNUSED(dev);
 }

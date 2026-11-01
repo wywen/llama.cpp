@@ -449,6 +449,21 @@ enum ggml_metal_keep_prepared_drain_result {
 GGML_BACKEND_API enum ggml_metal_keep_prepared_drain_result ggml_backend_metal_keep_prepared_drain(
         ggml_metal_placement_heap_t queue_owner, uint64_t timeout_ms);
 
+// Buffer type for compute buffers that the caller places in memory it manages. It can be passed to
+// ggml_backend_sched_new for the Metal backend of dev. alloc_buffer receives the requested size and
+// must return a buffer whose tensors resolve to Metal buffers, for example one created with
+// ggml_backend_dev_buffer_from_host_ptr on the Metal device. Alignment and per-tensor allocation sizes
+// follow the Metal mapped buffer type; max_size bounds each buffer the scheduler requests. The buffer
+// type must outlive every scheduler and buffer that uses it.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_metal_compute_buft_new(
+        ggml_backend_dev_t dev,
+        const char * name,
+        ggml_backend_buffer_t (*alloc_buffer)(ggml_backend_buffer_type_t buft, size_t size, void * user_data),
+        size_t max_size,
+        void * user_data);
+GGML_BACKEND_API void   ggml_backend_metal_compute_buft_free(ggml_backend_buffer_type_t buft);
+GGML_BACKEND_API void * ggml_backend_metal_compute_buft_user_data(ggml_backend_buffer_type_t buft);
+
 #ifdef __cplusplus
 }
 #endif
