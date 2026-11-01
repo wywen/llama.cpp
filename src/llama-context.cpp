@@ -712,6 +712,8 @@ void llama_context::sched_reserve() {
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_reserve_callback(sched.get(), cparams.cb_reserve, cparams.cb_reserve_user_data);
     ggml_backend_sched_set_graph_prepare_callback(sched.get(), cparams.cb_graph_prepare, cparams.cb_graph_prepare_user_data);
+    // a caller that tracks per-graph extents wants each graph placed tightly
+    ggml_backend_sched_set_replan_on_shrink(sched.get(), cparams.cb_graph_prepare != nullptr);
     ggml_backend_sched_set_synchronize_callback(sched.get(), cparams.cb_synchronize, cparams.cb_synchronize_user_data);
 
     llama_memory_context_ptr mctx;
@@ -750,6 +752,7 @@ void llama_context::sched_reserve() {
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_reserve_callback(sched.get(), cparams.cb_reserve, cparams.cb_reserve_user_data);
                 ggml_backend_sched_set_graph_prepare_callback(sched.get(), cparams.cb_graph_prepare, cparams.cb_graph_prepare_user_data);
+                ggml_backend_sched_set_replan_on_shrink(sched.get(), cparams.cb_graph_prepare != nullptr);
                 ggml_backend_sched_set_synchronize_callback(sched.get(), cparams.cb_synchronize, cparams.cb_synchronize_user_data);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }

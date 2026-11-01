@@ -499,6 +499,9 @@ struct ggml_gallocr {
 
     // bytes of each chunk addressed by the tensors of the last graph allocated with ggml_gallocr_alloc_graph
     size_t * chunk_extents; // [n_buffers * GGML_VBUFFER_MAX_CHUNKS]
+
+    // plan again whenever a tensor size differs from the recorded plan, not only when it grew
+    bool replan_on_shrink;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -548,6 +551,11 @@ void ggml_gallocr_set_reserve_callback(ggml_gallocr_t galloc, ggml_gallocr_reser
     GGML_ASSERT(galloc != NULL);
     galloc->callback_reserve = callback;
     galloc->callback_reserve_user_data = user_data;
+}
+
+void ggml_gallocr_set_replan_on_shrink(ggml_gallocr_t galloc, bool replan) {
+    GGML_ASSERT(galloc != NULL);
+    galloc->replan_on_shrink = replan;
 }
 
 void ggml_gallocr_free(ggml_gallocr_t galloc) {
@@ -1080,7 +1088,7 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
         }
         node_size = ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], node);
     }
-    return talloc->size_max >= node_size;
+    return galloc->replan_on_shrink ? talloc->size_max == node_size : talloc->size_max >= node_size;
 }
 
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
