@@ -757,6 +757,26 @@ static bool small_chunk_buft_is_host(ggml_backend_buffer_type_t) {
     return true;
 }
 
+struct replan_callback_counts {
+    int n_reserve     = 0;
+    int n_synchronize = 0;
+    std::vector<size_t> last_sizes;
+};
+
+static bool replan_reserve_callback(ggml_backend_sched_t, const ggml_backend_sched_buffer_reservation * r, size_t n, void * user_data) {
+    auto * counts = static_cast<replan_callback_counts *>(user_data);
+    counts->n_reserve++;
+    counts->last_sizes.clear();
+    for (size_t i = 0; i < n; i++) {
+        counts->last_sizes.push_back(r[i].size);
+    }
+    return true;
+}
+
+static void replan_synchronize_callback(ggml_backend_sched_t, void * user_data) {
+    static_cast<replan_callback_counts *>(user_data)->n_synchronize++;
+}
+
 // out = sum of n_branches scaled copies of one input of n_elements floats
 static ggml_tensor * build_fan_in(ggml_context * ctx, ggml_cgraph * graph, int64_t n_elements, int n_branches) {
     ggml_tensor * x = make_input_1d(ctx, n_elements);
@@ -850,6 +870,39 @@ static void test_sched_compute_extent() {
         }
         GGML_ASSERT(extents[0] + extents[1] + extents[2] + extents[3] <
                     wide_extents[0] + wide_extents[1] + wide_extents[2] + wide_extents[3]);
+    }
+
+    // with replan_on_shrink the narrow graph is placed like a fresh plan and the buffers stay
+    {
+        std::vector<size_t> sizes;
+        for (int c = 0; c < 4; c++) {
+            sizes.push_back(wide_buffers[c] ? ggml_backend_buffer_get_size(wide_buffers[c]) : 0);
+        }
+        replan_callback_counts counts;
+        ggml_backend_sched_set_reserve_callback(sched.get(), replan_reserve_callback, &counts);
+        ggml_backend_sched_set_synchronize_callback(sched.get(), replan_synchronize_callback, &counts);
+        ggml_backend_sched_set_replan_on_shrink(sched.get(), true);
+        ggml_backend_sched_reset(sched.get());
+        auto [ctx, graph, ctx_ptr] = make_context();
+        build_fan_in(ctx, graph, 16, 5);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+
+        std::vector<size_t> extents = sched_extents(sched.get(), buffers, 4);
+        printf("narrow replan extents: %zu %zu %zu %zu\n", extents[0], extents[1], extents[2], extents[3]);
+        printf("replan reserve callbacks: %d (sizes:", counts.n_reserve);
+        for (size_t v : counts.last_sizes) { printf(" %zu", v); }
+        printf("), synchronize callbacks: %d\n", counts.n_synchronize);
+        GGML_ASSERT(counts.n_reserve == 1);
+        GGML_ASSERT(counts.last_sizes.size() == 2 && counts.last_sizes[0] == sizes[0] && counts.last_sizes[1] == sizes[1]);
+        ggml_backend_sched_set_reserve_callback(sched.get(), nullptr, nullptr);
+        ggml_backend_sched_set_synchronize_callback(sched.get(), nullptr, nullptr);
+        GGML_ASSERT(extents[0] > 0 && extents[0] < wide_extents[0]);
+        GGML_ASSERT(extents[1] == 0 && extents[2] == 0 && extents[3] == 0);
+        for (int c = 0; c < 4; c++) {
+            GGML_ASSERT(buffers[c] == wide_buffers[c]);
+            GGML_ASSERT((buffers[c] ? ggml_backend_buffer_get_size(buffers[c]) : 0) == sizes[c]);
+        }
+        ggml_backend_sched_set_replan_on_shrink(sched.get(), false);
     }
 
     // a smaller graph is planned again: it fits in chunk 0 and leaves the other chunks untouched
