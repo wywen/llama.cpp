@@ -410,6 +410,8 @@ llama_context::llama_context(
     cparams.cb_graph_prepare_user_data = params.cb_graph_prepare_user_data;
     cparams.cb_synchronize             = params.cb_synchronize;
     cparams.cb_synchronize_user_data   = params.cb_synchronize_user_data;
+    cparams.cb_outputs_enqueued           = params.cb_outputs_enqueued;
+    cparams.cb_outputs_enqueued_user_data = params.cb_outputs_enqueued_user_data;
 
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         cparams.rope_scaling_type = hparams.rope_scaling_type_train;
@@ -1920,6 +1922,9 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_outputs*n_embd*sizeof(float));
     }
 
+    // every output copy of this graph is enqueued
+    notify_outputs_enqueued();
+
     // TODO: hacky solution
     if (model.arch == LLM_ARCH_T5 && t_embd) {
         //cross.t_embd = t_embd;
@@ -2344,6 +2349,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
         }
+
+        // every output copy of this ubatch's graph is enqueued
+        notify_outputs_enqueued();
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
@@ -2924,6 +2932,12 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
     LLAMA_LOG_INFO("%s: graph reallocation: nodes = %d (changed = %d), splits = %d, n_same = %d, n_diff = %d\n",
             __func__, ggml_graph_n_nodes(gf), graph_size_changed, ggml_backend_sched_get_n_splits(sched),
             lctx->n_reallocs_same, lctx->n_reallocs_diff);
+}
+
+void llama_context::notify_outputs_enqueued() {
+    if (cparams.cb_outputs_enqueued) {
+        cparams.cb_outputs_enqueued(sched.get(), cparams.cb_outputs_enqueued_user_data);
+    }
 }
 
 ggml_status llama_context::graph_compute(
@@ -4250,6 +4264,8 @@ llama_context_params llama_context_default_params() {
         /*.cb_graph_prepare_user_data  =*/ nullptr,
         /*.cb_synchronize              =*/ nullptr,
         /*.cb_synchronize_user_data    =*/ nullptr,
+        /*.cb_outputs_enqueued         =*/ nullptr,
+        /*.cb_outputs_enqueued_user_data =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.kv_rot_buft                 =*/ nullptr,
