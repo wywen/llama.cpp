@@ -959,20 +959,7 @@ void llama_context::sched_reserve() {
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
-        // TODO: the worst case graph is not always reached for `n_seqs > 1`
-        //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
-        ggml_cgraph * gf = nullptr;
-        switch (model.arch) {
-            case LLM_ARCH_KIMI_LINEAR:
-            case LLM_ARCH_MINIMAX_01:
-                // [TAG_RESERVE_DIAG_DECAY]
-                // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
-                // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
-                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.no_alloc());
-                break;
-            default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.no_alloc());
-        };
+        ggml_cgraph * gf = graph_reserve_widest(mctx.get(), model.no_alloc());
 
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
@@ -1013,6 +1000,28 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+}
+
+bool llama_context::sched_reserve_pending() const {
+    return sched_need_reserve;
+}
+
+ggml_cgraph * llama_context::graph_reserve_widest(const llama_memory_context_i * mctx, bool split_only) {
+    const uint32_t n_tokens  = std::min(cparams.n_ctx, cparams.n_ubatch_reserve);
+    const uint32_t n_outputs = std::min(n_tokens, cparams.n_outputs_max);
+
+    // TODO: the worst case graph is not always reached for `n_seqs > 1`
+    //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
+    switch (model.arch) {
+        case LLM_ARCH_KIMI_LINEAR:
+        case LLM_ARCH_MINIMAX_01:
+            // [TAG_RESERVE_DIAG_DECAY]
+            // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
+            // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
+            return graph_reserve(n_tokens, 1, n_outputs, mctx, split_only);
+        default:
+            return graph_reserve(n_tokens, cparams.n_seq_max, n_outputs, mctx, split_only);
+    }
 }
 
 void llama_context::synchronize() {
@@ -4977,6 +4986,29 @@ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
 
 bool llama_output_reserve(struct llama_context * ctx, uint32_t n_outputs) {
     return ctx && ctx->reserve_outputs(n_outputs);
+}
+
+struct ggml_cgraph * llama_graph_reserve_widest(struct llama_context * ctx) {
+    auto memory = ctx->get_memory();
+    llama_memory_context_ptr mctx;
+    if (memory) {
+        mctx = memory->init_full();
+    }
+    return ctx->graph_reserve_widest(mctx.get());
+}
+
+bool llama_sched_reserve_pending(const struct llama_context * ctx) {
+    return ctx->sched_reserve_pending();
+}
+
+bool llama_sched_reserve_now(struct llama_context * ctx) {
+    try {
+        ctx->sched_reserve();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: scheduler reserve failed: %s\n", __func__, err.what());
+        return false;
+    }
+    return true;
 }
 
 ggml_backend_buffer_t llama_get_output_buffer(const struct llama_context * ctx) {
