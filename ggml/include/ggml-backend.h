@@ -428,8 +428,9 @@ extern "C" {
     // Bytes of chunk `chunk` of the compute buffer of backend `backend_index` that the current graph's allocation uses,
     // which is at most the chunk's buffer size. The chunk's backend buffer is stored in *chunk_buffer (NULL if none).
     // Returns 0 and NULL past the last chunk, and for a backend that shares its allocator with an earlier backend
-    // (the chunks are reported under the first index). Valid after ggml_backend_sched_alloc_graph, including inside
-    // the graph-prepare callback.
+    // (the chunks are reported under the first index). Valid after ggml_backend_sched_reserve or
+    // ggml_backend_sched_alloc_graph, including inside the graph-prepare callback. After a reserve it is the planned
+    // extent, an upper bound of what an alloc of the same graph addresses.
     GGML_API size_t               ggml_backend_sched_get_compute_extent(ggml_backend_sched_t sched, int backend_index, int chunk, ggml_backend_buffer_t * chunk_buffer);
 
     // Invoke the graph-prepare callback for a graph that already has addresses (returns true if none is set)
