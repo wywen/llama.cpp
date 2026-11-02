@@ -831,6 +831,12 @@ uint64_t ggml_backend_metal_event_host_value(ggml_metal_event_t ev) {
     return ggml_metal_event_host_value(ev);
 }
 
+void ggml_backend_metal_event_signal(ggml_backend_t backend, ggml_metal_event_t ev, uint64_t value) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_event_signal((ggml_metal_t)backend->context, ev, value);
+}
+
 const char * ggml_backend_metal_last_error(ggml_backend_t backend) {
     if (!ggml_backend_is_metal(backend)) {
         return NULL;
