@@ -56,6 +56,14 @@ GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t bac
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
+// set the number of extra command buffers a graph compute is encoded across (default: 1)
+// with n_cb > 0 the graph is split into a head encoded by the calling thread and n_cb slices
+// encoded concurrently; kernels are fused only within one command buffer, so these split
+// points can break a fusable group. with n_cb == 0 the whole graph is encoded in one command
+// buffer, which fuses every graph the same way however it is sized
+// obtained through ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_set_n_cb")
+typedef void (*ggml_backend_metal_set_n_cb_t)(ggml_backend_t backend, int n_cb);
+
 typedef struct ggml_metal_event * ggml_metal_event_t;
 
 struct ggml_metal_tensor_copy_pair {
