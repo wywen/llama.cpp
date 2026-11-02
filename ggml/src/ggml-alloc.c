@@ -1019,6 +1019,26 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
+    if (!no_alloc) {
+        // report the planned extent, under the first buffer id that shares the allocator
+        memset(galloc->chunk_extents, 0, (size_t) galloc->n_buffers * GGML_VBUFFER_MAX_CHUNKS * sizeof(size_t));
+        for (int i = 0; i < galloc->n_buffers; i++) {
+            bool shared = false;
+            for (int j = 0; j < i; j++) {
+                if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
+                    shared = true;
+                    break;
+                }
+            }
+            if (shared) {
+                continue;
+            }
+            for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
+                galloc->chunk_extents[(size_t) i * GGML_VBUFFER_MAX_CHUNKS + c] = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
+            }
+        }
+    }
+
     return true;
 }
 

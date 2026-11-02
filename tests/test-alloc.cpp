@@ -893,6 +893,31 @@ static void test_sched_compute_extent() {
         GGML_ASSERT(buffers[0] == wide_buffers[0]);
         GGML_ASSERT(buffers[1] == wide_buffers[1]);
     }
+
+    // after a reserve the extent is the planned extent, and an alloc of the same graph reports at most that
+    {
+        ggml_backend_sched_ptr reserved(ggml_backend_sched_new(backends, bufts, 1, 64, false, false));
+        auto [ctx, graph, ctx_ptr] = make_context();
+        build_fan_in(ctx, graph, 128, 5);
+        GGML_ASSERT(ggml_backend_sched_reserve(reserved.get(), graph));
+
+        std::vector<ggml_backend_buffer_t> reserved_buffers;
+        std::vector<size_t> planned = sched_extents(reserved.get(), reserved_buffers, 4);
+        printf("reserved extents: %zu %zu %zu %zu\n", planned[0], planned[1], planned[2], planned[3]);
+        GGML_ASSERT(planned[0] > 0 && planned[1] > 0);
+        for (int c = 0; c < 4; c++) {
+            GGML_ASSERT(planned[c] == 0 || reserved_buffers[c] != nullptr);
+            GGML_ASSERT(planned[c] >= wide_extents[c]);
+        }
+
+        ggml_backend_sched_reset(reserved.get());
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(reserved.get(), graph));
+        std::vector<size_t> actual = sched_extents(reserved.get(), reserved_buffers, 4);
+        printf("alloc after reserve extents: %zu %zu %zu %zu\n", actual[0], actual[1], actual[2], actual[3]);
+        for (int c = 0; c < 4; c++) {
+            GGML_ASSERT(actual[c] <= planned[c]);
+        }
+    }
 }
 
 // Test re-using gallocr for a different graph. The new graph has the same
