@@ -305,6 +305,8 @@ llama_context::llama_context(
     cparams.cb_graph_prepare_user_data = params.cb_graph_prepare_user_data;
     cparams.cb_synchronize             = params.cb_synchronize;
     cparams.cb_synchronize_user_data   = params.cb_synchronize_user_data;
+    cparams.cb_outputs_enqueued           = params.cb_outputs_enqueued;
+    cparams.cb_outputs_enqueued_user_data = params.cb_outputs_enqueued_user_data;
 
     auto rope_scaling_type = params.rope_scaling_type;
     if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
@@ -1709,6 +1711,9 @@ int llama_context::encode(const llama_batch & batch_inp) {
         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
     }
 
+    // every output copy of this graph is enqueued
+    notify_outputs_enqueued();
+
     // TODO: hacky solution
     if (model.arch == LLM_ARCH_T5 && t_embd) {
         //cross.t_embd = t_embd;
@@ -2126,6 +2131,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
         }
+
+        // every output copy of this ubatch's graph is enqueued
+        notify_outputs_enqueued();
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
@@ -2649,6 +2657,12 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
+}
+
+void llama_context::notify_outputs_enqueued() {
+    if (cparams.cb_outputs_enqueued) {
+        cparams.cb_outputs_enqueued(sched.get(), cparams.cb_outputs_enqueued_user_data);
+    }
 }
 
 ggml_status llama_context::graph_compute(
@@ -3800,6 +3814,8 @@ llama_context_params llama_context_default_params() {
         /*.cb_graph_prepare_user_data  =*/ nullptr,
         /*.cb_synchronize              =*/ nullptr,
         /*.cb_synchronize_user_data    =*/ nullptr,
+        /*.cb_outputs_enqueued         =*/ nullptr,
+        /*.cb_outputs_enqueued_user_data =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,

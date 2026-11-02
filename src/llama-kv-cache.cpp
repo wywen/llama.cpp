@@ -957,6 +957,9 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                 return updated;
             }
 
+            // the K-shift graph copies no outputs
+            lctx->notify_outputs_enqueued();
+
             updated = true;
         }
 

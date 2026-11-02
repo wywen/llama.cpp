@@ -402,6 +402,16 @@ extern "C" {
         ggml_backend_sched_synchronize_callback cb_synchronize;
         void * cb_synchronize_user_data;
 
+        // Called once per graph that llama computes successfully on the context's scheduler (each
+        // ubatch of decode and encode, and each K-shift graph), after every asynchronous copy of that
+        // graph's outputs out of compute tensors (logits, embeddings, nextn hidden state, layer inputs,
+        // backend-sampler tensors) has been enqueued on its backend, and before llama allocates or
+        // writes the inputs of any later graph on the scheduler. A caller may record backend events
+        // here to observe when those copies complete. It is called even if the graph enqueues no
+        // output copies.
+        void (*cb_outputs_enqueued)(ggml_backend_sched_t sched, void * user_data);
+        void * cb_outputs_enqueued_user_data;
+
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 

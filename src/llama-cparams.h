@@ -77,4 +77,6 @@ struct llama_cparams : llama_memory_cparams {
     void * cb_graph_prepare_user_data;
     ggml_backend_sched_synchronize_callback cb_synchronize;
     void * cb_synchronize_user_data;
+    void (*cb_outputs_enqueued)(ggml_backend_sched_t sched, void * user_data);
+    void * cb_outputs_enqueued_user_data;
 };
