@@ -18,6 +18,20 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// Reserves, on the current scheduler, the prompt graph a scheduler reserve sizes its compute
+// buffers for last: the widest graph at the reserve width. Valid as llama_graph_reserve's.
+LLAMA_API struct ggml_cgraph * llama_graph_reserve_widest(struct llama_context * ctx);
+
+// Whether the next decode reserves a new scheduler: a setting changed since the last reserve (a
+// backend sampler, an adapter, the attention type, ...). That reserve recreates the scheduler and
+// reallocates its compute buffers.
+LLAMA_API bool llama_sched_reserve_pending(const struct llama_context * ctx);
+
+// Runs a pending scheduler reserve now, as the next decode would, so the compute buffers settle
+// before the first decode. Does nothing when none is pending. False when the reserve failed:
+// discard the context.
+LLAMA_API bool llama_sched_reserve_now(struct llama_context * ctx);
+
 // Constructor-phase reservation: call after final embedding/backend-sampler configuration and before decoding.
 // Rejects zero or rows beyond n_batch or n_outputs_max without changing the context.
 // A valid request returning false means allocation failed: discard the context, since its previous output

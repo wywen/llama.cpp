@@ -69,6 +69,12 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    // whether a setting changed since the last scheduler reserve
+    bool sched_reserve_pending() const;
+
+    // reserve the widest graph sched_reserve sizes the compute buffers for, on the current scheduler
+    ggml_cgraph * graph_reserve_widest(const llama_memory_context_i * mctx, bool split_only = false);
+
     void synchronize();
 
     const llama_model   & get_model()   const;
