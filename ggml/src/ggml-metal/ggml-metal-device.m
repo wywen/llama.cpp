@@ -1265,7 +1265,7 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                 }
 
                 // ggml's residency sets are disconnected whatever GGML_METAL_NO_RESIDENCY says: the
-                // owner of the placement heaps keeps device memory prepared
+                // caller keeps device memory resident (see ggml_backend_metal_buffer_request_residency)
                 dev->props.use_residency_sets = false;
 
                 dev->props.use_shared_buffers = dev->props.has_unified_memory;
@@ -1503,10 +1503,6 @@ bool ggml_metal_event_host_wait(ggml_metal_event_t ev, uint64_t value, uint64_t 
 uint64_t ggml_metal_event_host_value(ggml_metal_event_t ev) {
     id<MTLSharedEvent> event = (id<MTLSharedEvent>) ev->obj;
     return event.signaledValue;
-}
-
-void * ggml_metal_event_get_obj(ggml_metal_event_t ev) {
-    return ev->obj;
 }
 
 ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev) {
@@ -2062,9 +2058,6 @@ struct ggml_metal_buffer {
     // pointers to global device
     ggml_metal_device_t dev;
 
-    // buffers[0].metal is a placement sparse buffer
-    bool is_sparse;
-
     // A host-pointer buffer whose residency the caller took over (see ggml_metal_buffer_unwrap):
     // rset is out of the device's keep-alive collection and only the caller requests or ends it.
     // unwrapped: every buffers[i].metal is released and nil. The lock serializes the calls that
@@ -2243,29 +2236,6 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
     return res;
 }
 
-ggml_metal_buffer_t ggml_metal_buffer_init_sparse(ggml_metal_device_t dev, void * metal, void * va_base, size_t size) {
-    ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
-
-    res->dev       = dev;
-    res->is_sparse = true;
-
-    res->all_data  = va_base;
-    res->all_size  = size;
-    res->is_shared = false;
-    res->owned     = true;
-
-    res->n_buffers = 1;
-    res->buffers[0].data  = va_base;
-    res->buffers[0].size  = size;
-    res->buffers[0].metal = (id<MTLBuffer>) metal;
-
-    // the memory behind the buffer is the heaps', which carry their own residency
-    res->use_residency_sets = false;
-    res->rset = nil;
-
-    return res;
-}
-
 ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
 
@@ -2396,40 +2366,12 @@ bool ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf) {
     return buf->is_shared;
 }
 
-size_t ggml_metal_buffer_get_size(ggml_metal_buffer_t buf) {
-    return buf->all_size;
-}
-
-void * ggml_metal_buffer_get_sparse(ggml_metal_buffer_t buf) {
-    return buf->is_sparse ? buf->buffers[0].metal : NULL;
-}
-
-bool ggml_metal_buffer_set_sparse(ggml_metal_buffer_t buf, void * metal) {
-    if (!buf->is_sparse || metal == NULL) {
-        return false;
-    }
-
-    id<MTLBuffer> old = buf->buffers[0].metal;
-    buf->buffers[0].metal = (id<MTLBuffer>) metal;
-    [old release];
-
-    return true;
-}
-
-int ggml_metal_buffer_get_n_objs(ggml_metal_buffer_t buf) {
-    return buf->n_buffers;
-}
-
-void * ggml_metal_buffer_get_obj(ggml_metal_buffer_t buf, int i) {
-    return buf->buffers[i].metal;
-}
-
 //
 // host-pointer buffers released and recreated over the same memory
 //
 
 static bool ggml_metal_buffer_is_host_ptr(ggml_metal_buffer_t buf, const char * caller) {
-    if (buf->is_shared && !buf->owned && !buf->is_sparse) {
+    if (buf->is_shared && !buf->owned) {
         return true;
     }
     GGML_LOG_ERROR("%s: not a buffer over host memory\n", caller);
@@ -2609,27 +2551,6 @@ bool ggml_metal_buffer_end_residency(ggml_metal_buffer_t buf) {
     }
 
     os_unfair_lock_unlock(&buf->residency_lock);
-
-    return res;
-}
-
-struct ggml_metal_buffer_id ggml_metal_buffer_get_range(ggml_metal_buffer_t buf, size_t offs, size_t size) {
-    struct ggml_metal_buffer_id res = { nil, 0 };
-
-    if (offs > buf->all_size || size > buf->all_size - offs) {
-        return res;
-    }
-
-    const char * begin = (const char *) buf->all_data + offs;
-
-    for (int i = 0; i < buf->n_buffers; ++i) {
-        const char * data = (const char *) buf->buffers[i].data;
-        if (begin >= data && (size_t) (begin - data) + size <= buf->buffers[i].size) {
-            res.metal = buf->buffers[i].metal;
-            res.offs  = (size_t) (begin - data);
-            return res;
-        }
-    }
 
     return res;
 }
