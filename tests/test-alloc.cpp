@@ -1008,6 +1008,18 @@ static std::vector<std::pair<ggml_backend_buffer_t, size_t>> node_placements(ggm
     return placements;
 }
 
+// the placement of each node of graph a plan places, in graph order, skipping views
+static std::vector<std::pair<ggml_backend_buffer_t, size_t>> planned_placements(ggml_cgraph * graph) {
+    std::vector<std::pair<ggml_backend_buffer_t, size_t>> placements;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        ggml_tensor * t = ggml_graph_node(graph, i);
+        if (t->view_src == nullptr) {
+            placements.emplace_back(t->buffer, (size_t) ((char *) t->data - (char *) ggml_backend_buffer_get_base(t->buffer)));
+        }
+    }
+    return placements;
+}
+
 // A graph that only shrank is planned again under replan_on_shrink, and a fresh plan of it can need
 // more of a chunk than the plan that sized the buffers left there. The allocator places the graph
 // by that plan instead: where the wide graph was, with no reserve offered, the buffers as they were,
@@ -1086,6 +1098,32 @@ static void test_shrink_replan_keeps_the_fitting_plan() {
         }
         GGML_ASSERT(node_placements(narrow.graph) == wide_placements);
         check_no_overlap(narrow.graph);
+    }
+
+    // a backend's graph optimizer may move a view of the cache, whose memory no plan places, as the
+    // view narrows; the narrow graph so reordered is still held by the wide graph's plan
+    {
+        ggml_backend_sched_reset(sched.get());
+        block_graph narrow = build_block(4, 1, 16);
+        ggml_cgraph * graph = narrow.graph;
+        int view = -1;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            if (graph->nodes[i]->view_src != nullptr && graph->nodes[i]->data != nullptr) {
+                view = i;
+            }
+        }
+        GGML_ASSERT(view > 0 && "the block has no view of the cache to move");
+        ggml_tensor * moved = graph->nodes[view];
+        std::rotate(graph->nodes, graph->nodes + view, graph->nodes + view + 1);
+        GGML_ASSERT(graph->nodes[0] == moved);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+        GGML_ASSERT(counts.n_reserve == n_reserve && "a reordered narrow graph was planned afresh");
+        sched_extents(sched.get(), buffers, n_chunks);
+        for (int c = 0; c < n_chunks; c++) {
+            GGML_ASSERT(buffers[c] == wide_buffers[c]);
+        }
+        GGML_ASSERT(planned_placements(graph) == planned_placements(wide.graph));
+        check_no_overlap(graph);
     }
 
     // a graph whose own plan fits the chunks is placed by that plan and offered; a graph wider than
