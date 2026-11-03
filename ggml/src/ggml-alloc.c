@@ -502,6 +502,10 @@ struct ggml_gallocr {
 
     // plan again whenever a tensor size differs from the recorded plan, not only when it grew
     bool replan_on_shrink;
+
+    // the last reserve kept the recorded plan: the graph fits it, and its own plan would have
+    // grown a chunk; the next ggml_gallocr_alloc_graph places the graph by the recorded plan
+    bool keep_recorded_plan;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -846,8 +850,21 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     }
 }
 
+static bool ggml_gallocr_needs_realloc_fit(ggml_gallocr_t galloc, struct ggml_cgraph * graph, bool exact);
+static bool ggml_gallocr_recorded_plan_fits(
+        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids);
+static bool ggml_gallocr_plan_grows_a_chunk(ggml_gallocr_t galloc);
+static void ggml_gallocr_note_recorded_extents(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
+
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
+    galloc->keep_recorded_plan = false;
+
+    // a plan made only because a tensor shrank must not grow a chunk the recorded plan still
+    // serves: the allocator plans from empty chunks, so a narrower graph can split its tensors
+    // across the chunks differently and need more of one than the recorded plan left there
+    const bool recorded_plan_fits = !no_alloc && galloc->replan_on_shrink &&
+        ggml_gallocr_recorded_plan_fits(galloc, graph, node_buffer_ids, leaf_buffer_ids);
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
     // add 25% margin to avoid hash collisions
     min_hash_size += min_hash_size / 4;
@@ -870,6 +887,13 @@ static bool ggml_gallocr_reserve_n_impl(
 
     // allocate in hash table
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+
+    if (recorded_plan_fits && ggml_gallocr_plan_grows_a_chunk(galloc)) {
+        // keep the recorded plan and its buffers; the extents are the graph's under that plan
+        galloc->keep_recorded_plan = true;
+        ggml_gallocr_note_recorded_extents(galloc, graph);
+        return true;
+    }
 
     if (!no_alloc && galloc->callback_reserve != NULL) {
         if ((size_t) galloc->n_buffers > SIZE_MAX / GGML_VBUFFER_MAX_CHUNKS ||
@@ -1061,6 +1085,21 @@ bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
     return ggml_gallocr_reserve_n(galloc, graph, NULL, NULL);
 }
 
+// account the bytes a tensor placed by tensor_alloc addresses in its chunk, under the first buffer
+// id that shares the buffer's allocator
+static void ggml_gallocr_note_extent(ggml_gallocr_t galloc, const struct ggml_tensor * tensor, const struct tensor_alloc * tensor_alloc) {
+    const int buffer_id = tensor_alloc->buffer_id;
+    int owner = buffer_id;
+    for (int j = 0; j < buffer_id; j++) {
+        if (galloc->buf_tallocs[j] == galloc->buf_tallocs[buffer_id]) {
+            owner = j;
+            break;
+        }
+    }
+    size_t * extent = &galloc->chunk_extents[(size_t) owner * GGML_VBUFFER_MAX_CHUNKS + tensor_alloc->addr.chunk];
+    *extent = MAX(*extent, tensor_alloc->addr.offset + ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor));
+}
+
 static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor, struct tensor_alloc * tensor_alloc) {
     int buffer_id = tensor_alloc->buffer_id;
     assert(tensor->data || tensor->view_src || ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
@@ -1079,17 +1118,7 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
             assert(tensor_alloc->addr.offset != SIZE_MAX);
             assert(ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
             ggml_vbuffer_tensor_alloc(galloc->buffers[buffer_id], tensor, tensor_alloc->addr);
-
-            // account the extent under the first buffer id that shares this allocator
-            int owner = buffer_id;
-            for (int j = 0; j < buffer_id; j++) {
-                if (galloc->buf_tallocs[j] == galloc->buf_tallocs[buffer_id]) {
-                    owner = j;
-                    break;
-                }
-            }
-            size_t * extent = &galloc->chunk_extents[(size_t) owner * GGML_VBUFFER_MAX_CHUNKS + tensor_alloc->addr.chunk];
-            *extent = MAX(*extent, tensor_alloc->addr.offset + ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor));
+            ggml_gallocr_note_extent(galloc, tensor, tensor_alloc);
         } else {
             if (tensor->buffer == NULL) {
                 // this tensor was allocated without ggml-backend
@@ -1099,7 +1128,9 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
     }
 }
 
-static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc) {
+// whether the recorded allocation of a tensor still holds it: exactly its size when exact is set,
+// at least its size otherwise
+static bool ggml_gallocr_tensor_fits(ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc, bool exact) {
     size_t node_size = 0;
     if (!node->data && !node->view_src) {
         // If we previously had data but don't now then reallocate
@@ -1108,10 +1139,75 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
         }
         node_size = ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], node);
     }
-    return galloc->replan_on_shrink ? talloc->size_max == node_size : talloc->size_max >= node_size;
+    return exact ? talloc->size_max == node_size : talloc->size_max >= node_size;
 }
 
-static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+// whether the recorded plan places every tensor of graph as it is: the same topology on the same
+// buffer ids, every buffer allocated, and no tensor larger than its recorded allocation
+static bool ggml_gallocr_recorded_plan_fits(
+        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+    if (ggml_gallocr_needs_realloc_fit(galloc, graph, /*exact =*/ false)) {
+        return false;
+    }
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (galloc->buffers[i] == NULL) {
+            return false;
+        }
+    }
+    for (int i = 0; i < graph->n_leafs; i++) {
+        const int buffer_id = galloc->leaf_allocs[i].leaf.buffer_id;
+        if (buffer_id >= 0 && buffer_id != get_node_buffer_id(leaf_buffer_ids, i)) {
+            return false;
+        }
+    }
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const int buffer_id = galloc->node_allocs[i].dst.buffer_id;
+        if (buffer_id >= 0 && buffer_id != get_node_buffer_id(node_buffer_ids, i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// whether the plan just made in the allocators needs more of any chunk than its buffer holds
+static bool ggml_gallocr_plan_grows_a_chunk(ggml_gallocr_t galloc) {
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
+            const size_t current = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], c) : 0;
+            if (ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c) > current) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// set the chunk extents to what graph addresses under the recorded plan
+static void ggml_gallocr_note_recorded_extents(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    memset(galloc->chunk_extents, 0, (size_t) galloc->n_buffers * GGML_VBUFFER_MAX_CHUNKS * sizeof(size_t));
+    for (int i = 0; i < graph->n_leafs; i++) {
+        struct ggml_tensor * leaf = graph->leafs[i];
+        const struct tensor_alloc * talloc = &galloc->leaf_allocs[i].leaf;
+        if (!leaf->data && !leaf->view_src && talloc->buffer_id >= 0) {
+            ggml_gallocr_note_extent(galloc, leaf, talloc);
+        }
+    }
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        struct node_alloc * node_alloc = &galloc->node_allocs[i];
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            struct ggml_tensor * src = node->src[j];
+            if (src != NULL && !src->data && !src->view_src && node_alloc->src[j].buffer_id >= 0) {
+                ggml_gallocr_note_extent(galloc, src, &node_alloc->src[j]);
+            }
+        }
+        if (!node->data && !node->view_src && node_alloc->dst.buffer_id >= 0) {
+            ggml_gallocr_note_extent(galloc, node, &node_alloc->dst);
+        }
+    }
+}
+
+static bool ggml_gallocr_needs_realloc_fit(ggml_gallocr_t galloc, struct ggml_cgraph * graph, bool exact) {
     if (galloc->n_nodes != graph->n_nodes) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
@@ -1130,7 +1226,7 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
 
-        if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
+        if (!ggml_gallocr_tensor_fits(galloc, node, &node_alloc->dst, exact)) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
 #endif
@@ -1142,7 +1238,7 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
             if (src == NULL) {
                 continue;
             }
-            if (!ggml_gallocr_node_needs_realloc(galloc, src, &node_alloc->src[j])) {
+            if (!ggml_gallocr_tensor_fits(galloc, src, &node_alloc->src[j], exact)) {
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
 #endif
@@ -1154,8 +1250,16 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
     return false;
 }
 
+static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    return ggml_gallocr_needs_realloc_fit(galloc, graph, galloc->replan_on_shrink);
+}
+
 bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
-    if (ggml_gallocr_needs_realloc(galloc, graph)) {
+    const bool keep_recorded_plan = galloc->keep_recorded_plan;
+    galloc->keep_recorded_plan = false;
+    if (keep_recorded_plan && !ggml_gallocr_needs_realloc_fit(galloc, graph, /*exact =*/ false)) {
+        // the reserve just made for this graph kept the recorded plan
+    } else if (ggml_gallocr_needs_realloc(galloc, graph)) {
         if (galloc->n_buffers == 1) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: reallocating buffers automatically\n", __func__);
@@ -1163,6 +1267,7 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
             if (!ggml_gallocr_reserve(galloc, graph)) {
                 return false;
             }
+            galloc->keep_recorded_plan = false;
         } else {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: cannot reallocate multi buffer graph automatically, call reserve\n", __func__);
