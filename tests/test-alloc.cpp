@@ -1009,9 +1009,9 @@ static std::vector<std::pair<ggml_backend_buffer_t, size_t>> node_placements(ggm
 }
 
 // A graph that only shrank is planned again under replan_on_shrink, and a fresh plan of it can need
-// more of a chunk than the recorded plan left there. The allocator keeps the recorded plan instead:
-// the graph is placed where the wide graph was, no reserve is offered, the buffers stay as they
-// were, and the extents are what the graph addresses under that plan.
+// more of a chunk than the plan that sized the buffers left there. The allocator places the graph
+// by that plan instead: where the wide graph was, with no reserve offered, the buffers as they were,
+// and the extents what the graph addresses under that plan.
 static void test_shrink_replan_keeps_the_fitting_plan() {
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     GGML_ASSERT(backend);
@@ -1088,11 +1088,29 @@ static void test_shrink_replan_keeps_the_fitting_plan() {
         check_no_overlap(narrow.graph);
     }
 
-    // a graph that grew is planned and offered as before
+    // a graph whose own plan fits the chunks is placed by that plan and offered; a graph wider than
+    // it but no wider than the wide graph is then placed by the wide graph's plan again
+    {
+        ggml_backend_sched_reset(sched.get());
+        block_graph single = build_block(1, 1, 16);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), single.graph));
+        GGML_ASSERT(counts.n_reserve == n_reserve + 1 && "a fitting plan was not adopted");
+        ggml_backend_sched_reset(sched.get());
+        block_graph narrow = build_block(4, 1, 16);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), narrow.graph));
+        GGML_ASSERT(counts.n_reserve == n_reserve + 1 && "the wide graph's plan was not kept");
+        GGML_ASSERT(node_placements(narrow.graph) == wide_placements);
+        sched_extents(sched.get(), buffers, n_chunks);
+        for (int c = 0; c < n_chunks; c++) {
+            GGML_ASSERT(buffers[c] == wide_buffers[c]);
+        }
+    }
+
+    // a graph wider than the wide graph is planned and offered as before
     ggml_backend_sched_reset(sched.get());
     block_graph wider = build_block(8, 8, 64);
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), wider.graph));
-    GGML_ASSERT(counts.n_reserve == n_reserve + 1);
+    GGML_ASSERT(counts.n_reserve == n_reserve + 2);
     ggml_backend_sched_set_reserve_callback(sched.get(), nullptr, nullptr);
 }
 
