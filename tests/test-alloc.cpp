@@ -1,6 +1,7 @@
 #include "ggml-alloc.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "ggml-cpp.h"
+#include "ggml-cpu.h"
 #include "../ggml/src/ggml-impl.h"
 #include "ggml.h"
 
@@ -657,6 +658,500 @@ static void test_reserve_refusal_preserves_published_layout() {
     check_all_allocated(new_graph);
 }
 
+struct sched_callback_state {
+    int  n_prepare     = 0;
+    int  n_synchronize = 0;
+    bool accept        = true;
+    bool all_addressed = true;
+};
+
+static bool sched_prepare_callback(ggml_backend_sched_t /*sched*/, ggml_cgraph * graph, void * user_data) {
+    auto * state = static_cast<sched_callback_state *>(user_data);
+    state->n_prepare++;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        if (ggml_graph_node(graph, i)->data == nullptr) {
+            state->all_addressed = false;
+        }
+    }
+    return state->accept;
+}
+
+static void sched_synchronize_callback(ggml_backend_sched_t /*sched*/, void * user_data) {
+    static_cast<sched_callback_state *>(user_data)->n_synchronize++;
+}
+
+static void test_sched_prepare_and_synchronize_callbacks() {
+    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    GGML_ASSERT(backend);
+
+    ggml_backend_t             backends[1] = { backend.get() };
+    ggml_backend_buffer_type_t bufts[1]    = { ggml_backend_get_default_buffer_type(backend.get()) };
+    ggml_backend_sched_ptr     sched(ggml_backend_sched_new(backends, bufts, 1, 16, false, false));
+
+    auto [ctx, graph, ctx_ptr] = make_context();
+    ggml_tensor * x   = make_input_1d(ctx, 8);
+    ggml_tensor * out = ggml_scale(ctx, x, 2.0f);
+    ggml_set_output(out);
+    ggml_build_forward_expand(graph, out);
+
+    // without callbacks both entry points succeed
+    GGML_ASSERT(ggml_backend_sched_prepare_graph(sched.get(), graph));
+
+    sched_callback_state state;
+    ggml_backend_sched_set_graph_prepare_callback(sched.get(), sched_prepare_callback, &state);
+    ggml_backend_sched_set_synchronize_callback(sched.get(), sched_synchronize_callback, &state);
+
+    // fires once per allocation, after the tensors have addresses
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+    GGML_ASSERT(state.n_prepare == 1);
+    GGML_ASSERT(state.all_addressed);
+
+    // fires on demand for a graph that is not allocated again
+    GGML_ASSERT(ggml_backend_sched_prepare_graph(sched.get(), graph));
+    GGML_ASSERT(state.n_prepare == 2);
+
+    // computing an allocated graph does not fire it again
+    GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched.get(), graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(state.n_prepare == 2);
+
+    // fires after the backends synchronized
+    GGML_ASSERT(state.n_synchronize == 0);
+    ggml_backend_sched_synchronize(sched.get());
+    GGML_ASSERT(state.n_synchronize == 1);
+
+    // a refusal fails the allocation
+    state.accept = false;
+    ggml_backend_sched_reset(sched.get());
+    GGML_ASSERT(!ggml_backend_sched_alloc_graph(sched.get(), graph));
+    GGML_ASSERT(state.n_prepare == 3);
+    GGML_ASSERT(!ggml_backend_sched_prepare_graph(sched.get(), graph));
+    GGML_ASSERT(state.n_prepare == 4);
+
+    // cleared callbacks are no longer invoked
+    ggml_backend_sched_set_graph_prepare_callback(sched.get(), nullptr, nullptr);
+    ggml_backend_sched_set_synchronize_callback(sched.get(), nullptr, nullptr);
+    GGML_ASSERT(ggml_backend_sched_prepare_graph(sched.get(), graph));
+    ggml_backend_sched_synchronize(sched.get());
+    GGML_ASSERT(state.n_prepare == 4);
+    GGML_ASSERT(state.n_synchronize == 1);
+}
+
+// CPU buffer type with a small maximum buffer size, so that a graph spans several chunks
+static const char * small_chunk_buft_get_name(ggml_backend_buffer_type_t) {
+    return "small_chunk_cpu";
+}
+
+static ggml_backend_buffer_t small_chunk_buft_alloc_buffer(ggml_backend_buffer_type_t, size_t size) {
+    return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+}
+
+static size_t small_chunk_buft_get_alignment(ggml_backend_buffer_type_t) {
+    return ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
+}
+
+static size_t small_chunk_buft_get_max_size(ggml_backend_buffer_type_t) {
+    return 1024;
+}
+
+static bool small_chunk_buft_is_host(ggml_backend_buffer_type_t) {
+    return true;
+}
+
+struct replan_callback_counts {
+    int n_reserve     = 0;
+    int n_synchronize = 0;
+    std::vector<size_t> last_sizes;
+};
+
+static bool replan_reserve_callback(ggml_backend_sched_t, const ggml_backend_sched_buffer_reservation * r, size_t n, void * user_data) {
+    auto * counts = static_cast<replan_callback_counts *>(user_data);
+    counts->n_reserve++;
+    counts->last_sizes.clear();
+    for (size_t i = 0; i < n; i++) {
+        counts->last_sizes.push_back(r[i].size);
+    }
+    return true;
+}
+
+static void replan_synchronize_callback(ggml_backend_sched_t, void * user_data) {
+    static_cast<replan_callback_counts *>(user_data)->n_synchronize++;
+}
+
+// out = sum of n_branches scaled copies of one input of n_elements floats
+static ggml_tensor * build_fan_in(ggml_context * ctx, ggml_cgraph * graph, int64_t n_elements, int n_branches) {
+    ggml_tensor * x = make_input_1d(ctx, n_elements);
+    std::vector<ggml_tensor *> branches;
+    for (int i = 0; i < n_branches; i++) {
+        branches.push_back(ggml_scale(ctx, x, 2.0f + i));
+    }
+    ggml_tensor * out = branches[0];
+    for (int i = 1; i < n_branches; i++) {
+        out = ggml_add(ctx, out, branches[i]);
+    }
+    ggml_set_output(out);
+    ggml_build_forward_expand(graph, out);
+    return out;
+}
+
+static std::vector<size_t> sched_extents(ggml_backend_sched_t sched, std::vector<ggml_backend_buffer_t> & buffers, int n_chunks) {
+    std::vector<size_t> extents;
+    buffers.assign(n_chunks, nullptr);
+    for (int c = 0; c < n_chunks; c++) {
+        extents.push_back(ggml_backend_sched_get_compute_extent(sched, 0, c, &buffers[c]));
+    }
+    return extents;
+}
+
+static void test_sched_compute_extent() {
+    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    GGML_ASSERT(backend);
+
+    ggml_backend_buffer_type buft{};
+    buft.iface.get_name      = small_chunk_buft_get_name;
+    buft.iface.alloc_buffer  = small_chunk_buft_alloc_buffer;
+    buft.iface.get_alignment = small_chunk_buft_get_alignment;
+    buft.iface.get_max_size  = small_chunk_buft_get_max_size;
+    buft.iface.is_host       = small_chunk_buft_is_host;
+    buft.device              = ggml_backend_get_device(backend.get());
+
+    ggml_backend_t             backends[1] = { backend.get() };
+    ggml_backend_buffer_type_t bufts[1]    = { &buft };
+    ggml_backend_sched_ptr     sched(ggml_backend_sched_new(backends, bufts, 1, 64, false, false));
+
+    std::vector<ggml_backend_buffer_t> buffers;
+
+    // wide graph: more than one chunk
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        build_fan_in(ctx, graph, 128, 5);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+
+        std::vector<size_t> extents = sched_extents(sched.get(), buffers, 4);
+        printf("wide extents: %zu %zu %zu %zu\n", extents[0], extents[1], extents[2], extents[3]);
+        GGML_ASSERT(extents[0] > 0 && extents[1] > 0);
+        for (int c = 0; c < 4; c++) {
+            if (extents[c] == 0) {
+                GGML_ASSERT(c >= 2 || buffers[c] == nullptr);
+                continue;
+            }
+            GGML_ASSERT(buffers[c] != nullptr);
+            GGML_ASSERT(extents[c] <= ggml_backend_buffer_get_size(buffers[c]));
+            GGML_ASSERT(extents[c] <= 1024);
+        }
+
+        // the chunk buffers are the ones that back the graph's tensors
+        for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+            ggml_backend_buffer_t b = ggml_graph_node(graph, i)->buffer;
+            GGML_ASSERT(b == buffers[0] || b == buffers[1] || b == buffers[2] || b == buffers[3]);
+        }
+
+        // a backend index past the chunk count reports nothing
+        ggml_backend_buffer_t none = buffers[0];
+        GGML_ASSERT(ggml_backend_sched_get_compute_extent(sched.get(), 0, 100, &none) == 0);
+        GGML_ASSERT(none == nullptr);
+    }
+
+    const std::vector<size_t>                wide_extents = sched_extents(sched.get(), buffers, 4);
+    const std::vector<ggml_backend_buffer_t> wide_buffers = buffers;
+
+    // same topology with narrower tensors: the plan is reused, so the extent covers what the
+    // narrower tensors actually address and never exceeds the wide extent
+    {
+        ggml_backend_sched_reset(sched.get());
+        auto [ctx, graph, ctx_ptr] = make_context();
+        build_fan_in(ctx, graph, 16, 5);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+
+        std::vector<size_t> extents = sched_extents(sched.get(), buffers, 4);
+        printf("narrow same-topology extents: %zu %zu %zu %zu\n", extents[0], extents[1], extents[2], extents[3]);
+        for (int c = 0; c < 4; c++) {
+            GGML_ASSERT(extents[c] <= wide_extents[c]);
+            GGML_ASSERT(buffers[c] == wide_buffers[c]);
+        }
+        GGML_ASSERT(extents[0] + extents[1] + extents[2] + extents[3] <
+                    wide_extents[0] + wide_extents[1] + wide_extents[2] + wide_extents[3]);
+    }
+
+    // with replan_on_shrink the narrow graph is placed like a fresh plan and the buffers stay
+    {
+        std::vector<size_t> sizes;
+        for (int c = 0; c < 4; c++) {
+            sizes.push_back(wide_buffers[c] ? ggml_backend_buffer_get_size(wide_buffers[c]) : 0);
+        }
+        replan_callback_counts counts;
+        ggml_backend_sched_set_reserve_callback(sched.get(), replan_reserve_callback, &counts);
+        ggml_backend_sched_set_synchronize_callback(sched.get(), replan_synchronize_callback, &counts);
+        ggml_backend_sched_set_replan_on_shrink(sched.get(), true);
+        ggml_backend_sched_reset(sched.get());
+        auto [ctx, graph, ctx_ptr] = make_context();
+        build_fan_in(ctx, graph, 16, 5);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+
+        std::vector<size_t> extents = sched_extents(sched.get(), buffers, 4);
+        printf("narrow replan extents: %zu %zu %zu %zu\n", extents[0], extents[1], extents[2], extents[3]);
+        printf("replan reserve callbacks: %d (sizes:", counts.n_reserve);
+        for (size_t v : counts.last_sizes) { printf(" %zu", v); }
+        printf("), synchronize callbacks: %d\n", counts.n_synchronize);
+        GGML_ASSERT(counts.n_reserve == 1);
+        GGML_ASSERT(counts.last_sizes.size() == 2 && counts.last_sizes[0] == sizes[0] && counts.last_sizes[1] == sizes[1]);
+        ggml_backend_sched_set_reserve_callback(sched.get(), nullptr, nullptr);
+        ggml_backend_sched_set_synchronize_callback(sched.get(), nullptr, nullptr);
+        GGML_ASSERT(extents[0] > 0 && extents[0] < wide_extents[0]);
+        GGML_ASSERT(extents[1] == 0 && extents[2] == 0 && extents[3] == 0);
+        for (int c = 0; c < 4; c++) {
+            GGML_ASSERT(buffers[c] == wide_buffers[c]);
+            GGML_ASSERT((buffers[c] ? ggml_backend_buffer_get_size(buffers[c]) : 0) == sizes[c]);
+        }
+        ggml_backend_sched_set_replan_on_shrink(sched.get(), false);
+    }
+
+    // a smaller graph is planned again: it fits in chunk 0 and leaves the other chunks untouched
+    {
+        ggml_backend_sched_reset(sched.get());
+        auto [ctx, graph, ctx_ptr] = make_context();
+        build_fan_in(ctx, graph, 16, 2);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+
+        std::vector<size_t> extents = sched_extents(sched.get(), buffers, 4);
+        printf("small extents: %zu %zu %zu %zu\n", extents[0], extents[1], extents[2], extents[3]);
+        GGML_ASSERT(extents[0] > 0);
+        GGML_ASSERT(extents[0] < wide_extents[0]);
+        GGML_ASSERT(extents[1] == 0 && extents[2] == 0 && extents[3] == 0);
+        GGML_ASSERT(buffers[0] == wide_buffers[0]);
+        GGML_ASSERT(buffers[1] == wide_buffers[1]);
+    }
+
+    // after a reserve the extent is the planned extent, and an alloc of the same graph reports at most that
+    {
+        ggml_backend_sched_ptr reserved(ggml_backend_sched_new(backends, bufts, 1, 64, false, false));
+        auto [ctx, graph, ctx_ptr] = make_context();
+        build_fan_in(ctx, graph, 128, 5);
+        GGML_ASSERT(ggml_backend_sched_reserve(reserved.get(), graph));
+
+        std::vector<ggml_backend_buffer_t> reserved_buffers;
+        std::vector<size_t> planned = sched_extents(reserved.get(), reserved_buffers, 4);
+        printf("reserved extents: %zu %zu %zu %zu\n", planned[0], planned[1], planned[2], planned[3]);
+        GGML_ASSERT(planned[0] > 0 && planned[1] > 0);
+        for (int c = 0; c < 4; c++) {
+            GGML_ASSERT(planned[c] == 0 || reserved_buffers[c] != nullptr);
+            GGML_ASSERT(planned[c] >= wide_extents[c]);
+        }
+
+        ggml_backend_sched_reset(reserved.get());
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(reserved.get(), graph));
+        std::vector<size_t> actual = sched_extents(reserved.get(), reserved_buffers, 4);
+        printf("alloc after reserve extents: %zu %zu %zu %zu\n", actual[0], actual[1], actual[2], actual[3]);
+        for (int c = 0; c < 4; c++) {
+            GGML_ASSERT(actual[c] <= planned[c]);
+        }
+    }
+}
+
+// one transformer block over n_tokens positions and a prefix of n_cells cells, then logits for
+// n_outputs of the positions; the weights and cache live in weights_buf, outside the plan
+struct block_graph {
+    ggml_context_ptr      weights_ctx;
+    ggml_backend_buffer_ptr weights_buf;
+    ggml_context_ptr      ctx;
+    ggml_cgraph *         graph;
+};
+
+static block_graph build_block(int64_t n_tokens, int64_t n_outputs, int64_t n_cells) {
+    const int64_t n_embd = 8, n_ff = 16, n_vocab = 32, n_head = 4, n_cells_max = 64;
+    block_graph g;
+    ggml_init_params wparams{};
+    wparams.mem_size = 8 * ggml_tensor_overhead();
+    wparams.no_alloc = true;
+    g.weights_ctx.reset(ggml_init(wparams));
+    ggml_context * w = g.weights_ctx.get();
+    ggml_tensor * wq   = ggml_new_tensor_2d(w, GGML_TYPE_F32, n_embd, n_head);
+    ggml_tensor * keys = ggml_new_tensor_2d(w, GGML_TYPE_F32, n_head, n_cells_max);
+    ggml_tensor * vals = ggml_new_tensor_2d(w, GGML_TYPE_F32, n_cells_max, n_embd);
+    ggml_tensor * up   = ggml_new_tensor_2d(w, GGML_TYPE_F32, n_embd, n_ff);
+    ggml_tensor * down = ggml_new_tensor_2d(w, GGML_TYPE_F32, n_ff, n_embd);
+    ggml_tensor * head = ggml_new_tensor_2d(w, GGML_TYPE_F32, n_embd, n_vocab);
+    g.weights_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(w, ggml_backend_cpu_buffer_type()));
+
+    ggml_init_params params{};
+    params.mem_size = 48 * ggml_tensor_overhead() + ggml_graph_overhead();
+    params.no_alloc = true;
+    g.ctx.reset(ggml_init(params));
+    ggml_context * ctx = g.ctx.get();
+    ggml_tensor * x = make_input_1d(ctx, n_embd * n_tokens);
+    x = ggml_reshape_2d(ctx, x, n_embd, n_tokens);
+    ggml_tensor * q  = ggml_mul_mat(ctx, wq, ggml_rms_norm(ctx, x, 1e-6f));
+    ggml_tensor * k  = ggml_view_2d(ctx, keys, n_head, n_cells, keys->nb[1], 0);
+    ggml_tensor * kq = ggml_soft_max(ctx, ggml_mul_mat(ctx, k, q));
+    ggml_tensor * v  = ggml_view_2d(ctx, vals, n_cells, n_embd, vals->nb[1], 0);
+    x = ggml_add(ctx, x, ggml_mul_mat(ctx, v, kq));
+    x = ggml_add(ctx, x, ggml_mul_mat(ctx, down, ggml_gelu(ctx, ggml_mul_mat(ctx, up, ggml_rms_norm(ctx, x, 1e-6f)))));
+    ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_outputs);
+    ggml_set_input(rows);
+    ggml_tensor * out = ggml_mul_mat(ctx, head, ggml_get_rows(ctx, x, rows));
+    ggml_set_output(out);
+    g.graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(g.graph, out);
+    return g;
+}
+
+// the offset of each allocated node of graph inside its buffer, and the buffer
+static std::vector<std::pair<ggml_backend_buffer_t, size_t>> node_placements(ggml_cgraph * graph) {
+    std::vector<std::pair<ggml_backend_buffer_t, size_t>> placements;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        ggml_tensor * t = ggml_graph_node(graph, i);
+        if (t->view_src != nullptr) {
+            placements.emplace_back(nullptr, 0);
+            continue;
+        }
+        placements.emplace_back(t->buffer, (size_t) ((char *) t->data - (char *) ggml_backend_buffer_get_base(t->buffer)));
+    }
+    return placements;
+}
+
+// the placement of each node of graph a plan places, in graph order, skipping views
+static std::vector<std::pair<ggml_backend_buffer_t, size_t>> planned_placements(ggml_cgraph * graph) {
+    std::vector<std::pair<ggml_backend_buffer_t, size_t>> placements;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        ggml_tensor * t = ggml_graph_node(graph, i);
+        if (t->view_src == nullptr) {
+            placements.emplace_back(t->buffer, (size_t) ((char *) t->data - (char *) ggml_backend_buffer_get_base(t->buffer)));
+        }
+    }
+    return placements;
+}
+
+// A graph that only shrank is planned again under replan_on_shrink, and a fresh plan of it can need
+// more of a chunk than the plan that sized the buffers left there. The allocator places the graph
+// by that plan instead: where the wide graph was, with no reserve offered, the buffers as they were,
+// and the extents what the graph addresses under that plan.
+static void test_shrink_replan_keeps_the_fitting_plan() {
+    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    GGML_ASSERT(backend);
+
+    ggml_backend_buffer_type buft{};
+    buft.iface.get_name      = small_chunk_buft_get_name;
+    buft.iface.alloc_buffer  = small_chunk_buft_alloc_buffer;
+    buft.iface.get_alignment = small_chunk_buft_get_alignment;
+    buft.iface.get_max_size  = small_chunk_buft_get_max_size;
+    buft.iface.is_host       = small_chunk_buft_is_host;
+    buft.device              = ggml_backend_get_device(backend.get());
+
+    ggml_backend_t             backends[1] = { backend.get() };
+    ggml_backend_buffer_type_t bufts[1]    = { &buft };
+    const int                  n_chunks    = 4;
+
+    // a fresh plan of the narrow graph needs more of some chunk than the wide graph's plan
+    std::vector<size_t> wide_sizes;
+    std::vector<size_t> fresh_sizes;
+    for (int narrow = 0; narrow < 2; narrow++) {
+        ggml_backend_sched_ptr fresh(ggml_backend_sched_new(backends, bufts, 1, 64, false, false));
+        block_graph g = narrow ? build_block(4, 1, 16) : build_block(4, 4, 64);
+        replan_callback_counts counts;
+        ggml_backend_sched_set_reserve_callback(fresh.get(), replan_reserve_callback, &counts);
+        GGML_ASSERT(ggml_backend_sched_reserve(fresh.get(), g.graph));
+        (narrow ? fresh_sizes : wide_sizes) = counts.last_sizes;
+    }
+    bool grows = fresh_sizes.size() > wide_sizes.size();
+    for (size_t c = 0; c < std::min(fresh_sizes.size(), wide_sizes.size()); c++) {
+        grows = grows || fresh_sizes[c] > wide_sizes[c];
+    }
+    GGML_ASSERT(grows && "the narrow graph's own plan fits the wide graph's chunks");
+
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 1, 64, false, false));
+    replan_callback_counts counts;
+    ggml_backend_sched_set_reserve_callback(sched.get(), replan_reserve_callback, &counts);
+    ggml_backend_sched_set_replan_on_shrink(sched.get(), true);
+
+    std::vector<ggml_backend_buffer_t> buffers;
+    block_graph wide = build_block(4, 4, 64);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), wide.graph));
+    const std::vector<size_t>                wide_extents = sched_extents(sched.get(), buffers, n_chunks);
+    const std::vector<ggml_backend_buffer_t> wide_buffers = buffers;
+    std::vector<size_t>                      sizes;
+    for (int c = 0; c < n_chunks; c++) {
+        sizes.push_back(buffers[c] ? ggml_backend_buffer_get_size(buffers[c]) : 0);
+    }
+    const auto wide_placements = node_placements(wide.graph);
+    const int  n_reserve       = counts.n_reserve;
+
+    for (int pass = 0; pass < 2; pass++) {
+        // first allocated directly, then reserved before it is allocated
+        ggml_backend_sched_reset(sched.get());
+        block_graph narrow = build_block(4, 1, 16);
+        if (pass == 1) {
+            GGML_ASSERT(ggml_backend_sched_reserve(sched.get(), narrow.graph));
+            const std::vector<size_t> reserved = sched_extents(sched.get(), buffers, n_chunks);
+            for (int c = 0; c < n_chunks; c++) {
+                GGML_ASSERT(reserved[c] <= wide_extents[c]);
+            }
+            ggml_backend_sched_reset(sched.get());
+        }
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), narrow.graph));
+        GGML_ASSERT(counts.n_reserve == n_reserve && "a kept plan offered a reserve");
+
+        const std::vector<size_t> extents = sched_extents(sched.get(), buffers, n_chunks);
+        printf("kept plan extents (pass %d): %zu %zu %zu %zu\n", pass, extents[0], extents[1], extents[2], extents[3]);
+        for (int c = 0; c < n_chunks; c++) {
+            GGML_ASSERT(buffers[c] == wide_buffers[c]);
+            GGML_ASSERT((buffers[c] ? ggml_backend_buffer_get_size(buffers[c]) : 0) == sizes[c]);
+            GGML_ASSERT(extents[c] <= wide_extents[c]);
+        }
+        GGML_ASSERT(node_placements(narrow.graph) == wide_placements);
+        check_no_overlap(narrow.graph);
+    }
+
+    // a backend's graph optimizer may move a view of the cache, whose memory no plan places, as the
+    // view narrows; the narrow graph so reordered is still held by the wide graph's plan
+    {
+        ggml_backend_sched_reset(sched.get());
+        block_graph narrow = build_block(4, 1, 16);
+        ggml_cgraph * graph = narrow.graph;
+        int view = -1;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            if (graph->nodes[i]->view_src != nullptr && graph->nodes[i]->data != nullptr) {
+                view = i;
+            }
+        }
+        GGML_ASSERT(view > 0 && "the block has no view of the cache to move");
+        ggml_tensor * moved = graph->nodes[view];
+        std::rotate(graph->nodes, graph->nodes + view, graph->nodes + view + 1);
+        GGML_ASSERT(graph->nodes[0] == moved);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+        GGML_ASSERT(counts.n_reserve == n_reserve && "a reordered narrow graph was planned afresh");
+        sched_extents(sched.get(), buffers, n_chunks);
+        for (int c = 0; c < n_chunks; c++) {
+            GGML_ASSERT(buffers[c] == wide_buffers[c]);
+        }
+        GGML_ASSERT(planned_placements(graph) == planned_placements(wide.graph));
+        check_no_overlap(graph);
+    }
+
+    // a graph whose own plan fits the chunks is placed by that plan and offered; a graph wider than
+    // it but no wider than the wide graph is then placed by the wide graph's plan again
+    {
+        ggml_backend_sched_reset(sched.get());
+        block_graph single = build_block(1, 1, 16);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), single.graph));
+        GGML_ASSERT(counts.n_reserve == n_reserve + 1 && "a fitting plan was not adopted");
+        ggml_backend_sched_reset(sched.get());
+        block_graph narrow = build_block(4, 1, 16);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), narrow.graph));
+        GGML_ASSERT(counts.n_reserve == n_reserve + 1 && "the wide graph's plan was not kept");
+        GGML_ASSERT(node_placements(narrow.graph) == wide_placements);
+        sched_extents(sched.get(), buffers, n_chunks);
+        for (int c = 0; c < n_chunks; c++) {
+            GGML_ASSERT(buffers[c] == wide_buffers[c]);
+        }
+    }
+
+    // a graph wider than the wide graph is planned and offered as before
+    ggml_backend_sched_reset(sched.get());
+    block_graph wider = build_block(8, 8, 64);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), wider.graph));
+    GGML_ASSERT(counts.n_reserve == n_reserve + 2);
+    ggml_backend_sched_set_reserve_callback(sched.get(), nullptr, nullptr);
+}
+
 // Test re-using gallocr for a different graph. The new graph has the same
 // total size, but one of the chunks is larger, so reallocation is required.
 static void test_reallocation() {
@@ -1170,6 +1665,9 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reserve_refusal_preserves_published_layout", test_reserve_refusal_preserves_published_layout);
+    run("test_sched_prepare_and_synchronize_callbacks", test_sched_prepare_and_synchronize_callbacks);
+    run("test_sched_compute_extent", test_sched_compute_extent);
+    run("test_shrink_replan_keeps_the_fitting_plan", test_shrink_replan_keeps_the_fitting_plan);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);

@@ -404,6 +404,14 @@ llama_context::llama_context(
     cparams.cb_eval_user_data    = params.cb_eval_user_data;
     cparams.cb_reserve           = params.cb_reserve;
     cparams.cb_reserve_user_data = params.cb_reserve_user_data;
+    cparams.cb_compute_buft            = params.cb_compute_buft;
+    cparams.cb_compute_buft_user_data  = params.cb_compute_buft_user_data;
+    cparams.cb_graph_prepare           = params.cb_graph_prepare;
+    cparams.cb_graph_prepare_user_data = params.cb_graph_prepare_user_data;
+    cparams.cb_synchronize             = params.cb_synchronize;
+    cparams.cb_synchronize_user_data   = params.cb_synchronize_user_data;
+    cparams.cb_outputs_enqueued           = params.cb_outputs_enqueued;
+    cparams.cb_outputs_enqueued_user_data = params.cb_outputs_enqueued_user_data;
 
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         cparams.rope_scaling_type = hparams.rope_scaling_type_train;
@@ -624,6 +632,10 @@ llama_context::llama_context(
                 }
             }
 
+            if (cparams.cb_compute_buft) {
+                buft = cparams.cb_compute_buft(backend.get(), buft, cparams.cb_compute_buft_user_data);
+            }
+
             backend_buft.push_back(buft);
             backend_ptrs.push_back(backend.get());
             backend_buf_exp_size.push_back(0);
@@ -837,6 +849,10 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
     ggml_backend_sched_set_reserve_callback(sched.get(), cparams.cb_reserve, cparams.cb_reserve_user_data);
+    ggml_backend_sched_set_graph_prepare_callback(sched.get(), cparams.cb_graph_prepare, cparams.cb_graph_prepare_user_data);
+    // a caller that tracks per-graph extents wants each graph placed tightly
+    ggml_backend_sched_set_replan_on_shrink(sched.get(), cparams.cb_graph_prepare != nullptr);
+    ggml_backend_sched_set_synchronize_callback(sched.get(), cparams.cb_synchronize, cparams.cb_synchronize_user_data);
 }
 
 void llama_context::sched_reserve() {
@@ -943,20 +959,7 @@ void llama_context::sched_reserve() {
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
-        // TODO: the worst case graph is not always reached for `n_seqs > 1`
-        //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
-        ggml_cgraph * gf = nullptr;
-        switch (model.arch) {
-            case LLM_ARCH_KIMI_LINEAR:
-            case LLM_ARCH_MINIMAX_01:
-                // [TAG_RESERVE_DIAG_DECAY]
-                // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
-                // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
-                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.no_alloc());
-                break;
-            default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.no_alloc());
-        };
+        ggml_cgraph * gf = graph_reserve_widest(mctx.get(), model.no_alloc());
 
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
@@ -997,6 +1000,28 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+}
+
+bool llama_context::sched_reserve_pending() const {
+    return sched_need_reserve;
+}
+
+ggml_cgraph * llama_context::graph_reserve_widest(const llama_memory_context_i * mctx, bool split_only) {
+    const uint32_t n_tokens  = std::min(cparams.n_ctx, cparams.n_ubatch_reserve);
+    const uint32_t n_outputs = std::min(n_tokens, cparams.n_outputs_max);
+
+    // TODO: the worst case graph is not always reached for `n_seqs > 1`
+    //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
+    switch (model.arch) {
+        case LLM_ARCH_KIMI_LINEAR:
+        case LLM_ARCH_MINIMAX_01:
+            // [TAG_RESERVE_DIAG_DECAY]
+            // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
+            // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
+            return graph_reserve(n_tokens, 1, n_outputs, mctx, split_only);
+        default:
+            return graph_reserve(n_tokens, cparams.n_seq_max, n_outputs, mctx, split_only);
+    }
 }
 
 void llama_context::synchronize() {
@@ -1684,6 +1709,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_sched_synchronize(sched.get());
         }
 
+        // the reused graph keeps its tensor addresses, the prepare callback still sees it before the inputs are written
+        if (!ggml_backend_sched_prepare_graph(sched.get(), gf)) {
+            LLAMA_LOG_ERROR("%s: failed to prepare graph\n", __func__);
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
+
         n_reused++;
     } else {
         gf_res_prev_active = nullptr;
@@ -1898,6 +1930,9 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         GGML_ASSERT(n_outputs*n_embd <= (int64_t) embd_nextn.size);
         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_outputs*n_embd*sizeof(float));
     }
+
+    // every output copy of this graph is enqueued
+    notify_outputs_enqueued();
 
     // TODO: hacky solution
     if (model.arch == LLM_ARCH_T5 && t_embd) {
@@ -2323,6 +2358,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
         }
+
+        // every output copy of this ubatch's graph is enqueued
+        notify_outputs_enqueued();
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
@@ -2903,6 +2941,12 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
     LLAMA_LOG_INFO("%s: graph reallocation: nodes = %d (changed = %d), splits = %d, n_same = %d, n_diff = %d\n",
             __func__, ggml_graph_n_nodes(gf), graph_size_changed, ggml_backend_sched_get_n_splits(sched),
             lctx->n_reallocs_same, lctx->n_reallocs_diff);
+}
+
+void llama_context::notify_outputs_enqueued() {
+    if (cparams.cb_outputs_enqueued) {
+        cparams.cb_outputs_enqueued(sched.get(), cparams.cb_outputs_enqueued_user_data);
+    }
 }
 
 ggml_status llama_context::graph_compute(
@@ -4223,6 +4267,14 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.cb_reserve                  =*/ nullptr,
         /*.cb_reserve_user_data        =*/ nullptr,
+        /*.cb_compute_buft             =*/ nullptr,
+        /*.cb_compute_buft_user_data   =*/ nullptr,
+        /*.cb_graph_prepare            =*/ nullptr,
+        /*.cb_graph_prepare_user_data  =*/ nullptr,
+        /*.cb_synchronize              =*/ nullptr,
+        /*.cb_synchronize_user_data    =*/ nullptr,
+        /*.cb_outputs_enqueued         =*/ nullptr,
+        /*.cb_outputs_enqueued_user_data =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.kv_rot_buft                 =*/ nullptr,
@@ -4934,6 +4986,29 @@ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
 
 bool llama_output_reserve(struct llama_context * ctx, uint32_t n_outputs) {
     return ctx && ctx->reserve_outputs(n_outputs);
+}
+
+struct ggml_cgraph * llama_graph_reserve_widest(struct llama_context * ctx) {
+    auto memory = ctx->get_memory();
+    llama_memory_context_ptr mctx;
+    if (memory) {
+        mctx = memory->init_full();
+    }
+    return ctx->graph_reserve_widest(mctx.get());
+}
+
+bool llama_sched_reserve_pending(const struct llama_context * ctx) {
+    return ctx->sched_reserve_pending();
+}
+
+bool llama_sched_reserve_now(struct llama_context * ctx) {
+    try {
+        ctx->sched_reserve();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: scheduler reserve failed: %s\n", __func__, err.what());
+        return false;
+    }
+    return true;
 }
 
 ggml_backend_buffer_t llama_get_output_buffer(const struct llama_context * ctx) {

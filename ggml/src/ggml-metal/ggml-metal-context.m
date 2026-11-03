@@ -1666,6 +1666,23 @@ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
     }
 }
 
+void ggml_metal_event_signal(ggml_metal_t ctx, ggml_metal_event_t ev, uint64_t value) {
+    @autoreleasepool {
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+
+        // on completion, like the boundary schedule's cut signals on the same events
+        ggml_metal_event_signal_on_complete(ev, (ggml_metal_cmd_buf_t) cmd_buf, value);
+
+        [cmd_buf commit];
+
+        [ctx->cmd_bufs_ext addObject:cmd_buf];
+        ctx->cmd_buf_last = cmd_buf;
+
+        [cmd_buf retain];
+    }
+}
+
 ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
     return ctx->ev_cpy;
 }

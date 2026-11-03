@@ -72,6 +72,12 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    // whether a setting changed since the last scheduler reserve
+    bool sched_reserve_pending() const;
+
+    // reserve the widest graph sched_reserve sizes the compute buffers for, on the current scheduler
+    ggml_cgraph * graph_reserve_widest(const llama_memory_context_i * mctx, bool split_only = false);
+
     void synchronize();
 
     const llama_model   & get_model()   const;
@@ -276,6 +282,9 @@ public:
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+
+    // invokes cparams.cb_outputs_enqueued, if set, once a computed graph's output copies are enqueued
+    void notify_outputs_enqueued();
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(

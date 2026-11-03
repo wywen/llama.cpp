@@ -402,6 +402,28 @@ extern "C" {
         ggml_backend_sched_reserve_callback cb_reserve;
         void * cb_reserve_user_data;
 
+        // Given the compute buffer type chosen for a backend, returns the buffer type to use instead
+        // (return buft to keep it). Called once per backend when the context builds its scheduler.
+        ggml_backend_buffer_type_t (*cb_compute_buft)(ggml_backend_t backend, ggml_backend_buffer_type_t buft, void * user_data);
+        void * cb_compute_buft_user_data;
+
+        // Scheduler callbacks, see ggml_backend_sched_set_graph_prepare_callback and
+        // ggml_backend_sched_set_synchronize_callback
+        ggml_backend_sched_graph_prepare_callback cb_graph_prepare;
+        void * cb_graph_prepare_user_data;
+        ggml_backend_sched_synchronize_callback cb_synchronize;
+        void * cb_synchronize_user_data;
+
+        // Called once per graph that llama computes successfully on the context's scheduler (each
+        // ubatch of decode and encode, and each K-shift graph), after every asynchronous copy of that
+        // graph's outputs out of compute tensors (logits, embeddings, nextn hidden state, layer inputs,
+        // backend-sampler tensors) has been enqueued on its backend, and before llama allocates or
+        // writes the inputs of any later graph on the scheduler. A caller may record backend events
+        // here to observe when those copies complete. It is called even if the graph enqueues no
+        // output copies.
+        void (*cb_outputs_enqueued)(ggml_backend_sched_t sched, void * user_data);
+        void * cb_outputs_enqueued_user_data;
+
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
