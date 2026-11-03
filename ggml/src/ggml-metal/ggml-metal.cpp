@@ -7,11 +7,9 @@
 #include "ggml-metal-fusion.h"
 #include "ggml-metal-context.h"
 #include "ggml-metal-ops.h"
-#include "ggml-metal-placement.h"
 #include "ggml-metal-tuning.h"
 
 #include <mutex>
-#include <vector>
 #include <string>
 
 #define GGML_METAL_NAME "MTL"
@@ -1238,24 +1236,8 @@ ggml_backend_reg_t ggml_backend_metal_reg(void) {
 }
 
 //
-// placement sparse memory
+// buffers over host memory, released and recreated
 //
-
-// the Metal device behind a backend, or NULL when it is not a Metal backend
-static ggml_metal_device_t ggml_backend_metal_device_of(ggml_backend_t backend) {
-    if (backend == NULL || !ggml_backend_is_metal(backend)) {
-        GGML_LOG_ERROR("%s: not a Metal backend\n", __func__);
-        return NULL;
-    }
-    return (ggml_metal_device_t) backend->device->context;
-}
-
-bool ggml_backend_metal_placement_supported(ggml_backend_t backend) {
-    if (backend == NULL || !ggml_backend_is_metal(backend)) {
-        return false;
-    }
-    return ggml_metal_placement_is_supported((ggml_metal_device_t) backend->device->context);
-}
 
 // the Metal buffer behind a backend buffer, or NULL when it is not a Metal buffer
 static ggml_metal_buffer_t ggml_backend_metal_buffer_of(ggml_backend_buffer_t buffer) {
@@ -1264,60 +1246,6 @@ static ggml_metal_buffer_t ggml_backend_metal_buffer_of(ggml_backend_buffer_t bu
         return NULL;
     }
     return (ggml_metal_buffer_t) buffer->context;
-}
-
-ggml_metal_placement_heap_t ggml_backend_metal_placement_heap_new(ggml_backend_t backend, size_t n_tiles) {
-    ggml_metal_device_t dev = ggml_backend_metal_device_of(backend);
-    return dev != NULL ? ggml_metal_placement_heap_init(dev, n_tiles) : NULL;
-}
-
-void ggml_backend_metal_placement_heap_free(ggml_metal_placement_heap_t heap) {
-    ggml_metal_placement_heap_free(heap);
-}
-
-void * ggml_backend_metal_placement_heap_contents(ggml_metal_placement_heap_t heap) {
-    return ggml_metal_placement_heap_contents(heap);
-}
-
-bool ggml_backend_metal_placement_heap_attach_residency(ggml_metal_placement_heap_t heap, ggml_metal_mapping_queue_t const * queues, size_t n_queues) {
-    return ggml_metal_placement_heap_attach_residency(heap, queues, n_queues);
-}
-
-void ggml_backend_metal_placement_heap_detach_residency(ggml_metal_placement_heap_t heap) {
-    ggml_metal_placement_heap_detach_residency(heap);
-}
-
-void ggml_backend_metal_placement_heap_request_residency(ggml_metal_placement_heap_t heap) {
-    ggml_metal_placement_heap_request_residency(heap);
-}
-
-size_t ggml_backend_metal_placement_tile_bytes(void) {
-    return ggml_metal_placement_tile_bytes();
-}
-
-ggml_backend_buffer_t ggml_backend_metal_sparse_buffer_new(ggml_backend_t backend, void * va_base, size_t size) {
-    ggml_metal_device_t dev = ggml_backend_metal_device_of(backend);
-    if (dev == NULL) {
-        return NULL;
-    }
-
-    ggml_metal_buffer_t res = ggml_metal_sparse_buffer_init(dev, va_base, size);
-    if (res == NULL) {
-        return NULL;
-    }
-
-    const int device = ggml_metal_device_get_props(dev)->device;
-
-    return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_private(device), ggml_backend_metal_buffer_private_i, res, ggml_metal_buffer_get_size(res));
-}
-
-bool ggml_backend_metal_sparse_buffer_renew(ggml_backend_t backend, ggml_backend_buffer_t buffer) {
-    ggml_metal_device_t dev = ggml_backend_metal_device_of(backend);
-    ggml_metal_buffer_t buf = ggml_backend_metal_buffer_of(buffer);
-    if (dev == NULL || buf == NULL) {
-        return false;
-    }
-    return ggml_metal_sparse_buffer_renew(dev, buf);
 }
 
 bool ggml_backend_metal_buffer_unwrap(ggml_backend_buffer_t buffer) {
@@ -1338,122 +1266,6 @@ bool ggml_backend_metal_buffer_request_residency(ggml_backend_buffer_t buffer) {
 bool ggml_backend_metal_buffer_end_residency(ggml_backend_buffer_t buffer) {
     ggml_metal_buffer_t buf = ggml_backend_metal_buffer_of(buffer);
     return buf != NULL && ggml_metal_buffer_end_residency(buf);
-}
-
-ggml_metal_mapping_queue_t ggml_backend_metal_mapping_queue_new(ggml_backend_t backend) {
-    ggml_metal_device_t dev = ggml_backend_metal_device_of(backend);
-    return dev != NULL ? ggml_metal_mapping_queue_init(dev) : NULL;
-}
-
-void ggml_backend_metal_mapping_queue_free(ggml_metal_mapping_queue_t queue) {
-    ggml_metal_mapping_queue_free(queue);
-}
-
-bool ggml_backend_metal_map_tiles(ggml_metal_mapping_queue_t queue, ggml_metal_placement_heap_t heap, ggml_backend_buffer_t buffer,
-        const ggml_metal_tile_run * runs, size_t n_runs, ggml_metal_event_t signal, uint64_t value) {
-    ggml_metal_buffer_t buf = ggml_backend_metal_buffer_of(buffer);
-    if (buf == NULL || heap == NULL) {
-        return false;
-    }
-    return ggml_metal_update_tiles(queue, heap, buf, runs, n_runs, signal, value);
-}
-
-bool ggml_backend_metal_unmap_tiles(ggml_metal_mapping_queue_t queue, ggml_backend_buffer_t buffer,
-        const ggml_metal_tile_run * runs, size_t n_runs, ggml_metal_event_t signal, uint64_t value) {
-    ggml_metal_buffer_t buf = ggml_backend_metal_buffer_of(buffer);
-    if (buf == NULL) {
-        return false;
-    }
-    return ggml_metal_update_tiles(queue, NULL, buf, runs, n_runs, signal, value);
-}
-
-ggml_metal_warm_t ggml_backend_metal_warm_new(ggml_backend_t backend) {
-    ggml_metal_device_t dev = ggml_backend_metal_device_of(backend);
-    return dev != NULL ? ggml_metal_warm_init(dev) : NULL;
-}
-
-void ggml_backend_metal_warm_free(ggml_metal_warm_t warm) {
-    ggml_metal_warm_free(warm);
-}
-
-bool ggml_backend_metal_mapping_queue_warm(ggml_metal_mapping_queue_t queue, ggml_metal_warm_t warm,
-        ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_backend_buffer_t const * buffers, size_t n_buffers,
-        ggml_metal_event_t signal, uint64_t value) {
-    if (queue == NULL || warm == NULL || (heaps == NULL && n_heaps > 0) || (buffers == NULL && n_buffers > 0) || signal == NULL) {
-        return false;
-    }
-
-    std::vector<ggml_metal_buffer_t> bufs(n_buffers);
-    for (size_t i = 0; i < n_buffers; ++i) {
-        bufs[i] = ggml_backend_metal_buffer_of(buffers[i]);
-        if (bufs[i] == NULL) {
-            return false;
-        }
-    }
-    return ggml_metal_mapping_queue_warm(queue, warm, heaps, n_heaps, bufs.data(), bufs.size(), signal, value);
-}
-
-ggml_metal_blit_queue_t ggml_backend_metal_blit_queue_new(ggml_backend_t backend, ggml_metal_placement_heap_t heap) {
-    ggml_metal_device_t dev = ggml_backend_metal_device_of(backend);
-    return dev != NULL ? ggml_metal_blit_queue_init(dev, heap) : NULL;
-}
-
-void ggml_backend_metal_blit_queue_free(ggml_metal_blit_queue_t queue) {
-    ggml_metal_blit_queue_free(queue);
-}
-
-const char * ggml_backend_metal_blit_queue_error(ggml_metal_blit_queue_t queue) {
-    return ggml_metal_blit_queue_error(queue);
-}
-
-ggml_metal_event_t ggml_backend_metal_blit_queue_event(ggml_metal_blit_queue_t queue) {
-    return ggml_metal_blit_queue_event(queue);
-}
-
-uint64_t ggml_backend_metal_blit_copy(ggml_metal_blit_queue_t queue,
-        ggml_backend_buffer_t src, size_t src_offs, ggml_backend_buffer_t dst, size_t dst_offs, size_t size,
-        const ggml_metal_wait * waits, size_t n_waits) {
-    ggml_metal_buffer_t from = ggml_backend_metal_buffer_of(src);
-    ggml_metal_buffer_t to   = ggml_backend_metal_buffer_of(dst);
-    if (from == NULL || to == NULL) {
-        return 0;
-    }
-    return ggml_metal_blit_copy(queue, from, src_offs, to, dst_offs, size, waits, n_waits);
-}
-
-uint64_t ggml_backend_metal_blit_fill(ggml_metal_blit_queue_t queue,
-        ggml_backend_buffer_t dst, size_t offs, size_t size, uint8_t byte,
-        const ggml_metal_wait * waits, size_t n_waits) {
-    ggml_metal_buffer_t to = ggml_backend_metal_buffer_of(dst);
-    if (to == NULL) {
-        return 0;
-    }
-    return ggml_metal_blit_fill(queue, to, offs, size, byte, waits, n_waits);
-}
-
-bool ggml_backend_metal_keep_prepared(ggml_metal_placement_heap_t const * heaps, size_t n_heaps, ggml_backend_buffer_t const * buffers, size_t n_buffers) {
-    if (heaps == NULL || n_heaps == 0) {
-        return false;
-    }
-    for (size_t i = 0; i < n_heaps; ++i) {
-        if (heaps[i] == NULL) {
-            return false;
-        }
-    }
-
-    std::vector<ggml_metal_buffer_t> bufs(n_buffers);
-    for (size_t i = 0; i < n_buffers; ++i) {
-        bufs[i] = ggml_backend_metal_buffer_of(buffers[i]);
-        if (bufs[i] == NULL) {
-            return false;
-        }
-    }
-    return ggml_metal_keep_prepared(heaps, n_heaps, bufs.data(), bufs.size());
-}
-
-enum ggml_metal_keep_prepared_drain_result ggml_backend_metal_keep_prepared_drain(
-        ggml_metal_placement_heap_t queue_owner, uint64_t timeout_ms) {
-    return ggml_metal_keep_prepared_drain(queue_owner, timeout_ms);
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_metal_reg)
