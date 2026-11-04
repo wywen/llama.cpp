@@ -49,6 +49,13 @@ void ggml_metal_set_paged_gate_abort_ms(ggml_metal_t ctx, uint32_t ms);
 
 void ggml_metal_set_boundary_entry_signal(ggml_metal_t ctx, ggml_metal_event_t ev, uint64_t value);
 
+// See ggml_backend_metal_set_host_cuts.
+void ggml_metal_set_host_cuts(
+        ggml_metal_t ctx,
+        int n, struct ggml_tensor * const * nodes,
+        ggml_metal_event_t ev, uint64_t base_value,
+        bool (*fn)(void * user_data, int i, struct ggml_tensor * node), void * user_data);
+
 void ggml_metal_set_encode_window(
         ggml_metal_t ctx,
         struct ggml_tensor * first_node,  struct ggml_tensor * last_node,

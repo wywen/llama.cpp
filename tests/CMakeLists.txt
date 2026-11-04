@@ -402,6 +402,8 @@ endif()
 if (GGML_METAL AND NOT GGML_BACKEND_DL)
     # drives the encode window through the public Metal API on a real device; skips without one
     llama_build_and_test(test-metal-encode-window.cpp  LABEL "main behavior backend"  LINK ggml ggml-metal)
+    # drives host cuts through the public Metal API on a real device and prints the cost of a cut; skips without one
+    llama_build_and_test(test-metal-host-cuts.cpp  LABEL "main behavior backend"  LINK ggml ggml-metal)
 endif()
 
 if (NOT GGML_BACKEND_DL AND GGML_CPU)
