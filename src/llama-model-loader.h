@@ -54,6 +54,15 @@ struct llama_model_loader {
         }
     };
 
+    // a dense [ne0, ne1, n_expert] expert weight that the file stores as one tensor per expert,
+    //     blk.N.ffn_<kind>_exps.<e>.weight, each holding the bytes of slice e
+    // it has no single range in the file, so it has no llama_tensor_weight and no source ordinal
+    struct llama_tensor_assembly {
+        ggml_tensor * tensor; // metadata of the dense tensor
+
+        std::vector<const llama_tensor_weight *> parts; // the tensor of each expert, in expert order
+    };
+
     // custom comparator to sort weights more nicely by layer
     struct weight_name_comparer {
         bool operator()(const std::string & a, const std::string & b) const {
@@ -128,6 +137,8 @@ struct llama_model_loader {
     llama_mmaps mappings;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
+    std::map<std::string, llama_tensor_assembly, weight_name_comparer> assemblies; // by the name of the dense tensor
+    ggml_context_ptr ctx_assemblies; // owns the metadata of the assembled tensors
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
@@ -151,16 +162,23 @@ struct llama_model_loader {
         }
     };
 
-    // lazy tensors need dedicated context
+    // where the tensors of a context take their data from
+    enum class ctx_source {
+        FILE,      // the tensor's own range of the file, mapped or read
+        LAZY,      // the tensor's own range of the file, read on demand
+        ASSEMBLED, // the per-expert tensors of the file, copied into a buffer
+    };
+
+    // lazy and assembled tensors need dedicated contexts: neither can be wrapped in place in a mapping
     struct ctx_key {
         ggml_backend_buffer_type_t buft;
-        bool lazy;
+        ctx_source source;
     };
 
     struct ctx_key_comparator {
         bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
-            if (lhs.lazy != rhs.lazy) {
-                return lhs.lazy < rhs.lazy;
+            if (lhs.source != rhs.source) {
+                return lhs.source < rhs.source;
             }
             return strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft)) < 0;
         }
@@ -228,6 +246,9 @@ struct llama_model_loader {
 
     const llama_tensor_weight & require_weight(const char * name) const;
 
+    const llama_tensor_assembly * get_assembly(const char * name) const;
+
+    // the metadata of a weight or of an assembled tensor
     struct ggml_tensor * get_tensor_meta(const char * name) const;
 
     struct ggml_tensor * require_tensor_meta(const std::string & name) const;
@@ -263,6 +284,10 @@ struct llama_model_loader {
     // read a byte range of a weight's data
     // with mmap, returns a pointer into the mapping, otherwise reads into buf and returns buf
     const void * load_data_range(const llama_tensor_weight & w, size_t offs, size_t size, void * buf) const;
+
+    // copy the tensor of each expert into its slice of the allocated tensor 'cur'
+    // a buffer that is not host memory takes the whole tensor at once from 'staging', as a repacking buffer requires
+    void load_assembly(ggml_tensor * cur, const llama_tensor_assembly & assembly, std::vector<no_init<uint8_t>> & staging) const;
 
     // Returns false if cancelled by progress_callback
     bool load_all_data(

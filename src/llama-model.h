@@ -948,6 +948,9 @@ struct llama_model {
     /// Return the resolved source record for a STAMPED tensor ordinal (i.e. a
     /// ggml_tensor::src_ordinal value, which is the canonical ordinal plus one),
     /// or nullptr when the stamp is GGML_TENSOR_SRC_ORDINAL_NONE or out of range.
+    /// A dense expert tensor assembled from per-expert GGUF tensors has no single
+    /// file range, so it stays at GGML_TENSOR_SRC_ORDINAL_NONE; the record of each
+    /// per-expert tensor is kept in tensor_sources under that tensor's own name.
     [[nodiscard]] const llama_tensor_source_info * tensor_source_at(int32_t stamped_ordinal) const noexcept {
         if (stamped_ordinal <= GGML_TENSOR_SRC_ORDINAL_NONE) {
             return nullptr;

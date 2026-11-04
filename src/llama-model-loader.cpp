@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <optional>
 #include <regex>
 #include <unordered_set>
 
@@ -534,6 +535,88 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key_or_arr<std::array<float,    512>>(enum llm_kv kid, std::array<float,    512> & result, uint32_t n, bool required);
 
 
+// a tensor of the file that holds one expert of a dense expert weight
+struct expert_part_name {
+    std::string base;   // the name of the dense tensor, blk.N.ffn_<kind>_exps.weight
+    int64_t     expert; // the expert this tensor holds
+};
+
+// the dense tensor and expert of a per-expert tensor named blk.N.ffn_<kind>_exps.<e>.weight, if 'name' is one
+static std::optional<expert_part_name> parse_expert_part_name(const std::string & name) {
+    if (name.find("_exps.") == std::string::npos) {
+        return std::nullopt;
+    }
+    // the expert index is canonical decimal, so that each expert has exactly one name
+    static const std::regex re(R"(^(blk\.\d+\.ffn_(?:gate_up|up|gate|down)_exps)\.(0|[1-9]\d{0,8})\.weight$)");
+    std::smatch m;
+    if (!std::regex_match(name, m, re)) {
+        return std::nullopt;
+    }
+    return expert_part_name { m[1].str() + ".weight", std::stoll(m[2].str()) };
+}
+
+static std::string expert_part_tensor_name(const std::string & base, int64_t expert) {
+    const std::string stem = base.substr(0, base.size() - strlen(".weight"));
+    return format("%s.%" PRId64 ".weight", stem.c_str(), expert);
+}
+
+// index the dense expert weights that the file stores as one tensor per expert
+static void index_assemblies(llama_model_loader & ml) {
+    std::map<std::string, std::map<int64_t, const llama_model_loader::llama_tensor_weight *>> parts_by_base;
+    for (const auto & [name, weight] : ml.weights_map) {
+        if (const auto part = parse_expert_part_name(name)) {
+            parts_by_base[part->base][part->expert] = &weight;
+        }
+    }
+    if (parts_by_base.empty()) {
+        return;
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*parts_by_base.size(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ml.ctx_assemblies.reset(ggml_init(params));
+    if (!ml.ctx_assemblies) {
+        throw std::runtime_error("failed to create ggml context");
+    }
+
+    for (const auto & [base, parts] : parts_by_base) {
+        if (ml.weights_map.count(base) > 0) {
+            throw std::runtime_error(format("invalid model: tensor '%s' is stored both whole and per expert", base.c_str()));
+        }
+
+        // the keys are distinct and non-negative, so they are 0..n-1 exactly when the last one is n-1
+        const int64_t n_expert = (int64_t) parts.size();
+        if (parts.rbegin()->first != n_expert - 1) {
+            int64_t missing = 0;
+            while (parts.count(missing) > 0) {
+                missing++;
+            }
+            throw std::runtime_error(format("invalid model: tensor '%s' is stored per expert, but tensor '%s' is missing",
+                base.c_str(), expert_part_tensor_name(base, missing).c_str()));
+        }
+
+        const ggml_tensor * first = parts.begin()->second->tensor;
+        llama_model_loader::llama_tensor_assembly assembly;
+        assembly.parts.reserve(parts.size());
+        for (const auto & [expert, weight] : parts) {
+            const ggml_tensor * t = weight->tensor;
+            if (t->type != first->type || t->ne[0] != first->ne[0] || t->ne[1] != first->ne[1] || t->ne[2] != 1 || t->ne[3] != 1) {
+                throw std::runtime_error(format("invalid model: tensor '%s' is %s %s, but tensor '%s' is %s %s",
+                    ggml_get_name(t), ggml_type_name(t->type), llama_format_tensor_shape(t).c_str(),
+                    ggml_get_name(first), ggml_type_name(first->type), llama_format_tensor_shape(first).c_str()));
+            }
+            assembly.parts.push_back(weight);
+        }
+
+        assembly.tensor = ggml_new_tensor_3d(ml.ctx_assemblies.get(), first->type, first->ne[0], first->ne[1], n_expert);
+        ggml_set_name(assembly.tensor, base.c_str());
+        ml.assemblies.emplace(base, std::move(assembly));
+    }
+}
+
 llama_model_loader::llama_model_loader(
         struct gguf_context * meta,
         llama_model_set_tensor_data_t set_tensor_data,
@@ -736,6 +819,8 @@ llama_model_loader::llama_model_loader(
         }
     }
 
+    index_assemblies(*this);
+
     fver = (enum llama_fver) gguf_get_version(metadata);
 
     LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n",
@@ -881,12 +966,23 @@ const llama_model_loader::llama_tensor_weight & llama_model_loader::require_weig
     return *weight;
 }
 
-struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) const {
-    const auto * weight = get_weight(name);
-    if (!weight) {
-        return nullptr;
+const llama_model_loader::llama_tensor_assembly * llama_model_loader::get_assembly(const char * name) const {
+    auto pos = assemblies.find(name);
+    if (pos != assemblies.end()) {
+        return &pos->second;
     }
-    return weight->tensor;
+
+    return nullptr;
+}
+
+struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) const {
+    if (const auto * weight = get_weight(name)) {
+        return weight->tensor;
+    }
+    if (const auto * assembly = get_assembly(name)) {
+        return assembly->tensor;
+    }
+    return nullptr;
 }
 
 struct ggml_tensor * llama_model_loader::require_tensor_meta(const std::string & name) const {
@@ -933,11 +1029,13 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(
     }
 
     if (!is_ok) {
+        const auto * assembly = get_assembly(name.c_str());
         throw std::runtime_error(
-                format("%s: tensor '%s' has wrong shape; expected %s, got %s",
+                format("%s: tensor '%s' has wrong shape; expected %s, got %s%s",
                     __func__, name.c_str(),
                     llama_format_tensor_shape(ne).c_str(),
-                    llama_format_tensor_shape(cur).c_str()));
+                    llama_format_tensor_shape(cur).c_str(),
+                    assembly ? format(" from %zu per-expert tensors", assembly->parts.size()).c_str() : ""));
     }
 
     return cur;
@@ -1144,10 +1242,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
-    bool is_lazy = false;
+    ctx_source source = ctx_source::FILE;
+
+    // the tensors of the file this tensor uses
+    const llama_tensor_assembly * assembly = files.empty() ? nullptr : get_assembly(tn.str().c_str());
+    const int n_file_tensors = assembly ? (int) assembly->parts.size() : 1;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
+        const ctx_key key { buft, source };
 
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
@@ -1207,7 +1309,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
 
             size_data -= nbytes;
-            n_created++;
+            n_created += n_file_tensors;
 
             return nullptr;
         }
@@ -1235,7 +1337,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        if (is_lazy) {
+        if (source == ctx_source::LAZY) {
             return lazy_read::buft();
         }
 
@@ -1366,9 +1468,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
-    if (flags & TENSOR_READ_LAZY) {
+    if (assembly) {
+        // lazy reads need the tensor's own range of the file, which an assembled tensor does not have
+        source = ctx_source::ASSEMBLED;
+    } else if (flags & TENSOR_READ_LAZY) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
-        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+        if (lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()))) {
+            source = ctx_source::LAZY;
+        }
     }
 
     ggml_tensor t_meta = *cur;
@@ -1410,7 +1517,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // stamp the canonical model-wide ordinal so the engine can look up this
     // tensor's GGUF source by a checked direct index instead of by name.
     // Stored as ordinal + 1 so that a zeroed tensor reads as unset (see
-    // GGML_TENSOR_SRC_ORDINAL_NONE).
+    // GGML_TENSOR_SRC_ORDINAL_NONE). An assembled tensor has no single source
+    // and stays unset; its per-expert tensors keep their own source records.
     const llama_tensor_weight * weight = get_weight(tn.str().c_str());
     if (weight) {
         tensor->src_ordinal = (int32_t) (weight->ordinal + 1);
@@ -1419,7 +1527,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);
     } else {
-        n_created++;
+        n_created += n_file_tensors;
     }
 
     return tensor;
@@ -1585,6 +1693,41 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
     return data;
 }
 
+// a staging buffer of at least 'size' bytes
+// tensors come biggest-first: shrink the buffer when it gets too large, so peak memory stays close to one tensor
+static uint8_t * staging_buffer(std::vector<no_init<uint8_t>> & buf, size_t size) {
+    if (buf.size() < size || buf.size() > 2*size) {
+        // free the old buffer first, `buf = {}` would keep its capacity
+        buf = std::vector<no_init<uint8_t>>();
+        buf.resize(size);
+    }
+    return (uint8_t *) buf.data();
+}
+
+void llama_model_loader::load_assembly(ggml_tensor * cur, const llama_tensor_assembly & assembly, std::vector<no_init<uint8_t>> & staging) const {
+    const size_t n_size    = ggml_nbytes(cur);
+    const size_t part_size = cur->nb[2];
+    GGML_ASSERT(part_size*assembly.parts.size() == n_size);
+
+    const bool in_place = ggml_backend_buffer_is_host(cur->buffer);
+    uint8_t * dst = in_place ? (uint8_t *) cur->data : staging_buffer(staging, n_size);
+
+    for (size_t e = 0; e < assembly.parts.size(); ++e) {
+        const llama_tensor_weight & part = *assembly.parts[e];
+        GGML_ASSERT(ggml_nbytes(part.tensor) == part_size);
+
+        uint8_t * slice = dst + e*part_size;
+        const void * data = load_data_range(part, 0, part_size, slice);
+        if (data != slice) {
+            memcpy(slice, data, part_size);
+        }
+    }
+
+    if (!in_place) {
+        ggml_backend_tensor_set(cur, dst, 0, n_size);
+    }
+}
+
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         std::vector<ggml_backend_buffer_t> & bufs,
@@ -1719,8 +1862,9 @@ bool llama_model_loader::load_all_data(
     // staging buffer for non-host buffers without async uploads, reused because a fresh allocation per tensor page faults on every load
     std::vector<no_init<uint8_t>> read_buf;
     for (struct ggml_tensor * cur : tensors) {
-        const auto * weight = get_weight(ggml_get_name(cur));
-        if (weight == nullptr) {
+        const auto * weight   = get_weight(ggml_get_name(cur));
+        const auto * assembly = weight ? nullptr : get_assembly(ggml_get_name(cur));
+        if (weight == nullptr && assembly == nullptr) {
             // this can happen with split experts models
             continue;
         }
@@ -1732,6 +1876,12 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        if (assembly) {
+            load_assembly(cur, *assembly, read_buf);
+            size_done += n_size;
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
@@ -1844,13 +1994,7 @@ bool llama_model_loader::load_all_data(
                     const size_t read_size      = (pad + n_size + align - 1) & ~(align - 1);
                     const size_t buf_size       = read_size + align - 1;
 
-                    // tensors come biggest-first: shrink the buffer when it gets too large, so peak memory stays close to one tensor
-                    if (read_buf.size() < buf_size || read_buf.size() > 2*buf_size) {
-                        // free the old buffer first, `read_buf = {}` would keep its capacity
-                        read_buf = std::vector<no_init<uint8_t>>();
-                        read_buf.resize(buf_size);
-                    }
-                    uint8_t * read_dst = (uint8_t *) GGML_PAD((uintptr_t) read_buf.data(), align);
+                    uint8_t * read_dst = (uint8_t *) GGML_PAD((uintptr_t) staging_buffer(read_buf, buf_size), align);
                     file->seek(aligned_offset, SEEK_SET);
                     file->read_raw_unsafe(read_dst, read_size);
 
