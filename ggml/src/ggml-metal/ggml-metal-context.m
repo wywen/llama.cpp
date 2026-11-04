@@ -166,10 +166,21 @@ struct ggml_metal {
     struct ggml_metal_tensor_range_copy * ewin_egress;
     size_t                                ewin_n_out_of_band;
     struct ggml_tensor                 ** ewin_out_of_band;
+
+    // Host cuts over the paged path (PERSISTENT + pointer-keyed, like the encode window; see
+    // ggml_metal_set_host_cuts). Owned copy of the node array; the event stays caller-owned.
+    // The next host cut encoded signals hcut_val + 1.
+    int                    hcut_n;
+    struct ggml_tensor  ** hcut_nodes;
+    ggml_metal_event_t     hcut_ev;
+    uint64_t               hcut_val;
+    bool                (* hcut_fn)(void * user_data, int i, struct ggml_tensor * node);
+    void                 * hcut_user_data;
 };
 
 // Boundary-event schedule helpers (definitions below).
 static void             ggml_metal_bsched_clear        (ggml_metal_t ctx);
+static void             ggml_metal_hcut_clear          (ggml_metal_t ctx);
 static enum ggml_status ggml_metal_graph_compute_paged (ggml_metal_t ctx, struct ggml_cgraph * gf);
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
@@ -337,6 +348,7 @@ void ggml_metal_free(ggml_metal_t ctx) {
 
     ggml_metal_bsched_clear(ctx);
     ggml_metal_clear_encode_window(ctx);
+    ggml_metal_hcut_clear(ctx);
 
     //[ctx->queue release]; // [TAG_QUEUE_PER_BACKEND]
 
@@ -702,6 +714,37 @@ void ggml_metal_set_boundary_schedule(
     }
 }
 
+static void ggml_metal_hcut_clear(ggml_metal_t ctx) {
+    free(ctx->hcut_nodes);
+    ctx->hcut_n         = 0;
+    ctx->hcut_nodes     = NULL;
+    ctx->hcut_ev        = NULL;
+    ctx->hcut_val       = 0;
+    ctx->hcut_fn        = NULL;
+    ctx->hcut_user_data = NULL;
+}
+
+void ggml_metal_set_host_cuts(
+        ggml_metal_t ctx,
+        int n, struct ggml_tensor * const * nodes,
+        ggml_metal_event_t ev, uint64_t base_value,
+        bool (*fn)(void * user_data, int i, struct ggml_tensor * node), void * user_data) {
+    ggml_metal_hcut_clear(ctx);
+    if (n <= 0) {
+        return;
+    }
+    GGML_ASSERT(nodes != NULL && ev != NULL && fn != NULL);
+
+    ctx->hcut_nodes = malloc(sizeof(struct ggml_tensor *) * n);
+    GGML_ASSERT(ctx->hcut_nodes != NULL);
+    memcpy(ctx->hcut_nodes, nodes, sizeof(struct ggml_tensor *) * n);
+    ctx->hcut_n         = n;
+    ctx->hcut_ev        = ev;
+    ctx->hcut_val       = base_value;
+    ctx->hcut_fn        = fn;
+    ctx->hcut_user_data = user_data;
+}
+
 // Owned whole-tensor ranges for a list of pairs: [0, ggml_nbytes(src)) on both sides.
 static struct ggml_metal_tensor_range_copy * ggml_metal_ewin_whole_ranges(size_t n, const struct ggml_metal_tensor_copy_pair * pairs) {
     if (n == 0) {
@@ -1053,6 +1096,81 @@ static bool ggml_metal_ewin_split_is_in_band(
 // command buffer committed ahead of its gate.
 #define GGML_METAL_PAGED_GATE_WAIT_MS 30000
 
+enum ggml_metal_paged_wait_status {
+    GGML_METAL_PAGED_WAIT_OK,
+    GGML_METAL_PAGED_WAIT_TIMED_OUT,
+    GGML_METAL_PAGED_WAIT_ABANDONED,
+};
+
+// The paged path's host wait for `ev` to reach `value`: in slices of GGML_METAL_PAGED_GATE_SLICE_MS,
+// warning after each, until paged_gate_abort_ms (0: no limit) has passed. `spin` polls the value
+// instead of blocking in Metal's wait. A value reached by saturation (UINT64_MAX while `value` is
+// lower) means the producer abandoned the wait, not that it delivered.
+static enum ggml_metal_paged_wait_status ggml_metal_paged_host_wait(
+        ggml_metal_t ctx, ggml_metal_event_t ev, uint64_t value, bool spin,
+        const char * node_name, const char * what) {
+    uint64_t waited_ms = 0;
+    while (true) {
+        uint64_t slice_ms = GGML_METAL_PAGED_GATE_SLICE_MS;
+        if (ctx->paged_gate_abort_ms != 0 && ctx->paged_gate_abort_ms - waited_ms < slice_ms) {
+            slice_ms = ctx->paged_gate_abort_ms - waited_ms;
+        }
+        const bool reached = spin ? ggml_metal_event_host_spin(ev, value, slice_ms)
+                                  : ggml_metal_event_host_wait(ev, value, slice_ms);
+        if (reached) {
+            const bool abandoned = value != UINT64_MAX && ggml_metal_event_host_value(ev) == UINT64_MAX;
+            return abandoned ? GGML_METAL_PAGED_WAIT_ABANDONED : GGML_METAL_PAGED_WAIT_OK;
+        }
+        waited_ms += slice_ms;
+        if (ctx->paged_gate_abort_ms != 0 && waited_ms >= ctx->paged_gate_abort_ms) {
+            return GGML_METAL_PAGED_WAIT_TIMED_OUT;
+        }
+        GGML_LOG_WARN("%s: paged segment at node '%s' still waiting for %s after %llu s (event value %llu)\n",
+                __func__, node_name, what, (unsigned long long) (waited_ms / 1000), (unsigned long long) value);
+    }
+}
+
+// A host cut whose segment has been committed and whose callback has not yet run.
+struct ggml_metal_hcut_pending {
+    bool                 active;
+    int                  i;     // index in the host cut list
+    struct ggml_tensor * node;
+    uint64_t             value; // signaled by the segment's command buffer
+};
+
+// Spins until the pending host cut's segment has completed, then runs the callback. False, with
+// the backend in its error state, when the segment does not complete within the abort limit, its
+// event is saturated, or the callback fails the graph.
+static bool ggml_metal_hcut_resolve(ggml_metal_t ctx, struct ggml_metal_hcut_pending * p) {
+    if (!p->active) {
+        return true;
+    }
+    p->active = false;
+
+    const char * name = ggml_get_name(p->node);
+    switch (ggml_metal_paged_host_wait(ctx, ctx->hcut_ev, p->value, true, name, "its host cut")) {
+        case GGML_METAL_PAGED_WAIT_OK:
+            if (ctx->hcut_fn(ctx->hcut_user_data, p->i, p->node)) {
+                return true;
+            }
+            snprintf(ctx->last_error, sizeof(ctx->last_error),
+                    "host cut %d at node '%s': the callback failed the graph", p->i, name);
+            break;
+        case GGML_METAL_PAGED_WAIT_TIMED_OUT:
+            snprintf(ctx->last_error, sizeof(ctx->last_error),
+                    "host cut %d at node '%s': its segment did not complete within %u ms", p->i, name,
+                    ctx->paged_gate_abort_ms);
+            break;
+        case GGML_METAL_PAGED_WAIT_ABANDONED:
+            snprintf(ctx->last_error, sizeof(ctx->last_error),
+                    "host cut %d at node '%s': its event was abandoned (event value saturated)", p->i, name);
+            break;
+    }
+    GGML_LOG_ERROR("%s: %s\n", __func__, ctx->last_error);
+    ctx->has_error = true;
+    return false;
+}
+
 static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     const int n_nodes = gf->n_nodes;
 
@@ -1080,8 +1198,10 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
         // (a schedule node not present in this graph simply never matches). One
         // pass over the graph, O(n_nodes * (n_cuts + n_waits)) -- both schedule
         // sizes are ~n_layer, negligible next to the encode itself.
-        bool * is_cut  = (bool *) calloc((size_t) n_nodes, sizeof(bool));
-        bool * is_wait = (bool *) calloc((size_t) n_nodes, sizeof(bool));
+        // hcut_idx is the node's index in the host cut list, or -1.
+        bool * is_cut   = (bool *) calloc((size_t) n_nodes, sizeof(bool));
+        bool * is_wait  = (bool *) calloc((size_t) n_nodes, sizeof(bool));
+        int  * hcut_idx = (int  *) malloc(sizeof(int) * (size_t) n_nodes);
         for (int i = 0; i < n_nodes; ++i) {
             struct ggml_tensor * node = gf->nodes[i];
             for (int c = 0; c < n_cuts; ++c) {
@@ -1090,17 +1210,22 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             for (int w = 0; w < n_waits; ++w) {
                 if (wait_nodes[w] == node) { is_wait[i] = true; break; }
             }
+            hcut_idx[i] = -1;
+            for (int h = 0; h < ctx->hcut_n; ++h) {
+                if (ctx->hcut_nodes[h] == node) { hcut_idx[i] = h; break; }
+            }
         }
 
-        // Sorted-unique segment START indices: 0, every (cut index + 1), and
-        // every wait index (each in (0, n_nodes)). Consecutive starts delimit
+        // Sorted-unique segment START indices: 0, every (cut or host cut index + 1),
+        // and every wait index (each in (0, n_nodes)). Consecutive starts delimit
         // the segments; the last segment ends at n_nodes.
-        const int cap = 2 * n_nodes + 2;
+        const int cap = 3 * n_nodes + 2;
         int * starts = (int *) malloc(sizeof(int) * (size_t) cap);
         int n_starts = 0;
         starts[n_starts++] = 0;
         for (int i = 0; i < n_nodes; ++i) {
             if (is_cut[i] && i + 1 < n_nodes) { starts[n_starts++] = i + 1; }
+            if (hcut_idx[i] >= 0 && i + 1 < n_nodes) { starts[n_starts++] = i + 1; }
             if (is_wait[i] && i > 0)          { starts[n_starts++] = i;     }
         }
         // insertion sort (n_starts is small, ~2*n_layer) + dedup in place
@@ -1169,12 +1294,19 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
                 free(starts);
                 free(is_cut);
                 free(is_wait);
+                free(hcut_idx);
 
                 return GGML_STATUS_FAILED;
             }
         }
 
         bool window_entered = false;
+
+        // The host cut whose callback has yet to run. It runs before anything after its
+        // segment is committed: before the next segment's entry signal or gate wait, which the
+        // callback may be what opens, or, when the next segment has neither, after that
+        // segment is encoded and before it is enqueued.
+        struct ggml_metal_hcut_pending hcut_pending = { false, -1, NULL, 0 };
 
         // Room for this graph's segments, grown ONLY while nothing is pending.
         //
@@ -1211,11 +1343,26 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             const bool window_last  = window_applies && seg_start <= window_hi && seg_end > window_hi;
             window_entered = true;
 
+            const bool entry_signal = window_first && blit_in_here && ctx->bsched_entry_ev != NULL;
+
+            // Pre-encode the segment behind a pending host cut when nothing has to wait on the
+            // host before encoding it. It is enqueued only after the callback, so the callback
+            // may commit work to this queue and wait for it.
+            const bool pre_encode = hcut_pending.active && !entry_signal && !is_wait[seg_start];
+            if (hcut_pending.active && !pre_encode && !ggml_metal_hcut_resolve(ctx, &hcut_pending)) {
+                free(starts);
+                free(is_cut);
+                free(is_wait);
+                free(hcut_idx);
+
+                return GGML_STATUS_FAILED;
+            }
+
             // Window entry signal: its own buffer, committed before the window's first
             // segment is enqueued, so it completes after everything ahead of the window
             // and depends on none of the window's waits -- nor on the host wait below,
             // which may itself wait for the gates this signal lets the caller open.
-            if (window_first && blit_in_here && ctx->bsched_entry_ev != NULL) {
+            if (entry_signal) {
                 id<MTLCommandBuffer> entry_buf = [queue commandBufferWithUnretainedReferences];
                 [entry_buf retain];
                 [entry_buf enqueue];
@@ -1227,7 +1374,9 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
 
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
-            [cmd_buf enqueue]; // reserve the queue slot so execution order == creation order
+            if (!pre_encode) {
+                [cmd_buf enqueue]; // reserve the queue slot so execution order == creation order
+            }
 
             // Waits BEFORE this segment's ops. The segment begins exactly at a
             // wait node (every wait node was injected as a segment start); more
@@ -1260,26 +1409,10 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
                 struct ggml_tensor * wnode = gf->nodes[seg_start];
                 for (int w = 0; w < n_waits && !gate_timed_out && !gate_abandoned; ++w) {
                     if (wait_nodes[w] == wnode && wait_ev[w] != NULL) {
-                        uint64_t waited_ms = 0;
-                        while (true) {
-                            uint64_t slice_ms = GGML_METAL_PAGED_GATE_SLICE_MS;
-                            if (ctx->paged_gate_abort_ms != 0 && ctx->paged_gate_abort_ms - waited_ms < slice_ms) {
-                                slice_ms = ctx->paged_gate_abort_ms - waited_ms;
-                            }
-                            if (ggml_metal_event_host_wait(wait_ev[w], wait_val[w], slice_ms)) {
-                                gate_abandoned = wait_val[w] != UINT64_MAX &&
-                                        ggml_metal_event_host_value(wait_ev[w]) == UINT64_MAX;
-                                break;
-                            }
-                            waited_ms += slice_ms;
-                            if (ctx->paged_gate_abort_ms != 0 && waited_ms >= ctx->paged_gate_abort_ms) {
-                                gate_timed_out = true;
-                                break;
-                            }
-                            GGML_LOG_WARN("%s: paged segment at node '%s' still waiting for its gate after %llu s (event value %llu)\n",
-                                    __func__, ggml_get_name(wnode), (unsigned long long) (waited_ms / 1000),
-                                    (unsigned long long) wait_val[w]);
-                        }
+                        const enum ggml_metal_paged_wait_status st =
+                                ggml_metal_paged_host_wait(ctx, wait_ev[w], wait_val[w], false, ggml_get_name(wnode), "its gate");
+                        gate_timed_out = st == GGML_METAL_PAGED_WAIT_TIMED_OUT;
+                        gate_abandoned = st == GGML_METAL_PAGED_WAIT_ABANDONED;
                     }
                 }
             }
@@ -1303,6 +1436,7 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
                 free(starts);
                 free(is_cut);
                 free(is_wait);
+                free(hcut_idx);
 
                 return GGML_STATUS_FAILED;
             }
@@ -1374,6 +1508,30 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
                 }
             }
 
+            // A host cut signals from the device, at the end of the command buffer, rather than
+            // from a completion handler: the host spins on the value, and a completion handler
+            // adds a Metal thread's wake-up to every cut. The signal follows every encoder of the
+            // buffer, so the host reads what the segment wrote once it sees the value.
+            struct ggml_metal_hcut_pending hcut_next = { false, -1, NULL, 0 };
+            if (hcut_idx[seg_last] >= 0) {
+                hcut_next = (struct ggml_metal_hcut_pending) { true, hcut_idx[seg_last], gf->nodes[seg_last], ++ctx->hcut_val };
+                ggml_metal_event_encode_signal_value(ctx->hcut_ev, (ggml_metal_cmd_buf_t) cmd_buf, hcut_next.value);
+            }
+
+            // The pre-encoded segment's predecessor cut runs its callback now, before this
+            // segment is enqueued. On failure the segment is dropped unenqueued.
+            if (pre_encode && !ggml_metal_hcut_resolve(ctx, &hcut_pending)) {
+                [cmd_buf release];
+
+                free(starts);
+                free(is_cut);
+                free(is_wait);
+                free(hcut_idx);
+
+                return GGML_STATUS_FAILED;
+            }
+            hcut_pending = hcut_next;
+
             // Capture this segment's outcome when it finishes, rather than
             // reading it back later: by then a failure has abandoned the rest of
             // the queue and the descriptions are gone. The slot is reserved
@@ -1402,9 +1560,18 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             ctx->cmd_buf_last = cmd_buf;
         }
 
+        // A host cut ending the last encoded segment runs its callback before the compute
+        // returns, so nothing committed later on this backend can overtake it.
+        const bool hcut_ok = ggml_metal_hcut_resolve(ctx, &hcut_pending);
+
         free(starts);
         free(is_cut);
         free(is_wait);
+        free(hcut_idx);
+
+        if (!hcut_ok) {
+            return GGML_STATUS_FAILED;
+        }
     }
 
     // Persistent: do NOT clear the schedule here -- it stays in force for the
@@ -1423,10 +1590,10 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         return GGML_STATUS_SUCCESS;
     }
 
-    // While a (persistent) paged-decode schedule is set, divert to the
-    // sequential per-boundary-committed encode with event signal/wait. It stays
-    // in force until the caller clears it, so it covers every split of a decode.
-    if (ctx->bsched_n_cuts > 0) {
+    // While a (persistent) paged-decode schedule or host cut list is set, divert
+    // to the sequential per-boundary-committed encode with event signal/wait. It
+    // stays in force until the caller clears it, so it covers every split of a decode.
+    if (ctx->bsched_n_cuts > 0 || ctx->hcut_n > 0) {
         return ggml_metal_graph_compute_paged(ctx, gf);
     }
 

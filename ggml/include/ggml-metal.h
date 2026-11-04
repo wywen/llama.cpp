@@ -90,6 +90,12 @@ GGML_BACKEND_API void     ggml_backend_metal_event_host_signal(ggml_metal_event_
 GGML_BACKEND_API bool     ggml_backend_metal_event_host_wait  (ggml_metal_event_t ev, uint64_t value, uint64_t timeout_ms);
 GGML_BACKEND_API uint64_t ggml_backend_metal_event_host_value (ggml_metal_event_t ev);
 
+// Like ggml_backend_metal_event_host_wait, but polls the event's value on the calling thread
+// instead of blocking in Metal's wait, which returns tens of microseconds later once the value
+// is reached. The thread stays busy for the whole wait. True once the value is >= `value`, false
+// when `timeout_ms` passes first; 0 checks once.
+GGML_BACKEND_API bool     ggml_backend_metal_event_host_spin  (ggml_metal_event_t ev, uint64_t value, uint64_t timeout_ms);
+
 // Set `ev` to `value` once everything committed on this backend's queue before the call has completed, e.g. the async tensor copies of the last graph.
 GGML_BACKEND_API void ggml_backend_metal_event_signal(ggml_backend_t backend, ggml_metal_event_t ev, uint64_t value);
 
@@ -127,6 +133,52 @@ GGML_BACKEND_API void ggml_backend_metal_set_boundary_entry_signal(
 // awaited value is lower, the paged path fails the graph instead of encoding the segment: the
 // backend enters its error state and ggml_backend_metal_last_error names the node.
 GGML_BACKEND_API void ggml_backend_metal_set_paged_gate_abort_ms(ggml_backend_t backend, uint32_t ms);
+
+// Host cuts: points in the paged compute path where the host runs code between two segments,
+// after the first has completed on the device and before the second is committed. A caller
+// that must read a node's result to decide what the rest of the graph reads (fill a buffer the
+// next segment binds, say) places a host cut at that node.
+//
+// Each node in `nodes` ends a segment, like a cut of the boundary schedule. Where a computed
+// graph contains one, the segment's command buffer signals `ev` from the device after all of its
+// work; the host then spins on the value (ggml_backend_metal_event_host_spin) and calls
+// fn(user_data, i, node), where `i` is the node's index in `nodes`. No later segment is
+// committed before fn returns. fn runs on the thread computing the graph, and must not compute on
+// this backend or change its boundary schedule, host cuts or encode window.
+//
+// The next segment is encoded before fn runs when it has no gate wait (a wait of the boundary
+// schedule) and no entry signal (ggml_backend_metal_set_boundary_entry_signal); it is enqueued
+// and committed after fn returns. Its kernels therefore bind the buffers its tensors resolved to
+// before fn ran: fn may change the contents of those buffers, but not which buffers they are. A
+// segment with a gate wait or an entry signal is encoded after fn, which may open the gate. In
+// either case fn may commit work to this backend's queue and wait for it.
+//
+// A host cut node at the end of a computed graph, or ending the last segment an encode window
+// keeps, runs fn before graph_compute returns. A host cut in a segment the encode window skips
+// never fires. Placing a host cut ends a fusion group like any segment boundary, so a caller
+// that needs the same fusion with and without host cuts places its other cuts at the same nodes.
+//
+// The first host cut encoded after this call signals base_value + 1, each later one the next
+// value, across graphs and computes until the list is replaced: a graph computed again (the next
+// token's) never waits for a value the event already holds. The caller owns `ev` for the life of
+// the list, and must not signal it otherwise except to saturate it.
+//
+// The graph fails, with GGML_STATUS_FAILED, the backend in its error state and
+// ggml_backend_metal_last_error naming the cut, when the segment does not complete within the
+// paged gate abort limit (ggml_backend_metal_set_paged_gate_abort_ms, with the same 10 s warnings
+// as a gate), when `ev` reads UINT64_MAX (abandoned), or when fn returns false. Nothing after the
+// cut is committed then.
+//
+// Persistent and pointer-keyed like the encode window; a list of nodes selects the paged path
+// even without a boundary schedule. The node array is copied. Each call replaces the list; n == 0
+// clears it. set_boundary_schedule leaves it in place.
+typedef bool (*ggml_backend_metal_host_cut_fn)(void * user_data, int i, struct ggml_tensor * node);
+
+GGML_BACKEND_API void ggml_backend_metal_set_host_cuts(
+        ggml_backend_t backend,
+        int n, struct ggml_tensor * const * nodes,
+        ggml_metal_event_t ev, uint64_t base_value,
+        ggml_backend_metal_host_cut_fn fn, void * user_data);
 
 // Restrict the boundary-scheduled (paged) compute path to the node range
 // (first_node, last_node] -- lower boundary EXCLUSIVE (pass the band-entry

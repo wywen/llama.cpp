@@ -825,6 +825,10 @@ bool ggml_backend_metal_event_host_wait(ggml_metal_event_t ev, uint64_t value, u
     return ggml_metal_event_host_wait(ev, value, timeout_ms);
 }
 
+bool ggml_backend_metal_event_host_spin(ggml_metal_event_t ev, uint64_t value, uint64_t timeout_ms) {
+    return ggml_metal_event_host_spin(ev, value, timeout_ms);
+}
+
 uint64_t ggml_backend_metal_event_host_value(ggml_metal_event_t ev) {
     return ggml_metal_event_host_value(ev);
 }
@@ -866,6 +870,16 @@ void ggml_backend_metal_set_boundary_entry_signal(ggml_backend_t backend, ggml_m
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
 
     ggml_metal_set_boundary_entry_signal(ctx, ev, value);
+}
+
+void ggml_backend_metal_set_host_cuts(
+        ggml_backend_t backend,
+        int n, struct ggml_tensor * const * nodes,
+        ggml_metal_event_t ev, uint64_t base_value,
+        ggml_backend_metal_host_cut_fn fn, void * user_data) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_set_host_cuts((ggml_metal_t)backend->context, n, nodes, ev, base_value, fn, user_data);
 }
 
 void ggml_backend_metal_set_encode_window(
