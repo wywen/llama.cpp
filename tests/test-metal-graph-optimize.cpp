@@ -1,5 +1,6 @@
 // checks the MUL_MAT+ADD packs of the Metal graph reorder (devices, pack readers, src1 rows), that the encoder fuses
-// no MUL_MAT+ADD the reorder leaves unpacked, and the reorder's boundary barriers
+// no MUL_MAT+ADD the reorder leaves unpacked, the reorder's boundary barriers, and that the encoder's concurrency
+// check covers the middle nodes of a fused group
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -8,6 +9,7 @@
 #include "ggml-metal-device.h"
 #include "ggml-metal-fusion.h"
 
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -204,6 +206,101 @@ static bool check_encoder_skips_weight_residual() {
     const bool ok = fuses_residual && !fuses_weight;
     std::printf("encoder fuses MUL_MAT+ADD of a residual %d (expected 1), of a weight %d (expected 0): %s\n",
         fuses_residual, fuses_weight, ok ? "OK" : "FAIL");
+    return ok;
+}
+
+// true if the encoder runs the MoE routing (fused SOFT_MAX + ARGSORT + GET_ROWS + norm) concurrently with a pending
+// node that reads r, when the argsort ids, which the fused kernel writes from a middle node, share r's memory if alias
+static bool encoder_runs_topk_moe_concurrently(bool alias, bool * group_ends_free) {
+    constexpr int64_t n_expert      = 8;
+    constexpr int64_t n_expert_used = 2;
+    constexpr int64_t n_tok         = 4;
+
+    ggml_init_params params = { n_tensors*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+
+    // the pending node reads r
+    ggml_tensor * r       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert, n_tok);
+    ggml_tensor * pending = ggml_scale(ctx, r, scale);
+
+    // the routing as the MoE graph builds it
+    ggml_tensor * logits  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert, n_tok);
+    ggml_tensor * probs   = ggml_soft_max(ctx, logits);
+    ggml_tensor * ids     = ggml_argsort_top_k(ctx, probs, n_expert_used);
+    ggml_tensor * weights = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, n_expert, n_tok), ids);
+    weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tok);
+    ggml_tensor * sum = ggml_clamp(ctx, ggml_sum_rows(ctx, weights), 6.103515625e-5f, INFINITY);
+    weights = ggml_reshape_3d(ctx, ggml_div(ctx, weights, sum), 1, n_expert_used, n_tok);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, pending);
+    ggml_build_forward_expand(gf, weights);
+
+    // each tensor gets memory of its own, except that the argsort may take r's
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU));
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+    std::vector<ggml_tensor *> owners;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->view_src == nullptr) {
+            owners.push_back(t);
+        }
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, owners.size()*GGML_PAD(ggml_nbytes(r), align) + align);
+    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buffer);
+    size_t offs = 0;
+    for (ggml_tensor * t : owners) {
+        if (alias && t == ids->view_src) {
+            continue;
+        }
+        GGML_ASSERT(ggml_nbytes(t) <= ggml_nbytes(r));
+        ggml_backend_tensor_alloc(buffer, t, base + offs);
+        offs += GGML_PAD(ggml_nbytes(r), align);
+    }
+    if (alias) {
+        ggml_backend_tensor_alloc(buffer, ids->view_src, r->data);
+    }
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->view_src != nullptr) {
+            ggml_backend_view_init(t);
+        }
+    }
+
+    // the nodes the encoder runs, the pending node first
+    std::vector<int> idxs;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        if (!ggml_op_is_empty(ggml_graph_node(gf, i)->op)) {
+            idxs.push_back(i);
+        }
+    }
+    GGML_ASSERT(ggml_graph_node(gf, idxs[0]) == pending);
+
+    ggml_mem_ranges_t mrs = ggml_mem_ranges_init(0);
+    ggml_mem_ranges_add(mrs, pending);
+
+    int n_fused = 1;
+    const ggml_metal_fusion * fusion = ggml_metal_fusion_next(gf, idxs.data(), (int) idxs.size(), 1, GGML_METAL_FUSION_FULL, &n_fused);
+    GGML_ASSERT(fusion != nullptr && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_TOPK_MOE && n_fused == (int) idxs.size() - 1);
+
+    *group_ends_free = ggml_mem_ranges_check(mrs, ggml_graph_node(gf, idxs[1])) &&
+        ggml_mem_ranges_check(mrs, ggml_graph_node(gf, idxs.back()));
+    const bool res = ggml_metal_fusion_concurrent(mrs, gf, idxs.data(), (int) idxs.size(), 1, true);
+
+    ggml_mem_ranges_free(mrs);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return res;
+}
+
+// a fused kernel writes the dst of a middle node, so the group needs a barrier when that dst is still being read
+static bool check_encoder_checks_fused_middle_nodes() {
+    bool ends_free_alias = false;
+    bool ends_free       = false;
+    const bool concurrent_alias = encoder_runs_topk_moe_concurrently(true,  &ends_free_alias);
+    const bool concurrent       = encoder_runs_topk_moe_concurrently(false, &ends_free);
+    const bool ok = ends_free_alias && ends_free && !concurrent_alias && concurrent;
+    std::printf("fused MoE routing next to a reader of the memory of its argsort ids: concurrent %d (expected 0), "
+        "of other memory: concurrent %d (expected 1), first and last node free %d %d (expected 1 1): %s\n",
+        concurrent_alias, concurrent, ends_free_alias, ends_free, ok ? "OK" : "FAIL");
     return ok;
 }
 
@@ -573,7 +670,8 @@ int main() {
         { "probed or no simdgroup matrices", false, true },
     };
     const int failures = run_pack_cases(devices) + (check_chained_pack_reader() ? 0 : 1) + run_row_independent_pack_cases() +
-        (check_encoder_skips_weight_residual() ? 0 : 1) + run_boundary_barrier_cases();
+        (check_encoder_skips_weight_residual() ? 0 : 1) + (check_encoder_checks_fused_middle_nodes() ? 0 : 1) +
+        run_boundary_barrier_cases();
 
     return failures == 0 ? 0 : 1;
 }

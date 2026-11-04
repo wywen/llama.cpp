@@ -17,6 +17,7 @@ extern "C" {
 #endif
 
 struct ggml_metal_device_props;
+struct ggml_mem_ranges;
 
 // the maximum number of nodes that can be fused in a single kernel
 // (also the maximum length of a packed fusion group during graph optimization)
@@ -92,6 +93,16 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
         int idx,
         ggml_metal_fusion_mode mode,
         int * n_out);
+
+// compute phase: true if the node at idx (a position in node_idxs) can run concurrently with the ranges in mrs,
+// together with the nodes that the encoder fuses into its kernel when use_fusion is set
+bool ggml_metal_fusion_concurrent(
+        struct ggml_mem_ranges * mrs,
+        const struct ggml_cgraph * gf,
+        const int * node_idxs,
+        int n_idxs,
+        int idx,
+        bool use_fusion);
 
 // optimize phase: maximum number of nodes starting at idx (a raw sequential graph index) that
 // could be fused on a device with props, chaining patterns back-to-back. returns at least 1.

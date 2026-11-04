@@ -90,6 +90,11 @@ struct ggml_metal_op {
         return ggml_metal_fusion_next(gf, idxs.data(), (int) idxs.size(), i0, mode, n_out);
     }
 
+    // whether the node at i, with the nodes fused into its kernel, can run concurrently with the pending nodes
+    bool concurrent(int i) const {
+        return ggml_metal_fusion_concurrent(mem_ranges, gf, idxs.data(), (int) idxs.size(), i, use_fusion());
+    }
+
     // whether to attempt fusion; the toggle lives in the shared fusion debugging context owned
     // by the device (initialized from GGML_METAL_FUSION_DISABLE, overridable by the test)
     bool use_fusion() const {
@@ -168,12 +173,12 @@ static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
     return true;
 }
 
-static bool ggml_metal_op_concurrency_check(ggml_metal_op_t ctx, const ggml_tensor * node) {
+static bool ggml_metal_op_concurrency_check(ggml_metal_op_t ctx, int idx) {
     if (!ctx->mem_ranges) {
         return false;
     }
 
-    return ggml_mem_ranges_check(ctx->mem_ranges, node);
+    return ctx->concurrent(idx);
 }
 
 static bool ggml_metal_op_concurrency_add(ggml_metal_op_t ctx, const ggml_tensor * node) {
@@ -230,16 +235,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     // otherwise, we add the new ranges to the encoding context and process the node concurrently
     //
     {
-        bool is_concurrent = ggml_metal_op_concurrency_check(ctx, node);
-
-        if (is_concurrent && ctx->use_fusion()) {
-            int n_fuse = 1;
-            const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n_fuse);
-            // the fused kernel reads the sources of every node in the group and can write any of their dsts
-            for (int i = 1; fusion && is_concurrent && i < n_fuse; ++i) {
-                is_concurrent = ggml_mem_ranges_check(ctx->mem_ranges, ctx->node(idx + i));
-            }
-        }
+        const bool is_concurrent = ggml_metal_op_concurrency_check(ctx, idx);
 
         if (!is_concurrent) {
             ggml_metal_op_concurrency_reset(ctx);
@@ -4309,14 +4305,6 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
 
     if (n_fuse > 1) {
         bid_dst = ggml_metal_get_buffer_id(ctx->node(idx + n_fuse - 1));
-
-        for (int i = 1; i < n_fuse; ++i) {
-            if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
-                ggml_metal_op_concurrency_reset(ctx);
-
-                break;
-            }
-        }
     }
 
     if (pipeline.c4) {
@@ -4594,14 +4582,6 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
 
     if (n_fuse > 1) {
         bid_dst = ggml_metal_get_buffer_id(ctx->node(idx + n_fuse - 1));
-
-        for (int i = 1; i < n_fuse; ++i) {
-            if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
-                ggml_metal_op_concurrency_reset(ctx);
-
-                break;
-            }
-        }
     }
 
     auto pipeline = fused_norm_scale ?
@@ -5149,15 +5129,6 @@ int ggml_metal_op_snake_fused(ggml_metal_op_t ctx, int idx) {
     const int T     = (int) x->ne[0];
     const int C     = (int) x->ne[1];
     const int total = T * C;
-
-    // the encode loop pre-checked the leading mul only, check the rest of the chain
-    for (int i = 1; i < 5; ++i) {
-        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
-            ggml_metal_op_concurrency_reset(ctx);
-
-            break;
-        }
-    }
 
     auto pipeline = ggml_metal_library_get_pipeline_snake(lib, x->type);
 
