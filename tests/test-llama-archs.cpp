@@ -241,6 +241,14 @@ static bool host_experts_test(const llm_arch arch) {
     }
 }
 
+// number of experts of an arch's MoE model; gemma4 gets enough for a partial expert cache to matter
+static uint32_t moe_expert_count(const llm_arch arch) {
+    if (host_experts_test(arch)) {
+        return 64;
+    }
+    return arch == LLM_ARCH_GEMMA4 ? 8 : 2;
+}
+
 // writes arch-resolved GGUF keys into the fixture context, the test-side equivalent of llama_model_saver
 struct kv_writer {
     struct gguf_context * gguf_ctx;
@@ -729,7 +737,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_EXPERT_LATENT_LENGTH,       n_ff);
         ms.add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,  uint32_t(2));
         // with more experts than a ubatch uses, the copy of the used experts in host memory skips some of them
-        ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(host_experts_test(arch) ? 64 : 2));
+        ms.add_kv(LLM_KV_EXPERT_COUNT,               moe_expert_count(arch));
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
 
@@ -1348,6 +1356,7 @@ static bool moe_implemented(const llm_arch arch) {
         return true;
     }
     switch (arch) {
+        case LLM_ARCH_GEMMA4:
         case LLM_ARCH_LLAMA:
         case LLM_ARCH_REFACT:
         case LLM_ARCH_MINICPM:
