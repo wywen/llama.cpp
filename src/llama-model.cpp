@@ -1664,6 +1664,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
+    ml.moe_slots    = params.moe_slots;
+    ml.moe_slots_ud = params.moe_slots_user_data;
+
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
@@ -1986,6 +1989,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             continue;
         }
 
+        // the stock expert weights of slot layers have no buffer
+        if (ctx_key.source == llama_model_loader::ctx_source::SLOT_META) {
+            moe_slots.own_meta(std::move(ctx_ptr));
+            continue;
+        }
+
         // check if it is possible to use buffer_from_host_ptr with this buffer type
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
         if (!dev) {
@@ -2075,6 +2084,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
     }
 
+    load_tensors_moe_slots(ml);
+
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, n_layer_all);
 
@@ -2127,6 +2138,68 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     load_tensors_hadamard();
 
     return true;
+}
+
+// the slot regions of the layers that read their expert weights from slots, and the file runs that fill each slot
+void llama_model_base::load_tensors_moe_slots(llama_model_loader & ml) {
+    std::map<int32_t, ggml_backend_buffer_type_t> bufts;
+
+    for (auto & [il, plan] : ml.moe_slot_plans) {
+        if (plan.n_assigned == 0) {
+            continue;
+        }
+
+        llama_moe_slot_region & region = moe_slots.add(il);
+        region.n_expert   = plan.n_expert;
+        region.n_assigned = plan.n_assigned;
+        region.n_spare    = plan.n_spare;
+        region.slot_size  = plan.slot_size;
+
+        for (const auto & m : plan.members) {
+            if (m.stock == nullptr) {
+                throw std::runtime_error(format("layer %d reads its expert weights from MoE slots, but the model does not use tensor '%s'", il, m.name.c_str()));
+            }
+            llama_moe_slot_region::member rm;
+            rm.name   = m.name;
+            rm.stock  = m.stock;
+            rm.offset = m.offset;
+            rm.size   = m.size;
+            region.members.push_back(std::move(rm));
+        }
+        bufts.emplace(il, plan.buft);
+
+        // a stock tensor is one range of the file, expert e at e*size; an assembled one has a tensor per expert
+        region.runs.resize(region.n_expert);
+        for (int32_t e = 0; e < region.n_expert; ++e) {
+            auto & runs = region.runs[e];
+            for (const auto & m : region.members) {
+                const llama_model_loader::llama_tensor_weight * w = ml.get_weight(m.name.c_str());
+                llama_moe_slot_region::run r;
+                if (w) {
+                    r = { w->idx, w->offs + (uint64_t) e*m.size, m.size, m.offset };
+                } else {
+                    const llama_model_loader::llama_tensor_assembly * assembly = ml.get_assembly(m.name.c_str());
+                    GGML_ASSERT(assembly != nullptr && (int32_t) assembly->parts.size() == region.n_expert);
+                    const llama_model_loader::llama_tensor_weight * part = assembly->parts[e];
+                    GGML_ASSERT(ggml_nbytes(part->tensor) == m.size);
+                    r = { part->idx, part->offs, m.size, m.offset };
+                }
+                // one read covers members that the file holds with the gaps of the slot
+                if (!runs.empty()) {
+                    auto & prev = runs.back();
+                    if (prev.file == r.file && r.offset >= prev.offset && r.offset - prev.offset == r.slot_offset - prev.slot_offset) {
+                        prev.size = r.slot_offset + r.size - prev.slot_offset;
+                        continue;
+                    }
+                }
+                runs.push_back(r);
+            }
+        }
+    }
+
+    if (!moe_slots.empty()) {
+        moe_slots.allocate(bufts, ml.no_alloc);
+    }
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
@@ -2517,7 +2590,7 @@ bool llama_model::no_alloc() const {
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
-    std::map<ggml_backend_buffer_type_t, size_t> ret;
+    std::map<ggml_backend_buffer_type_t, size_t> ret = moe_slots.memory_breakdown();
     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
         if (no_alloc()) {
             GGML_ASSERT(bufs.size() == 1);
@@ -3474,6 +3547,8 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.moe_slots                   =*/ nullptr,
+        /*.moe_slots_user_data         =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.use_mmap_prefetch           =*/ true,
         /*.check_tensors               =*/ false,
@@ -3924,6 +3999,43 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
 
 int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
+}
+
+bool llama_model_moe_slot_layout(const struct llama_model * model, int32_t il, struct llama_moe_slot_layout * layout) {
+    const llama_moe_slot_region * region = model->moe_slots.layer(il);
+    if (region == nullptr) {
+        return false;
+    }
+
+    llama_moe_slot_layout res = {};
+    res.n_expert   = region->n_expert;
+    res.n_assigned = region->n_assigned;
+    res.n_spare    = region->n_spare;
+    res.slot_size  = region->slot_size;
+    res.buffer     = region->buf;
+    res.region     = region->region;
+    res.slot_map   = region->slot_map;
+    res.n_members  = (int32_t) region->members.size();
+    for (size_t i = 0; i < region->members.size(); ++i) {
+        const auto & m = region->members[i];
+        res.members[i] = { m.name.c_str(), m.tensor, m.offset, m.size };
+    }
+    *layout = res;
+    return true;
+}
+
+int32_t llama_model_moe_expert_runs(const struct llama_model * model, int32_t il, int32_t expert, struct llama_moe_expert_run * runs, int32_t n_max) {
+    const llama_moe_slot_region * region = model->moe_slots.layer(il);
+    if (region == nullptr || expert < 0 || expert >= region->n_expert) {
+        return -1;
+    }
+
+    const auto & src = region->runs[expert];
+    for (int32_t i = 0; i < n_max && i < (int32_t) src.size(); ++i) {
+        const std::string * path = model->source_path((uint16_t) src[i].file);
+        runs[i] = { path ? path->c_str() : nullptr, src[i].file, src[i].offset, src[i].size, src[i].slot_offset };
+    }
+    return (int32_t) src.size();
 }
 
 int32_t llama_model_n_devices(const struct llama_model * model) {

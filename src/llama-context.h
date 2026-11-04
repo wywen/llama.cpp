@@ -462,6 +462,9 @@ private:
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;
 
+    // true after the check that no op reads an expert weight read from MoE slots passes on a reserved graph
+    bool moe_slots_verified = false;
+
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;

@@ -5744,8 +5744,19 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 }
 
 // TODO: move these functions here
+// a weight that indexes its rows or matrices by byte strides that are not whole blocks of its type, e.g. one
+// expert per padded slot of a region; the kernels index src0 in whole blocks
+static bool ggml_cuda_has_partial_block_strides(const ggml_tensor * t) {
+    const size_t ts = ggml_type_size(t->type);
+    return t->nb[1] % ts != 0 || t->nb[2] % ts != 0 || t->nb[3] % ts != 0;
+}
+
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+
+    if ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID || op->op == GGML_OP_GET_ROWS) && ggml_cuda_has_partial_block_strides(op->src[0])) {
+        return false;
+    }
 
     // check if all the sources are allocated on this device
     for (int i = 0; i < GGML_MAX_SRC; i++) {
