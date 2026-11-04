@@ -191,10 +191,10 @@ struct slot_counts {
     int32_t n_spare = 0;
 };
 
-static int32_t get_slot_count(int32_t il, int32_t n_expert, void * ud) {
+static llama_moe_slot_pool_params get_slot_count(int32_t il, int32_t n_expert, void * ud) {
     const auto * counts = (const slot_counts *) ud;
     const auto it = counts->n_slots.find(il);
-    return it == counts->n_slots.end() ? n_expert + counts->n_spare : it->second;
+    return { it == counts->n_slots.end() ? n_expert + counts->n_spare : it->second, nullptr };
 }
 
 static std::vector<llama_token> get_tokens(uint32_t n_tokens, uint32_t n_vocab, size_t seed) {

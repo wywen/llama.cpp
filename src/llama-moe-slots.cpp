@@ -54,10 +54,11 @@ static void place(ggml_backend_buffer_t buf, ggml_tensor * t, size_t offset, boo
     }
 }
 
-llama_moe_slot_pool::llama_moe_slot_pool(const llama_moe_slots & slots, llama_moe_slot_count_callback n_slots, void * user_data, bool no_alloc) :
+llama_moe_slot_pool::llama_moe_slot_pool(const llama_moe_slots & slots, llama_moe_slot_pool_callback get_params, void * user_data, bool no_alloc) :
     slots(slots) {
     for (const auto & [il, layer] : slots.all()) {
-        const int32_t n = n_slots ? n_slots(il, layer->n_expert, user_data) : 0;
+        const llama_moe_slot_pool_params pp = get_params ? get_params(il, layer->n_expert, user_data) : llama_moe_slot_pool_params{ 0, nullptr };
+        const int32_t n = pp.n_slots;
         if (n < 0) {
             throw std::runtime_error(format("layer %d: invalid number of MoE slots %d", il, n));
         }
@@ -66,10 +67,31 @@ llama_moe_slot_pool::llama_moe_slot_pool(const llama_moe_slots & slots, llama_mo
             continue;
         }
 
+        const size_t map_size = layer->map_size();
+        const size_t size     = map_size + (size_t) n*layer->slot_size;
+
+        ggml_backend_buffer_type_t buft = layer->buft;
+        if (pp.buft != nullptr) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(layer->buft);
+            if (ggml_backend_buft_get_device(pp.buft) != dev) {
+                throw std::runtime_error(format("layer %d: the MoE slot buffer type %s is not on the device %s of the layer",
+                    il, ggml_backend_buft_name(pp.buft), dev ? ggml_backend_dev_name(dev) : "(none)"));
+            }
+            if (ggml_backend_buft_get_alignment(pp.buft) > layer->alignment) {
+                throw std::runtime_error(format("layer %d: the alignment %zu of the MoE slot buffer type %s is greater than the MoE slot alignment %zu",
+                    il, ggml_backend_buft_get_alignment(pp.buft), ggml_backend_buft_name(pp.buft), layer->alignment));
+            }
+            if (ggml_backend_buft_get_max_size(pp.buft) < size) {
+                throw std::runtime_error(format("layer %d: the max size %zu of the MoE slot buffer type %s is less than the %zu bytes of the slots",
+                    il, ggml_backend_buft_get_max_size(pp.buft), ggml_backend_buft_name(pp.buft), size));
+            }
+            buft = pp.buft;
+        }
+
         llama_moe_slot_region & region = regions[il];
         region.layer    = layer.get();
         region.n_slots  = n;
-        region.map_size = GGML_PAD((size_t) layer->n_expert*sizeof(int32_t), layer->alignment);
+        region.map_size = map_size;
 
         ggml_init_params params = {
             /*.mem_size   =*/ ggml_tensor_overhead()*(layer->members.size() + 2),
@@ -81,15 +103,15 @@ llama_moe_slot_pool::llama_moe_slot_pool(const llama_moe_slots & slots, llama_mo
             throw std::runtime_error("failed to create ggml context");
         }
 
-        const size_t size = region.map_size + (size_t) n*layer->slot_size;
-        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(layer->buft, no_alloc ? 0 : size);
+        // without allocation, a placeholder of the layer's buffer type, which the scheduler places as the real buffer
+        ggml_backend_buffer_t buf = no_alloc ? ggml_backend_buft_alloc_buffer(layer->buft, 0) : ggml_backend_buft_alloc_buffer(buft, size);
         if (buf == nullptr) {
             throw std::runtime_error(format("unable to allocate %s buffer of %zu bytes for the MoE slots of layer %d",
-                ggml_backend_buft_name(layer->buft), size, il));
+                ggml_backend_buft_name(buft), size, il));
         }
         // the scheduler runs the ops that read weights on the backend of their buffer
         ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        bufs.push_back({ ggml_backend_buffer_ptr(buf), layer->buft, size });
+        bufs.push_back({ ggml_backend_buffer_ptr(buf), ggml_backend_buffer_get_type(buf), size });
         region.buf = buf;
 
         region.region = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, size);
@@ -122,7 +144,7 @@ llama_moe_slot_pool::llama_moe_slot_pool(const llama_moe_slots & slots, llama_mo
 
         ctxs.push_back(std::move(ctx));
 
-        LLAMA_LOG_INFO("%s: layer %3d: %d slots of %zu bytes in %s\n", __func__, il, n, layer->slot_size, ggml_backend_buft_name(layer->buft));
+        LLAMA_LOG_INFO("%s: layer %3d: %d slots of %zu bytes in %s\n", __func__, il, n, layer->slot_size, ggml_backend_buft_name(buft));
     }
 }
 

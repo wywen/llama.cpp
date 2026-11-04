@@ -42,6 +42,11 @@ struct llama_moe_slot_layer {
     ggml_backend_buffer_type_t buft = nullptr; // of the slots, as selected for the member tensors
 
     std::vector<std::vector<run>> runs; // [n_expert]
+
+    // the slot map, zero padded to the alignment: the offset of the first slot
+    size_t map_size() const {
+        return GGML_PAD((size_t) n_expert*sizeof(int32_t), alignment);
+    }
 };
 
 // the slot layers of a model, see llama_model_params.moe_slots
@@ -94,8 +99,8 @@ struct llama_moe_slot_region {
 // the slots of a context, for each slot layer of its model, see llama_context_params.moe_slots
 class llama_moe_slot_pool {
 public:
-    // asks `n_slots` for the number of slots of each slot layer; NULL = no slots
-    llama_moe_slot_pool(const llama_moe_slots & slots, llama_moe_slot_count_callback n_slots, void * user_data, bool no_alloc);
+    // asks `get_params` for the slots of each slot layer; NULL = no slots
+    llama_moe_slot_pool(const llama_moe_slots & slots, llama_moe_slot_pool_callback get_params, void * user_data, bool no_alloc);
 
     // the slots of layer il, nullptr if the layer is not a slot layer or this context has no slots for it
     const llama_moe_slot_region * region(int32_t il) const;

@@ -4010,6 +4010,18 @@ int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
 }
 
+bool llama_model_moe_slot_geometry(const struct llama_model * model, int32_t il, size_t * slot_size, size_t * map_size, int32_t * n_expert) {
+    const llama_moe_slot_layer * layer = model->moe_slots.layer(il);
+    if (layer == nullptr) {
+        return false;
+    }
+
+    *slot_size = layer->slot_size;
+    *map_size  = layer->map_size();
+    *n_expert  = layer->n_expert;
+    return true;
+}
+
 int32_t llama_model_moe_expert_runs(const struct llama_model * model, int32_t il, int32_t expert, struct llama_moe_expert_run * runs, int32_t n_max) {
     const llama_moe_slot_layer * layer = model->moe_slots.layer(il);
     if (layer == nullptr || expert < 0 || expert >= layer->n_expert) {
