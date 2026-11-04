@@ -6,8 +6,9 @@
 //   - reduced:  fewer slots than experts, holding exactly the experts the router selects for a short prompt, and a
 //               spare holding garbage that every other expert maps to
 // each from the stock file and from a copy that stores the expert weights one tensor per expert
-// and that two contexts on one model have their own slots, that a non-default alignment computes the same, and that
-//     a context without the slots of a layer that its graph reads fails to initialize
+// and that two contexts on one model have their own slots, that the slots can be of a buffer type that the caller
+//     chooses, that the model reports the geometry of the slots of every context, that a non-default alignment
+//     computes the same, and that a context without the slots of a layer that its graph reads fails to initialize
 //
 // the models are the MoE models written by test-llama-archs (-o <dir>)
 
@@ -22,6 +23,9 @@
 // the test checks that the stock expert weights have no buffer, and the memory that the slots take
 #include "../src/llama-ext.h"
 #include "../src/llama-model.h"
+
+// the test implements a buffer type
+#include "../ggml/src/ggml-backend-impl.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -185,17 +189,67 @@ static llama_model_ptr load_model(const std::string & path, std::vector<ggml_bac
     return model;
 }
 
-// the slot counts that a context asks for, by layer
+// the slot counts that a context asks for, by layer, and the buffer type of every layer's slots
 struct slot_counts {
     std::map<int32_t, int32_t> n_slots; // a layer not listed gets one slot per expert and n_spare
     int32_t n_spare = 0;
+    ggml_backend_buffer_type_t buft = nullptr;
 };
 
 static llama_moe_slot_pool_params get_slot_count(int32_t il, int32_t n_expert, void * ud) {
     const auto * counts = (const slot_counts *) ud;
     const auto it = counts->n_slots.find(il);
-    return { it == counts->n_slots.end() ? n_expert + counts->n_spare : it->second, nullptr };
+    return { it == counts->n_slots.end() ? n_expert + counts->n_spare : it->second, counts->buft };
 }
+
+// a caller's buffer type that wraps another one and recognizes the slot buffers at their allocation: it records each
+// allocation and returns the wrapped type's buffer unchanged, so that the backend sees a buffer of its own type
+struct wrapper_buft {
+    ggml_backend_buffer_type wrapper;
+    ggml_backend_buffer_type_t inner;
+    size_t alignment = 0;        // 0 = the inner one
+    size_t max_size  = SIZE_MAX; // the inner one, at most
+    std::vector<size_t> allocs;  // the sizes allocated
+    std::vector<ggml_backend_buffer_t> bufs; // the buffers returned
+
+    wrapper_buft(ggml_backend_buffer_type_t inner, ggml_backend_dev_t dev) : inner(inner) {
+        wrapper.iface = {
+            /*.get_name         =*/ [](ggml_backend_buffer_type_t) { return "wrapper"; },
+            /*.alloc_buffer     =*/ [](ggml_backend_buffer_type_t buft, size_t size) {
+                auto * w = (wrapper_buft *) buft->context;
+                w->allocs.push_back(size);
+                ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(w->inner, size);
+                w->bufs.push_back(buf);
+                return buf;
+            },
+            /*.alloc_buffer_n   =*/ nullptr,
+            /*.get_alignment    =*/ [](ggml_backend_buffer_type_t buft) {
+                auto * w = (wrapper_buft *) buft->context;
+                return w->alignment ? w->alignment : ggml_backend_buft_get_alignment(w->inner);
+            },
+            /*.get_max_size     =*/ [](ggml_backend_buffer_type_t buft) {
+                auto * w = (wrapper_buft *) buft->context;
+                return std::min(w->max_size, ggml_backend_buft_get_max_size(w->inner));
+            },
+            /*.get_alloc_size   =*/ [](ggml_backend_buffer_type_t buft, const ggml_tensor * t) {
+                return ggml_backend_buft_get_alloc_size(((wrapper_buft *) buft->context)->inner, t);
+            },
+            /*.get_alloc_size_n =*/ nullptr,
+            /*.is_host          =*/ [](ggml_backend_buffer_type_t buft) {
+                return ggml_backend_buft_is_host(((wrapper_buft *) buft->context)->inner);
+            },
+        };
+        wrapper.device  = dev;
+        wrapper.context = this;
+    }
+
+    wrapper_buft(const wrapper_buft &) = delete;
+    wrapper_buft & operator=(const wrapper_buft &) = delete;
+
+    ggml_backend_buffer_type_t get() {
+        return &wrapper;
+    }
+};
 
 static std::vector<llama_token> get_tokens(uint32_t n_tokens, uint32_t n_vocab, size_t seed) {
     std::mt19937 gen(seed);
@@ -556,6 +610,135 @@ static void test_two_contexts(const std::string & path, const std::vector<ggml_b
     check(same_bits(get_logits(ctx_b.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long), stem + ", two contexts: B with its map fixed computes the stock logits");
 }
 
+// the caller chooses the buffer type of the slots: the context calls a wrapper of the layer's buffer type once per
+//     layer, for the documented size, uses the buffer it returns, and computes the stock logits
+// a buffer type on another device, with a greater alignment or with a max size too small for the slots is refused
+static void test_pool_buft(const std::string & path, const std::vector<ggml_backend_dev_t> & devs, const std::vector<float> & ref_long,
+        const std::string & stem, checker & check) {
+    slot_layers layers;
+    llama_model_ptr model = load_model(path, devs, &layers);
+
+    ggml_backend_buffer_type_t inner = model->moe_slots.layer(layers.begin()->first)->buft;
+    bool one_buft = true;
+    for (const auto & [il, _] : layers) {
+        one_buft = one_buft && model->moe_slots.layer(il)->buft == inner;
+    }
+    check(one_buft, stem + ", buffer type: the slot layers share one buffer type, " + ggml_backend_buft_name(inner));
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(inner);
+
+    {
+        wrapper_buft w(inner, dev);
+        slot_counts counts;
+        counts.n_spare = 1;
+        counts.buft    = w.get();
+        llama_context_ptr lctx = new_context(model.get(), &counts);
+
+        // the layers allocate in layer order
+        std::vector<size_t> expected;
+        std::vector<ggml_backend_buffer_t> buffers;
+        bool layout_ok = true;
+        for (const auto & [il, n] : layers) {
+            size_t  slot_size = 0;
+            size_t  map_size  = 0;
+            int32_t n_expert  = 0;
+            llama_moe_slot_layout layout = {};
+            layout_ok = layout_ok && llama_model_moe_slot_geometry(model.get(), il, &slot_size, &map_size, &n_expert) &&
+                llama_context_moe_slot_layout(lctx.get(), il, &layout);
+            expected.push_back(map_size + (size_t) (n + 1)*slot_size);
+            buffers.push_back(layout.buffer);
+        }
+        check(layout_ok && w.allocs == expected, stem + ", buffer type: alloc_buffer is called once per slot layer (" +
+            std::to_string(w.allocs.size()) + "), for map_size + n_slots*slot_size bytes");
+        check(layout_ok && w.bufs == buffers, stem + ", buffer type: the buffer it returns is the layer's slot buffer, of type " +
+            (buffers.empty() || !buffers[0] ? "?" : ggml_backend_buft_name(ggml_backend_buffer_get_type(buffers[0]))));
+
+        assignment assign = identity(layers);
+        for (auto & [_, slots] : assign) {
+            slots.push_back(-1);
+        }
+        fill_slots(lctx.get(), assign, false, DEFAULT_ALIGNMENT, stem + ", buffer type", check);
+        check(same_bits(get_logits(lctx.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long), stem + ", buffer type: logits are bitwise identical");
+        check(w.allocs.size() == expected.size(), stem + ", buffer type: the decodes allocate nothing more of it");
+    }
+
+    // a context on a model loaded with no_alloc allocates nothing
+    {
+        slot_layers layers_fit;
+        llama_model_ptr model_fit = load_model(path, devs, &layers_fit, 0, LLAMA_LOAD_MODE_NONE, true);
+        wrapper_buft w(model_fit->moe_slots.layer(layers_fit.begin()->first)->buft, dev);
+        slot_counts counts;
+        counts.buft = w.get();
+        llama_context_ptr lctx = new_context(model_fit.get(), &counts);
+        check(w.allocs.empty(), stem + ", buffer type: a context on a model loaded with no_alloc allocates nothing of it");
+    }
+
+    auto refused = [&](wrapper_buft & w, const char * error) {
+        slot_counts counts;
+        counts.buft = w.get();
+        g_log.clear();
+        llama_context_ptr lctx(llama_init_from_model(model.get(), context_params(&counts, nullptr)));
+        return !lctx && w.allocs.empty() && g_log.find(error) != std::string::npos;
+    };
+
+    // another device: with a single device, e.g. a CPU-only build, there is none to try
+    ggml_backend_dev_t other = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count() && other == nullptr; ++i) {
+        if (ggml_backend_dev_get(i) != dev) {
+            other = ggml_backend_dev_get(i);
+        }
+    }
+    if (other != nullptr) {
+        wrapper_buft w(inner, other);
+        check(refused(w, "is not on the device"), stem + ", buffer type: a buffer type on " + ggml_backend_dev_name(other) + " is refused");
+    } else {
+        printf("  %-90s %s\n", (stem + ", buffer type: a buffer type on another device is refused").c_str(), "SKIPPED (one device)");
+    }
+
+    {
+        wrapper_buft w(inner, dev);
+        w.alignment = 2*DEFAULT_ALIGNMENT;
+        check(refused(w, "is greater than the MoE slot alignment"), stem + ", buffer type: an alignment greater than the slot alignment is refused");
+    }
+    {
+        wrapper_buft w(inner, dev);
+        w.max_size = DEFAULT_ALIGNMENT;
+        check(refused(w, "is less than the"), stem + ", buffer type: a max size less than the slots is refused");
+    }
+}
+
+// the model reports the slot geometry that every context lays its slots out with
+static void test_geometry(const std::string & path, const std::vector<ggml_backend_dev_t> & devs, const std::string & stem, checker & check) {
+    slot_layers layers;
+    llama_model_ptr model = load_model(path, devs, &layers);
+    slot_counts counts_a;
+    slot_counts counts_b;
+    counts_b.n_spare = 3;
+    llama_context_ptr ctx_a = new_context(model.get(), &counts_a);
+    llama_context_ptr ctx_b = new_context(model.get(), &counts_b);
+
+    bool ok = true;
+    for (const auto & [il, n] : layers) {
+        size_t  slot_size = 0;
+        size_t  map_size  = 0;
+        int32_t n_expert  = 0;
+        ok = ok && llama_model_moe_slot_geometry(model.get(), il, &slot_size, &map_size, &n_expert) && n_expert == n;
+        for (llama_context * lctx : { ctx_a.get(), ctx_b.get() }) {
+            llama_moe_slot_layout layout;
+            ok = ok && llama_context_moe_slot_layout(lctx, il, &layout) &&
+                layout.slot_size == slot_size && layout.map_size == map_size && layout.n_expert == n_expert;
+        }
+    }
+    check(ok, stem + ", geometry: the model's slot geometry is the layout of contexts with " + std::to_string(counts_a.n_spare) +
+        " and " + std::to_string(counts_b.n_spare) + " spare slots");
+
+    llama_model_ptr stock = load_model(path, devs, nullptr);
+    size_t  slot_size = 0;
+    size_t  map_size  = 0;
+    int32_t n_expert  = 0;
+    check(!llama_model_moe_slot_geometry(stock.get(), layers.begin()->first, &slot_size, &map_size, &n_expert),
+        stem + ", geometry: a layer that loads its expert weights has none");
+}
+
 static void test_model(const std::string & path, const std::string & dir, const std::vector<ggml_backend_dev_t> & devs, checker & check) {
     const std::string stem = std::filesystem::path(path).stem().string();
     printf("%s\n", stem.c_str());
@@ -596,6 +779,8 @@ static void test_model(const std::string & path, const std::string & dir, const 
     check(distinct, stem + ": the experts of each layer differ");
 
     test_two_contexts(path, devs, ref_long, stem, check);
+    test_pool_buft(path, devs, ref_long, stem, check);
+    test_geometry(path, devs, stem, check);
 
     // a non-default alignment pads the members, the map and the slots to it, and computes the same
     {
