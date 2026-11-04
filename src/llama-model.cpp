@@ -1409,8 +1409,9 @@ void llama_model::retain_tensor_sources(llama_model_loader & loader, std::vector
     // Fail loudly here, at model initialization, rather than let the engine
     // resolve a mismatched or stale ordinal later.
     for (const auto & [name, tensor] : tensors_by_name) {
-        // a tensor llama synthesized itself (not backed by a GGUF weight) is left
-        // at the sentinel ordinal and has nothing to validate against
+        // a tensor llama synthesized itself or assembled from per-expert tensors
+        // (not backed by a single GGUF weight) is left at the sentinel ordinal and
+        // has nothing to validate against
         if (tensor->src_ordinal == GGML_TENSOR_SRC_ORDINAL_NONE && loader.get_weight(name.c_str()) == nullptr) {
             continue;
         }
@@ -2002,9 +2003,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         std::vector<ggml_backend_buffer_ptr> bufs;
 
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
-        const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
+        const bool is_lazy_mapped = ctx_key.source == llama_model_loader::ctx_source::LAZY && !ml.no_alloc;
+        // an assembled tensor has no range of the file to wrap: it is allocated and filled from the file
+        const bool is_assembled = ctx_key.source == llama_model_loader::ctx_source::ASSEMBLED;
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if ((ml.use_mmap || is_lazy_mapped) && !is_assembled && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             const size_t max_size = ggml_get_max_tensor_size(ctx);
 
