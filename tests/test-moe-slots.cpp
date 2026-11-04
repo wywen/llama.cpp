@@ -1,11 +1,13 @@
 // checks that a MoE model whose expert weights are read from caller-filled slots (llama_model_params.moe_slots,
 //     llama_context_params.moe_slots) computes bitwise identical logits to the same model loaded with its expert
 //     weights, when the test fills the slots of a context itself from the file runs that the model reports:
-//   - identity: one slot per expert, slot e holds expert e
+//   - identity: one slot per expert, slot e holds expert e; then the experts move to other slots of the same context
 //   - permuted: one slot per expert and a spare, slot p holds expert perm[p], the spare holds garbage
 //   - reduced:  fewer slots than experts, holding exactly the experts the router selects for a short prompt, and a
 //               spare holding garbage that every other expert maps to
 // each from the stock file and from a copy that stores the expert weights one tensor per expert
+// and that two contexts on one model have their own slots, that a non-default alignment computes the same, and that
+//     a context without the slots of a layer that its graph reads fails to initialize
 //
 // the models are the MoE models written by test-llama-archs (-o <dir>)
 
@@ -403,10 +405,25 @@ static expert_bytes fill_slots(llama_context * lctx, const assignment & assign, 
         ggml_backend_tensor_set(layout.slot_map, slot_map.data(), 0, slot_map.size()*sizeof(int32_t));
     }
 
-    check(layout_ok, label + ": slot layout");
+    check(layout_ok, label + ": slot layout, the map at offset 0 and slot 0 at map_size");
     check(runs_ok,   label + ": the runs cover each expert's members in " + (per_expert_file ? "one read" : "one read per member"));
     check(stock_ok,  label + ": the stock expert weights have no buffer");
     return res;
+}
+
+// the slot map and its padding of each layer start out zeroed
+static bool maps_zeroed(llama_context * lctx, const slot_layers & layers) {
+    bool ok = true;
+    for (const auto & [il, _] : layers) {
+        llama_moe_slot_layout layout;
+        if (!llama_context_moe_slot_layout(lctx, il, &layout)) {
+            return false;
+        }
+        std::vector<uint8_t> bytes(layout.map_size, 0xff);
+        ggml_backend_tensor_get(layout.region, bytes.data(), 0, bytes.size());
+        ok = ok && std::all_of(bytes.begin(), bytes.end(), [](uint8_t b) { return b == 0; });
+    }
+    return ok;
 }
 
 static assignment identity(const slot_layers & layers) {
@@ -424,16 +441,24 @@ static void test_file(const std::string & path, bool per_expert_file, const std:
         const std::string & stem, expert_bytes & bytes_identity, checker & check) {
     const std::string label = stem + (per_expert_file ? " (per-expert file)" : " (stock file)");
 
-    // identity: slot e holds expert e
+    // identity: slot e holds expert e; then the experts move to other slots of the same context
     {
         slot_layers layers;
         llama_model_ptr model = load_model(path, devs, &layers);
         check(!layers.empty(), label + ", identity: the loader asks about the slots of " + std::to_string(layers.size()) + " MoE layers");
         const slot_counts counts;
         llama_context_ptr lctx = new_context(model.get(), &counts);
+        check(maps_zeroed(lctx.get(), layers), label + ", identity: the slot maps start out zeroed");
         bytes_identity = fill_slots(lctx.get(), identity(layers), per_expert_file, DEFAULT_ALIGNMENT, label + ", identity", check);
         check(same_bits(get_logits(lctx.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long), label + ", identity: logits are bitwise identical");
 
+        assignment moved = identity(layers);
+        for (auto & [_, slots] : moved) {
+            std::reverse(slots.begin(), slots.end());
+        }
+        fill_slots(lctx.get(), moved, per_expert_file, DEFAULT_ALIGNMENT, label + ", moved", check);
+        check(same_bits(get_logits(lctx.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long),
+            label + ", moved: the experts in reversed slots of the same context, logits are bitwise identical");
     }
 
     // permuted: slot p holds expert perm[p], and a spare holds garbage
@@ -488,6 +513,49 @@ static void test_file(const std::string & path, bool per_expert_file, const std:
     }
 }
 
+// two contexts on one model have their own slots: one holds the right experts, the other the wrong ones
+static void test_two_contexts(const std::string & path, const std::vector<ggml_backend_dev_t> & devs, const std::vector<float> & ref_long,
+        const std::string & stem, checker & check) {
+    slot_layers layers;
+    llama_model_ptr model = load_model(path, devs, &layers);
+    const slot_counts counts;
+    llama_context_ptr ctx_a = new_context(model.get(), &counts);
+    llama_context_ptr ctx_b = new_context(model.get(), &counts);
+
+    bool separate = true;
+    for (const auto & [il, _] : layers) {
+        llama_moe_slot_layout la;
+        llama_moe_slot_layout lb;
+        separate = separate && llama_context_moe_slot_layout(ctx_a.get(), il, &la) && llama_context_moe_slot_layout(ctx_b.get(), il, &lb) &&
+            la.buffer != lb.buffer && la.region != lb.region && la.slot_map != lb.slot_map && la.members[0].tensor != lb.members[0].tensor;
+    }
+    check(separate, stem + ", two contexts: each has its own slot buffers and tensors");
+
+    fill_slots(ctx_a.get(), identity(layers), false, DEFAULT_ALIGNMENT, stem + ", two contexts, A", check);
+
+    // B: slot p holds expert p + 1, but the map sends expert e to slot e
+    assignment rotated = identity(layers);
+    for (auto & [_, slots] : rotated) {
+        std::rotate(slots.begin(), slots.begin() + 1, slots.end());
+    }
+    fill_slots(ctx_b.get(), rotated, false, DEFAULT_ALIGNMENT, stem + ", two contexts, B", check);
+    for (const auto & [il, n] : layers) {
+        llama_moe_slot_layout layout;
+        llama_context_moe_slot_layout(ctx_b.get(), il, &layout);
+        std::vector<int32_t> slot_map(n);
+        std::iota(slot_map.begin(), slot_map.end(), 0);
+        ggml_backend_tensor_set(layout.slot_map, slot_map.data(), 0, slot_map.size()*sizeof(int32_t));
+    }
+
+    check(same_bits(get_logits(ctx_a.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long), stem + ", two contexts: A computes the stock logits");
+    check(!same_bits(get_logits(ctx_b.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long), stem + ", two contexts: B, with the wrong experts, does not");
+    check(same_bits(get_logits(ctx_a.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long), stem + ", two contexts: A still computes the stock logits after B");
+
+    // B with its map written for its slots
+    fill_slots(ctx_b.get(), rotated, false, DEFAULT_ALIGNMENT, stem + ", two contexts, B fixed", check);
+    check(same_bits(get_logits(ctx_b.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long), stem + ", two contexts: B with its map fixed computes the stock logits");
+}
+
 static void test_model(const std::string & path, const std::string & dir, const std::vector<ggml_backend_dev_t> & devs, checker & check) {
     const std::string stem = std::filesystem::path(path).stem().string();
     printf("%s\n", stem.c_str());
@@ -526,6 +594,54 @@ static void test_model(const std::string & path, const std::string & dir, const 
         }
     }
     check(distinct, stem + ": the experts of each layer differ");
+
+    test_two_contexts(path, devs, ref_long, stem, check);
+
+    // a non-default alignment pads the members, the map and the slots to it, and computes the same
+    {
+        const size_t alignment = 2*DEFAULT_ALIGNMENT;
+        slot_layers layers;
+        llama_model_ptr model = load_model(path, devs, &layers, alignment);
+        const slot_counts counts;
+        llama_context_ptr lctx = new_context(model.get(), &counts);
+        fill_slots(lctx.get(), identity(layers), false, alignment, stem + ", alignment " + std::to_string(alignment), check);
+        check(same_bits(get_logits(lctx.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long),
+            stem + ", alignment " + std::to_string(alignment) + ": logits are bitwise identical");
+    }
+
+    // an alignment that is not a power of two, or below the alignment of the buffer type, is refused
+    for (const size_t alignment : { 3*DEFAULT_ALIGNMENT/2, (size_t) 8 }) {
+        slot_layers layers;
+        bool refused = false;
+        try {
+            load_model(path, devs, &layers, alignment);
+        } catch (const std::exception &) {
+            refused = g_log.find(alignment == 8 ? "is less than the alignment" : "is not a power of two") != std::string::npos;
+        }
+        check(refused, stem + ": the MoE slot alignment " + std::to_string(alignment) + " is refused");
+    }
+
+    // a context without the slots of a layer that its graph reads fails to initialize, as does a negative count
+    {
+        slot_layers layers;
+        llama_model_ptr model = load_model(path, devs, &layers);
+        slot_counts counts;
+        counts.n_slots[layers.begin()->first] = 0;
+        g_log.clear();
+        llama_context_ptr lctx(llama_init_from_model(model.get(), context_params(&counts, nullptr)));
+        check(!lctx && g_log.find("but the context has no slots for it") != std::string::npos,
+            stem + ": a context with 0 slots for a layer that its graph reads fails to initialize");
+
+        g_log.clear();
+        lctx.reset(llama_init_from_model(model.get(), context_params(nullptr, nullptr)));
+        check(!lctx && g_log.find("but the context has no slots for it") != std::string::npos,
+            stem + ": a context with no slot counts fails to initialize");
+
+        counts.n_slots[layers.begin()->first] = -1;
+        g_log.clear();
+        lctx.reset(llama_init_from_model(model.get(), context_params(&counts, nullptr)));
+        check(!lctx && g_log.find("invalid number of MoE slots") != std::string::npos, stem + ": a negative slot count is refused");
+    }
 
     // the memory-fit pass, which allocates nothing, counts the memory of the context that it would allocate
     {
