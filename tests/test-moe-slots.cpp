@@ -4,7 +4,7 @@
 //   - identity: one slot per expert, slot e holds expert e
 //   - permuted: one slot per expert and a spare, slot p holds expert perm[p], the spare holds garbage
 //   - reduced:  fewer slots than experts, holding exactly the experts the router selects for a short prompt, and a
-//               spare holding garbage that every other expert maps to
+//               spare holding garbage that every other expert maps to; both runs record the routing
 // each from the stock file and from a copy that stores the expert weights one tensor per expert
 //
 // the models are the MoE models written by test-llama-archs (-o <dir>)
@@ -385,7 +385,7 @@ static assignment identity(const slot_counts & counts) {
 }
 
 static void test_file(const std::string & path, bool per_expert_file, const std::vector<ggml_backend_dev_t> & devs,
-        const std::vector<float> & ref_long, const std::vector<float> & ref_short, const selection & sel,
+        const std::vector<float> & ref_long, const std::vector<float> & ref_routed, const selection & sel,
         const std::string & stem, expert_bytes & bytes_identity, checker & check) {
     const std::string label = stem + (per_expert_file ? " (per-expert file)" : " (stock file)");
 
@@ -433,7 +433,11 @@ static void test_file(const std::string & path, bool per_expert_file, const std:
             n_reduced += (int32_t) it->second.size() < n ? 1 : 0;
         }
         fill_slots(*model, assign, per_expert_file, label + ", reduced", check);
-        check(same_bits(get_logits(model.get(), N_TOKENS_SHORT, N_BATCH_SHORT), ref_short),
+        // observed like the reference, so that both run the same kernels and the slots hold what the router selects
+        selection sel_slots;
+        const std::vector<float> logits = get_logits(model.get(), N_TOKENS_SHORT, N_BATCH_SHORT, &sel_slots);
+        check(sel_slots == sel, label + ", reduced: the router selects the experts it selects in the stock model");
+        check(same_bits(logits, ref_routed),
             label + ", reduced (" + std::to_string(n_reduced) + " of " + std::to_string(assign.size()) + " layers with fewer slots than experts): logits are bitwise identical");
     }
 }
@@ -443,13 +447,17 @@ static void test_model(const std::string & path, const std::string & dir, const 
     printf("%s\n", stem.c_str());
 
     std::vector<float> ref_long;
-    std::vector<float> ref_short;
+    std::vector<float> ref_routed; // with the routing recorded
     selection sel;
     {
         llama_model_ptr model = load_model(path, devs, nullptr);
-        ref_long  = get_logits(model.get(), N_TOKENS_LONG, N_BATCH_LONG);
-        ref_short = get_logits(model.get(), N_TOKENS_SHORT, N_BATCH_SHORT);
-        check(same_bits(get_logits(model.get(), N_TOKENS_SHORT, N_BATCH_SHORT, &sel), ref_short), stem + ": recording the routing leaves the logits unchanged");
+        ref_long   = get_logits(model.get(), N_TOKENS_LONG, N_BATCH_LONG);
+        ref_routed = get_logits(model.get(), N_TOKENS_SHORT, N_BATCH_SHORT, &sel);
+        // on a GPU, observing the router's nodes splits fused kernels into separate ops that round differently,
+        //     so the observed and the unobserved logits are equal only on the CPU
+        if (devs.empty()) {
+            check(same_bits(get_logits(model.get(), N_TOKENS_SHORT, N_BATCH_SHORT), ref_routed), stem + ": recording the routing leaves the logits unchanged");
+        }
     }
 
     const std::string path_parts = dir + "/" + stem + "-slot-order.gguf";
@@ -457,8 +465,8 @@ static void test_model(const std::string & path, const std::string & dir, const 
 
     expert_bytes bytes_stock;
     expert_bytes bytes_parts;
-    test_file(path,       false, devs, ref_long, ref_short, sel, stem, bytes_stock, check);
-    test_file(path_parts, true,  devs, ref_long, ref_short, sel, stem, bytes_parts, check);
+    test_file(path,       false, devs, ref_long, ref_routed, sel, stem, bytes_stock, check);
+    test_file(path_parts, true,  devs, ref_long, ref_routed, sel, stem, bytes_parts, check);
     check(!bytes_stock.empty() && bytes_stock == bytes_parts, stem + ": the stock and the per-expert file fill identical slots");
 
     // a slot that holds the wrong expert changes the logits only if the experts differ
