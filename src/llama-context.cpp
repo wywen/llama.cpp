@@ -23,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 //
 // llama_context
@@ -34,12 +35,20 @@ static void llama_verify_hadamard_graph(
         ggml_cgraph * gf,
         const llama_hadamard_rotations & rotations,
         const llama_hadamard_rotations & inverses,
-        const llama_moe_cache * moe_cache) {
+        const llama_moe_cache * moe_cache,
+        const llama_moe_slots & moe_slots) {
     // the MoE cache gives the matmul a copy of the expert weights, so the copy also needs the transform of its source
     llama_hadamard_rotations forward = rotations;
     for (const auto & [w, t] : rotations) {
         if (const ggml_tensor * cached = moe_cache ? moe_cache->get_experts(w) : nullptr) {
             forward.emplace(cached, t);
+        }
+    }
+    // so do the slot tensors read in place of the expert weights
+    for (const auto & [w, slots] : moe_slots.substitutes()) {
+        const auto it = rotations.find(w);
+        if (it != rotations.end()) {
+            forward.emplace(slots, it->second);
         }
     }
 
@@ -107,6 +116,23 @@ static void llama_verify_hadamard_graph(
             throw std::runtime_error(format(
                 "Hadamard-latent table '%s' is read without the inverse transform",
                 node->src[0]->name));
+        }
+    }
+}
+
+// check that no op reads an expert weight that is read from slots: it has no data
+static void llama_verify_moe_slots_graph(ggml_cgraph * gf, const llama_moe_slots & moe_slots) {
+    std::unordered_set<const ggml_tensor *> stock;
+    for (const auto & [w, _] : moe_slots.substitutes()) {
+        stock.insert(w);
+    }
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (node->src[s] != nullptr && stock.count(node->src[s]) > 0) {
+                throw std::runtime_error(format("expert weight '%s' is read from MoE slots, but op '%s' (%s) reads the weight itself",
+                    node->src[s]->name, node->name, ggml_op_name(node->op)));
+            }
         }
     }
 }
@@ -680,6 +706,9 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
+            if (!model.moe_slots.empty()) {
+                throw std::runtime_error("the MoE cache cannot be used with a model that reads expert weights from MoE slots");
+            }
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size);
         }
 
@@ -2874,8 +2903,12 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
-        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get());
+        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get(), model.moe_slots);
         hadamard_verified = true;
+    }
+    if (!moe_slots_verified && gf && !model.moe_slots.empty()) {
+        llama_verify_moe_slots_graph(gf, model.moe_slots);
+        moe_slots_verified = true;
     }
 
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
@@ -2915,6 +2948,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
+        /*.moe_slots   =*/ model.moe_slots.empty() ? nullptr : &model.moe_slots,
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
