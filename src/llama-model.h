@@ -1046,7 +1046,7 @@ struct llama_model_base : public llama_model {
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
 
-    // helper: allocate the slot regions of the MoE layers that read their expert weights from slots
+    // helper: the slot geometry and file runs of the MoE layers that read their expert weights from slots
     void load_tensors_moe_slots(llama_model_loader & ml);
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern

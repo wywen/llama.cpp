@@ -23,7 +23,6 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 
 //
 // llama_context
@@ -36,7 +35,7 @@ static void llama_verify_hadamard_graph(
         const llama_hadamard_rotations & rotations,
         const llama_hadamard_rotations & inverses,
         const llama_moe_cache * moe_cache,
-        const llama_moe_slots & moe_slots) {
+        const llama_moe_slot_pool * moe_slots) {
     // the MoE cache gives the matmul a copy of the expert weights, so the copy also needs the transform of its source
     llama_hadamard_rotations forward = rotations;
     for (const auto & [w, t] : rotations) {
@@ -45,10 +44,12 @@ static void llama_verify_hadamard_graph(
         }
     }
     // so do the slot tensors read in place of the expert weights
-    for (const auto & [w, slots] : moe_slots.substitutes()) {
-        const auto it = rotations.find(w);
-        if (it != rotations.end()) {
-            forward.emplace(slots, it->second);
+    if (moe_slots) {
+        for (const auto & [w, slots] : moe_slots->substitutes()) {
+            const auto it = rotations.find(w);
+            if (it != rotations.end()) {
+                forward.emplace(slots, it->second);
+            }
         }
     }
 
@@ -122,14 +123,10 @@ static void llama_verify_hadamard_graph(
 
 // check that no op reads an expert weight that is read from slots: it has no data
 static void llama_verify_moe_slots_graph(ggml_cgraph * gf, const llama_moe_slots & moe_slots) {
-    std::unordered_set<const ggml_tensor *> stock;
-    for (const auto & [w, _] : moe_slots.substitutes()) {
-        stock.insert(w);
-    }
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
         const ggml_tensor * node = ggml_graph_node(gf, i);
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
-            if (node->src[s] != nullptr && stock.count(node->src[s]) > 0) {
+            if (node->src[s] != nullptr && moe_slots.of(node->src[s]) != nullptr) {
                 throw std::runtime_error(format("expert weight '%s' is read from MoE slots, but op '%s' (%s) reads the weight itself",
                     node->src[s]->name, node->name, ggml_op_name(node->op)));
             }
@@ -637,6 +634,11 @@ llama_context::llama_context(
         memory.reset(llama_context_create_memory(model, params, cparams));
     }
 
+    // the slots of the MoE layers that read their expert weights from slots, as the KV cache: per context, not state
+    if (!model.moe_slots.empty()) {
+        moe_slots = std::make_unique<llama_moe_slot_pool>(model.moe_slots, params.moe_slots, params.moe_slots_user_data, model.no_alloc());
+    }
+
     // init backends
     if (!hparams.vocab_only) {
         LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__);
@@ -1129,6 +1131,10 @@ uint32_t llama_context::n_threads_batch() const {
 
 llama_memory_t llama_context::get_memory() const {
     return memory.get();
+}
+
+const llama_moe_slot_pool * llama_context::get_moe_slots() const {
+    return moe_slots.get();
 }
 
 bool llama_context::memory_update(bool optimize) {
@@ -1755,7 +1761,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
+        try {
+            gf = model.build_graph(gparams);
+        } catch (const std::exception & err) {
+            // e.g. the graph reads a MoE layer that this context has no slots for
+            LLAMA_LOG_ERROR("%s: failed to build the graph: %s\n", __func__, err.what());
+            gf = nullptr;
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -2903,7 +2915,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
-        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get(), model.moe_slots);
+        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get(), moe_slots.get());
         hadamard_verified = true;
     }
     if (!moe_slots_verified && gf && !model.moe_slots.empty()) {
@@ -2948,7 +2960,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
-        /*.moe_slots   =*/ model.moe_slots.empty() ? nullptr : &model.moe_slots,
+        /*.moe_slots   =*/ moe_slots.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
@@ -4012,6 +4024,11 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
+    if (moe_slots) {
+        for (const auto & [buft, size] : moe_slots->memory_breakdown()) {
+            ret[buft].context += size;
+        }
+    }
     if (model.no_alloc()) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
@@ -4315,6 +4332,8 @@ llama_context_params llama_context_default_params() {
         /*.cb_kv_rot_set               =*/ nullptr,
         /*.cb_kv_rot_set_user_data     =*/ nullptr,
         /*.moe_cache_size              =*/ 0,
+        /*.moe_slots                   =*/ nullptr,
+        /*.moe_slots_user_data         =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -4536,6 +4555,33 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     }
 
     return ctx->get_memory();
+}
+
+bool llama_context_moe_slot_layout(const struct llama_context * ctx, int32_t il, struct llama_moe_slot_layout * layout) {
+    const llama_moe_slot_pool * pool = ctx->get_moe_slots();
+    const llama_moe_slot_region * region = pool ? pool->region(il) : nullptr;
+    if (region == nullptr) {
+        return false;
+    }
+
+    const llama_moe_slot_layer & layer = *region->layer;
+
+    llama_moe_slot_layout res = {};
+    res.n_expert  = layer.n_expert;
+    res.n_slots   = region->n_slots;
+    res.alignment = layer.alignment;
+    res.map_size  = region->map_size;
+    res.slot_size = layer.slot_size;
+    res.buffer    = region->buf;
+    res.region    = region->region;
+    res.slot_map  = region->slot_map;
+    res.n_members = (int32_t) layer.members.size();
+    for (size_t i = 0; i < layer.members.size(); ++i) {
+        const auto & m = layer.members[i];
+        res.members[i] = { m.name.c_str(), region->members[i], m.offset, m.size };
+    }
+    *layout = res;
+    return true;
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {

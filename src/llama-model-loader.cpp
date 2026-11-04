@@ -1262,15 +1262,10 @@ llama_model_loader::moe_slot_plan & llama_model_loader::get_moe_slot_plan(llm_ar
         return plan;
     }
 
-    const llama_moe_slot_count count = moe_slots(il, plan.n_expert, moe_slots_ud);
-    if (count.n_assigned < 0 || count.n_assigned > plan.n_expert || count.n_spare < 0) {
-        throw std::runtime_error(format("layer %d: invalid MoE slot count %d + %d for %d experts", il, count.n_assigned, count.n_spare, plan.n_expert));
-    }
-    if (count.n_assigned == 0) {
+    if (!moe_slots(il, plan.n_expert, moe_slots_ud)) {
         return plan;
     }
-    plan.n_assigned = count.n_assigned;
-    plan.n_spare    = count.n_spare;
+    plan.slots = true;
 
     // the slot layout is the same whatever the order and layout of the file
     const LLM_TN tn(arch);
@@ -1288,7 +1283,7 @@ llama_model_loader::moe_slot_plan & llama_model_loader::get_moe_slot_plan(llm_ar
         m.name   = name;
         m.size   = t->nb[2];
         m.offset = plan.slot_size;
-        plan.slot_size += GGML_PAD(m.size, LLAMA_MOE_SLOT_ALIGNMENT);
+        plan.slot_size += GGML_PAD(m.size, moe_slot_alignment);
         plan.members.push_back(std::move(m));
     }
     GGML_ASSERT(!plan.members.empty() && plan.members.size() <= LLAMA_MOE_SLOT_MAX_MEMBERS);
@@ -1530,7 +1525,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     moe_slot_plan * slot_plan = nullptr;
     if (is_expert_weight(tn) && !(flags & TENSOR_SKIP)) {
         moe_slot_plan & plan = get_moe_slot_plan(tn.arch, tn.bid, cur);
-        if (plan.n_assigned > 0) {
+        if (plan.slots) {
             slot_plan = &plan;
         }
     }
@@ -1576,9 +1571,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     // the buffer type of a slot layer's expert weight must support the member's slot tensor, strided by the slot size
+    // (the number of slots is chosen by each context, the check takes one slot per expert)
     ggml_tensor t_slots = t_meta;
     if (slot_plan) {
-        t_slots.ne[2] = slot_plan->n_assigned + slot_plan->n_spare;
         t_slots.nb[2] = slot_plan->slot_size;
         t_slots.nb[3] = t_slots.nb[2]*t_slots.ne[2];
     }
