@@ -238,6 +238,16 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_test(test-fp8 NAME test-fp8-requantize LABEL "main behavior backend"
         ARGS --models "${FP8_MODEL_DIR}")
     set_tests_properties(test-fp8-requantize PROPERTIES FIXTURES_REQUIRED fp8-models)
+
+    llama_build(test-per-expert-tensors.cpp)
+    set(PER_EXPERT_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-per-expert")
+    file(MAKE_DIRECTORY "${PER_EXPERT_MODEL_DIR}")
+    llama_test(test-llama-archs NAME test-generate-per-expert-models LABEL "main behavior backend"
+        ARGS -a "^(qwen3moe|qwen35moe|gemma4)$" -o "${PER_EXPERT_MODEL_DIR}")
+    set_tests_properties(test-generate-per-expert-models PROPERTIES FIXTURES_SETUP per-expert-models)
+    llama_test(test-per-expert-tensors LABEL "main behavior backend"
+        ARGS --models "${PER_EXPERT_MODEL_DIR}")
+    set_tests_properties(test-per-expert-tensors PROPERTIES FIXTURES_REQUIRED per-expert-models)
 endif()
 
 set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
