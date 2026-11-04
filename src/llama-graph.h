@@ -23,7 +23,7 @@ struct llama_prec_policy;
 struct llama_hadamard;
 
 class llama_moe_cache;
-class llama_moe_slots;
+class llama_moe_slot_pool;
 
 struct llama_memory_context_i;
 
@@ -807,7 +807,7 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
-    const llama_moe_slots        * moe_slots;
+    const llama_moe_slot_pool    * moe_slots;
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -1076,7 +1076,7 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
-    const llama_moe_slots        * moe_slots;
+    const llama_moe_slot_pool    * moe_slots;
 
     const llama_prec_policy * prec_policy;
 
@@ -1240,7 +1240,8 @@ struct llm_graph_context {
                    float   post_exp_norm_eps = 1e-5f) const;
 
     // the slots of the selected experts and the tensors that stand in for the expert weights, from the caller-filled
-    //     slots of the layer or from the MoE cache; no slots if the layer reads its expert weights
+    //     slots of the layer in the context or from the MoE cache; no slots if the layer reads its expert weights
+    // throws if the layer reads its expert weights from slots and the context has none for it
     llm_graph_moe_slots build_moe_slots(
              ggml_tensor * selected_experts,
              ggml_tensor * up_exps,

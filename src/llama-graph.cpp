@@ -23,6 +23,7 @@
 #include <cstring>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 
@@ -2557,26 +2558,33 @@ llm_graph_moe_slots llm_graph_context::build_moe_slots(
     };
 
     // the layer's caller-filled slots: the slot map is a device weight, so the lookup runs where the experts are read
-    const llama_moe_slot_region * region = nullptr;
+    const llama_moe_slot_layer * layer = nullptr;
     if (moe_slots != nullptr) {
         bool first = true;
         for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
             if (w == nullptr) {
                 continue;
             }
-            const llama_moe_slot_region * r = moe_slots->of(w);
+            const llama_moe_slot_layer * l = moe_slots->model_slots().of(w);
             if (first) {
-                region = r;
-                first  = false;
-            } else if (r != region) {
+                layer = l;
+                first = false;
+            } else if (l != layer) {
                 GGML_ABORT("fatal error: the expert weights of layer %d are not all read from the same MoE slots", il);
-            }
-            if (r != nullptr) {
-                res.weights.emplace_back(w, r->get(w));
             }
         }
     }
-    if (region != nullptr) {
+    if (layer != nullptr) {
+        const llama_moe_slot_region * region = moe_slots->region(layer->il);
+        if (region == nullptr) {
+            throw std::runtime_error(format("layer %d reads its expert weights from MoE slots, but the context has no slots for it", layer->il));
+        }
+        for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
+            if (w != nullptr) {
+                res.weights.emplace_back(w, region->get(w));
+            }
+        }
+
         ggml_tensor * slots = ggml_get_rows(ctx0, region->slot_map, selected_ids()); // [1, n_expert_used*n_tokens]
         cb(slots, "ffn_moe_slots", il);
         ggml_build_forward_expand(gf, slots);

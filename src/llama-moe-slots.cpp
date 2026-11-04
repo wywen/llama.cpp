@@ -4,64 +4,44 @@
 
 #include <stdexcept>
 
-ggml_tensor * llama_moe_slot_region::get(const ggml_tensor * w) const {
-    for (const member & m : members) {
-        if (m.stock == w) {
-            return m.tensor;
-        }
-    }
-    return nullptr;
+const llama_moe_slot_layer * llama_moe_slots::layer(int32_t il) const {
+    const auto it = layers.find(il);
+    return it == layers.end() ? nullptr : it->second.get();
 }
 
-const llama_moe_slot_region * llama_moe_slots::layer(int32_t il) const {
-    const auto it = regions.find(il);
-    return it == regions.end() ? nullptr : it->second.get();
-}
-
-const llama_moe_slot_region * llama_moe_slots::of(const ggml_tensor * w) const {
+const llama_moe_slot_layer * llama_moe_slots::of(const ggml_tensor * w) const {
     const auto it = by_stock.find(w);
     return it == by_stock.end() ? nullptr : it->second;
 }
 
-std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> llama_moe_slots::substitutes() const {
-    std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> res;
-    for (const auto & [_, region] : regions) {
-        for (const auto & m : region->members) {
-            res.emplace_back(m.stock, m.tensor);
-        }
-    }
-    return res;
-}
-
-std::map<ggml_backend_buffer_type_t, size_t> llama_moe_slots::memory_breakdown() const {
-    std::map<ggml_backend_buffer_type_t, size_t> res;
-    for (const buffer & b : bufs) {
-        res[b.buft] += b.size;
-    }
-    return res;
-}
-
-llama_moe_slot_region & llama_moe_slots::add(int32_t il) {
-    auto & region = regions[il];
-    GGML_ASSERT(!region);
-    region = std::make_unique<llama_moe_slot_region>();
-    region->il = il;
-    return *region;
+llama_moe_slot_layer & llama_moe_slots::add(int32_t il) {
+    auto & layer = layers[il];
+    GGML_ASSERT(!layer);
+    layer = std::make_unique<llama_moe_slot_layer>();
+    layer->il = il;
+    return *layer;
 }
 
 void llama_moe_slots::own_meta(ggml_context_ptr ctx) {
     ctxs.push_back(std::move(ctx));
 }
 
-// a buffer of `size` bytes, or without allocation a placeholder that holds nothing
-static ggml_backend_buffer_t alloc_buffer(ggml_backend_buffer_type_t buft, size_t size, bool no_alloc) {
-    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, no_alloc ? 0 : size);
-    if (buf == nullptr) {
-        throw std::runtime_error(format("unable to allocate %s buffer of %zu bytes for MoE slots", ggml_backend_buft_name(buft), size));
+void llama_moe_slots::index() {
+    by_stock.clear();
+    for (const auto & [_, layer] : layers) {
+        for (const auto & m : layer->members) {
+            by_stock.emplace(m.stock, layer.get());
+        }
     }
-    // the scheduler runs the ops that read weights on the backend of their buffer
-    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    return buf;
+}
+
+ggml_tensor * llama_moe_slot_region::get(const ggml_tensor * w) const {
+    for (size_t i = 0; i < members.size(); ++i) {
+        if (layer->members[i].stock == w) {
+            return members[i];
+        }
+    }
+    return nullptr;
 }
 
 static void place(ggml_backend_buffer_t buf, ggml_tensor * t, size_t offset, bool no_alloc) {
@@ -74,16 +54,25 @@ static void place(ggml_backend_buffer_t buf, ggml_tensor * t, size_t offset, boo
     }
 }
 
-void llama_moe_slots::allocate(const std::map<int32_t, ggml_backend_buffer_type_t> & bufts, bool no_alloc) {
-    // the slot maps of the layers in one buffer type share a buffer
-    std::map<ggml_backend_buffer_type_t, std::vector<llama_moe_slot_region *>> by_buft;
+llama_moe_slot_pool::llama_moe_slot_pool(const llama_moe_slots & slots, llama_moe_slot_count_callback n_slots, void * user_data, bool no_alloc) :
+    slots(slots) {
+    for (const auto & [il, layer] : slots.all()) {
+        const int32_t n = n_slots ? n_slots(il, layer->n_expert, user_data) : 0;
+        if (n < 0) {
+            throw std::runtime_error(format("layer %d: invalid number of MoE slots %d", il, n));
+        }
+        // the context never computes this layer
+        if (n == 0) {
+            continue;
+        }
 
-    for (auto & [il, region] : regions) {
-        ggml_backend_buffer_type_t buft = bufts.at(il);
-        by_buft[buft].push_back(region.get());
+        llama_moe_slot_region & region = regions[il];
+        region.layer    = layer.get();
+        region.n_slots  = n;
+        region.map_size = GGML_PAD((size_t) layer->n_expert*sizeof(int32_t), layer->alignment);
 
         ggml_init_params params = {
-            /*.mem_size   =*/ ggml_tensor_overhead()*(region->members.size() + 1),
+            /*.mem_size   =*/ ggml_tensor_overhead()*(layer->members.size() + 2),
             /*.mem_buffer =*/ NULL,
             /*.no_alloc   =*/ true,
         };
@@ -92,71 +81,70 @@ void llama_moe_slots::allocate(const std::map<int32_t, ggml_backend_buffer_type_
             throw std::runtime_error("failed to create ggml context");
         }
 
-        const size_t size = region->n_slots()*region->slot_size;
-        ggml_backend_buffer_t buf = alloc_buffer(buft, size, no_alloc);
-        bufs.push_back({ ggml_backend_buffer_ptr(buf), buft, size });
-        region->buf = buf;
+        const size_t size = region.map_size + (size_t) n*layer->slot_size;
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(layer->buft, no_alloc ? 0 : size);
+        if (buf == nullptr) {
+            throw std::runtime_error(format("unable to allocate %s buffer of %zu bytes for the MoE slots of layer %d",
+                ggml_backend_buft_name(layer->buft), size, il));
+        }
+        // the scheduler runs the ops that read weights on the backend of their buffer
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        bufs.push_back({ ggml_backend_buffer_ptr(buf), layer->buft, size });
+        region.buf = buf;
 
-        region->region = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, size);
-        ggml_format_name(region->region, "blk.%d.ffn_exps_slots", il);
-        place(buf, region->region, 0, no_alloc);
+        region.region = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, size);
+        ggml_format_name(region.region, "blk.%d.ffn_exps_slots", il);
+        place(buf, region.region, 0, no_alloc);
 
-        for (auto & m : region->members) {
+        region.slot_map = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, layer->n_expert);
+        ggml_format_name(region.slot_map, "blk.%d.ffn_exps_slot_map", il);
+        place(buf, region.slot_map, 0, no_alloc);
+
+        for (const auto & m : layer->members) {
             const ggml_tensor * s = m.stock;
-            ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), s->type, s->ne[0], s->ne[1], region->n_slots());
-            t->nb[2] = region->slot_size;
-            t->nb[3] = region->slot_size*region->n_slots();
+            ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), s->type, s->ne[0], s->ne[1], n);
+            t->nb[2] = layer->slot_size;
+            t->nb[3] = layer->slot_size*n;
             std::string name = m.name;
             const size_t pos = name.rfind(".weight");
             GGML_ASSERT(pos != std::string::npos);
             name.replace(pos, std::string::npos, ".slots");
             ggml_set_name(t, name.c_str());
-            place(buf, t, m.offset, no_alloc);
-            m.tensor = t;
+            place(buf, t, region.map_size + m.offset, no_alloc);
+            region.members.push_back(t);
+        }
 
-            by_stock.emplace(s, region.get());
+        // the slot map and its padding start zeroed, the slots uninitialized
+        if (!no_alloc) {
+            const std::vector<uint8_t> zeros(region.map_size, 0);
+            ggml_backend_tensor_set(region.region, zeros.data(), 0, zeros.size());
         }
 
         ctxs.push_back(std::move(ctx));
+
+        LLAMA_LOG_INFO("%s: layer %3d: %d slots of %zu bytes in %s\n", __func__, il, n, layer->slot_size, ggml_backend_buft_name(layer->buft));
     }
+}
 
-    for (auto & [buft, layer_regions] : by_buft) {
-        ggml_init_params params = {
-            /*.mem_size   =*/ ggml_tensor_overhead()*layer_regions.size(),
-            /*.mem_buffer =*/ NULL,
-            /*.no_alloc   =*/ true,
-        };
-        ggml_context_ptr ctx(ggml_init(params));
-        if (!ctx) {
-            throw std::runtime_error("failed to create ggml context");
+const llama_moe_slot_region * llama_moe_slot_pool::region(int32_t il) const {
+    const auto it = regions.find(il);
+    return it == regions.end() ? nullptr : &it->second;
+}
+
+std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> llama_moe_slot_pool::substitutes() const {
+    std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> res;
+    for (const auto & [_, region] : regions) {
+        for (size_t i = 0; i < region.members.size(); ++i) {
+            res.emplace_back(region.layer->members[i].stock, region.members[i]);
         }
-
-        for (llama_moe_slot_region * region : layer_regions) {
-            region->slot_map = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, region->n_expert);
-            ggml_format_name(region->slot_map, "blk.%d.ffn_exps_slot_map", region->il);
-        }
-
-        if (no_alloc) {
-            ggml_backend_buffer_t buf = alloc_buffer(buft, 0, true);
-            bufs.push_back({ ggml_backend_buffer_ptr(buf), buft, ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft) });
-            for (llama_moe_slot_region * region : layer_regions) {
-                region->slot_map->buffer = buf;
-            }
-        } else {
-            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
-            if (buf == nullptr) {
-                throw std::runtime_error(format("unable to allocate %s buffer for MoE slot maps", ggml_backend_buft_name(buft)));
-            }
-            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-            ggml_backend_buffer_clear(buf, 0);
-            bufs.push_back({ ggml_backend_buffer_ptr(buf), buft, ggml_backend_buffer_get_size(buf) });
-        }
-
-        ctxs.push_back(std::move(ctx));
     }
+    return res;
+}
 
-    for (const auto & [il, region] : regions) {
-        LLAMA_LOG_INFO("%s: layer %3d: %d + %d slots of %zu bytes in %s\n", __func__, il,
-            region->n_assigned, region->n_spare, region->slot_size, ggml_backend_buft_name(bufts.at(il)));
+std::map<ggml_backend_buffer_type_t, size_t> llama_moe_slot_pool::memory_breakdown() const {
+    std::map<ggml_backend_buffer_type_t, size_t> res;
+    for (const buffer & b : bufs) {
+        res[b.buft] += b.size;
     }
+    return res;
 }

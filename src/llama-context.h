@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-slots.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -95,6 +96,9 @@ struct llama_context {
     uint32_t n_threads_batch() const;
 
     llama_memory_t get_memory() const;
+
+    // the slots of the MoE layers that read their expert weights from slots, nullptr if the model has none
+    const llama_moe_slot_pool * get_moe_slots() const;
 
     // return true if the memory was updated
     bool memory_update(bool optimize);
@@ -338,6 +342,9 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+
+    // the slots of this context, see llama_context_params.moe_slots
+    std::unique_ptr<llama_moe_slot_pool> moe_slots;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

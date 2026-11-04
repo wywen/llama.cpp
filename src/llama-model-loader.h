@@ -197,18 +197,18 @@ struct llama_model_loader {
             ggml_tensor * stock  = nullptr; // set when the model creates it
         };
 
-        int32_t n_expert   = 0;
-        int32_t n_assigned = 0; // 0: the layer loads its expert weights
-        int32_t n_spare    = 0;
-        size_t  slot_size  = 0;
+        int32_t n_expert  = 0;
+        bool    slots     = false; // false: the layer loads its expert weights
+        size_t  slot_size = 0;
 
         std::vector<member> members;
 
         ggml_backend_buffer_type_t buft = nullptr; // of the members, as selected for their slot tensors
     };
 
-    llama_moe_slots_callback moe_slots    = nullptr;
-    void *                   moe_slots_ud = nullptr;
+    llama_moe_slot_layer_callback moe_slots          = nullptr;
+    void *                        moe_slots_ud       = nullptr;
+    size_t                        moe_slot_alignment = 0;
     std::map<int32_t, moe_slot_plan> moe_slot_plans; // by layer, for each MoE layer seen
 
     // the plan of layer il, made with the callback when the first expert weight 'cur' of the layer is created

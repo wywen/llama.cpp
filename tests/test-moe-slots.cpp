@@ -1,6 +1,6 @@
-// checks that a MoE model whose expert weights are read from caller-filled slots (llama_model_params.moe_slots)
-//     computes bitwise identical logits to the same model loaded with its expert weights, when the test fills the
-//     slots itself from the file runs that the model reports:
+// checks that a MoE model whose expert weights are read from caller-filled slots (llama_model_params.moe_slots,
+//     llama_context_params.moe_slots) computes bitwise identical logits to the same model loaded with its expert
+//     weights, when the test fills the slots of a context itself from the file runs that the model reports:
 //   - identity: one slot per expert, slot e holds expert e
 //   - permuted: one slot per expert and a spare, slot p holds expert perm[p], the spare holds garbage
 //   - reduced:  fewer slots than experts, holding exactly the experts the router selects for a short prompt, and a
@@ -37,6 +37,9 @@
 #include <vector>
 
 static std::string g_log;
+
+// the alignment of the members and slots when llama_model_params.moe_slot_alignment is 0
+static constexpr size_t DEFAULT_ALIGNMENT = 16384;
 
 // the position of an expert weight in a slot, or -1
 static int slot_rank(const std::string & name) {
@@ -84,7 +87,7 @@ struct gguf_file {
     }
 };
 
-// write `src` with each expert weight stored as one tensor per expert at LLAMA_MOE_SLOT_ALIGNMENT, expert by
+// write `src` with each expert weight stored as one tensor per expert at DEFAULT_ALIGNMENT, expert by
 //     expert in slot order, so that the file holds each expert's weights with the gaps of a slot
 static void write_per_expert(const gguf_file & src, const std::string & path) {
     std::map<int, std::vector<std::pair<int, ggml_tensor *>>> layers; // layer -> (rank, tensor)
@@ -107,14 +110,14 @@ static void write_per_expert(const gguf_file & src, const std::string & path) {
         const std::string path_kv = path + ".kv";
         gguf_context_ptr kv(gguf_init_empty());
         gguf_set_kv(kv.get(), src.gguf.get());
-        gguf_set_val_u32(kv.get(), GGUF_KEY_GENERAL_ALIGNMENT, LLAMA_MOE_SLOT_ALIGNMENT);
+        gguf_set_val_u32(kv.get(), GGUF_KEY_GENERAL_ALIGNMENT, DEFAULT_ALIGNMENT);
         if (!gguf_write_to_file(kv.get(), path_kv.c_str(), /*only_meta =*/ true)) {
             throw std::runtime_error("failed to write " + path_kv);
         }
         gguf_init_params params = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
         out.reset(gguf_init_from_file(path_kv.c_str(), params));
         std::filesystem::remove(path_kv);
-        if (!out || gguf_get_alignment(out.get()) != LLAMA_MOE_SLOT_ALIGNMENT) {
+        if (!out || gguf_get_alignment(out.get()) != DEFAULT_ALIGNMENT) {
             throw std::runtime_error("failed to read back " + path_kv);
         }
     }
@@ -148,28 +151,23 @@ static void write_per_expert(const gguf_file & src, const std::string & path) {
     }
 }
 
-// the slot counts that the loader asks for, by layer
-struct slot_counts {
-    std::map<int32_t, int32_t> n_assigned; // a layer not listed gets one slot per expert
-    int32_t n_spare = 0;
-    std::map<int32_t, int32_t> n_expert; // as the loader reported them
-};
+// the MoE layers that the loader asks about, with their number of experts; each one reads its experts from slots
+using slot_layers = std::map<int32_t, int32_t>;
 
-static llama_moe_slot_count get_slot_count(int32_t il, int32_t n_expert, void * ud) {
-    auto * counts = (slot_counts *) ud;
-    counts->n_expert[il] = n_expert;
-    const auto it = counts->n_assigned.find(il);
-    return { it == counts->n_assigned.end() ? n_expert : it->second, counts->n_spare };
+static bool get_slot_layer(int32_t il, int32_t n_expert, void * ud) {
+    (*(slot_layers *) ud)[il] = n_expert;
+    return true;
 }
 
-static llama_model_ptr load_model(const std::string & path, std::vector<ggml_backend_dev_t> devs, slot_counts * counts,
-        llama_load_mode load_mode = LLAMA_LOAD_MODE_AUTO, bool no_alloc = false) {
+static llama_model_ptr load_model(const std::string & path, std::vector<ggml_backend_dev_t> devs, slot_layers * layers,
+        size_t alignment = 0, llama_load_mode load_mode = LLAMA_LOAD_MODE_AUTO, bool no_alloc = false) {
     llama_model_params mparams = llama_model_default_params();
     mparams.load_mode = load_mode;
     mparams.no_alloc  = no_alloc;
-    if (counts) {
-        mparams.moe_slots           = get_slot_count;
-        mparams.moe_slots_user_data = counts;
+    if (layers) {
+        mparams.moe_slots           = get_slot_layer;
+        mparams.moe_slots_user_data = layers;
+        mparams.moe_slot_alignment  = alignment;
     }
     if (devs.empty()) {
         mparams.n_gpu_layers = 0;
@@ -183,6 +181,18 @@ static llama_model_ptr load_model(const std::string & path, std::vector<ggml_bac
         throw std::runtime_error("failed to load " + path + ":\n" + g_log);
     }
     return model;
+}
+
+// the slot counts that a context asks for, by layer
+struct slot_counts {
+    std::map<int32_t, int32_t> n_slots; // a layer not listed gets one slot per expert and n_spare
+    int32_t n_spare = 0;
+};
+
+static int32_t get_slot_count(int32_t il, int32_t n_expert, void * ud) {
+    const auto * counts = (const slot_counts *) ud;
+    const auto it = counts->n_slots.find(il);
+    return it == counts->n_slots.end() ? n_expert + counts->n_spare : it->second;
 }
 
 static std::vector<llama_token> get_tokens(uint32_t n_tokens, uint32_t n_vocab, size_t seed) {
@@ -215,44 +225,60 @@ static bool record_selection(ggml_tensor * t, bool ask, void * ud) {
     return true;
 }
 
-// the logits of `n_batch` tokens in one batch, then of the other tokens one at a time, which take the vector kernels
-static std::vector<float> get_logits(llama_model * model, size_t n_tokens, size_t n_batch, selection * sel = nullptr) {
+static llama_context_params context_params(const slot_counts * counts, selection * sel) {
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx           = 0;
     cparams.n_threads       = 4;
     cparams.n_threads_batch = 4;
     cparams.n_ubatch        = 64;
+    if (counts) {
+        cparams.moe_slots           = get_slot_count;
+        cparams.moe_slots_user_data = (void *) counts;
+    }
     if (sel) {
         cparams.cb_eval           = record_selection;
         cparams.cb_eval_user_data = sel;
     }
-    llama_context_ptr lctx(llama_init_from_model(model, cparams));
+    return cparams;
+}
+
+static llama_context_ptr new_context(llama_model * model, const slot_counts * counts, selection * sel = nullptr) {
+    g_log.clear();
+    llama_context_ptr lctx(llama_init_from_model(model, context_params(counts, sel)));
     if (!lctx) {
         throw std::runtime_error("failed to create a context:\n" + g_log);
     }
+    return lctx;
+}
 
+// the logits of `n_batch` tokens in one batch, then of the other tokens one at a time, which take the vector kernels
+// starts from an empty memory, so that a context computes the same logits each time
+static std::vector<float> get_logits(llama_context * lctx, size_t n_tokens, size_t n_batch) {
+    llama_memory_clear(llama_get_memory(lctx), true);
+
+    const llama_model * model = llama_get_model(lctx);
     const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const std::vector<llama_token> tokens = get_tokens(n_tokens, n_vocab, 42);
 
     std::vector<float> ret;
-    common_batch batch(lctx.get());
+    common_batch batch(lctx);
     for (size_t i = 0; i < n_batch; i++) {
         batch.add(tokens[i], i, 0, true);
     }
-    if (llama_process(lctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+    if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
         throw std::runtime_error("failed to decode");
     }
     for (size_t i = 0; i < n_batch; i++) {
-        const float * l = llama_get_logits_ith(lctx.get(), i);
+        const float * l = llama_get_logits_ith(lctx, i);
         ret.insert(ret.end(), l, l + n_vocab);
     }
     for (size_t i = n_batch; i < tokens.size(); i++) {
-        common_batch one(lctx.get());
+        common_batch one(lctx);
         one.add(tokens[i], i, 0, true);
-        if (llama_process(lctx.get(), LLAMA_PROCESS_TYPE_DECODE, one.get())) {
+        if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, one.get())) {
             throw std::runtime_error("failed to decode");
         }
-        const float * l = llama_get_logits_ith(lctx.get(), 0);
+        const float * l = llama_get_logits_ith(lctx, 0);
         ret.insert(ret.end(), l, l + n_vocab);
     }
     return ret;
@@ -293,9 +319,12 @@ static std::vector<uint8_t> read_file(const std::string & path, uint64_t offset,
     return res;
 }
 
-// play the caller: fill each slot from the runs of its expert, write the slot maps, and check the layout
+// play the caller: fill each slot of a context from the runs of its expert, write the slot maps, and check the layout
 // returns the slot contents of each expert, member bytes only
-static expert_bytes fill_slots(const llama_model & model, const assignment & assign, bool per_expert_file, const std::string & label, checker & check) {
+static expert_bytes fill_slots(llama_context * lctx, const assignment & assign, bool per_expert_file, size_t alignment,
+        const std::string & label, checker & check) {
+    const llama_model & model = *llama_get_model(lctx);
+
     expert_bytes res;
     bool layout_ok = true;
     bool runs_ok   = true;
@@ -303,27 +332,33 @@ static expert_bytes fill_slots(const llama_model & model, const assignment & ass
 
     for (const auto & [il, slots] : assign) {
         llama_moe_slot_layout layout;
-        if (!llama_model_moe_slot_layout(&model, il, &layout)) {
+        if (!llama_context_moe_slot_layout(lctx, il, &layout)) {
             fprintf(stderr, "%s: layer %d has no slots\n", label.c_str(), il);
             layout_ok = false;
             continue;
         }
-        const int64_t n_slots = (int64_t) layout.n_assigned + layout.n_spare;
-        layout_ok = layout_ok && n_slots == (int64_t) slots.size() && layout.slot_size % LLAMA_MOE_SLOT_ALIGNMENT == 0 &&
-            ggml_backend_buffer_get_size(layout.buffer) >= n_slots*layout.slot_size &&
-            ggml_nbytes(layout.region) == n_slots*layout.slot_size && layout.region->data == ggml_backend_buffer_get_base(layout.buffer) &&
-            layout.slot_map->type == GGML_TYPE_I32 && layout.slot_map->ne[0] == 1 && layout.slot_map->ne[1] == layout.n_expert;
+        const int64_t n_slots = layout.n_slots;
+        const char *  base    = (const char *) layout.region->data;
+
+        // the slot map at offset 0, zero padded to the alignment, then the slots
+        layout_ok = layout_ok && n_slots == (int64_t) slots.size() && layout.alignment == alignment &&
+            layout.slot_size % alignment == 0 && layout.map_size % alignment == 0 &&
+            layout.map_size == GGML_PAD(layout.n_expert*sizeof(int32_t), alignment) &&
+            ggml_backend_buffer_get_size(layout.buffer) >= layout.map_size + n_slots*layout.slot_size &&
+            ggml_nbytes(layout.region) == layout.map_size + n_slots*layout.slot_size && base == ggml_backend_buffer_get_base(layout.buffer) &&
+            layout.slot_map->type == GGML_TYPE_I32 && layout.slot_map->ne[0] == 1 && layout.slot_map->ne[1] == layout.n_expert &&
+            layout.slot_map->buffer == layout.buffer && (const char *) layout.slot_map->data == base;
 
         size_t end = 0;
         for (int32_t k = 0; k < layout.n_members; ++k) {
             const llama_moe_slot_member & m = layout.members[k];
             const ggml_tensor * stock = model.get_tensor(m.name);
-            layout_ok = layout_ok && stock != nullptr && m.offset % LLAMA_MOE_SLOT_ALIGNMENT == 0 && m.offset >= end &&
+            layout_ok = layout_ok && stock != nullptr && m.offset % alignment == 0 && m.offset >= end &&
                 m.tensor->type == stock->type && m.tensor->ne[0] == stock->ne[0] && m.tensor->ne[1] == stock->ne[1] &&
                 m.tensor->ne[2] == n_slots && m.tensor->nb[1] == stock->nb[1] && m.tensor->nb[2] == layout.slot_size &&
-                m.size == stock->nb[2] && (const char *) m.tensor->data == (const char *) layout.region->data + m.offset;
+                m.size == stock->nb[2] && (const char *) m.tensor->data == base + layout.map_size + m.offset;
             stock_ok = stock_ok && stock != nullptr && stock->buffer == nullptr;
-            end = m.offset + GGML_PAD(m.size, LLAMA_MOE_SLOT_ALIGNMENT);
+            end = m.offset + GGML_PAD(m.size, alignment);
         }
         layout_ok = layout_ok && end == layout.slot_size;
 
@@ -364,7 +399,7 @@ static expert_bytes fill_slots(const llama_model & model, const assignment & ass
                 s = garbage == slots.end() ? 0 : (int32_t) (garbage - slots.begin());
             }
         }
-        ggml_backend_tensor_set(layout.region, region.data(), 0, region.size());
+        ggml_backend_tensor_set(layout.region, region.data(), layout.map_size, region.size());
         ggml_backend_tensor_set(layout.slot_map, slot_map.data(), 0, slot_map.size()*sizeof(int32_t));
     }
 
@@ -374,9 +409,9 @@ static expert_bytes fill_slots(const llama_model & model, const assignment & ass
     return res;
 }
 
-static assignment identity(const slot_counts & counts) {
+static assignment identity(const slot_layers & layers) {
     assignment res;
-    for (const auto & [il, n] : counts.n_expert) {
+    for (const auto & [il, n] : layers) {
         std::vector<int32_t> & slots = res[il];
         slots.resize(n);
         std::iota(slots.begin(), slots.end(), 0);
@@ -391,55 +426,61 @@ static void test_file(const std::string & path, bool per_expert_file, const std:
 
     // identity: slot e holds expert e
     {
-        slot_counts counts;
-        llama_model_ptr model = load_model(path, devs, &counts);
-        check(!counts.n_expert.empty(), label + ", identity: the loader asks for the slots of " + std::to_string(counts.n_expert.size()) + " MoE layers");
-        bytes_identity = fill_slots(*model, identity(counts), per_expert_file, label + ", identity", check);
-        check(same_bits(get_logits(model.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long), label + ", identity: logits are bitwise identical");
+        slot_layers layers;
+        llama_model_ptr model = load_model(path, devs, &layers);
+        check(!layers.empty(), label + ", identity: the loader asks about the slots of " + std::to_string(layers.size()) + " MoE layers");
+        const slot_counts counts;
+        llama_context_ptr lctx = new_context(model.get(), &counts);
+        bytes_identity = fill_slots(lctx.get(), identity(layers), per_expert_file, DEFAULT_ALIGNMENT, label + ", identity", check);
+        check(same_bits(get_logits(lctx.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long), label + ", identity: logits are bitwise identical");
+
     }
 
     // permuted: slot p holds expert perm[p], and a spare holds garbage
     {
+        slot_layers layers;
+        llama_model_ptr model = load_model(path, devs, &layers);
         slot_counts counts;
         counts.n_spare = 1;
-        llama_model_ptr model = load_model(path, devs, &counts);
-        assignment assign = identity(counts);
+        llama_context_ptr lctx = new_context(model.get(), &counts);
+        assignment assign = identity(layers);
         for (auto & [_, slots] : assign) {
             // a rotation: no expert keeps its own slot
             std::rotate(slots.begin(), slots.begin() + 1, slots.end());
             slots.push_back(-1);
         }
-        fill_slots(*model, assign, per_expert_file, label + ", permuted", check);
-        check(same_bits(get_logits(model.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long), label + ", permuted: logits are bitwise identical");
+        fill_slots(lctx.get(), assign, per_expert_file, DEFAULT_ALIGNMENT, label + ", permuted", check);
+        check(same_bits(get_logits(lctx.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long), label + ", permuted: logits are bitwise identical");
     }
 
     // reduced: only the selected experts have slots, every other expert reads a spare that holds garbage
     {
+        slot_layers layers;
+        llama_model_ptr model = load_model(path, devs, &layers);
         slot_counts counts;
-        counts.n_spare = 1;
-        for (const auto & [il, experts] : sel) {
-            counts.n_assigned[il] = (int32_t) experts.size();
-        }
-        llama_model_ptr model = load_model(path, devs, &counts);
         assignment assign;
         int n_reduced = 0;
-        for (const auto & [il, n] : counts.n_expert) {
+        for (const auto & [il, n] : layers) {
             const auto it = sel.find(il);
             if (it == sel.end()) {
                 throw std::runtime_error("no selection recorded for layer " + std::to_string(il));
             }
             assign[il].assign(it->second.begin(), it->second.end());
             assign[il].push_back(-1);
+            counts.n_slots[il] = (int32_t) assign[il].size();
             n_reduced += (int32_t) it->second.size() < n ? 1 : 0;
         }
-        fill_slots(*model, assign, per_expert_file, label + ", reduced", check);
         // unobserved, as the reference: observing the router splits fused GPU kernels, and the slot graph's lookup
         //     after the top-k fuses differently from the stock graph, so observed runs compare like-for-like only
         //     on the CPU; the recorded selection only chooses which experts the slots hold
-        const std::vector<float> logits = get_logits(model.get(), N_TOKENS_SHORT, N_BATCH_SHORT);
+        llama_context_ptr lctx = new_context(model.get(), &counts);
+        fill_slots(lctx.get(), assign, per_expert_file, DEFAULT_ALIGNMENT, label + ", reduced", check);
+        const std::vector<float> logits = get_logits(lctx.get(), N_TOKENS_SHORT, N_BATCH_SHORT);
         if (devs.empty()) {
             selection sel_slots;
-            get_logits(model.get(), N_TOKENS_SHORT, N_BATCH_SHORT, &sel_slots);
+            llama_context_ptr lctx_observed = new_context(model.get(), &counts, &sel_slots);
+            fill_slots(lctx_observed.get(), assign, per_expert_file, DEFAULT_ALIGNMENT, label + ", reduced, observed", check);
+            get_logits(lctx_observed.get(), N_TOKENS_SHORT, N_BATCH_SHORT);
             check(sel_slots == sel, label + ", reduced: the router selects the experts it selects in the stock model");
         }
         check(same_bits(logits, ref_short),
@@ -456,9 +497,11 @@ static void test_model(const std::string & path, const std::string & dir, const 
     selection sel;
     {
         llama_model_ptr model = load_model(path, devs, nullptr);
-        ref_long  = get_logits(model.get(), N_TOKENS_LONG, N_BATCH_LONG);
-        ref_short = get_logits(model.get(), N_TOKENS_SHORT, N_BATCH_SHORT);
-        const std::vector<float> routed = get_logits(model.get(), N_TOKENS_SHORT, N_BATCH_SHORT, &sel);
+        llama_context_ptr lctx = new_context(model.get(), nullptr);
+        ref_long  = get_logits(lctx.get(), N_TOKENS_LONG, N_BATCH_LONG);
+        ref_short = get_logits(lctx.get(), N_TOKENS_SHORT, N_BATCH_SHORT);
+        llama_context_ptr lctx_observed = new_context(model.get(), nullptr, &sel);
+        const std::vector<float> routed = get_logits(lctx_observed.get(), N_TOKENS_SHORT, N_BATCH_SHORT);
         // on a GPU, observing the router's nodes splits fused kernels into separate ops that round differently,
         //     so the observed and the unobserved logits are equal only on the CPU
         if (devs.empty()) {
@@ -484,57 +527,42 @@ static void test_model(const std::string & path, const std::string & dir, const 
     }
     check(distinct, stem + ": the experts of each layer differ");
 
-    // the memory-fit pass, which allocates nothing, counts the memory of the model that it would allocate
+    // the memory-fit pass, which allocates nothing, counts the memory of the context that it would allocate
     {
-        auto model_memory = [&](bool no_alloc, size_t * region_bytes) {
+        auto memory = [&](bool no_alloc, size_t * region_bytes) {
+            slot_layers layers;
+            llama_model_ptr model = load_model(path, devs, &layers, 0, LLAMA_LOAD_MODE_NONE, no_alloc);
             slot_counts counts;
             counts.n_spare = 1;
-            llama_model_ptr model = load_model(path, devs, &counts, LLAMA_LOAD_MODE_NONE, no_alloc);
+            llama_context_ptr lctx = new_context(model.get(), &counts);
             *region_bytes = 0;
-            for (const auto & [il, _] : counts.n_expert) {
+            for (const auto & [il, _] : layers) {
                 llama_moe_slot_layout layout;
-                if (llama_model_moe_slot_layout(model.get(), il, &layout)) {
+                if (llama_context_moe_slot_layout(lctx.get(), il, &layout)) {
                     *region_bytes += ggml_nbytes(layout.region);
                 }
             }
-            llama_context_params cparams = llama_context_default_params();
-            cparams.n_ctx = 0;
-            llama_context_ptr lctx(llama_init_from_model(model.get(), cparams));
-            if (!lctx) {
-                throw std::runtime_error("failed to create a context:\n" + g_log);
-            }
-            size_t res = 0;
+            std::pair<size_t, size_t> res = { 0, 0 }; // model, context
             for (const auto & [_, mb] : llama_get_memory_breakdown(lctx.get())) {
-                res += mb.model;
+                res.first  += mb.model;
+                res.second += mb.context;
             }
             return res;
         };
         size_t regions_fit   = 0;
         size_t regions_alloc = 0;
-        const size_t fit   = model_memory(true,  &regions_fit);
-        const size_t alloc = model_memory(false, &regions_alloc);
-        check(regions_fit > 0 && regions_fit == regions_alloc && fit == alloc && alloc >= regions_alloc,
-            stem + ": the memory-fit pass counts the model memory with its slots (" + std::to_string(fit) + " bytes)");
-    }
-
-    // more assigned slots than experts
-    {
-        slot_counts counts;
-        counts.n_assigned[sel.begin()->first] = 1 << 20;
-        llama_model_params mparams = llama_model_default_params();
-        mparams.moe_slots           = get_slot_count;
-        mparams.moe_slots_user_data = &counts;
-        mparams.n_gpu_layers        = 0;
-        g_log.clear();
-        llama_model_ptr model(llama_model_load_from_file(path.c_str(), mparams));
-        check(!model && g_log.find("invalid MoE slot count") != std::string::npos, stem + ": more assigned slots than experts are refused");
+        const auto fit   = memory(true,  &regions_fit);
+        const auto alloc = memory(false, &regions_alloc);
+        check(regions_fit > 0 && regions_fit == regions_alloc && fit == alloc && alloc.second >= regions_alloc,
+            stem + ": the memory-fit pass counts the context memory with its slots (" + std::to_string(fit.second) + " bytes)");
     }
 
     // the MoE cache keeps its own copies of the experts, it does not combine with slots
     {
-        slot_counts counts;
-        llama_model_ptr model = load_model(path, devs, &counts);
-        llama_context_params cparams = llama_context_default_params();
+        slot_layers layers;
+        llama_model_ptr model = load_model(path, devs, &layers);
+        const slot_counts counts;
+        llama_context_params cparams = context_params(&counts, nullptr);
         cparams.moe_cache_size = 1024*1024;
         g_log.clear();
         llama_context_ptr lctx(llama_init_from_model(model.get(), cparams));
