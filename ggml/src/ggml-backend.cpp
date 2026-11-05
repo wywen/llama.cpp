@@ -1929,6 +1929,18 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->graph.n_nodes = 0;
     sched->graph.n_leafs = 0;
 
+    // the copy borrows the use counts of the graph it was split from, as every split's
+    // ggml_graph_view does: a node of the original graph then has the same count here as in
+    // the split a backend computes, so a fusion check over this graph decides what the
+    // backend's check over its split decides. the nodes added below - the views that keep
+    // split inputs alive, the input copies and the alloc dependency views - are not in the
+    // original graph's hash set, so their count is 0 and they never satisfy a fusion check;
+    // the uses they add only extend lifetimes and are deliberately not counted. like the
+    // node pointers, the borrowed counts stay valid as long as the original graph does
+    sched->graph.use_counts       = graph->use_counts;
+    sched->graph.visited_hash_set = graph->visited_hash_set;
+    sched->graph.order            = graph->order;
+
     struct ggml_cgraph * graph_copy = &sched->graph;
 
     int n_dep_nodes_added = 0;
