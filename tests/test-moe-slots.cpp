@@ -196,7 +196,7 @@ struct slot_counts {
     ggml_backend_buffer_type_t buft = nullptr;
 };
 
-static llama_moe_slot_pool_params get_slot_count(int32_t il, int32_t n_expert, void * ud) {
+static llama_moe_slot_pool_params get_slot_count(int32_t il, int32_t n_expert, int32_t /*set*/, void * ud) {
     const auto * counts = (const slot_counts *) ud;
     const auto it = counts->n_slots.find(il);
     return { it == counts->n_slots.end() ? n_expert + counts->n_spare : it->second, counts->buft };
@@ -388,7 +388,7 @@ static expert_bytes fill_slots(llama_context * lctx, const assignment & assign, 
 
     for (const auto & [il, slots] : assign) {
         llama_moe_slot_layout layout;
-        if (!llama_context_moe_slot_layout(lctx, il, &layout)) {
+        if (!llama_context_moe_slot_layout(lctx, il, 0, &layout)) {
             fprintf(stderr, "%s: layer %d has no slots\n", label.c_str(), il);
             layout_ok = false;
             continue;
@@ -470,7 +470,7 @@ static bool maps_zeroed(llama_context * lctx, const slot_layers & layers) {
     bool ok = true;
     for (const auto & [il, _] : layers) {
         llama_moe_slot_layout layout;
-        if (!llama_context_moe_slot_layout(lctx, il, &layout)) {
+        if (!llama_context_moe_slot_layout(lctx, il, 0, &layout)) {
             return false;
         }
         std::vector<uint8_t> bytes(layout.map_size, 0xff);
@@ -580,7 +580,7 @@ static void test_two_contexts(const std::string & path, const std::vector<ggml_b
     for (const auto & [il, _] : layers) {
         llama_moe_slot_layout la;
         llama_moe_slot_layout lb;
-        separate = separate && llama_context_moe_slot_layout(ctx_a.get(), il, &la) && llama_context_moe_slot_layout(ctx_b.get(), il, &lb) &&
+        separate = separate && llama_context_moe_slot_layout(ctx_a.get(), il, 0, &la) && llama_context_moe_slot_layout(ctx_b.get(), il, 0, &lb) &&
             la.buffer != lb.buffer && la.region != lb.region && la.slot_map != lb.slot_map && la.members[0].tensor != lb.members[0].tensor;
     }
     check(separate, stem + ", two contexts: each has its own slot buffers and tensors");
@@ -595,7 +595,7 @@ static void test_two_contexts(const std::string & path, const std::vector<ggml_b
     fill_slots(ctx_b.get(), rotated, false, DEFAULT_ALIGNMENT, stem + ", two contexts, B", check);
     for (const auto & [il, n] : layers) {
         llama_moe_slot_layout layout;
-        llama_context_moe_slot_layout(ctx_b.get(), il, &layout);
+        llama_context_moe_slot_layout(ctx_b.get(), il, 0, &layout);
         std::vector<int32_t> slot_map(n);
         std::iota(slot_map.begin(), slot_map.end(), 0);
         ggml_backend_tensor_set(layout.slot_map, slot_map.data(), 0, slot_map.size()*sizeof(int32_t));
@@ -643,7 +643,7 @@ static void test_pool_buft(const std::string & path, const std::vector<ggml_back
             int32_t n_expert  = 0;
             llama_moe_slot_layout layout = {};
             layout_ok = layout_ok && llama_model_moe_slot_geometry(model.get(), il, &slot_size, &map_size, &n_expert) &&
-                llama_context_moe_slot_layout(lctx.get(), il, &layout);
+                llama_context_moe_slot_layout(lctx.get(), il, 0, &layout);
             expected.push_back(map_size + (size_t) (n + 1)*slot_size);
             buffers.push_back(layout.buffer);
         }
@@ -724,7 +724,7 @@ static void test_geometry(const std::string & path, const std::vector<ggml_backe
         ok = ok && llama_model_moe_slot_geometry(model.get(), il, &slot_size, &map_size, &n_expert) && n_expert == n;
         for (llama_context * lctx : { ctx_a.get(), ctx_b.get() }) {
             llama_moe_slot_layout layout;
-            ok = ok && llama_context_moe_slot_layout(lctx, il, &layout) &&
+            ok = ok && llama_context_moe_slot_layout(lctx, il, 0, &layout) &&
                 layout.slot_size == slot_size && layout.map_size == map_size && layout.n_expert == n_expert;
         }
     }
@@ -839,7 +839,7 @@ static void test_model(const std::string & path, const std::string & dir, const 
             *region_bytes = 0;
             for (const auto & [il, _] : layers) {
                 llama_moe_slot_layout layout;
-                if (llama_context_moe_slot_layout(lctx.get(), il, &layout)) {
+                if (llama_context_moe_slot_layout(lctx.get(), il, 0, &layout)) {
                     *region_bytes += ggml_nbytes(layout.region);
                 }
             }

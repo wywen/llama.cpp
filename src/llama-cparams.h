@@ -35,6 +35,9 @@ struct llama_cparams : llama_memory_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    uint32_t moe_slot_sets = 1; // the number of MoE slot sets
+    int32_t  moe_slot_set  = 0; // the MoE slot set that the graph reads
+
     float rope_freq_base;
     float rope_freq_scale;
 

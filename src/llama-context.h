@@ -145,6 +145,9 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+
+    // the MoE slot set that the following graphs read; false, keeping the current set, if `set` is out of range
+    bool set_moe_slot_set(int32_t set);
     void set_ubatch_reserve(uint32_t n_tokens);
     // grow the reservation to fit a batch about to be submitted
     void widen_ubatch_reserve(uint32_t n_tokens);

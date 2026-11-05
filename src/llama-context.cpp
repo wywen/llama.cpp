@@ -537,6 +537,8 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.moe_cache_size = params.moe_cache_size;
     cparams.moe_router_ahead = params.moe_router_ahead;
+    cparams.moe_slot_sets    = params.moe_slot_sets;
+    cparams.moe_slot_set     = 0;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -637,7 +639,7 @@ llama_context::llama_context(
 
     // the slots of the MoE layers that read their expert weights from slots, as the KV cache: per context, not state
     if (!model.moe_slots.empty()) {
-        moe_slots = std::make_unique<llama_moe_slot_pool>(model.moe_slots, params.moe_slots, params.moe_slots_user_data, model.no_alloc());
+        moe_slots = std::make_unique<llama_moe_slot_pool>(model.moe_slots, cparams.moe_slot_sets, params.moe_slots, params.moe_slots_user_data, model.no_alloc());
     }
 
     if (cparams.moe_router_ahead && !hparams.vocab_only) {
@@ -1556,6 +1558,18 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
+}
+
+bool llama_context::set_moe_slot_set(int32_t set) {
+    if (set < 0 || (uint32_t) set >= cparams.moe_slot_sets) {
+        LLAMA_LOG_ERROR("%s: MoE slot set %d is out of range, the context has %u sets; keeping set %d\n",
+                __func__, set, cparams.moe_slot_sets, cparams.moe_slot_set);
+        return false;
+    }
+
+    // the sets differ only in the slot tensors that the graph reads: the graph is rebuilt, the scheduler is not reserved again
+    cparams.moe_slot_set = set;
+    return true;
 }
 
 void llama_context::set_ubatch_reserve(uint32_t n_tokens) {
@@ -4343,6 +4357,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_size              =*/ 0,
         /*.moe_slots                   =*/ nullptr,
         /*.moe_slots_user_data         =*/ nullptr,
+        /*.moe_slot_sets               =*/ 1,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -4559,6 +4574,10 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
 }
 
+void llama_set_moe_slot_set(llama_context * ctx, int32_t set) {
+    ctx->set_moe_slot_set(set);
+}
+
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     if (!ctx) {
         return nullptr;
@@ -4567,9 +4586,9 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     return ctx->get_memory();
 }
 
-bool llama_context_moe_slot_layout(const struct llama_context * ctx, int32_t il, struct llama_moe_slot_layout * layout) {
+bool llama_context_moe_slot_layout(const struct llama_context * ctx, int32_t il, int32_t set, struct llama_moe_slot_layout * layout) {
     const llama_moe_slot_pool * pool = ctx->get_moe_slots();
-    const llama_moe_slot_region * region = pool ? pool->region(il) : nullptr;
+    const llama_moe_slot_region * region = pool ? pool->region(set, il) : nullptr;
     if (region == nullptr) {
         return false;
     }

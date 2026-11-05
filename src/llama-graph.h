@@ -902,6 +902,11 @@ struct llm_graph_params {
             return false;
         }
 
+        // the slot sets have the same topology, but the graph reads the slot tensors of its set
+        if (cparams.moe_slot_set != other.cparams.moe_slot_set) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&

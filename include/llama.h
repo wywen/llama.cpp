@@ -255,7 +255,7 @@ extern "C" {
     // returns true if the layer reads its expert weights from slots, see llama_model_params.moe_slots
     typedef bool (*llama_moe_slot_layer_callback)(int32_t il, int32_t n_expert, void * user_data);
 
-    // the slots of a MoE layer in a context, see llama_context_params.moe_slots
+    // the slots of a MoE layer in one slot set of a context, see llama_context_params.moe_slots
     struct llama_moe_slot_pool_params {
         int32_t n_slots;
 
@@ -270,9 +270,11 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
-    // called during context initialization once for each MoE layer il that reads its expert weights from slots
-    // returns the slots of the layer in the context, see llama_context_params.moe_slots
-    typedef struct llama_moe_slot_pool_params (*llama_moe_slot_pool_callback)(int32_t il, int32_t n_expert, void * user_data);
+    // called during context initialization once for each MoE layer il that reads its expert weights from slots and
+    // each slot set `set` in [0, llama_context_params.moe_slot_sets)
+    // returns the slots of the layer in that set, see llama_context_params.moe_slots
+    // note: the `set` argument is a breaking change from the callback (il, n_expert, user_data)
+    typedef struct llama_moe_slot_pool_params (*llama_moe_slot_pool_callback)(int32_t il, int32_t n_expert, int32_t set, void * user_data);
 
     // Input data for llama_encode/llama_decode
     // A llama_batch object can contain input about one or many sequences
@@ -473,11 +475,14 @@ extern "C" {
 
         // the number of slots and the buffer type of each MoE layer that reads its expert weights from slots, see
         // llama_model_params.moe_slots and llama_context_moe_slot_layout; any expert can be held by any slot
-        // n_slots 0 = the context has no slots for the layer and never computes it, e.g. a draft context that computes only
-        // the next-token prediction layers; a graph that reads the layer then fails to build
+        // n_slots 0 = the set has no slots for the layer and the context never computes it while it reads that set, e.g. a
+        // draft context that computes only the next-token prediction layers; a graph that reads the layer then fails to build
         // NULL = no slots for any layer
         llama_moe_slot_pool_callback moe_slots;
         void *                       moe_slots_user_data;
+
+        // the number of slot sets, each with its own slots for each slot layer, see llama_set_moe_slot_set; at least 1
+        uint32_t moe_slot_sets;
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -769,8 +774,9 @@ extern "C" {
     // that is a multiple of the alignment (llama_model_params.moe_slot_alignment), and slot_size is a multiple of it.
     //
     // Each context allocates its own slots, at initialization, for each slot layer that it gives slots (see
-    // llama_context_params.moe_slots): one buffer per layer, allocated through the layer's buffer type or a buffer type
-    // that the caller chooses on the same device, which holds from its base
+    // llama_context_params.moe_slots), in each of its slot sets (llama_context_params.moe_slot_sets): one buffer per
+    // layer and set, allocated through the layer's buffer type or a buffer type that the caller chooses on the same
+    // device, which holds from its base
     //
     //   offset 0          map_size          map_size + slot_size
     //   | slot map | pad | slot 0          | slot 1          | ... n_slots slots
@@ -787,6 +793,12 @@ extern "C" {
     // ggml_backend_tensor_set on `region` and `slot_map`, and keeps the writes out of the graph computations that
     // read them. The slot map starts out zeroed; the slots start out uninitialized. Every expert the router can
     // select must map to a slot in [0, n_slots) that holds it.
+    //
+    // A context with several slot sets holds independent slots and slot maps for a layer in each set, each with its own
+    // number of slots, e.g. a caller that keeps a small slot set for single-token decode and a full set for batched
+    // prompt processing. Each graph reads the set chosen with llama_set_moe_slot_set (initially 0). The sets differ
+    // only in the slot tensors that the graph reads, so a change of set rebuilds the graph but does not reserve the
+    // scheduler again.
     //
     // A member tensor indexes its experts by the byte stride slot_size, which is not a whole number of blocks of
     // every type: a device that cannot read such a tensor is not offered it, and the layer is placed on the next
@@ -827,9 +839,13 @@ extern "C" {
         uint64_t     slot_offset; // in the slot, from the start of the slot (slot p starts at map_size + p*slot_size in the region)
     };
 
-    // the slots of layer il in the context; returns false, leaving `layout` untouched, if the layer does not read its
-    // experts from slots or the context has no slots for it
-    LLAMA_API bool llama_context_moe_slot_layout(const struct llama_context * ctx, int32_t il, struct llama_moe_slot_layout * layout);
+    // the slots of layer il in slot set `set` of the context; returns false, leaving `layout` untouched, if the layer does
+    // not read its experts from slots, `set` is out of range or the set has no slots for the layer
+    LLAMA_API bool llama_context_moe_slot_layout(const struct llama_context * ctx, int32_t il, int32_t set, struct llama_moe_slot_layout * layout);
+
+    // the slot set that the following graphs read, in [0, llama_context_params.moe_slot_sets); an out-of-range set is
+    // refused with an error and the context keeps reading its current set
+    LLAMA_API void llama_set_moe_slot_set(struct llama_context * ctx, int32_t set);
 
     // the slot geometry of layer il, as llama_context_moe_slot_layout reports it for every context; returns false,
     // leaving the outputs untouched, if the layer does not read its experts from slots

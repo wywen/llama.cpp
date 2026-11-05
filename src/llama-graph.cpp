@@ -2606,9 +2606,10 @@ llm_graph_moe_slots llm_graph_context::build_moe_slots(
         }
     }
     if (layer != nullptr) {
-        const llama_moe_slot_region * region = moe_slots->region(layer->il);
+        const llama_moe_slot_region * region = moe_slots->region(cparams.moe_slot_set, layer->il);
         if (region == nullptr) {
-            throw std::runtime_error(format("layer %d reads its expert weights from MoE slots, but the context has no slots for it", layer->il));
+            throw std::runtime_error(format("layer %d reads its expert weights from MoE slots, but the context has no slots for it in set %d",
+                layer->il, cparams.moe_slot_set));
         }
         for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
             if (w != nullptr) {
