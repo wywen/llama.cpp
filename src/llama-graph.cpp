@@ -2581,10 +2581,10 @@ llm_graph_moe_slots llm_graph_context::build_moe_slots(
     llm_graph_moe_slots res;
 
     auto selected_ids = [&]() {
-        ggml_tensor * ids = selected_experts;
-        if (!ggml_is_contiguous(ids)) {
-            ids = ggml_cont(ctx0, ids);
-        }
+        // always copy: whether the router's ids are contiguous depends on the layer's token count (the last layer of a
+        // graph runs only its outputs), and the graph's node list must not depend on it so that a scheduler can reuse
+        // its allocation plan for graphs with any number of outputs
+        ggml_tensor * ids = ggml_cont(ctx0, selected_experts);
         return ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
     };
 

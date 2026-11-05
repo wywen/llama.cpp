@@ -1091,6 +1091,36 @@ static void test_slot_sets(const std::string & path, const std::vector<ggml_back
     }
 }
 
+// the graph a context builds has the same nodes whatever the number of outputs: the last layer of a graph runs only its
+// outputs, and a node list that depended on their number would not match the scheduler's reserved allocation plan
+static void test_graph_structure(const std::string & path, const std::vector<ggml_backend_dev_t> & devs, const std::string & stem, checker & check) {
+    const std::string label = stem + ", graph structure";
+
+    slot_layers layers;
+    llama_model_ptr model = load_model(path, devs, &layers);
+    set_counts counts;
+    counts.n_slots.resize(1);
+    llama_context_ptr lctx = new_set_context(model.get(), counts);
+
+    constexpr uint32_t n_tokens = 8;
+    auto nodes = [&](uint32_t n_outputs) {
+        ggml_cgraph * gf = llama_graph_reserve(lctx.get(), n_tokens, 1, n_outputs);
+        std::vector<std::string> res;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const ggml_tensor * t = ggml_graph_node(gf, i);
+            res.push_back(std::string(ggml_op_desc(t)) + " " + t->name + " " + ggml_type_name(t->type));
+        }
+        return res;
+    };
+    const auto one   = nodes(1);
+    const auto two   = nodes(2);
+    const auto some  = nodes(3);
+    const auto all   = nodes(n_tokens);
+    check(!one.empty() && one == two && one == some && one == all,
+        label + ": the node list is the same for 1, 2, 3 and " + std::to_string(n_tokens) + " outputs (" +
+        std::to_string(one.size()) + ", " + std::to_string(two.size()) + ", " + std::to_string(some.size()) + ", " + std::to_string(all.size()) + " nodes)");
+}
+
 static void test_model(const std::string & path, const std::string & dir, const std::vector<ggml_backend_dev_t> & devs, checker & check) {
     const std::string stem = std::filesystem::path(path).stem().string();
     printf("%s\n", stem.c_str());
@@ -1134,6 +1164,7 @@ static void test_model(const std::string & path, const std::string & dir, const 
     test_pool_buft(path, devs, ref_long, stem, check);
     test_geometry(path, devs, stem, check);
     test_slot_sets(path, devs, ref_long, ref_short, sel, stem, check);
+    test_graph_structure(path, devs, stem, check);
 
     // a non-default alignment pads the members, the map and the slots to it, and computes the same
     {
