@@ -60,6 +60,11 @@ struct ggml_metal {
     // stop the graph reorder at boundary marker nodes (see ggml_metal_set_reorder_barriers)
     bool use_reorder_barriers;
 
+    // node-name prefixes the graph reorder treats as barriers (see
+    // ggml_metal_set_reorder_barrier_prefixes). Owned copies, replaced on each set
+    int     reorder_n_prefixes;
+    char ** reorder_prefixes;
+
     int debug_graph;
 
     struct ggml_metal_fusion_info * finfo;
@@ -259,6 +264,8 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
         // off unless a caller asks for it: the stock path must reorder exactly as before
         res->use_reorder_barriers = false;
+        res->reorder_n_prefixes   = 0;
+        res->reorder_prefixes     = NULL;
 
         GGML_LOG_INFO("%s: use fusion         = %s\n", __func__, ggml_metal_fusion_info_enabled(res->finfo) ? "true" : "false");
         GGML_LOG_INFO("%s: use concurrency    = %s\n", __func__, res->use_concurrency    ? "true" : "false");
@@ -349,6 +356,7 @@ void ggml_metal_free(ggml_metal_t ctx) {
     ggml_metal_bsched_clear(ctx);
     ggml_metal_clear_encode_window(ctx);
     ggml_metal_hcut_clear(ctx);
+    ggml_metal_set_reorder_barrier_prefixes(ctx, 0, NULL);
 
     //[ctx->queue release]; // [TAG_QUEUE_PER_BACKEND]
 
@@ -1021,6 +1029,32 @@ static void ggml_metal_ewin_blit(id<MTLCommandBuffer> cmd_buf, const struct ggml
 // set this, and ggml_graph_node_is_boundary_marker for what counts as a marker.
 void ggml_metal_set_reorder_barriers(ggml_metal_t ctx, bool enable) {
     ctx->use_reorder_barriers = enable;
+}
+
+// Replace the barrier name prefixes of the graph reorder. See
+// ggml_backend_metal_set_reorder_barrier_prefixes.
+void ggml_metal_set_reorder_barrier_prefixes(ggml_metal_t ctx, int n, const char * const * prefixes) {
+    for (int i = 0; i < ctx->reorder_n_prefixes; ++i) {
+        free(ctx->reorder_prefixes[i]);
+    }
+    free(ctx->reorder_prefixes);
+    ctx->reorder_n_prefixes = 0;
+    ctx->reorder_prefixes   = NULL;
+
+    if (n <= 0) {
+        return;
+    }
+    GGML_ASSERT(prefixes != NULL);
+
+    ctx->reorder_prefixes = malloc(sizeof(char *) * n);
+    GGML_ASSERT(ctx->reorder_prefixes != NULL);
+    for (int i = 0; i < n; ++i) {
+        // an empty prefix would match every node and turn the reorder off
+        GGML_ASSERT(prefixes[i] != NULL && prefixes[i][0] != '\0');
+        ctx->reorder_prefixes[i] = strdup(prefixes[i]);
+        GGML_ASSERT(ctx->reorder_prefixes[i] != NULL);
+    }
+    ctx->reorder_n_prefixes = n;
 }
 
 // The band invariant check: does this split encode ONLY in-band nodes?
@@ -1795,7 +1829,8 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     //const int64_t t_start = ggml_time_us();
 
     if (ctx->use_graph_optimize) {
-        ggml_graph_optimize(gf, ctx->use_reorder_barriers);
+        ggml_graph_optimize(gf, ctx->use_reorder_barriers,
+            ctx->reorder_n_prefixes, (const char * const *) ctx->reorder_prefixes);
     }
 
     //printf("%s: graph optimize took %.3f ms\n", __func__, (ggml_time_us() - t_start) / 1000.0);

@@ -924,6 +924,14 @@ void ggml_backend_metal_set_reorder_barriers(ggml_backend_t backend, bool enable
     ggml_metal_set_reorder_barriers(ctx, enable);
 }
 
+void ggml_backend_metal_set_reorder_barrier_prefixes(ggml_backend_t backend, int n, const char * const * prefixes) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+
+    ggml_metal_set_reorder_barrier_prefixes(ctx, n, prefixes);
+}
+
 bool ggml_backend_metal_supports_family(ggml_backend_t backend, int family) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
 

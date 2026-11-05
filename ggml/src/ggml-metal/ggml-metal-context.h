@@ -73,6 +73,9 @@ void ggml_metal_clear_encode_window(ggml_metal_t ctx);
 // See ggml_backend_metal_set_reorder_barriers.
 void ggml_metal_set_reorder_barriers(ggml_metal_t ctx, bool enable);
 
+// See ggml_backend_metal_set_reorder_barrier_prefixes.
+void ggml_metal_set_reorder_barrier_prefixes(ggml_metal_t ctx, int n, const char * const * prefixes);
+
 void ggml_metal_set_n_cb            (ggml_metal_t ctx, int n_cb);
 void ggml_metal_set_abort_callback  (ggml_metal_t ctx, ggml_abort_callback abort_callback, void * user_data);
 

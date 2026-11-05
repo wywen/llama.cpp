@@ -105,7 +105,7 @@ static std::vector<int> reorder_mul_mat_add(int64_t rows, add_operand_kind kind)
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, add);
     ggml_build_forward_expand(graph, other);
-    ggml_graph_optimize(graph, false);
+    ggml_graph_optimize(graph, false, 0, nullptr);
     const std::vector<int> res = node_positions(graph, { mm, add, other });
 
     ggml_backend_buffer_free(weights);
@@ -319,7 +319,7 @@ static void expand_all(ggml_cgraph * graph, const std::vector<ggml_tensor *> & o
 static ggml_cgraph * optimized_graph(ggml_context * ctx, const std::vector<ggml_tensor *> & outputs) {
     ggml_cgraph * graph = ggml_new_graph(ctx);
     expand_all(graph, outputs);
-    ggml_graph_optimize(graph, false);
+    ggml_graph_optimize(graph, false, 0, nullptr);
     return graph;
 }
 
@@ -564,7 +564,7 @@ static int run_boundary_barrier_cases() {
         test_ctx     tc;
         ggml_cgraph * gf = build_hoist_across(tc.ctx, "l_out-0");
 
-        ggml_graph_optimize(gf, false);
+        ggml_graph_optimize(gf, false, 0, nullptr);
 
         check_order("barriers off: hoists across marker", gf, { "a", "c", "b", "l_out-0" });
     }
@@ -574,7 +574,7 @@ static int run_boundary_barrier_cases() {
         test_ctx     tc;
         ggml_cgraph * gf = build_hoist_across(tc.ctx, "l_out-0");
 
-        ggml_graph_optimize(gf, true);
+        ggml_graph_optimize(gf, true, 0, nullptr);
 
         check_order("barriers on: stops at marker", gf, { "a", "b", "l_out-0", "c" });
     }
@@ -585,7 +585,7 @@ static int run_boundary_barrier_cases() {
         test_ctx     tc;
         ggml_cgraph * gf = build_hoist_across(tc.ctx, "ffn_out-0");
 
-        ggml_graph_optimize(gf, true);
+        ggml_graph_optimize(gf, true, 0, nullptr);
 
         check_order("barriers on: non-marker still hoists", gf, { "a", "c", "b", "ffn_out-0" });
     }
@@ -595,7 +595,7 @@ static int run_boundary_barrier_cases() {
         test_ctx     tc;
         ggml_cgraph * gf = build_marker_anchor(tc.ctx);
 
-        ggml_graph_optimize(gf, false);
+        ggml_graph_optimize(gf, false, 0, nullptr);
 
         check_order("barriers off: hoists in front of marker", gf, { "a", "c", "l_out-0" });
     }
@@ -604,7 +604,7 @@ static int run_boundary_barrier_cases() {
         test_ctx     tc;
         ggml_cgraph * gf = build_marker_anchor(tc.ctx);
 
-        ggml_graph_optimize(gf, true);
+        ggml_graph_optimize(gf, true, 0, nullptr);
 
         check_order("barriers on: marker takes nothing along", gf, { "a", "l_out-0", "c" });
     }
@@ -616,7 +616,7 @@ static int run_boundary_barrier_cases() {
         test_ctx     tc;
         ggml_cgraph * gf = build_fused_group(tc.ctx);
 
-        ggml_graph_optimize(gf, false);
+        ggml_graph_optimize(gf, false, 0, nullptr);
 
         check_order("barriers off: fused group hoists", gf, { "a", "s", "l_out-0", "b" });
     }
@@ -627,7 +627,7 @@ static int run_boundary_barrier_cases() {
         test_ctx     tc;
         ggml_cgraph * gf = build_fused_group(tc.ctx);
 
-        ggml_graph_optimize(gf, true);
+        ggml_graph_optimize(gf, true, 0, nullptr);
 
         check_order("barriers on: fused group holds", gf, { "a", "b", "s", "l_out-0" });
     }
