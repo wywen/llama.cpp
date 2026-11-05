@@ -2929,7 +2929,10 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+
+    // the compute buffers cover every MoE slot set: some backends size an expert matmul's scratch by its slot count
+    gparams.cparams.moe_slot_set = LLAMA_MOE_SLOT_SET_WIDEST;
 
     res->reset();
 

@@ -109,6 +109,9 @@ public:
     // the slots of layer il in set `set`, nullptr if the layer is not a slot layer or this set has no slots for it
     const llama_moe_slot_region * region(int32_t set, int32_t il) const;
 
+    // the slots of layer il in the set with the most slots for it, nullptr if no set has slots for it
+    const llama_moe_slot_region * widest(int32_t il) const;
+
     const llama_moe_slots & model_slots() const {
         return slots;
     }

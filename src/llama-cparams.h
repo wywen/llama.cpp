@@ -7,6 +7,9 @@
 
 #define LLAMA_MAX_SEQ 256
 
+// a reserve graph's MoE slot set: each slot layer reads the set with the most slots for it
+#define LLAMA_MOE_SLOT_SET_WIDEST -1
+
 // Parameters shared by context construction and memory planning.
 struct llama_memory_cparams {
     uint32_t n_ctx;           // context size used during inference
@@ -36,7 +39,7 @@ struct llama_cparams : llama_memory_cparams {
     int32_t  nextn_layer_offset = 0;
 
     uint32_t moe_slot_sets = 1; // the number of MoE slot sets
-    int32_t  moe_slot_set  = 0; // the MoE slot set that the graph reads
+    int32_t  moe_slot_set  = 0; // the MoE slot set that the graph reads, or LLAMA_MOE_SLOT_SET_WIDEST
 
     float rope_freq_base;
     float rope_freq_scale;

@@ -797,8 +797,10 @@ extern "C" {
     // A context with several slot sets holds independent slots and slot maps for a layer in each set, each with its own
     // number of slots, e.g. a caller that keeps a small slot set for single-token decode and a full set for batched
     // prompt processing. Each graph reads the set chosen with llama_set_moe_slot_set (initially 0). The sets differ
-    // only in the slot tensors that the graph reads, so a change of set rebuilds the graph but does not reserve the
-    // scheduler again.
+    // only in the slot tensors that the graph reads, so a change of set rebuilds the graph, with the same nodes and
+    // splits, but does not reserve the scheduler again. The compute buffers are reserved for every set (each layer
+    // at its largest slot count), so a change of set never grows them; when the slot counts of the sets differ, a
+    // backend whose expert matmul scratch depends on the slot count may place the rebuilt graph again within them.
     //
     // A member tensor indexes its experts by the byte stride slot_size, which is not a whole number of blocks of
     // every type: a device that cannot read such a tensor is not offered it, and the layer is placed on the next

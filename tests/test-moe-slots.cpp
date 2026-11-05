@@ -10,7 +10,8 @@
 //     chooses, that the model reports the geometry of the slots of every context, that a non-default alignment
 //     computes the same, and that a context without the slots of a layer that its graph reads fails to initialize
 // and that a context with two slot sets computes the stock logits on whichever set each graph reads, rebuilds its
-//     graph on a set switch without reserving its scheduler, and counts the memory of every set
+//     graph on a set switch without reserving its scheduler or growing its compute buffers, and counts the memory of
+//     every set
 //
 // the models are the MoE models written by test-llama-archs (-o <dir>)
 
@@ -761,16 +762,39 @@ static llama_moe_slot_pool_params get_set_slot_count(int32_t il, int32_t n_exper
     return { it == n_slots.end() ? n_expert : it->second, counts->buft };
 }
 
-// the graphs a context prepares, and the scheduler reserves it makes
+// the graphs a context prepares, and the compute buffer plans its scheduler admits
 struct graph_log {
     int n_reserve = 0;
+    int n_grow    = 0; // the plans that grow a compute buffer
     std::vector<std::vector<std::string>> nodes; // per graph: op, name, type and shape of each node
     std::vector<std::set<std::string>>    slots; // per graph: the slot tensors that its nodes read
 };
 
-static bool log_reserve(ggml_backend_sched_t, const ggml_backend_sched_buffer_reservation *, size_t, void * ud) {
-    ((graph_log *) ud)->n_reserve++;
+static bool log_reserve(ggml_backend_sched_t sched, const ggml_backend_sched_buffer_reservation * res, size_t n, void * ud) {
+    auto * log = (graph_log *) ud;
+    log->n_reserve++;
+    // each entry is max(current, planned) for one chunk, so a plan grows a buffer when its entries sum to more
+    std::map<int, size_t> planned;
+    for (size_t i = 0; i < n; ++i) {
+        planned[res[i].backend_index] += res[i].size;
+    }
+    for (const auto & [b, size] : planned) {
+        if (size > ggml_backend_sched_get_buffer_size(sched, ggml_backend_sched_get_backend(sched, b))) {
+            log->n_grow++;
+            break;
+        }
+    }
     return true;
+}
+
+// the compute buffer size of each backend of the context's scheduler
+static std::vector<size_t> compute_sizes(llama_context * lctx) {
+    ggml_backend_sched_t sched = llama_get_sched(lctx);
+    std::vector<size_t> res;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        res.push_back(ggml_backend_sched_get_buffer_size(sched, ggml_backend_sched_get_backend(sched, i)));
+    }
+    return res;
 }
 
 static bool log_graph(ggml_backend_sched_t, ggml_cgraph * gf, void * ud) {
@@ -904,45 +928,71 @@ static void test_slot_sets(const std::string & path, const std::vector<ggml_back
             label + ": the layout of an out-of-range set is refused");
     }
 
-    // graph shape: a set switch rebuilds the graph with the same nodes, and reserves nothing
-    {
+    // graph shape: a set switch rebuilds the graph with the same nodes and splits, and needs no scheduler reserve; the
+    //     compute buffers that the context reserved at initialization cover every set
+    // with the slot counts of the sets equal, a switch places the graph as the previous one; with different counts, a
+    //     backend that sizes an expert matmul's scratch by its slot count places it again within the same buffers
+    set_counts equal;
+    equal.n_slots.resize(2);
+    assignment reversed = full;
+    for (auto & [_, slots] : reversed) {
+        std::reverse(slots.begin(), slots.end());
+    }
+    for (const bool same_counts : { false, true }) {
+        const std::string lbl = label + (same_counts ? ", equal counts" : ", different counts");
+        const set_counts & cnt = same_counts ? equal : counts;
+
         graph_log log;
-        llama_context_ptr lctx = new_set_context(model.get(), counts, &log);
-        fill_slots(lctx.get(), small, false, DEFAULT_ALIGNMENT, label + ", graph, set 0", check, 0);
-        fill_slots(lctx.get(), full,  false, DEFAULT_ALIGNMENT, label + ", graph, set 1", check, 1);
+        llama_context_ptr lctx = new_set_context(model.get(), cnt, &log);
+        const std::vector<size_t> sizes_init = compute_sizes(lctx.get());
+        fill_slots(lctx.get(), same_counts ? reversed : small, false, DEFAULT_ALIGNMENT, lbl + ", set 0", check, 0);
+        fill_slots(lctx.get(), full, false, DEFAULT_ALIGNMENT, lbl + ", set 1", check, 1);
 
         llama_memory_clear(llama_get_memory(lctx.get()), true);
         const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
-        const std::vector<llama_token> tokens = get_tokens(N_TOKENS_SHORT, n_vocab, 42);
-        auto decode = [&](size_t pos, int32_t set) {
+        const std::vector<llama_token> tokens = get_tokens(64, n_vocab, 42);
+        llama_pos pos = 0;
+        auto decode = [&](size_t n, int32_t set) {
             llama_set_moe_slot_set(lctx.get(), set);
             const bool pending = llama_sched_reserve_pending(lctx.get());
-            common_batch one(lctx.get());
-            one.add(tokens[pos % tokens.size()], (llama_pos) pos, 0, true);
-            if (llama_process(lctx.get(), LLAMA_PROCESS_TYPE_DECODE, one.get())) {
+            common_batch batch(lctx.get());
+            for (size_t i = 0; i < n; ++i, ++pos) {
+                batch.add(tokens[pos % tokens.size()], pos, 0, true);
+            }
+            if (llama_process(lctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
                 throw std::runtime_error("failed to decode");
             }
             return pending;
         };
 
-        // a first single-token graph on each set settles the allocation of that shape
-        decode(0, 0);
+        // a first single-token graph settles the placement of that shape
         decode(1, 1);
         const size_t first = log.nodes.size();
         const int n_reserve = log.n_reserve;
+        const int n_grow    = log.n_grow;
+        const int n_splits  = ggml_backend_sched_get_n_splits(llama_get_sched(lctx.get()));
         const int32_t n_reused = llama_perf_context(lctx.get()).n_reused;
 
         const int32_t sets[] = { 0, 0, 1, 1, 0 };
         bool pending = false;
+        bool splits  = true;
         std::vector<int32_t> reused;
         for (size_t i = 0; i < std::size(sets); ++i) {
-            pending = decode(2 + i, sets[i]) || pending;
+            pending = decode(1, sets[i]) || pending;
+            splits  = splits && ggml_backend_sched_get_n_splits(llama_get_sched(lctx.get())) == n_splits;
             reused.push_back(llama_perf_context(lctx.get()).n_reused - n_reused);
         }
-        check(log.nodes.size() == first + std::size(sets), label + ": one graph per decode");
+        const int n_replan = log.n_reserve - n_reserve;
+        check(log.nodes.size() == first + std::size(sets), lbl + ": one graph per decode");
         // decodes 0 and 2 and 4 switch sets, decodes 1 and 3 repeat theirs
-        check(reused == std::vector<int32_t>({ 0, 1, 1, 2, 2 }), label + ": a set switch rebuilds the graph, a repeated set reuses it");
-        check(!pending && log.n_reserve == n_reserve, label + ": a set switch reserves no scheduler (" + std::to_string(log.n_reserve - n_reserve) + " reserves)");
+        check(reused == std::vector<int32_t>({ 0, 1, 1, 2, 2 }), lbl + ": a set switch rebuilds the graph, a repeated set reuses it");
+        check(!pending, lbl + ": a set switch leaves no scheduler reserve pending");
+        check(splits,   lbl + ": the graph of every set has the same splits (" + std::to_string(n_splits) + ")");
+        if (same_counts) {
+            check(n_replan == 0, lbl + ": a set switch places the graph as the previous one (" + std::to_string(n_replan) + " placements)");
+        } else {
+            printf("  %-90s %s\n", (lbl + ": placements on the 3 set switches").c_str(), std::to_string(n_replan).c_str());
+        }
 
         bool same_nodes = true;
         bool own_slots  = true;
@@ -954,34 +1004,42 @@ static void test_slot_sets(const std::string & path, const std::vector<ggml_back
             }
             own_slots = own_slots && log.slots[g].size() >= layers.size();
         }
-        check(same_nodes, label + ": the node list is identical across sets (" + std::to_string(log.nodes[first].size()) + " nodes)");
-        check(own_slots,  label + ": each graph reads the slot tensors of its set only");
+        check(same_nodes, lbl + ": the node list is identical across sets (" + std::to_string(log.nodes[first].size()) + " nodes)");
+        check(own_slots,  lbl + ": each graph reads the slot tensors of its set only");
+
+        // a batch of the reserve width on each set, the widest graph a decode can build, fits the initial buffers
+        llama_memory_clear(llama_get_memory(lctx.get()), true);
+        pos = 0;
+        decode(64, 1);
+        decode(64, 0);
+        check(log.n_grow == n_grow && compute_sizes(lctx.get()) == sizes_init,
+            lbl + ": the compute buffers reserved at initialization hold every set, single tokens and full batches");
     }
 
-    // a set with no slots for a layer: the context initializes, a graph that reads the layer on that set fails to build
+    // a set with no slots for a layer, even the initial set 0: the context initializes, its reserve reads the set that
+    //     has slots, and a graph that reads the layer on the set without them fails to build
     {
         set_counts holes;
         holes.n_slots.resize(2);
-        holes.n_slots[1][layers.begin()->first] = 0;
+        holes.n_slots[0][layers.begin()->first] = 0;
         llama_context_ptr lctx = new_set_context(model.get(), holes);
         llama_moe_slot_layout layout;
-        check(!llama_context_moe_slot_layout(lctx.get(), layers.begin()->first, 1, &layout) &&
-               llama_context_moe_slot_layout(lctx.get(), layers.begin()->first, 0, &layout),
-            label + ": a layer with 0 slots in set 1 has no layout in set 1, and one in set 0");
-        fill_slots(lctx.get(), full, false, DEFAULT_ALIGNMENT, label + ", holes, set 0", check, 0);
+        check(!llama_context_moe_slot_layout(lctx.get(), layers.begin()->first, 0, &layout) &&
+               llama_context_moe_slot_layout(lctx.get(), layers.begin()->first, 1, &layout),
+            label + ": a layer with 0 slots in set 0 has no layout in set 0, and one in set 1");
+        fill_slots(lctx.get(), full, false, DEFAULT_ALIGNMENT, label + ", holes, set 1", check, 1);
 
-        llama_set_moe_slot_set(lctx.get(), 1);
         g_log.clear();
         bool failed = false;
         try {
             get_logits(lctx.get(), N_TOKENS_SHORT, N_BATCH_SHORT);
         } catch (const std::exception &) {
-            failed = g_log.find("but the context has no slots for it in set 1") != std::string::npos;
+            failed = g_log.find("but the context has no slots for it in set 0") != std::string::npos;
         }
         check(failed, label + ": a decode on a set with 0 slots for a layer that its graph reads fails to build");
 
-        llama_set_moe_slot_set(lctx.get(), 0);
-        check(same_bits(get_logits(lctx.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long), label + ": the context then decodes on set 0");
+        llama_set_moe_slot_set(lctx.get(), 1);
+        check(same_bits(get_logits(lctx.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long), label + ": the context then decodes on set 1");
     }
 
     // a context with no slot set is refused

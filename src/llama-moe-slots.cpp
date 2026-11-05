@@ -171,6 +171,17 @@ const llama_moe_slot_region * llama_moe_slot_pool::region(int32_t set, int32_t i
     return it == regions[set].end() ? nullptr : &it->second;
 }
 
+const llama_moe_slot_region * llama_moe_slot_pool::widest(int32_t il) const {
+    const llama_moe_slot_region * res = nullptr;
+    for (const auto & set : regions) {
+        const auto it = set.find(il);
+        if (it != set.end() && (res == nullptr || it->second.n_slots > res->n_slots)) {
+            res = &it->second;
+        }
+    }
+    return res;
+}
+
 std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> llama_moe_slot_pool::substitutes() const {
     std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> res;
     for (const auto & set : regions) {
