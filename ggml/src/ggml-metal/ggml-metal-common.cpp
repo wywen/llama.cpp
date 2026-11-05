@@ -410,7 +410,21 @@ struct node_info {
     }
 };
 
-static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node_info> & nodes, bool stop_at_boundary_markers) {
+// does the name of node start with one of the n prefixes?
+static bool ggml_graph_node_has_name_prefix(const ggml_tensor * node, int n, const char * const * prefixes) {
+    const char * name = ggml_get_name(node);
+
+    for (int i = 0; i < n; i++) {
+        if (strncmp(name, prefixes[i], strlen(prefixes[i])) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static std::vector<int> ggml_metal_graph_optimize_reorder(
+        const std::vector<node_info> & nodes, bool stop_at_boundary_markers, int n_barrier_prefixes, const char * const * barrier_prefixes) {
     // helper to add node src and dst ranges
     const auto & h_add = [](ggml_mem_ranges_t mrs, const node_info & node) {
         // only external sources matter: sources produced by the fused group are internal
@@ -517,21 +531,26 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
         }
     };
 
-    // helper to check if a node is a segment boundary that nothing may be moved across
+    // helper to check if a node is a barrier that nothing may be moved across: a boundary
+    //   marker when stop_at_boundary_markers is set, or a node with a barrier name prefix
     //
     // fusion never reorders anything by itself, but it does make a marker travel with the
     //   group it was packed into, so a group is a barrier when ANY of its nodes is one
-    const auto & h_barrier = [stop_at_boundary_markers](const node_info & node) {
-        if (!stop_at_boundary_markers) {
-            return false;
+    const auto & h_is_barrier = [&](const ggml_tensor * t) {
+        if (stop_at_boundary_markers && ggml_graph_node_is_boundary_marker(t)) {
+            return true;
         }
 
-        if (ggml_graph_node_is_boundary_marker(node.node)) {
+        return ggml_graph_node_has_name_prefix(t, n_barrier_prefixes, barrier_prefixes);
+    };
+
+    const auto & h_barrier = [&](const node_info & node) {
+        if (h_is_barrier(node.node)) {
             return true;
         }
 
         for (const auto * fused : node.fused) {
-            if (ggml_graph_node_is_boundary_marker(fused)) {
+            if (h_is_barrier(fused)) {
                 return true;
             }
         }
@@ -575,7 +594,7 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             constexpr int N_FORWARD = 64;
 
             // every node this scan selects is emitted BEFORE node0, so when node0 is a
-            //   boundary marker there is nothing it may legally pick up
+            //   barrier there is nothing it may legally pick up
             const int i1_end = h_barrier(node0) ? i0 + 1 : (i0 + N_FORWARD < n ? i0 + N_FORWARD : n);
 
             for (int i1 = i0 + 1; i1 < i1_end; i1++) {
@@ -585,7 +604,7 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
 
                 const auto & node1 = nodes[i1];
 
-                // never hoist a node from beyond a boundary marker, nor the marker itself
+                // never hoist a node from beyond a barrier, nor the barrier itself
                 if (h_barrier(node1)) {
                     break;
                 }
@@ -630,7 +649,7 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
     return res;
 }
 
-void ggml_graph_optimize(ggml_cgraph * gf, bool stop_at_boundary_markers) {
+void ggml_graph_optimize(ggml_cgraph * gf, bool stop_at_boundary_markers, int n_barrier_prefixes, const char * const * barrier_prefixes) {
     const int n = gf->n_nodes;
 
     std::vector<node_info> nodes;
@@ -645,8 +664,11 @@ void ggml_graph_optimize(ggml_cgraph * gf, bool stop_at_boundary_markers) {
     //
     // the packing itself moves nothing: a group is contiguous, and the unfuse below writes
     //   its members back in their original relative order. so a group may straddle a
-    //   boundary marker without any work crossing it - all the marker has to do is make
-    //   the group it landed in immovable, which is what h_barrier above does
+    //   barrier without any work crossing it - all the barrier has to do is make the group
+    //   it landed in immovable, which is what h_barrier above does. a barrier therefore
+    //   neither creates nor removes a fusion: the packing is the same with or without it,
+    //   and the encoder fuses over the order this function leaves, which differs only in
+    //   that the barrier's neighbours were not moved
     for (int i = 0; i < n; i++) {
         node_info node = {
             /*.node =*/ gf->nodes[i],
@@ -668,7 +690,7 @@ void ggml_graph_optimize(ggml_cgraph * gf, bool stop_at_boundary_markers) {
 
 #if 1
     // reorder to improve concurrency
-    const auto order = ggml_metal_graph_optimize_reorder(nodes, stop_at_boundary_markers);
+    const auto order = ggml_metal_graph_optimize_reorder(nodes, stop_at_boundary_markers, n_barrier_prefixes, barrier_prefixes);
 #else
     std::vector<int> order(nodes.size());
     for (size_t i = 0; i < nodes.size(); i++) {

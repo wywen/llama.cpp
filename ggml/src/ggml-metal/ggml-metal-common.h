@@ -72,9 +72,14 @@ bool ggml_graph_node_is_boundary_marker(const struct ggml_tensor * node);
 //   produce where its consumer expects it. off - the default - the reorder behaves
 //   exactly as it always has
 //
+// a node whose name starts with one of the n_barrier_prefixes barrier_prefixes is the same
+//   kind of barrier, whether or not stop_at_boundary_markers is set (see
+//   ggml_backend_metal_set_reorder_barrier_prefixes). with no prefixes and
+//   stop_at_boundary_markers off, the reorder behaves exactly as it always has
+//
 // note: this implementation is generic and not specific to metal
 //       if it proves to work well, we can start using it for other backends in the future
-void ggml_graph_optimize(struct ggml_cgraph * gf, bool stop_at_boundary_markers);
+void ggml_graph_optimize(struct ggml_cgraph * gf, bool stop_at_boundary_markers, int n_barrier_prefixes, const char * const * barrier_prefixes);
 
 // mat-mat vs mat-vec dispatch; used by both supports_op and ggml_metal_op_mul_mat*
 bool ggml_metal_op_mul_mat_use_fwht (const struct ggml_tensor * op, size_t max_tg_mem);

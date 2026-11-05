@@ -262,6 +262,30 @@ GGML_BACKEND_API void ggml_backend_metal_clear_encode_window(ggml_backend_t back
 // reorder freely within a segment. Off, the reorder is byte-for-byte what it always was.
 GGML_BACKEND_API void ggml_backend_metal_set_reorder_barriers(ggml_backend_t backend, bool enable);
 
+// Make the Metal graph reorder treat every node whose name starts with one of `prefixes` as a
+// hard barrier, the way ggml_backend_metal_set_reorder_barriers treats the per-layer output
+// tensors: no node moves across one in either direction, and a fusion group that contains one
+// keeps its place. Fusion is otherwise unchanged; nodes still reorder freely between barriers.
+//
+// A caller that places boundary-schedule cuts or host cuts at nodes other than the per-layer
+// outputs needs those nodes to keep their place. The reorder only sees the dependencies the
+// graph records, not the ones a cut adds: it may move a node that reads what a host cut's fn
+// writes (a lookup into a buffer fn fills, say) in front of the cut, or move a node meant to run
+// before the cut behind it, since neither depends on the cut node in the graph.
+//
+// The schedule and the host cuts cannot name the barriers themselves: ggml_backend_sched
+// reorders each split while splitting the graph, before a caller installs them, and a reused
+// graph is not reordered again. What a node already carries at that point is its name, so the
+// caller registers the prefixes of the names it will cut at -- before the graph is allocated,
+// and covering every node it may cut at in any compute of that graph. A prefix that matches more
+// nodes than are cut only costs concurrency.
+//
+// Independent of ggml_backend_metal_set_reorder_barriers. Each call replaces the list and copies
+// the strings; n == 0 clears it, which is the default. Prefixes must be non-empty. Applies to
+// graphs reordered after the call.
+GGML_BACKEND_API void ggml_backend_metal_set_reorder_barrier_prefixes(
+        ggml_backend_t backend, int n, const char * const * prefixes);
+
 //
 // buffers over host memory, released and recreated
 //

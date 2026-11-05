@@ -1222,6 +1222,88 @@ static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(!graph_reuses_allocation(true));
 }
 
+// keeps the first node of the split alive until its last one
+static void keep_first_until_last(ggml_backend_t /*backend*/, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
+    if (graph->n_nodes >= 2) {
+        params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[graph->n_nodes - 1]);
+    }
+}
+
+static int graph_node_index(ggml_cgraph * graph, const ggml_tensor * t) {
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        if (ggml_graph_node(graph, i) == t) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// The scheduler's graph copy (ggml_backend_sched_get_graph) gives every node of the original
+// graph its original use count, so that a fusion check over it decides as one over a split does,
+// and gives the nodes the scheduler inserts - split input copies, the views that keep their
+// sources alive, alloc dependencies - a count of 0.
+static void test_sched_graph_use_counts() {
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    // x -> a -> b, and c = a + b on backend A; d reads c on backend B, so x and c are split
+    // inputs, and A keeps a alive until c
+    ggml_tensor * x = make_input_with_size(ctx, 16);
+    ggml_tensor * a = ggml_scale(ctx, x, 2.0f);
+    ggml_tensor * b = ggml_scale(ctx, a, 2.0f);
+    ggml_tensor * c = ggml_add(ctx, a, b);
+    ggml_tensor * d = ggml_scale(ctx, c, 2.0f);
+    assign_names(ctx);
+    ggml_set_output(d);
+    ggml_build_forward_expand(graph, d);
+
+    std::vector<ggml_tensor *> nodes;
+    std::vector<int32_t>       counts;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        nodes.push_back(ggml_graph_node(graph, i));
+        counts.push_back(ggml_node_get_use_count(graph, i));
+    }
+    GGML_ASSERT(counts[graph_node_index(graph, a)] == 2);
+
+    dummy_backend backend_a = dummy_backend_init(SIZE_MAX);
+    dummy_backend backend_b = dummy_backend_init(SIZE_MAX);
+    backend_a.context->backend.iface.graph_optimize = keep_first_until_last;
+
+    ggml_backend_t             backends[2] = { &backend_a.context->backend, &backend_b.context->backend };
+    ggml_backend_buffer_type_t bufts[2]    = { &backend_a.buffer_type, &backend_b.buffer_type };
+    ggml_backend_sched_ptr     sched(ggml_backend_sched_new(backends, bufts, 2, 16, false, false));
+    for (ggml_tensor * t : { a, b, c }) {
+        ggml_backend_sched_set_tensor_backend(sched.get(), t, backends[0]);
+    }
+    ggml_backend_sched_set_tensor_backend(sched.get(), d, backends[1]);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+    GGML_ASSERT(ggml_backend_sched_get_n_splits(sched.get()) == 2);
+
+    ggml_cgraph * scheduled = ggml_backend_sched_get_graph(sched.get());
+
+    int  n_original = 0;
+    int  n_inserted = 0;
+    bool has_dep    = false;
+    for (int i = 0; i < ggml_graph_n_nodes(scheduled); i++) {
+        ggml_tensor * node = ggml_graph_node(scheduled, i);
+        const int32_t count = ggml_node_get_use_count(scheduled, i);
+
+        const auto it = std::find(nodes.begin(), nodes.end(), node);
+        if (it != nodes.end()) {
+            GGML_ASSERT(count == counts[it - nodes.begin()]);
+            n_original++;
+        } else {
+            GGML_ASSERT(count == 0);
+            n_inserted++;
+            has_dep = has_dep || node->src[0] == a;
+        }
+    }
+
+    GGML_ASSERT(n_original == (int) nodes.size());
+    // x and c each add a source view and a copy, and A adds the dependency on a
+    GGML_ASSERT(n_inserted == 5);
+    GGML_ASSERT(has_dep);
+}
+
 // Check that the size reported by ggml_backend_alloc_ctx_tensors_from_buft_size
 // matches the actual size of the buffer allocated for the ctx tensors
 static ggml_backend_buffer_ptr check_size_matches(ggml_backend_buffer_type_t buft, ggml_context * ctx) {
@@ -1670,6 +1752,7 @@ int main() {
     run("test_shrink_replan_keeps_the_fitting_plan", test_shrink_replan_keeps_the_fitting_plan);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_sched_graph_use_counts", test_sched_graph_use_counts);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
     run("test_buft_alloc_buffer_n_zero_size", test_buft_alloc_buffer_n_zero_size);
