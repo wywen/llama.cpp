@@ -496,6 +496,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool moe_router_ahead; // add the router lookahead outputs of the MoE layers to the graph, see "MoE router lookahead" [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -851,6 +852,29 @@ extern "C" {
                              int32_t   expert,
               struct llama_moe_expert_run * runs,
                              int32_t   n_max);
+
+    //
+    // MoE router lookahead [EXPERIMENTAL]
+    //
+    // With llama_context_params.moe_router_ahead set, the graph of every MoE layer il that has a following MoE layer
+    // (see llama_model_moe_router_ahead_layer) also computes the tensor named "ffn_moe_logits_ahead-<il>": the router
+    // logits that the next MoE layer would compute if its input were layer il's router input. It uses the next layer's
+    // router weights and any scaling that the architecture applies inside its router, so it equals what that layer's
+    // "ffn_moe_logits" would hold on that input; as "ffn_moe_logits", it is taken before any router bias and gating.
+    // F32 [n_expert, n_tokens], marked as a graph output. A caller that loads experts on demand can use it to predict the
+    // next layer's choice while layer il runs, e.g. read it with ggml_graph_get_tensor on the graph, or with cb_eval.
+    //
+    // The lookahead nodes are added to the graph ahead of layer il's router and leave the rest of the graph as it is,
+    // and with the parameter off the graph has none.
+    //
+    // Supported for the architectures whose router is the plain matmul of the shared MoE FFN (e.g. llama, qwen2moe,
+    // qwen3moe, qwen35moe, qwen3next, deepseek2) and for gemma4. The other architectures that build a router of their
+    // own (nemotron-h, muse-spark, deepseek41, kimi-k3, kolibri1, grovemoe, smallthinker) have no lookahead: their
+    // graphs have no "ffn_moe_logits_ahead" tensors.
+
+    // the MoE layer that follows MoE layer il, whose router the lookahead of layer il predicts, or -1 if il is not a MoE
+    // layer or is the last one (the next-token prediction layers are not counted)
+    LLAMA_API int32_t llama_model_moe_router_ahead_layer(const struct llama_model * model, int32_t il);
 
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(

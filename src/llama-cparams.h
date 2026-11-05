@@ -65,6 +65,7 @@ struct llama_cparams : llama_memory_cparams {
     bool op_offload;
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
+    bool moe_router_ahead;   // add the router lookahead outputs of the MoE layers
 
     size_t moe_cache_size;
 

@@ -4022,6 +4022,19 @@ bool llama_model_moe_slot_geometry(const struct llama_model * model, int32_t il,
     return true;
 }
 
+int32_t llama_model_moe_router_ahead_layer(const struct llama_model * model, int32_t il) {
+    const int32_t n_layer = model->hparams.n_layer();
+    if (il < 0 || il >= n_layer || model->layers[il].ffn_gate_inp == nullptr) {
+        return -1;
+    }
+    for (int32_t il_next = il + 1; il_next < n_layer; ++il_next) {
+        if (model->layers[il_next].ffn_gate_inp != nullptr) {
+            return il_next;
+        }
+    }
+    return -1;
+}
+
 int32_t llama_model_moe_expert_runs(const struct llama_model * model, int32_t il, int32_t expert, struct llama_moe_expert_run * runs, int32_t n_max) {
     const llama_moe_slot_layer * layer = model->moe_slots.layer(il);
     if (layer == nullptr || expert < 0 || expert >= layer->n_expert) {

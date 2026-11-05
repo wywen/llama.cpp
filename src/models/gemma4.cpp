@@ -330,6 +330,14 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             // custom MoE logits calculation (router operates on attn_out, not cur)
             ggml_tensor * tmp = ggml_rms_norm(ctx0, attn_out, hparams.f_norm_rms_eps);
             tmp = ggml_scale(ctx0, tmp, 1.0f / sqrtf((float) n_embd));
+
+            // the next MoE layer's router on this layer's router input, the norm shared and the scale of that layer
+            const int il_ahead = moe_router_ahead_layer(il, model.layers[il].ffn_gate_inp);
+            if (il_ahead >= 0) {
+                ggml_tensor * tmp_ahead = ggml_mul(ctx0, tmp, model.layers[il_ahead].ffn_gate_inp_s);
+                build_moe_router_ahead(build_lora_mm(model.layers[il_ahead].ffn_gate_inp, tmp_ahead), il);
+            }
+
             tmp = ggml_mul(ctx0, tmp, model.layers[il].ffn_gate_inp_s);
             ggml_tensor * logits = build_lora_mm(model.layers[il].ffn_gate_inp, tmp); // [n_expert, n_tokens]
             cb(logits, "ffn_moe_logits", il);

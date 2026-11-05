@@ -1510,6 +1510,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     moe_cache        (params.moe_cache),
     moe_slots        (params.moe_slots),
+    moe_routers      (params.moe_routers),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     samplers         (params.samplers),
@@ -2165,6 +2166,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
+        const int il_ahead = moe_router_ahead_layer(il, gate_inp);
+        if (il_ahead >= 0) {
+            ggml_tensor * logits_ahead = build_lora_mm((*moe_routers)[il_ahead], cur); // [n_expert, n_tokens]
+            if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+                ggml_prec_set_acc(logits_ahead, GGML_PREC_F32);
+            }
+            build_moe_router_ahead(logits_ahead, il);
+        }
+
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
             ggml_prec_set_acc(logits, GGML_PREC_F32);
@@ -2538,6 +2548,27 @@ ggml_tensor * llm_graph_moe_slots::get(const ggml_tensor * w) const {
         }
     }
     GGML_ABORT("fatal error: expert weight %s has no stand-in", w->name);
+}
+
+int llm_graph_context::moe_router_ahead_layer(int il, const ggml_tensor * router) const {
+    if (moe_routers == nullptr || router == nullptr || il < 0 || il >= (int) moe_routers->size() ||
+        (*moe_routers)[il] != router) {
+        return -1;
+    }
+
+    for (int il_next = il + 1; il_next < (int) moe_routers->size(); ++il_next) {
+        if ((*moe_routers)[il_next] != nullptr) {
+            return il_next;
+        }
+    }
+
+    return -1;
+}
+
+void llm_graph_context::build_moe_router_ahead(ggml_tensor * logits_ahead, int il) const {
+    cb(logits_ahead, "ffn_moe_logits_ahead", il);
+    ggml_set_output(logits_ahead);
+    ggml_build_forward_expand(gf, logits_ahead);
 }
 
 llm_graph_moe_slots llm_graph_context::build_moe_slots(

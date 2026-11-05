@@ -536,6 +536,7 @@ llama_context::llama_context(
 
     cparams.op_offload     = params.op_offload;
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_router_ahead = params.moe_router_ahead;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -637,6 +638,13 @@ llama_context::llama_context(
     // the slots of the MoE layers that read their expert weights from slots, as the KV cache: per context, not state
     if (!model.moe_slots.empty()) {
         moe_slots = std::make_unique<llama_moe_slot_pool>(model.moe_slots, params.moe_slots, params.moe_slots_user_data, model.no_alloc());
+    }
+
+    if (cparams.moe_router_ahead && !hparams.vocab_only) {
+        const int32_t n_layer = hparams.n_layer();
+        for (int32_t il = 0; il < n_layer; ++il) {
+            moe_routers.push_back(model.layers[il].ffn_gate_inp);
+        }
     }
 
     // init backends
@@ -2961,6 +2969,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
         /*.moe_slots   =*/ moe_slots.get(),
+        /*.moe_routers =*/ moe_routers.empty() ? nullptr : &moe_routers,
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
@@ -4342,6 +4351,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.moe_router_ahead            =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
