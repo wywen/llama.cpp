@@ -887,10 +887,17 @@ extern "C" {
     // The lookahead nodes are added to the graph ahead of layer il's router and leave the rest of the graph as it is,
     // and with the parameter off the graph has none.
     //
+    // Cost: as graph outputs, the lookaheads are never overwritten by later nodes, so the compute buffers hold all of
+    // them at once: up to n_expert * n_ubatch * 4 bytes more per MoE layer that has a following MoE layer.
+    //
+    // Devices: the lookahead matmul reads the next MoE layer's router weights, so the scheduler normally runs it on the
+    // device that holds them, as any matmul on weights. When layer il and the next MoE layer are on different devices, layer il's router input is copied
+    // to that device and the lookahead lives there.
+    //
     // Supported for the architectures whose router is the plain matmul of the shared MoE FFN (e.g. llama, qwen2moe,
     // qwen3moe, qwen35moe, qwen3next, deepseek2) and for gemma4. The other architectures that build a router of their
-    // own (nemotron-h, muse-spark, deepseek41, kimi-k3, kolibri1, grovemoe, smallthinker) have no lookahead: their
-    // graphs have no "ffn_moe_logits_ahead" tensors.
+    // own (nemotron_h, nemotron_h_moe, muse-spark, deepseek41, kimi-k3, kolibri1, grovemoe, smallthinker,
+    // maion-coder) have no lookahead: their graphs have no "ffn_moe_logits_ahead" tensors.
 
     // the MoE layer that follows MoE layer il, whose router the lookahead of layer il predicts, or -1 if il is not a MoE
     // layer or is the last one (the next-token prediction layers are not counted)
