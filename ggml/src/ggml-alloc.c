@@ -503,8 +503,9 @@ struct ggml_gallocr {
     // plan again whenever a tensor size differs from the recorded plan, not only when it grew
     bool replan_on_shrink;
 
-    // the plan that last sized the buffers: it holds every tensor of a graph of its topology no
-    // larger than its own, in buffers no plan has grown since
+    // the plan that last sized the buffers, or of the last covering reserve whose graph it did not
+    // hold: it holds every tensor of a graph of its topology no larger than its own, in buffers no
+    // plan has grown since
     struct node_alloc * covering_node_allocs; // [n_covering_nodes]
     int n_covering_nodes;
     struct leaf_alloc * covering_leaf_allocs; // [n_covering_leafs]
@@ -870,14 +871,15 @@ static void ggml_gallocr_publish_covering_plan(
 static void ggml_gallocr_record_covering_plan(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 
 static bool ggml_gallocr_reserve_n_impl(
-        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
+        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc,
+        bool covers) {
     galloc->keep_recorded_plan = false;
 
     // a re-plan must not grow a chunk while the plan that sized the buffers still holds the graph:
     // the allocator plans from empty chunks, so a graph no wider than that plan's can split its
     // tensors across the chunks differently and need more of one than that plan left there
-    const bool covering_plan_fits = !no_alloc && galloc->replan_on_shrink &&
-        ggml_gallocr_covering_plan_fits(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+    const bool covering_holds = !no_alloc && ggml_gallocr_covering_plan_fits(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+    const bool covering_plan_fits = galloc->replan_on_shrink && covering_holds;
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
     // add 25% margin to avoid hash collisions
     min_hash_size += min_hash_size / 4;
@@ -1059,7 +1061,9 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
-    if (!no_alloc && reallocated) {
+    // a covering reserve names the graphs the buffers must hold from now on: its plan covers them
+    // unless the covering plan already holds its graph
+    if (!no_alloc && (reallocated || (covers && !covering_holds))) {
         ggml_gallocr_record_covering_plan(galloc, graph);
     }
 
@@ -1088,7 +1092,7 @@ static bool ggml_gallocr_reserve_n_impl(
 
 void ggml_gallocr_reserve_n_size(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, size_t * sizes) {
-    GGML_ASSERT(ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ true));
+    GGML_ASSERT(ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ true, /*covers =*/ false));
     for (int i = 0; i < galloc->n_buffers; i++) {
         sizes[i] = 0;
         for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
@@ -1098,7 +1102,11 @@ void ggml_gallocr_reserve_n_size(
 }
 
 bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
-    return ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false);
+    return ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false, /*covers =*/ false);
+}
+
+bool ggml_gallocr_reserve_n_covering(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+    return ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ false, /*covers =*/ true);
 }
 
 bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {

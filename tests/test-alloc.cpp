@@ -956,7 +956,11 @@ struct block_graph {
     ggml_cgraph *         graph;
 };
 
-static block_graph build_block(int64_t n_tokens, int64_t n_outputs, int64_t n_cells) {
+// how a block's last step reads its rows: the outputs' rows gathered, or every row, as a graph that
+// keeps every row's hidden state does
+enum class block_rows { outputs, every };
+
+static block_graph build_block(int64_t n_tokens, int64_t n_outputs, int64_t n_cells, block_rows rows_read = block_rows::outputs) {
     const int64_t n_embd = 8, n_ff = 16, n_vocab = 32, n_head = 4, n_cells_max = 64;
     block_graph g;
     ggml_init_params wparams{};
@@ -985,9 +989,13 @@ static block_graph build_block(int64_t n_tokens, int64_t n_outputs, int64_t n_ce
     ggml_tensor * v  = ggml_view_2d(ctx, vals, n_cells, n_embd, vals->nb[1], 0);
     x = ggml_add(ctx, x, ggml_mul_mat(ctx, v, kq));
     x = ggml_add(ctx, x, ggml_mul_mat(ctx, down, ggml_gelu(ctx, ggml_mul_mat(ctx, up, ggml_rms_norm(ctx, x, 1e-6f)))));
-    ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_outputs);
-    ggml_set_input(rows);
-    ggml_tensor * out = ggml_mul_mat(ctx, head, ggml_get_rows(ctx, x, rows));
+    ggml_tensor * read = x;
+    if (rows_read == block_rows::outputs) {
+        ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_outputs);
+        ggml_set_input(rows);
+        read = ggml_get_rows(ctx, x, rows);
+    }
+    ggml_tensor * out = ggml_mul_mat(ctx, head, read);
     ggml_set_output(out);
     g.graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(g.graph, out);
@@ -1150,6 +1158,74 @@ static void test_shrink_replan_keeps_the_fitting_plan() {
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), wider.graph));
     GGML_ASSERT(counts.n_reserve == n_reserve + 2);
     ggml_backend_sched_set_reserve_callback(sched.get(), nullptr, nullptr);
+}
+
+// The buffers are sized by a graph of one topology, and a reserve then names a graph of another
+// that fits them, as a context whose graphs change shape after its first reserve does. That
+// reserve's plan is the one a narrower graph of its topology falls back on: the narrow graph is
+// placed where the reserved graph was, with no reserve offered, though a fresh plan of it would grow
+// a chunk. A graph allocated without a reserve never takes that place.
+static void test_covering_reserve_names_the_graphs_to_hold() {
+    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    GGML_ASSERT(backend);
+
+    ggml_backend_buffer_type buft{};
+    buft.iface.get_name      = small_chunk_buft_get_name;
+    buft.iface.alloc_buffer  = small_chunk_buft_alloc_buffer;
+    buft.iface.get_alignment = small_chunk_buft_get_alignment;
+    buft.iface.get_max_size  = small_chunk_buft_get_max_size;
+    buft.iface.is_host       = small_chunk_buft_is_host;
+    buft.device              = ggml_backend_get_device(backend.get());
+
+    ggml_backend_t             backends[1] = { backend.get() };
+    ggml_backend_buffer_type_t bufts[1]    = { &buft };
+    const int                  n_chunks    = 4;
+
+    for (int covering = 0; covering < 2; covering++) {
+        ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 1, 64, false, false));
+        replan_callback_counts counts;
+        ggml_backend_sched_set_reserve_callback(sched.get(), replan_reserve_callback, &counts);
+        ggml_backend_sched_set_replan_on_shrink(sched.get(), true);
+
+        // the first topology sizes the buffers
+        block_graph first = build_block(4, 4, 64, block_rows::outputs);
+        GGML_ASSERT(ggml_backend_sched_reserve(sched.get(), first.graph));
+        std::vector<ggml_backend_buffer_t> buffers;
+        sched_extents(sched.get(), buffers, n_chunks);
+        std::vector<size_t> sizes;
+        for (int c = 0; c < n_chunks; c++) {
+            sizes.push_back(buffers[c] ? ggml_backend_buffer_get_size(buffers[c]) : 0);
+        }
+
+        // the second topology fits them
+        ggml_backend_sched_reset(sched.get());
+        block_graph second = build_block(4, 4, 64, block_rows::every);
+        if (covering) {
+            GGML_ASSERT(ggml_backend_sched_reserve(sched.get(), second.graph));
+            ggml_backend_sched_reset(sched.get());
+            second = build_block(4, 4, 64, block_rows::every);
+        }
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), second.graph));
+        sched_extents(sched.get(), buffers, n_chunks);
+        for (int c = 0; c < n_chunks; c++) {
+            GGML_ASSERT((buffers[c] ? ggml_backend_buffer_get_size(buffers[c]) : 0) == sizes[c] &&
+                        "the second topology grew the buffers");
+        }
+        const auto second_placements = node_placements(second.graph);
+        const int  before            = counts.n_reserve;
+
+        ggml_backend_sched_reset(sched.get());
+        block_graph narrow = build_block(4, 4, 16, block_rows::every);
+        const bool placed = ggml_backend_sched_alloc_graph(sched.get(), narrow.graph);
+        printf("covering reserve %d: narrow graph placed %d, reserves offered %d\n", covering, placed,
+               counts.n_reserve - before);
+        if (covering) {
+            GGML_ASSERT(placed);
+            GGML_ASSERT(counts.n_reserve == before && "the reserved graph's plan was not kept");
+            GGML_ASSERT(node_placements(narrow.graph) == second_placements);
+            check_no_overlap(narrow.graph);
+        }
+    }
 }
 
 // Test re-using gallocr for a different graph. The new graph has the same
@@ -1750,6 +1826,7 @@ int main() {
     run("test_sched_prepare_and_synchronize_callbacks", test_sched_prepare_and_synchronize_callbacks);
     run("test_sched_compute_extent", test_sched_compute_extent);
     run("test_shrink_replan_keeps_the_fitting_plan", test_shrink_replan_keeps_the_fitting_plan);
+    run("test_covering_reserve_names_the_graphs_to_hold", test_covering_reserve_names_the_graphs_to_hold);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_sched_graph_use_counts", test_sched_graph_use_counts);
