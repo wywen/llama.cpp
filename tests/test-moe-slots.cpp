@@ -216,6 +216,7 @@ struct wrapper_buft {
     std::vector<size_t> allocs;  // the sizes allocated
     std::vector<ggml_backend_buffer_t> bufs; // the buffers returned
     bool own_type = false;       // the buffers returned are of the wrapper's type instead of the inner one's
+    bool flip_host = false;      // the wrapper reports the opposite of the inner one's is_host
 
     wrapper_buft(ggml_backend_buffer_type_t inner, ggml_backend_dev_t dev) : inner(inner) {
         wrapper.iface = {
@@ -244,7 +245,8 @@ struct wrapper_buft {
             },
             /*.get_alloc_size_n =*/ nullptr,
             /*.is_host          =*/ [](ggml_backend_buffer_type_t buft) {
-                return ggml_backend_buft_is_host(((wrapper_buft *) buft->context)->inner);
+                auto * w = (wrapper_buft *) buft->context;
+                return ggml_backend_buft_is_host(w->inner) != w->flip_host;
             },
         };
         wrapper.device  = dev;
@@ -1048,13 +1050,16 @@ static void test_slot_sets(const std::string & path, const std::vector<ggml_back
         check(same_bits(get_logits(lctx.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long), label + ": the context then decodes on set 1");
     }
 
-    // the sets of a layer read their slots from buffers of one type: a buft that wraps the layer's buffer type and
-    //     returns its buffers is taken for one set, one that returns buffers of its own type is refused
+    // the sets of a layer read their slots from buffers of one device and one host-ness, not of one type object: a
+    // buft that returns the layer's buffers, and one that returns buffers of its own type on the same device with the
+    // same host-ness, are taken for one set; one whose host-ness differs is refused
     {
         ggml_backend_buffer_type_t inner = model->moe_slots.layer(layers.begin()->first)->buft;
-        for (const bool own_type : { false, true }) {
+        struct variant { bool own_type; bool flip_host; };
+        for (const variant v : { variant { false, false }, variant { true, false }, variant { true, true } }) {
             wrapper_buft w(inner, ggml_backend_buft_get_device(inner));
-            w.own_type = own_type;
+            w.own_type  = v.own_type;
+            w.flip_host = v.flip_host;
             set_counts one_buft = counts;
             one_buft.buft     = w.get();
             one_buft.buft_set = 1;
@@ -1064,9 +1069,11 @@ static void test_slot_sets(const std::string & path, const std::vector<ggml_back
             cparams.moe_slot_sets       = (uint32_t) one_buft.n_slots.size();
             g_log.clear();
             llama_context_ptr lctx(llama_init_from_model(model.get(), cparams));
-            if (own_type) {
-                check(!lctx && g_log.find("every set of a layer must use one buffer type") != std::string::npos,
-                    label + ": set 1 in buffers of another type than set 0's is refused");
+            if (v.flip_host) {
+                check(!lctx && g_log.find("one device and of one host-ness") != std::string::npos,
+                    label + ": set 1 in buffers of another host-ness than set 0's is refused");
+            } else if (v.own_type) {
+                check(lctx != nullptr, label + ": set 1 in buffers of its own type on set 0's device and host-ness initializes");
             } else {
                 check(lctx != nullptr, label + ": set 1 through a buft that returns buffers of set 0's type initializes");
             }
