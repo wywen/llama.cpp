@@ -127,13 +127,19 @@ void llama_moe_slot_pool::add_region(int32_t set, const llama_moe_slot_layer * l
     bufs.push_back({ ggml_backend_buffer_ptr(buf), ggml_backend_buffer_get_type(buf), size });
     region.buf = buf;
 
-    // a switch of set must keep the graph's splits, so every set of a layer reads its slots on the same backend
+    // a switch of set must keep the graph's splits, so every set of a layer reads its slots on the same backend: the
+    // choice depends on the buffer type's device and on whether it is host memory, not on the type object
     for (int32_t s = 0; s < set; ++s) {
         const auto it = regions[s].find(il);
-        if (it != regions[s].end() && ggml_backend_buffer_get_type(it->second.buf) != ggml_backend_buffer_get_type(buf)) {
-            throw std::runtime_error(format("layer %d, set %d: the MoE slot buffer is of type %s, set %d's of type %s; every set of a layer must use one buffer type",
-                il, set, ggml_backend_buft_name(ggml_backend_buffer_get_type(buf)), s,
-                ggml_backend_buft_name(ggml_backend_buffer_get_type(it->second.buf))));
+        if (it == regions[s].end()) {
+            continue;
+        }
+        ggml_backend_buffer_type_t other = ggml_backend_buffer_get_type(it->second.buf);
+        ggml_backend_buffer_type_t mine  = ggml_backend_buffer_get_type(buf);
+        if (ggml_backend_buft_get_device(other) != ggml_backend_buft_get_device(mine) ||
+            ggml_backend_buft_is_host(other)    != ggml_backend_buft_is_host(mine)) {
+            throw std::runtime_error(format("layer %d, set %d: the MoE slot buffer is of type %s, set %d's of type %s; every set of a layer must use buffer types of one device and of one host-ness",
+                il, set, ggml_backend_buft_name(mine), s, ggml_backend_buft_name(other)));
         }
     }
 
