@@ -912,15 +912,13 @@ static void test_slot_sets(const std::string & path, const std::vector<ggml_back
             label + ": a batch on set 0, then a token on set 1, in one sequence is bitwise identical");
 
         // an out-of-range set is refused, and the context keeps reading its set: set 0 cannot compute the long prompt
-        llama_set_moe_slot_set(lctx.get(), 1);
-        bool refused = true;
+        bool refused = llama_set_moe_slot_set(lctx.get(), 1);
         for (const int32_t set : { 2, -1 }) {
             g_log.clear();
-            llama_set_moe_slot_set(lctx.get(), set);
-            refused = refused && g_log.find("is out of range") != std::string::npos;
+            refused = refused && !llama_set_moe_slot_set(lctx.get(), set) && g_log.find("is out of range") != std::string::npos;
         }
         check(refused && same_bits(get_logits(lctx.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long),
-            label + ": sets 2 and -1 are refused, the context keeps reading set 1");
+            label + ": set 1 is taken, sets 2 and -1 are refused, the context keeps reading set 1");
 
         llama_moe_slot_layout layout;
         check(!llama_context_moe_slot_layout(lctx.get(), layers.begin()->first, 2, &layout) &&

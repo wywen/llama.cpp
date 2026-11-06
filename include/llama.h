@@ -845,9 +845,9 @@ extern "C" {
     // not read its experts from slots, `set` is out of range or the set has no slots for the layer
     LLAMA_API bool llama_context_moe_slot_layout(const struct llama_context * ctx, int32_t il, int32_t set, struct llama_moe_slot_layout * layout);
 
-    // the slot set that the following graphs read, in [0, llama_context_params.moe_slot_sets); an out-of-range set is
-    // refused with an error and the context keeps reading its current set
-    LLAMA_API void llama_set_moe_slot_set(struct llama_context * ctx, int32_t set);
+    // the slot set that the following graphs read, in [0, llama_context_params.moe_slot_sets); returns false for an
+    // out-of-range set, which is refused with an error, and the context keeps reading its current set
+    LLAMA_API bool llama_set_moe_slot_set(struct llama_context * ctx, int32_t set);
 
     // the slot geometry of layer il, as llama_context_moe_slot_layout reports it for every context; returns false,
     // leaving the outputs untouched, if the layer does not read its experts from slots
