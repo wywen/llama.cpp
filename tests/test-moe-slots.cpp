@@ -1056,7 +1056,13 @@ static void test_slot_sets(const std::string & path, const std::vector<ggml_back
     {
         ggml_backend_buffer_type_t inner = model->moe_slots.layer(layers.begin()->first)->buft;
         struct variant { bool own_type; bool flip_host; };
+        // a GPU backend recognizes its buffer types by their functions, so only the CPU takes a buft of another object
+        const bool on_cpu = ggml_backend_dev_type(ggml_backend_buft_get_device(inner)) == GGML_BACKEND_DEVICE_TYPE_CPU;
         for (const variant v : { variant { false, false }, variant { true, false }, variant { true, true } }) {
+            if (v.own_type && !v.flip_host && !on_cpu) {
+                fprintf(stderr, "%s: skipped, a buft of its own type on the layer's device is accepted on the CPU only\n", label.c_str());
+                continue;
+            }
             wrapper_buft w(inner, ggml_backend_buft_get_device(inner));
             w.own_type  = v.own_type;
             w.flip_host = v.flip_host;
