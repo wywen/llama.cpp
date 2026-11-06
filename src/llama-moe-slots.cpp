@@ -127,6 +127,16 @@ void llama_moe_slot_pool::add_region(int32_t set, const llama_moe_slot_layer * l
     bufs.push_back({ ggml_backend_buffer_ptr(buf), ggml_backend_buffer_get_type(buf), size });
     region.buf = buf;
 
+    // a switch of set must keep the graph's splits, so every set of a layer reads its slots on the same backend
+    for (int32_t s = 0; s < set; ++s) {
+        const auto it = regions[s].find(il);
+        if (it != regions[s].end() && ggml_backend_buffer_get_type(it->second.buf) != ggml_backend_buffer_get_type(buf)) {
+            throw std::runtime_error(format("layer %d, set %d: the MoE slot buffer is of type %s, set %d's of type %s; every set of a layer must use one buffer type",
+                il, set, ggml_backend_buft_name(ggml_backend_buffer_get_type(buf)), s,
+                ggml_backend_buft_name(ggml_backend_buffer_get_type(it->second.buf))));
+        }
+    }
+
     // the tensors of set 0 keep the names of a context with one set
     const std::string suffix = set == 0 ? "" : format(".set%d", set);
 
