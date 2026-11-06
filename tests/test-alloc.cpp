@@ -1230,6 +1230,73 @@ static void test_covering_reserve_names_the_graphs_to_hold() {
     }
 }
 
+// The buffers are sized by a wide graph of one topology, and a reserve then names a narrower graph
+// of another. That reserve's plan covers its own topology only: a narrower graph of the first
+// topology is still placed by the wide graph's plan, with no reserve offered, though a fresh plan of
+// it would grow a chunk; a narrower graph of the second topology is placed by the reserve's plan.
+static void test_narrow_reserve_of_another_topology_keeps_the_plan() {
+    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    GGML_ASSERT(backend);
+
+    ggml_backend_buffer_type buft{};
+    buft.iface.get_name      = small_chunk_buft_get_name;
+    buft.iface.alloc_buffer  = small_chunk_buft_alloc_buffer;
+    buft.iface.get_alignment = small_chunk_buft_get_alignment;
+    buft.iface.get_max_size  = small_chunk_buft_get_max_size;
+    buft.iface.is_host       = small_chunk_buft_is_host;
+    buft.device              = ggml_backend_get_device(backend.get());
+
+    ggml_backend_t             backends[1] = { backend.get() };
+    ggml_backend_buffer_type_t bufts[1]    = { &buft };
+
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 1, 64, false, false));
+    replan_callback_counts counts;
+    ggml_backend_sched_set_reserve_callback(sched.get(), replan_reserve_callback, &counts);
+    ggml_backend_sched_set_replan_on_shrink(sched.get(), true);
+
+    // the wide graph of the first topology sizes the buffers
+    block_graph wide = build_block(4, 4, 64, block_rows::outputs);
+    GGML_ASSERT(ggml_backend_sched_reserve(sched.get(), wide.graph));
+    const std::vector<size_t> wide_sizes = counts.last_sizes;
+    const size_t              wide_size  = ggml_backend_sched_get_buffer_size(sched.get(), backend.get());
+    ggml_backend_sched_reset(sched.get());
+    wide = build_block(4, 4, 64, block_rows::outputs);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), wide.graph));
+    const auto wide_placements = node_placements(wide.graph);
+
+    // a narrower reserve of the second topology fits them
+    ggml_backend_sched_reset(sched.get());
+    block_graph other = build_block(4, 4, 48, block_rows::every);
+    GGML_ASSERT(ggml_backend_sched_reserve(sched.get(), other.graph));
+    // each reservation is max(current, planned) for one chunk
+    GGML_ASSERT(counts.last_sizes == wide_sizes && "the second topology's reserve grew the buffers");
+    ggml_backend_sched_reset(sched.get());
+    other = build_block(4, 4, 48, block_rows::every);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), other.graph));
+    const auto other_placements = node_placements(other.graph);
+    const int n_reserve = counts.n_reserve;
+
+    // a narrower graph of the first topology, whose fresh plan grows a chunk, keeps the wide plan
+    ggml_backend_sched_reset(sched.get());
+    block_graph narrow = build_block(4, 1, 16, block_rows::outputs);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), narrow.graph));
+    printf("narrow graph of the first topology: reserves offered %d\n", counts.n_reserve - n_reserve);
+    GGML_ASSERT(counts.n_reserve == n_reserve && "the other topology's reserve took the wide graph's plan");
+    GGML_ASSERT(node_placements(narrow.graph) == wide_placements);
+    GGML_ASSERT(ggml_backend_sched_get_buffer_size(sched.get(), backend.get()) == wide_size);
+    check_no_overlap(narrow.graph);
+
+    // the second topology still falls back on its reserve's plan
+    ggml_backend_sched_reset(sched.get());
+    block_graph other_narrow = build_block(4, 1, 16, block_rows::every);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), other_narrow.graph));
+    printf("narrow graph of the second topology: reserves offered %d\n", counts.n_reserve - n_reserve);
+    GGML_ASSERT(counts.n_reserve == n_reserve && "the second topology's reserve plan was not kept");
+    GGML_ASSERT(node_placements(other_narrow.graph) == other_placements);
+    check_no_overlap(other_narrow.graph);
+    ggml_backend_sched_set_reserve_callback(sched.get(), nullptr, nullptr);
+}
+
 // Test re-using gallocr for a different graph. The new graph has the same
 // total size, but one of the chunks is larger, so reallocation is required.
 static void test_reallocation() {
@@ -1829,6 +1896,7 @@ int main() {
     run("test_sched_compute_extent", test_sched_compute_extent);
     run("test_shrink_replan_keeps_the_fitting_plan", test_shrink_replan_keeps_the_fitting_plan);
     run("test_covering_reserve_names_the_graphs_to_hold", test_covering_reserve_names_the_graphs_to_hold);
+    run("test_narrow_reserve_of_another_topology_keeps_the_plan", test_narrow_reserve_of_another_topology_keeps_the_plan);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_sched_graph_use_counts", test_sched_graph_use_counts);

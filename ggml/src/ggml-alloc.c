@@ -479,6 +479,25 @@ struct node_alloc {
     struct tensor_alloc src[GGML_MAX_SRC];
 };
 
+// a plan recorded for a re-plan to fall back on rather than grow a chunk
+struct covering_plan {
+    struct node_alloc * node_allocs; // [n_nodes]
+    int n_nodes;
+    struct leaf_alloc * leaf_allocs; // [n_leafs]
+    int n_leafs;
+    // whether each node was outside the plan: see ggml_gallocr_node_is_outside_plan
+    bool * node_outside; // [n_nodes]
+};
+
+#define GGML_GALLOCR_MAX_COVERING_PLANS 8
+
+static void ggml_gallocr_free_covering_plan(struct covering_plan * plan) {
+    free(plan->node_allocs);
+    free(plan->leaf_allocs);
+    free(plan->node_outside);
+    *plan = (struct covering_plan) {0};
+}
+
 struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
@@ -503,15 +522,11 @@ struct ggml_gallocr {
     // plan again whenever a tensor size differs from the recorded plan, not only when it grew
     bool replan_on_shrink;
 
-    // the plan that last sized the buffers, or of the last covering reserve whose graph it did not
-    // hold: it holds every tensor of a graph of its topology no larger than its own, in buffers no
-    // plan has grown since
-    struct node_alloc * covering_node_allocs; // [n_covering_nodes]
-    int n_covering_nodes;
-    struct leaf_alloc * covering_leaf_allocs; // [n_covering_leafs]
-    int n_covering_leafs;
-    // whether each node of the covering plan was outside it: see ggml_gallocr_node_is_outside_plan
-    bool * covering_node_outside; // [n_covering_nodes]
+    // at most one covering plan per topology: the plan that last sized the buffers, and the plans of
+    // the covering reserves of other topologies since; each holds every tensor of a graph of its
+    // topology no larger than its own, in buffers no plan has grown since
+    struct covering_plan covering[GGML_GALLOCR_MAX_COVERING_PLANS];
+    int n_covering;
 
     // the last reserve published the covering plan in place of its own, which would have grown a
     // chunk; the next ggml_gallocr_alloc_graph places the graph by it
@@ -614,9 +629,9 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->chunk_extents);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
-    free(galloc->covering_node_allocs);
-    free(galloc->covering_leaf_allocs);
-    free(galloc->covering_node_outside);
+    for (int i = 0; i < galloc->n_covering; i++) {
+        ggml_gallocr_free_covering_plan(&galloc->covering[i]);
+    }
     free(galloc);
 }
 
@@ -863,23 +878,24 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     }
 }
 
-static bool ggml_gallocr_covering_plan_fits(
+static int ggml_gallocr_find_covering_plan(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids);
 static bool ggml_gallocr_plan_grows_a_chunk(ggml_gallocr_t galloc);
 static void ggml_gallocr_publish_covering_plan(
-        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids);
-static void ggml_gallocr_record_covering_plan(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
+        ggml_gallocr_t galloc, const struct covering_plan * plan, struct ggml_cgraph * graph, const int * node_buffer_ids,
+        const int * leaf_buffer_ids);
+static void ggml_gallocr_record_covering_plan(ggml_gallocr_t galloc, struct ggml_cgraph * graph, bool resized);
 
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc,
         bool covers) {
     galloc->keep_recorded_plan = false;
 
-    // a re-plan must not grow a chunk while the plan that sized the buffers still holds the graph:
+    // a re-plan must not grow a chunk while a covering plan still holds the graph:
     // the allocator plans from empty chunks, so a graph no wider than that plan's can split its
     // tensors across the chunks differently and need more of one than that plan left there
-    const bool covering_holds = !no_alloc && ggml_gallocr_covering_plan_fits(galloc, graph, node_buffer_ids, leaf_buffer_ids);
-    const bool covering_plan_fits = galloc->replan_on_shrink && covering_holds;
+    const int covering_holds = no_alloc ? -1 : ggml_gallocr_find_covering_plan(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+    const bool covering_plan_fits = galloc->replan_on_shrink && covering_holds >= 0;
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
     // add 25% margin to avoid hash collisions
     min_hash_size += min_hash_size / 4;
@@ -906,7 +922,7 @@ static bool ggml_gallocr_reserve_n_impl(
     if (covering_plan_fits && ggml_gallocr_plan_grows_a_chunk(galloc)) {
         // place the graph by the covering plan in the buffers it sized; the extents are the
         // graph's under that plan
-        ggml_gallocr_publish_covering_plan(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+        ggml_gallocr_publish_covering_plan(galloc, &galloc->covering[covering_holds], graph, node_buffer_ids, leaf_buffer_ids);
         galloc->keep_recorded_plan = true;
         return true;
     }
@@ -1062,9 +1078,9 @@ static bool ggml_gallocr_reserve_n_impl(
     }
 
     // a covering reserve names the graphs the buffers must hold from now on: its plan covers them
-    // unless the covering plan already holds its graph
-    if (!no_alloc && (reallocated || (covers && !covering_holds))) {
-        ggml_gallocr_record_covering_plan(galloc, graph);
+    // unless a covering plan already holds its graph
+    if (!no_alloc && (reallocated || (covers && covering_holds < 0))) {
+        ggml_gallocr_record_covering_plan(galloc, graph, reallocated);
     }
 
     if (!no_alloc) {
@@ -1186,24 +1202,24 @@ static bool ggml_gallocr_node_is_outside_plan(const struct ggml_tensor * node) {
     return true;
 }
 
-// whether the covering plan places every tensor of graph as it is: the same topology on the same
-// buffer ids, and no tensor larger than its allocation in the plan. The nodes outside the plan are
-// set aside on both sides, so a graph whose optimizer moved them still matches; the nodes the plan
-// places are matched in order. With remapped set, writes the plan for graph's own node order
-// there, [graph->n_nodes].
+// whether plan places every tensor of graph as it is: the same topology on the same buffer ids, and
+// no tensor larger than its allocation in the plan. The nodes outside the plan are set aside on
+// both sides, so a graph whose optimizer moved them still matches; the nodes the plan places are
+// matched in order. With remapped set, writes the plan for graph's own node order there,
+// [graph->n_nodes].
 static bool ggml_gallocr_match_covering_plan(
-        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids,
-        struct node_alloc * remapped) {
-    if (galloc->n_covering_nodes != graph->n_nodes || galloc->n_covering_leafs != graph->n_leafs) {
+        ggml_gallocr_t galloc, const struct covering_plan * plan, struct ggml_cgraph * graph, const int * node_buffer_ids,
+        const int * leaf_buffer_ids, struct node_alloc * remapped) {
+    if (plan->n_nodes != graph->n_nodes || plan->n_leafs != graph->n_leafs) {
         return false;
     }
     for (int i = 0; i < graph->n_leafs; i++) {
-        const int buffer_id = galloc->covering_leaf_allocs[i].leaf.buffer_id;
+        const int buffer_id = plan->leaf_allocs[i].leaf.buffer_id;
         if (buffer_id >= 0 && buffer_id != get_node_buffer_id(leaf_buffer_ids, i)) {
             return false;
         }
     }
-    int k = 0; // the next covering node not yet matched
+    int k = 0; // the next plan node not yet matched
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         if (ggml_gallocr_node_is_outside_plan(node)) {
@@ -1218,13 +1234,13 @@ static bool ggml_gallocr_match_covering_plan(
             }
             continue;
         }
-        while (k < galloc->n_covering_nodes && galloc->covering_node_outside[k]) {
+        while (k < plan->n_nodes && plan->node_outside[k]) {
             k++;
         }
-        if (k == galloc->n_covering_nodes) {
+        if (k == plan->n_nodes) {
             return false;
         }
-        struct node_alloc node_alloc = galloc->covering_node_allocs[k++];
+        struct node_alloc node_alloc = plan->node_allocs[k++];
         if (node_alloc.dst.buffer_id >= 0 && node_alloc.dst.buffer_id != get_node_buffer_id(node_buffer_ids, i)) {
             return false;
         }
@@ -1241,22 +1257,71 @@ static bool ggml_gallocr_match_covering_plan(
             remapped[i] = node_alloc;
         }
     }
-    // every node the covering plan places is matched: the counts agree, so none is left over
-    while (k < galloc->n_covering_nodes && galloc->covering_node_outside[k]) {
+    // every node the plan places is matched: the counts agree, so none is left over
+    while (k < plan->n_nodes && plan->node_outside[k]) {
         k++;
     }
-    return k == galloc->n_covering_nodes;
+    return k == plan->n_nodes;
 }
 
-static bool ggml_gallocr_covering_plan_fits(
+// the index of a covering plan that holds graph in the current buffers, or -1
+static int ggml_gallocr_find_covering_plan(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
     for (int i = 0; i < galloc->n_buffers; i++) {
         if (galloc->buffers[i] == NULL) {
-            return false;
+            return -1;
         }
     }
-    return galloc->covering_node_allocs != NULL &&
-        ggml_gallocr_match_covering_plan(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*remapped =*/ NULL);
+    for (int i = 0; i < galloc->n_covering; i++) {
+        if (ggml_gallocr_match_covering_plan(galloc, &galloc->covering[i], graph, node_buffer_ids, leaf_buffer_ids, /*remapped =*/ NULL)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool ggml_gallocr_talloc_covers(const struct tensor_alloc * a, const struct tensor_alloc * b, bool * same_topology) {
+    if (a->buffer_id != b->buffer_id) {
+        *same_topology = false;
+        return false;
+    }
+    return a->size_max >= b->size_max;
+}
+
+// whether plans a and b are of one topology, as far as plans tell (the same tensor counts on the
+// same buffer ids), and whether a then gives every tensor at least the room b does, so that a
+// holds every graph b holds. Taking two topologies for one only drops a plan to fall back on: a
+// plan places a graph only after ggml_gallocr_match_covering_plan holds it.
+static bool ggml_gallocr_plan_covers(const struct covering_plan * a, const struct covering_plan * b, bool * same_topology) {
+    *same_topology = a->n_nodes == b->n_nodes && a->n_leafs == b->n_leafs;
+    if (!*same_topology) {
+        return false;
+    }
+    bool covers = true;
+    for (int i = 0; i < a->n_leafs; i++) {
+        covers &= ggml_gallocr_talloc_covers(&a->leaf_allocs[i].leaf, &b->leaf_allocs[i].leaf, same_topology);
+    }
+    int ka = 0;
+    int kb = 0;
+    for (;;) {
+        while (ka < a->n_nodes && a->node_outside[ka]) {
+            ka++;
+        }
+        while (kb < b->n_nodes && b->node_outside[kb]) {
+            kb++;
+        }
+        if (ka == a->n_nodes || kb == b->n_nodes) {
+            *same_topology &= ka == a->n_nodes && kb == b->n_nodes;
+            break;
+        }
+        covers &= ggml_gallocr_talloc_covers(&a->node_allocs[ka].dst, &b->node_allocs[kb].dst, same_topology);
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            covers &= ggml_gallocr_talloc_covers(&a->node_allocs[ka].src[j], &b->node_allocs[kb].src[j], same_topology);
+        }
+        ka++;
+        kb++;
+    }
+    return *same_topology && covers;
 }
 
 // whether the plan just made in the allocators needs more of any chunk than its buffer holds
@@ -1272,30 +1337,62 @@ static bool ggml_gallocr_plan_grows_a_chunk(ggml_gallocr_t galloc) {
     return false;
 }
 
-// copy the published plan, made for graph, as the covering plan
-static void ggml_gallocr_record_covering_plan(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+// record the published plan, made for graph, as a covering plan. A plan that resized the buffers
+// replaces every other, which may not hold their graphs in the new buffers. Otherwise it is the
+// covering plan of its topology, unless a plan of that topology gives some tensor more room.
+static void ggml_gallocr_record_covering_plan(ggml_gallocr_t galloc, struct ggml_cgraph * graph, bool resized) {
     GGML_ASSERT(galloc->n_nodes == graph->n_nodes);
-    free(galloc->covering_node_allocs);
-    free(galloc->covering_leaf_allocs);
-    free(galloc->covering_node_outside);
-    galloc->covering_node_allocs = malloc(sizeof(struct node_alloc) * (galloc->n_nodes > 0 ? galloc->n_nodes : 1));
-    galloc->covering_leaf_allocs = malloc(sizeof(struct leaf_alloc) * (galloc->n_leafs > 0 ? galloc->n_leafs : 1));
-    galloc->covering_node_outside = malloc(sizeof(bool) * (galloc->n_nodes > 0 ? galloc->n_nodes : 1));
-    GGML_ASSERT(galloc->covering_node_allocs != NULL && galloc->covering_leaf_allocs != NULL &&
-        galloc->covering_node_outside != NULL);
-    memcpy(galloc->covering_node_allocs, galloc->node_allocs, sizeof(struct node_alloc) * galloc->n_nodes);
-    memcpy(galloc->covering_leaf_allocs, galloc->leaf_allocs, sizeof(struct leaf_alloc) * galloc->n_leafs);
+    struct covering_plan plan = {0};
+    plan.node_allocs = malloc(sizeof(struct node_alloc) * (galloc->n_nodes > 0 ? galloc->n_nodes : 1));
+    plan.leaf_allocs = malloc(sizeof(struct leaf_alloc) * (galloc->n_leafs > 0 ? galloc->n_leafs : 1));
+    plan.node_outside = malloc(sizeof(bool) * (galloc->n_nodes > 0 ? galloc->n_nodes : 1));
+    GGML_ASSERT(plan.node_allocs != NULL && plan.leaf_allocs != NULL && plan.node_outside != NULL);
+    memcpy(plan.node_allocs, galloc->node_allocs, sizeof(struct node_alloc) * galloc->n_nodes);
+    memcpy(plan.leaf_allocs, galloc->leaf_allocs, sizeof(struct leaf_alloc) * galloc->n_leafs);
     for (int i = 0; i < graph->n_nodes; i++) {
-        galloc->covering_node_outside[i] = ggml_gallocr_node_is_outside_plan(graph->nodes[i]);
+        plan.node_outside[i] = ggml_gallocr_node_is_outside_plan(graph->nodes[i]);
     }
-    galloc->n_covering_nodes = galloc->n_nodes;
-    galloc->n_covering_leafs = galloc->n_leafs;
+    plan.n_nodes = galloc->n_nodes;
+    plan.n_leafs = galloc->n_leafs;
+
+    if (resized) {
+        for (int i = 0; i < galloc->n_covering; i++) {
+            ggml_gallocr_free_covering_plan(&galloc->covering[i]);
+        }
+        galloc->covering[0] = plan;
+        galloc->n_covering = 1;
+        return;
+    }
+
+    for (int i = 0; i < galloc->n_covering; i++) {
+        bool same_topology = false;
+        if (ggml_gallocr_plan_covers(&plan, &galloc->covering[i], &same_topology)) {
+            ggml_gallocr_free_covering_plan(&galloc->covering[i]);
+            galloc->covering[i] = plan;
+            return;
+        }
+        if (same_topology) {
+            // the plan of this topology gives some tensor more room: keep it
+            ggml_gallocr_free_covering_plan(&plan);
+            return;
+        }
+    }
+
+    // a new topology; when every place is taken, the oldest plan after the one that sized the
+    // buffers gives way
+    if (galloc->n_covering == GGML_GALLOCR_MAX_COVERING_PLANS) {
+        ggml_gallocr_free_covering_plan(&galloc->covering[1]);
+        memmove(&galloc->covering[1], &galloc->covering[2], sizeof(struct covering_plan) * (GGML_GALLOCR_MAX_COVERING_PLANS - 2));
+        galloc->n_covering--;
+    }
+    galloc->covering[galloc->n_covering++] = plan;
 }
 
 // publish the covering plan for graph, in graph's own node order, and set the chunk extents to
 // what graph addresses under it
 static void ggml_gallocr_publish_covering_plan(
-        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+        ggml_gallocr_t galloc, const struct covering_plan * plan, struct ggml_cgraph * graph, const int * node_buffer_ids,
+        const int * leaf_buffer_ids) {
     if (galloc->n_nodes < graph->n_nodes) {
         free(galloc->node_allocs);
         galloc->node_allocs = calloc(graph->n_nodes, sizeof(struct node_alloc));
@@ -1306,9 +1403,9 @@ static void ggml_gallocr_publish_covering_plan(
         galloc->leaf_allocs = calloc(graph->n_leafs, sizeof(struct leaf_alloc));
         GGML_ASSERT(galloc->leaf_allocs != NULL);
     }
-    const bool matched = ggml_gallocr_match_covering_plan(galloc, graph, node_buffer_ids, leaf_buffer_ids, galloc->node_allocs);
+    const bool matched = ggml_gallocr_match_covering_plan(galloc, plan, graph, node_buffer_ids, leaf_buffer_ids, galloc->node_allocs);
     GGML_ASSERT(matched && "the covering plan was published for a graph it does not hold");
-    memcpy(galloc->leaf_allocs, galloc->covering_leaf_allocs, sizeof(struct leaf_alloc) * graph->n_leafs);
+    memcpy(galloc->leaf_allocs, plan->leaf_allocs, sizeof(struct leaf_alloc) * graph->n_leafs);
     galloc->n_nodes = graph->n_nodes;
     galloc->n_leafs = graph->n_leafs;
 
