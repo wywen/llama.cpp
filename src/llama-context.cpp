@@ -4577,8 +4577,8 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
 }
 
-void llama_set_moe_slot_set(llama_context * ctx, int32_t set) {
-    ctx->set_moe_slot_set(set);
+bool llama_set_moe_slot_set(llama_context * ctx, int32_t set) {
+    return ctx->set_moe_slot_set(set);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

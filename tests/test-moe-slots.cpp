@@ -197,6 +197,7 @@ struct slot_counts {
     std::map<int32_t, int32_t> n_slots; // a layer not listed gets one slot per expert and n_spare
     int32_t n_spare = 0;
     ggml_backend_buffer_type_t buft = nullptr;
+    int32_t buft_set = -1; // the only set that uses buft, -1 = every set
 };
 
 static llama_moe_slot_pool_params get_slot_count(int32_t il, int32_t n_expert, int32_t /*set*/, void * ud) {
@@ -214,6 +215,7 @@ struct wrapper_buft {
     size_t max_size  = SIZE_MAX; // the inner one, at most
     std::vector<size_t> allocs;  // the sizes allocated
     std::vector<ggml_backend_buffer_t> bufs; // the buffers returned
+    bool own_type = false;       // the buffers returned are of the wrapper's type instead of the inner one's
 
     wrapper_buft(ggml_backend_buffer_type_t inner, ggml_backend_dev_t dev) : inner(inner) {
         wrapper.iface = {
@@ -222,6 +224,9 @@ struct wrapper_buft {
                 auto * w = (wrapper_buft *) buft->context;
                 w->allocs.push_back(size);
                 ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(w->inner, size);
+                if (buf != nullptr && w->own_type) {
+                    buf->buft = buft;
+                }
                 w->bufs.push_back(buf);
                 return buf;
             },
@@ -753,13 +758,14 @@ static void test_geometry(const std::string & path, const std::vector<ggml_backe
 struct set_counts {
     std::vector<std::map<int32_t, int32_t>> n_slots; // [n_sets]; a layer not listed gets one slot per expert
     ggml_backend_buffer_type_t buft = nullptr;
+    int32_t buft_set = -1; // the only set that uses buft, -1 = every set
 };
 
 static llama_moe_slot_pool_params get_set_slot_count(int32_t il, int32_t n_expert, int32_t set, void * ud) {
     const auto * counts = (const set_counts *) ud;
     const auto & n_slots = counts->n_slots.at(set);
     const auto it = n_slots.find(il);
-    return { it == n_slots.end() ? n_expert : it->second, counts->buft };
+    return { it == n_slots.end() ? n_expert : it->second, counts->buft_set < 0 || counts->buft_set == set ? counts->buft : nullptr };
 }
 
 // the graphs a context prepares, and the compute buffer plans its scheduler admits
@@ -912,15 +918,13 @@ static void test_slot_sets(const std::string & path, const std::vector<ggml_back
             label + ": a batch on set 0, then a token on set 1, in one sequence is bitwise identical");
 
         // an out-of-range set is refused, and the context keeps reading its set: set 0 cannot compute the long prompt
-        llama_set_moe_slot_set(lctx.get(), 1);
-        bool refused = true;
+        bool refused = llama_set_moe_slot_set(lctx.get(), 1);
         for (const int32_t set : { 2, -1 }) {
             g_log.clear();
-            llama_set_moe_slot_set(lctx.get(), set);
-            refused = refused && g_log.find("is out of range") != std::string::npos;
+            refused = refused && !llama_set_moe_slot_set(lctx.get(), set) && g_log.find("is out of range") != std::string::npos;
         }
         check(refused && same_bits(get_logits(lctx.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long),
-            label + ": sets 2 and -1 are refused, the context keeps reading set 1");
+            label + ": set 1 is taken, sets 2 and -1 are refused, the context keeps reading set 1");
 
         llama_moe_slot_layout layout;
         check(!llama_context_moe_slot_layout(lctx.get(), layers.begin()->first, 2, &layout) &&
@@ -991,7 +995,9 @@ static void test_slot_sets(const std::string & path, const std::vector<ggml_back
         if (same_counts) {
             check(n_replan == 0, lbl + ": a set switch places the graph as the previous one (" + std::to_string(n_replan) + " placements)");
         } else {
-            printf("  %-90s %s\n", (lbl + ": placements on the 3 set switches").c_str(), std::to_string(n_replan).c_str());
+            // 3 switches; a backend whose scratch does not depend on the slot count places nothing new
+            check(n_replan <= 3 && log.n_grow == n_grow,
+                lbl + ": a set switch places the graph at most once, within the buffers (" + std::to_string(n_replan) + " placements on 3 switches)");
         }
 
         bool same_nodes = true;
@@ -1040,6 +1046,31 @@ static void test_slot_sets(const std::string & path, const std::vector<ggml_back
 
         llama_set_moe_slot_set(lctx.get(), 1);
         check(same_bits(get_logits(lctx.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long), label + ": the context then decodes on set 1");
+    }
+
+    // the sets of a layer read their slots from buffers of one type: a buft that wraps the layer's buffer type and
+    //     returns its buffers is taken for one set, one that returns buffers of its own type is refused
+    {
+        ggml_backend_buffer_type_t inner = model->moe_slots.layer(layers.begin()->first)->buft;
+        for (const bool own_type : { false, true }) {
+            wrapper_buft w(inner, ggml_backend_buft_get_device(inner));
+            w.own_type = own_type;
+            set_counts one_buft = counts;
+            one_buft.buft     = w.get();
+            one_buft.buft_set = 1;
+            llama_context_params cparams = context_params(nullptr, nullptr);
+            cparams.moe_slots           = get_set_slot_count;
+            cparams.moe_slots_user_data = (void *) &one_buft;
+            cparams.moe_slot_sets       = (uint32_t) one_buft.n_slots.size();
+            g_log.clear();
+            llama_context_ptr lctx(llama_init_from_model(model.get(), cparams));
+            if (own_type) {
+                check(!lctx && g_log.find("every set of a layer must use one buffer type") != std::string::npos,
+                    label + ": set 1 in buffers of another type than set 0's is refused");
+            } else {
+                check(lctx != nullptr, label + ": set 1 through a buft that returns buffers of set 0's type initializes");
+            }
+        }
     }
 
     // a context with no slot set is refused
