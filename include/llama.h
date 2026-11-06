@@ -267,6 +267,8 @@ extern "C" {
         // with no_alloc calls it never
         // the ops that read the slots run on the backend that supports the type of the returned buffer, so a buft
         // that wraps the device's buffer type returns buffers of the device's type
+        // the buffers returned for one layer in every slot set must be of one type: the context refuses to initialize
+        // otherwise, since a change of set must keep the graph's splits
         ggml_backend_buffer_type_t buft;
     };
 
@@ -845,9 +847,9 @@ extern "C" {
     // not read its experts from slots, `set` is out of range or the set has no slots for the layer
     LLAMA_API bool llama_context_moe_slot_layout(const struct llama_context * ctx, int32_t il, int32_t set, struct llama_moe_slot_layout * layout);
 
-    // the slot set that the following graphs read, in [0, llama_context_params.moe_slot_sets); an out-of-range set is
-    // refused with an error and the context keeps reading its current set
-    LLAMA_API void llama_set_moe_slot_set(struct llama_context * ctx, int32_t set);
+    // the slot set that the following graphs read, in [0, llama_context_params.moe_slot_sets); returns false for an
+    // out-of-range set, which is refused with an error, and the context keeps reading its current set
+    LLAMA_API bool llama_set_moe_slot_set(struct llama_context * ctx, int32_t set);
 
     // the slot geometry of layer il, as llama_context_moe_slot_layout reports it for every context; returns false,
     // leaving the outputs untouched, if the layer does not read its experts from slots
@@ -885,10 +887,17 @@ extern "C" {
     // The lookahead nodes are added to the graph ahead of layer il's router and leave the rest of the graph as it is,
     // and with the parameter off the graph has none.
     //
+    // Cost: as graph outputs, the lookaheads are never overwritten by later nodes, so the compute buffers hold all of
+    // them at once: up to n_expert * n_ubatch * 4 bytes more per MoE layer that has a following MoE layer.
+    //
+    // Devices: the lookahead matmul reads the next MoE layer's router weights, so the scheduler normally runs it on the
+    // device that holds them, as any matmul on weights. When layer il and the next MoE layer are on different devices, layer il's router input is copied
+    // to that device and the lookahead lives there.
+    //
     // Supported for the architectures whose router is the plain matmul of the shared MoE FFN (e.g. llama, qwen2moe,
     // qwen3moe, qwen35moe, qwen3next, deepseek2) and for gemma4. The other architectures that build a router of their
-    // own (nemotron-h, muse-spark, deepseek41, kimi-k3, kolibri1, grovemoe, smallthinker) have no lookahead: their
-    // graphs have no "ffn_moe_logits_ahead" tensors.
+    // own (nemotron_h, nemotron_h_moe, muse-spark, deepseek41, kimi-k3, kolibri1, grovemoe, smallthinker,
+    // maion-coder) have no lookahead: their graphs have no "ffn_moe_logits_ahead" tensors.
 
     // the MoE layer that follows MoE layer il, whose router the lookahead of layer il predicts, or -1 if il is not a MoE
     // layer or is the last one (the next-token prediction layers are not counted)
