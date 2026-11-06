@@ -2,7 +2,8 @@
 //   - with the parameter off, the graph has no "ffn_moe_logits_ahead" tensors
 //   - with it on, every MoE layer with a following MoE layer has one, it reads the following layer's router weights,
 //     and the graph without the lookahead nodes is the graph with the parameter off, node for node
-//   - each lookahead equals the following layer's router logits recomputed on the host from the layer's router input
+//   - in each decode, the 12-token batch and every one-token decode, each lookahead equals the following layer's router
+//     logits recomputed on the host from the layer's router input
 //   - the logits with the parameter on are bitwise identical to the logits with it off
 //
 // the models are the MoE models written by test-llama-archs (-o <dir>)
@@ -85,8 +86,12 @@ static std::vector<llama_token> get_tokens(uint32_t n_tokens, uint32_t n_vocab, 
 static constexpr size_t N_TOKENS = 16;
 static constexpr size_t N_BATCH  = 12;
 
-// the logits of N_BATCH tokens in one batch, then of the other tokens one at a time, from an empty memory
-static std::vector<float> get_logits(llama_context * lctx, size_t n_batch = N_BATCH) {
+struct capture;
+static void begin_decode(capture * cap);
+
+// the logits of N_BATCH tokens in one batch, then of the other tokens one at a time, from an empty memory; a capture
+//     records each decode apart
+static std::vector<float> get_logits(llama_context * lctx, size_t n_batch = N_BATCH, capture * cap = nullptr) {
     llama_memory_clear(llama_get_memory(lctx), true);
 
     const llama_model * model = llama_get_model(lctx);
@@ -98,6 +103,7 @@ static std::vector<float> get_logits(llama_context * lctx, size_t n_batch = N_BA
     for (size_t i = 0; i < n_batch; i++) {
         batch.add(tokens[i], i, 0, true);
     }
+    begin_decode(cap);
     if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
         throw std::runtime_error("failed to decode");
     }
@@ -108,6 +114,7 @@ static std::vector<float> get_logits(llama_context * lctx, size_t n_batch = N_BA
     for (size_t i = n_batch; i < tokens.size(); i++) {
         common_batch one(lctx);
         one.add(tokens[i], i, 0, true);
+        begin_decode(cap);
         if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, one.get())) {
             throw std::runtime_error("failed to decode");
         }
@@ -259,29 +266,51 @@ static void test_graph(llama_model * model, const std::string & stem, checker & 
     }
 }
 
-// the data of the nodes that a decode computes, by tensor; the scheduler computes one node at a time
-struct capture {
-    std::map<const ggml_tensor *, std::vector<float>> data;
-    std::vector<const ggml_tensor *> ahead;  // the lookahead tensors, in graph order
-    std::map<int, const ggml_tensor *> logits; // the router logits by layer
+// a node that a decode computed, copied when the scheduler computes it: the graph of a later decode reuses the
+//     memory of the tensors, so nothing is kept by pointer except the model weights
+struct captured {
+    ggml_op op;
+    int64_t n_tokens;                      // ne[1]
+    std::vector<float> data;               // empty unless the node is F32 and contiguous
+    std::string src_name[2];
+    const ggml_tensor * src_weight[2] = {}; // a source that is a model weight, which outlives the graphs
 };
+
+// the nodes of each decode, by name; ggml names every unnamed node of a graph uniquely
+struct capture {
+    std::vector<std::map<std::string, captured>> decodes;
+};
+
+static void begin_decode(capture * cap) {
+    if (cap != nullptr) {
+        cap->decodes.emplace_back();
+    }
+}
 
 static bool capture_node(ggml_tensor * t, bool ask, void * ud) {
     if (ask) {
         return true;
     }
     auto * cap = (capture *) ud;
+    if (cap->decodes.empty()) {
+        return true; // the warmup decode at context creation
+    }
+    captured & c = cap->decodes.back()[ggml_get_name(t)];
+    c.op       = t->op;
+    c.n_tokens = t->ne[1];
     if (t->type == GGML_TYPE_F32 && ggml_is_contiguous(t)) {
-        std::vector<float> & v = cap->data[t];
-        v.resize(ggml_nelements(t));
-        ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
+        c.data.resize(ggml_nelements(t));
+        ggml_backend_tensor_get(t, c.data.data(), 0, ggml_nbytes(t));
     }
-    if (layer_of(t, AHEAD_PREFIX) >= 0) {
-        cap->ahead.push_back(t);
-    }
-    const int il = layer_of(t, LOGITS_PREFIX);
-    if (il >= 0) {
-        cap->logits[il] = t;
+    for (int s = 0; s < 2; ++s) {
+        const ggml_tensor * src = t->src[s];
+        if (src == nullptr) {
+            continue;
+        }
+        c.src_name[s] = ggml_get_name(src);
+        if (src->buffer != nullptr && ggml_backend_buffer_get_usage(src->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            c.src_weight[s] = src;
+        }
     }
     return true;
 }
@@ -316,71 +345,102 @@ static double rel_error(const std::vector<float> & a, const std::vector<double> 
     return mag > 0.0 ? err / mag : err;
 }
 
+// the lookahead of layer il in one decode against the following router recomputed on the host, or -1 if the decode
+//     lacks a node that the check needs
+static double ahead_error(const llama_model * model, const std::map<std::string, captured> & nodes, int il) {
+    const auto find = [&](const std::string & name) -> const captured * {
+        const auto it = nodes.find(name);
+        return it == nodes.end() ? nullptr : &it->second;
+    };
+    const captured * a      = find(AHEAD_PREFIX + std::to_string(il));
+    const captured * logits = find(LOGITS_PREFIX + std::to_string(il));
+    if (a == nullptr || logits == nullptr || a->data.empty() || a->src_weight[0] == nullptr) {
+        return -1.0;
+    }
+
+    // layer il's router input; an architecture that scales inside its router (gemma4) scales the shared normalized
+    // input by each layer's scale, so the lookahead scales it by the following layer's
+    std::vector<float> x_next;
+    if (a->src_name[1] == logits->src_name[1]) {
+        const captured * x = find(logits->src_name[1]);
+        if (x == nullptr || x->data.empty()) {
+            return -1.0;
+        }
+        x_next = x->data;
+    } else {
+        const captured * scaled = find(a->src_name[1]);
+        const captured * x      = find(logits->src_name[1]);
+        const std::string scale = "blk." + std::to_string(llama_model_moe_router_ahead_layer(model, il)) + ".";
+        if (scaled == nullptr || x == nullptr || scaled->op != GGML_OP_MUL || x->op != GGML_OP_MUL ||
+            x->src_name[0] != scaled->src_name[0] || scaled->src_weight[1] == nullptr ||
+            strncmp(scaled->src_name[1].c_str(), scale.c_str(), scale.size()) != 0) {
+            fprintf(stderr, "    layer %d: the lookahead input is neither the router input nor its scaled norm\n", il);
+            return -1.0;
+        }
+        const captured * norm = find(scaled->src_name[0]);
+        if (norm == nullptr || norm->data.empty()) {
+            return -1.0;
+        }
+        const std::vector<float> s = weight_rows(scaled->src_weight[1]);
+        x_next = norm->data;
+        for (size_t i = 0; i < x_next.size(); ++i) {
+            x_next[i] *= s[i % s.size()];
+        }
+    }
+
+    const ggml_tensor * w = a->src_weight[0];
+    const std::vector<float> wf = weight_rows(w);
+    const int64_t n_embd   = w->ne[0];
+    const int64_t n_expert = w->ne[1];
+    const int64_t n_tokens = a->n_tokens;
+    if ((int64_t) a->data.size() != n_expert*n_tokens || (int64_t) x_next.size() != n_embd*n_tokens) {
+        return -1.0;
+    }
+    std::vector<double> ref(n_expert*n_tokens);
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for (int64_t e = 0; e < n_expert; ++e) {
+            double sum = 0.0;
+            for (int64_t k = 0; k < n_embd; ++k) {
+                sum += (double) wf[e*n_embd + k] * x_next[t*n_embd + k];
+            }
+            ref[t*n_expert + e] = sum;
+        }
+    }
+    return rel_error(a->data, ref);
+}
+
 static void test_values(llama_model * model, const std::string & stem, checker & check) {
     capture cap;
     llama_context_ptr lctx = new_context(model, true, capture_node, &cap);
-    get_logits(lctx.get(), N_BATCH);
+    get_logits(lctx.get(), N_BATCH, &cap);
 
-    // the batch decode computes the lookahead of every layer first, then each one-token decode
-    bool all_ok = !cap.ahead.empty();
-    double worst = 0.0;
-    for (const ggml_tensor * a : cap.ahead) {
-        const int il = layer_of(a, AHEAD_PREFIX);
-        const ggml_tensor * logits = cap.logits.count(il) ? cap.logits.at(il) : nullptr;
-        if (logits == nullptr || !cap.data.count(a)) {
-            all_ok = false;
-            continue;
+    std::vector<int> layers;
+    for (int32_t il = 0; il < llama_model_n_layer(model); ++il) {
+        if (llama_model_moe_router_ahead_layer(model, il) >= 0) {
+            layers.push_back(il);
         }
-
-        // layer il's router input; an architecture that scales inside its router (gemma4) scales the shared
-        // normalized input by each layer's scale, so the lookahead scales it by the following layer's
-        const ggml_tensor * x = logits->src[1];
-        std::vector<float> x_next;
-        if (a->src[1] == x) {
-            if (!cap.data.count(x)) {
-                all_ok = false;
-                continue;
-            }
-            x_next = cap.data.at(x);
-        } else {
-            const ggml_tensor * scaled = a->src[1];
-            const ggml_tensor * norm   = scaled->src[0];
-            const std::string scale = "blk." + std::to_string(llama_model_moe_router_ahead_layer(model, il)) + ".";
-            if (scaled->op != GGML_OP_MUL || x->op != GGML_OP_MUL || x->src[0] != norm || !cap.data.count(norm) ||
-                strncmp(ggml_get_name(scaled->src[1]), scale.c_str(), scale.size()) != 0) {
-                fprintf(stderr, "    layer %d: the lookahead input is neither the router input nor its scaled norm\n", il);
-                all_ok = false;
-                continue;
-            }
-            const std::vector<float> s = weight_rows(scaled->src[1]);
-            x_next = cap.data.at(norm);
-            for (size_t i = 0; i < x_next.size(); ++i) {
-                x_next[i] *= s[i % s.size()];
-            }
-        }
-
-        const ggml_tensor * w = a->src[0];
-        const std::vector<float> wf = weight_rows(w);
-        const int64_t n_embd = w->ne[0];
-        const int64_t n_expert = w->ne[1];
-        const int64_t n_tokens = a->ne[1];
-        std::vector<double> ref(n_expert*n_tokens);
-        for (int64_t t = 0; t < n_tokens; ++t) {
-            for (int64_t e = 0; e < n_expert; ++e) {
-                double sum = 0.0;
-                for (int64_t k = 0; k < n_embd; ++k) {
-                    sum += (double) wf[e*n_embd + k] * x_next[t*n_embd + k];
-                }
-                ref[t*n_expert + e] = sum;
-            }
-        }
-        const double err = rel_error(cap.data.at(a), ref);
-        worst = std::max(worst, err);
-        all_ok &= err < 1e-2;
     }
-    char buf[64];
-    snprintf(buf, sizeof(buf), " (worst %.2e)", worst);
-    check(all_ok, stem + ": " + std::to_string(cap.ahead.size()) + " lookaheads equal the following router on the router input" + buf);
+
+    // the batch decode, then each one-token decode
+    check(cap.decodes.size() == 1 + N_TOKENS - N_BATCH, stem + ": a capture for each decode");
+    for (size_t d = 0; d < cap.decodes.size(); ++d) {
+        const size_t n_tokens = d == 0 ? N_BATCH : 1;
+        bool all_ok = !layers.empty();
+        double worst = 0.0;
+        for (const int il : layers) {
+            const auto it = cap.decodes[d].find(AHEAD_PREFIX + std::to_string(il));
+            const double err = ahead_error(model, cap.decodes[d], il);
+            all_ok &= it != cap.decodes[d].end() && it->second.n_tokens == (int64_t) n_tokens && err >= 0.0 && err < 1e-2;
+            worst = std::max(worst, err);
+        }
+        if (d > 1 && all_ok) {
+            continue; // one line for the batch and one for the first one-token decode; a failure prints its decode
+        }
+        char buf[64];
+        snprintf(buf, sizeof(buf), " (worst %.2e)", worst);
+        check(all_ok, stem + ", decode " + std::to_string(d) + " (" + std::to_string(n_tokens) + " tokens): " +
+            std::to_string(layers.size()) + " lookaheads equal the following router on the router input" + buf);
+    }
 }
 
 static void test_model(const std::string & path, const std::vector<ggml_backend_dev_t> & devs, checker & check) {
