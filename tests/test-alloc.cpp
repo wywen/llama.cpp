@@ -1224,6 +1224,8 @@ static void test_covering_reserve_names_the_graphs_to_hold() {
             GGML_ASSERT(counts.n_reserve == before && "the reserved graph's plan was not kept");
             GGML_ASSERT(node_placements(narrow.graph) == second_placements);
             check_no_overlap(narrow.graph);
+        } else {
+            GGML_ASSERT(counts.n_reserve > before && "a graph allocated without a reserve became a covering plan");
         }
     }
 }
