@@ -995,7 +995,9 @@ static void test_slot_sets(const std::string & path, const std::vector<ggml_back
         if (same_counts) {
             check(n_replan == 0, lbl + ": a set switch places the graph as the previous one (" + std::to_string(n_replan) + " placements)");
         } else {
-            printf("  %-90s %s\n", (lbl + ": placements on the 3 set switches").c_str(), std::to_string(n_replan).c_str());
+            // 3 switches; a backend whose scratch does not depend on the slot count places nothing new
+            check(n_replan <= 3 && log.n_grow == n_grow,
+                lbl + ": a set switch places the graph at most once, within the buffers (" + std::to_string(n_replan) + " placements on 3 switches)");
         }
 
         bool same_nodes = true;
