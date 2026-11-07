@@ -310,7 +310,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         // TODO: expand coverage to both GQA and MQA (see https://github.com/ggml-org/llama.cpp/pull/31401#pullrequestreview-5710165130)
         n_head = 4;
         if (iswa_only) {
-            n_layer = 12; // two periods of 5 sliding window layers and 1 full attention layer, as in the 12B layer types
+            n_layer = 12; // two periods of 5 sliding window layers and 1 full attention layer, as in the Gemma 4 12B layer types
         } else {
             n_layer = 10; // last 5 layers reuse KV, both SWA and full attention
         }
@@ -518,7 +518,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,      n_embd_head);
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT_SWA,        n_embd_head);
         ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,              10000.0f);
-        // SWA pattern: every 5th (6th with iswa_only) layer is full attention (matches E2B (12B) layer_types)
+        // SWA pattern: every 5th layer is full attention as in Gemma 4 E2B, every 6th with iswa_only as in Gemma 4 12B
         const uint32_t period = iswa_only ? 6 : 5;
         std::vector<uint32_t> pattern;
         pattern.reserve(n_layer);
@@ -1072,7 +1072,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         model->cls_out_b = nullptr;
     }
     if (gguf_ctx != nullptr && model->arch == LLM_ARCH_GEMMA4 && model->hparams.n_embd_per_layer == 0) {
-        // without per-layer embeddings (the 12B), full attention layers have no V projection and use K as V
+        // without per-layer embeddings (Gemma 4 12B), full attention layers have no V projection and use K as V
         for (uint32_t il = 0; il < model->hparams.n_layer(); il++) {
             if (!model->hparams.is_swa(il)) {
                 model->layers[il].wv      = nullptr;

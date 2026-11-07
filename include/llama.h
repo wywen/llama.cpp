@@ -267,9 +267,10 @@ extern "C" {
         // with no_alloc calls it never
         // the ops that read the slots run on the backend that supports the type of the returned buffer, so a buft
         // that wraps the device's buffer type returns buffers of the device's type
-        // the buffers returned for one layer in every slot set must be of buffer types on one device and all host or
-        // all not host (not necessarily the same type object): the context refuses to initialize otherwise, since a
-        // change of set must keep the graph's splits
+        // the buffers returned for one layer in every slot set must be of buffer types that every device supports
+        // alike, i.e. for each device either all or none of them (not necessarily the same type object, e.g. two
+        // buffer types of one backend): the context refuses to initialize otherwise, since a change of set must keep
+        // the graph's splits
         ggml_backend_buffer_type_t buft;
     };
 
