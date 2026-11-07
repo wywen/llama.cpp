@@ -273,10 +273,11 @@ struct captured {
     int64_t n_tokens;                      // ne[1]
     std::vector<float> data;               // empty unless the node is F32 and contiguous
     std::string src_name[2];
+    bool repeated = false;                 // more nodes of the decode have this name, so the entry is ambiguous
     const ggml_tensor * src_weight[2] = {}; // a source that is a model weight, which outlives the graphs
 };
 
-// the nodes of each decode, by name; ggml names every unnamed node of a graph uniquely
+// the nodes of each decode, by name; ggml names every unnamed node of a graph uniquely, but a named one may repeat
 struct capture {
     std::vector<std::map<std::string, captured>> decodes;
 };
@@ -296,8 +297,13 @@ static bool capture_node(ggml_tensor * t, bool ask, void * ud) {
         return true; // the warmup decode at context creation
     }
     const auto inserted = cap->decodes.back().emplace(ggml_get_name(t), captured{});
-    GGML_ASSERT(inserted.second && "node names must be unique within a decode");
     captured & c = inserted.first->second;
+    if (!inserted.second) {
+        // a graph builder may give several nodes one name (a projection and its bias); keep the first and mark the
+        // name so that no check reads the data of an ambiguous node
+        c.repeated = true;
+        return true;
+    }
     c.op       = t->op;
     c.n_tokens = t->ne[1];
     if (t->type == GGML_TYPE_F32 && ggml_is_contiguous(t)) {
@@ -352,7 +358,7 @@ static double rel_error(const std::vector<float> & a, const std::vector<double> 
 static double ahead_error(const llama_model * model, const std::map<std::string, captured> & nodes, int il) {
     const auto find = [&](const std::string & name) -> const captured * {
         const auto it = nodes.find(name);
-        return it == nodes.end() ? nullptr : &it->second;
+        return it == nodes.end() || it->second.repeated ? nullptr : &it->second;
     };
     const captured * a      = find(AHEAD_PREFIX + std::to_string(il));
     const captured * logits = find(LOGITS_PREFIX + std::to_string(il));
@@ -432,7 +438,7 @@ static void test_values(llama_model * model, const std::string & stem, checker &
         for (const int il : layers) {
             const auto it = cap.decodes[d].find(AHEAD_PREFIX + std::to_string(il));
             const double err = ahead_error(model, cap.decodes[d], il);
-            all_ok &= it != cap.decodes[d].end() && it->second.n_tokens == (int64_t) n_tokens && err >= 0.0 && err < 1e-2;
+            all_ok &= it != cap.decodes[d].end() && !it->second.repeated && it->second.n_tokens == (int64_t) n_tokens && err >= 0.0 && err < 1e-2;
             worst = std::max(worst, err);
         }
         if (d > 1 && all_ok) {
