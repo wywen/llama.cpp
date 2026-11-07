@@ -295,7 +295,9 @@ static bool capture_node(ggml_tensor * t, bool ask, void * ud) {
     if (cap->decodes.empty()) {
         return true; // the warmup decode at context creation
     }
-    captured & c = cap->decodes.back()[ggml_get_name(t)];
+    const auto inserted = cap->decodes.back().emplace(ggml_get_name(t), captured{});
+    GGML_ASSERT(inserted.second && "node names must be unique within a decode");
+    captured & c = inserted.first->second;
     c.op       = t->op;
     c.n_tokens = t->ne[1];
     if (t->type == GGML_TYPE_F32 && ggml_is_contiguous(t)) {

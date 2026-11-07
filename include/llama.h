@@ -263,8 +263,8 @@ extern "C" {
         // it must be on the same device, with an alignment of at most llama_model_params.moe_slot_alignment; the
         // context allocates one buffer of map_size + n_slots*slot_size bytes from it (none with no_alloc)
         // the ops that read the slots run on the backend that supports the type of the returned buffer
-        // the buffers of one layer in all slot sets must be on one device and all host or all not host, so that a
-        // change of set keeps the graph's splits
+        // the buffers of one layer in all slot sets must be of buffer types that every device supports alike (all or
+        // none of them, not necessarily one type object), so that a change of set keeps the graph's splits
         ggml_backend_buffer_type_t buft;
     };
 

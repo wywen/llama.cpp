@@ -1050,21 +1050,17 @@ static void test_slot_sets(const std::string & path, const std::vector<ggml_back
         check(same_bits(get_logits(lctx.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long), label + ": the context then decodes on set 1");
     }
 
-    // the sets of a layer read their slots from buffers of one device and one host-ness, not of one type object: a
-    // buft that returns the layer's buffers, and one that returns buffers of its own type on the same device with the
-    // same host-ness, are taken for one set; one whose host-ness differs is refused
+    // the sets of a layer read their slots on the same backends, so their buffer types must be supported alike by
+    // every device: a buft that returns the layer's buffers is taken for one set; a buft of its own type is taken only
+    // where the device supports it (the CPU, which takes any host type), and one the device does not support, by
+    // host-ness or by its functions, is refused
     {
         ggml_backend_buffer_type_t inner = model->moe_slots.layer(layers.begin()->first)->buft;
         struct variant { bool own_type; bool flip_host; };
-        // a GPU backend recognizes its buffer types by their functions, so only the CPU takes a buft of another object
         ggml_backend_dev_t inner_dev = ggml_backend_buft_get_device(inner);
         const bool on_cpu = inner_dev == nullptr || ggml_backend_dev_type(inner_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
         for (const variant v : { variant { false, false }, variant { true, false }, variant { true, true } }) {
-            if (v.own_type && !v.flip_host && !on_cpu) {
-                fprintf(stderr, "%s: skipped, a buft of its own type on the layer's device is accepted on the CPU only\n", label.c_str());
-                continue;
-            }
-            wrapper_buft w(inner, ggml_backend_buft_get_device(inner));
+            wrapper_buft w(inner, inner_dev);
             w.own_type  = v.own_type;
             w.flip_host = v.flip_host;
             set_counts one_buft = counts;
@@ -1076,11 +1072,11 @@ static void test_slot_sets(const std::string & path, const std::vector<ggml_back
             cparams.moe_slot_sets       = (uint32_t) one_buft.n_slots.size();
             g_log.clear();
             llama_context_ptr lctx(llama_init_from_model(model.get(), cparams));
-            if (v.flip_host) {
-                check(!lctx && g_log.find("one device and of one host-ness") != std::string::npos,
-                    label + ": set 1 in buffers of another host-ness than set 0's is refused");
+            if (v.own_type && (v.flip_host || !on_cpu)) {
+                check(!lctx && g_log.find("supports one and not the other") != std::string::npos,
+                    label + ": set 1 in buffers of a type that the device does not support is refused");
             } else if (v.own_type) {
-                check(lctx != nullptr, label + ": set 1 in buffers of its own type on set 0's device and host-ness initializes");
+                check(lctx != nullptr, label + ": set 1 in buffers of its own type that the device supports initializes");
             } else {
                 check(lctx != nullptr, label + ": set 1 through a buft that returns buffers of set 0's type initializes");
             }
