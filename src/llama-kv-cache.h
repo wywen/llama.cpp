@@ -17,9 +17,8 @@ struct llama_context;
 // llama_kv_cache
 //
 
-// How every llama_kv_cache constructed on this thread while in scope places and fills its attention rotation matrices.
-// A context opens one around building its memory, so the caches nested in every memory type follow the context's
-// settings. Scopes nest: the innermost one applies.
+// how every llama_kv_cache constructed on this thread while in scope places and fills its attention rotation matrices
+// a context opens one around building its memory; scopes nest, the innermost applies
 struct llama_kv_cache_rot_params {
     // buffer type of the matrices, nullptr keeps the buffer type of each layer's cache tensor
     ggml_backend_buffer_type_t buft = nullptr;
@@ -43,8 +42,7 @@ private:
     llama_kv_cache_rot_params outer;
 };
 
-// Saved cell metadata for one or more KV caches: one entry per cache, in the
-// order the owner snapshotted them.
+// saved cell metadata of one or more KV caches: one entry per cache, in snapshot order
 struct llama_kv_cache_cells : llama_memory_cells_i {
     struct entry {
         llama_kv_cells cells;
@@ -188,9 +186,8 @@ public:
     llama_memory_cells_t cells_snapshot(llama_seq_id seq_id) const override;
     void cells_restore(llama_seq_id seq_id, const llama_memory_cells_i * snap) override;
 
-    // Append this cache's (cells, head) pair for `seq_id` to `out`, and take
-    // the next unconsumed pair from `in`. Split out so the interleaved-SWA
-    // wrapper can snapshot and restore its two sub-caches through one handle.
+    // append this cache's (cells, head) pair for `seq_id` to `out`, and restore from the entry of `in` at `idx`, advancing it
+    // for llama_kv_cache_iswa, which snapshots its two sub-caches through one handle
     void cells_snapshot_append(llama_seq_id seq_id, llama_kv_cache_cells & out) const;
     void cells_restore_at(llama_seq_id seq_id, const llama_kv_cache_cells & in, size_t & idx);
 

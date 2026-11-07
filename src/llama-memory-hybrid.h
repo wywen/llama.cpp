@@ -16,9 +16,7 @@
 // utilizes instances of llama_memory_recurrent and llama_kv_cache to
 //   support models where each layer may be either attention-based or recurrent
 
-// Saved cell metadata of both caches. The attention part is a plain KV cache
-// snapshot, readable the same way; the handle itself is not one, so neither
-// cache accepts it in place of its own.
+// saved cell metadata of both caches; neither cache accepts this handle in place of its own
 struct llama_memory_hybrid_cells : llama_memory_cells_i {
     llama_kv_cache_cells         attn;
     llama_memory_recurrent_cells recr;
@@ -77,9 +75,8 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
-    // The attention part is scoped like llama_kv_cache (the stream of seq_id),
-    // the recurrent part covers every sequence (see llama_memory_recurrent).
-    // Restore is all or nothing: a snapshot either cache cannot take changes neither.
+    // the attention part is scoped like llama_kv_cache (the stream of seq_id), the recurrent part covers every sequence
+    // restore is all or nothing
     llama_memory_cells_t cells_snapshot(llama_seq_id seq_id) const override;
     void cells_restore(llama_seq_id seq_id, const llama_memory_cells_i * snap) override;
 

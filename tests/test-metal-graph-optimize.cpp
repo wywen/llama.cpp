@@ -373,16 +373,9 @@ static bool check_chained_pack_reader() {
     return report_reader("reader of a chained MUL_MAT+ADD sum", packed, after);
 }
 
-// the boundary barriers of the graph reorder
-//
-// ggml_graph_optimize hoists memory-concurrent nodes forward to widen the concurrent set.
-// A caller that installs a boundary-event schedule and an encode window cuts the graph at
-// the per-layer output markers, and the reorder runs before that schedule exists, so left
-// alone it can move a node out of the segment that is supposed to produce it. These tests
-// pin both halves of the fix: with the barriers off the hoist still happens (the reorder
-// is untouched), and with them on nothing crosses a marker.
-//
-// Every case is a hand-built graph: no device, no model, no allocation.
+// boundary barriers of the graph reorder: with the barriers off the reorder hoists nodes across a
+// per-layer output marker as usual, with them on nothing crosses a marker.
+// every case is a hand-built graph: no device, no model, no allocation
 
 static int g_n_fail = 0;
 
@@ -457,8 +450,7 @@ static ggml_tensor * named(ggml_tensor * t, const char * name) {
     return t;
 }
 
-// An independent lookup into a persistent cache: nothing in the graph anchors it, which is
-// exactly the node the reorder is free to hoist as far as it likes.
+// an independent lookup into a persistent cache; nothing anchors it, so the reorder may hoist it freely
 static ggml_tensor * cache_lookup(ggml_context * ctx, const char * name) {
     ggml_tensor * cache = leaf(ctx, "cache");
     ggml_tensor * ids   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
@@ -467,8 +459,7 @@ static ggml_tensor * cache_lookup(ggml_context * ctx, const char * name) {
     return named(ggml_get_rows(ctx, cache, ids), name);
 }
 
-// n0 writes "a", n1 reads it -- n1 therefore conflicts with the concurrent set n0 opened,
-// which is what makes the reorder look forward for something to hoist in front of n1.
+// b conflicts with the concurrent set a opened, so the reorder looks forward for a node to hoist in front of it
 //
 //   a  -> mul(x, y)
 //   b  -> mul(a, w)      conflicts with a
@@ -494,8 +485,7 @@ static ggml_cgraph * build_hoist_across(ggml_context * ctx, const char * marker_
     return gf;
 }
 
-// Same idea, but the marker is itself the node that opens the look-forward scan. Everything
-// the scan picks up is emitted BEFORE the marker, so the scan has to be skipped entirely.
+// the marker is itself the node that opens the look-forward scan, so the scan has to be skipped
 //
 //   a  -> mul(x, y)
 //   mk -> add(a, x)      the boundary marker, and the conflicting node
@@ -517,8 +507,8 @@ static ggml_cgraph * build_marker_anchor(ggml_context * ctx) {
     return gf;
 }
 
-// The marker packed into a fused group as a non-head member. The reorder moves whole groups,
-// so the marker rides along with "s" unless the barrier test looks past the group's head.
+// the marker is a non-head member of a fused group; the reorder moves whole groups, so the barrier test
+// has to look past the group's head
 //
 //   a  -> mul(x, y)
 //   b  -> mul(a, w)      conflicts with a
@@ -547,9 +537,8 @@ static ggml_cgraph * build_fused_group(ggml_context * ctx, const char * marker_n
     return gf;
 }
 
-// A router whose ops do not fuse, ending in the node a caller cuts at, followed by a lookup by
-// expert ids that reads memory the host fills at that cut. The graph records no dependency
-// between the lookup and the router, so the reorder is free to run the lookup first.
+// a router whose ops do not fuse, ending in the node a caller cuts at, followed by a lookup by expert ids
+// that reads memory the host fills at that cut; the graph records no dependency between the two
 //
 //   router_logits-0 -> mul_mat(w, x)
 //   router_probs-0  -> scale(router_logits-0)   conflicts with router_logits-0
@@ -576,8 +565,7 @@ static ggml_cgraph * build_router_lookup(ggml_context * ctx) {
     return gf;
 }
 
-// The other direction: the cut node itself is independent of the node before it, so the reorder
-// would run the cut first and leave a node that belongs before the cut behind it.
+// the cut node is independent of the node before it, so the reorder could run the cut first
 //
 //   a     -> mul(x, y)
 //   b     -> mul(a, w)        conflicts with a, belongs before the cut
@@ -761,9 +749,7 @@ static void run_backend_prefix_cases() {
 
 // the boundary barrier cases, returns the number of failed checks
 static int run_boundary_barrier_cases() {
-    // The reorder only ever has something to do when the graph it is given is in the order
-    // these builders lay it out, so check that first -- otherwise a change in how
-    // ggml_build_forward_expand walks the graph would quietly make every case below vacuous.
+    // the cases below are vacuous unless the builders lay the graph out in this order
     {
         test_ctx     tc;
         ggml_cgraph * gf = build_hoist_across(tc.ctx, "l_out-0");
@@ -771,9 +757,7 @@ static int run_boundary_barrier_cases() {
         check_order("graph as built", gf, { "a", "b", "l_out-0", "c" });
     }
 
-    // Positive control: with the barriers off, the reorder hoists the independent lookup
-    // across the marker. This is the behaviour every non-boundary-scheduling caller gets,
-    // and it must not change.
+    // control: with the barriers off, the reorder hoists the independent lookup across the marker
     {
         test_ctx     tc;
         ggml_cgraph * gf = build_hoist_across(tc.ctx, "l_out-0");
@@ -793,8 +777,7 @@ static int run_boundary_barrier_cases() {
         check_order("barriers on: stops at marker", gf, { "a", "b", "l_out-0", "c" });
     }
 
-    // The barrier keys on the marker, not on the switch: a node that is not a marker is
-    // still hoisted with the barriers on, so turning them on is not a blanket "no reorder".
+    // only markers are barriers: a node that is not a marker is still hoisted with the barriers on
     {
         test_ctx     tc;
         ggml_cgraph * gf = build_hoist_across(tc.ctx, "ffn_out-0");
@@ -823,9 +806,7 @@ static int run_boundary_barrier_cases() {
         check_order("barriers on: marker takes nothing along", gf, { "a", "l_out-0", "c" });
     }
 
-    // Fusion packs "s" and the marker into one group. With the barriers off the group is
-    // hoisted whole, which moves the marker itself -- the two staying adjacent is what says
-    // they were really fused rather than reordered independently.
+    // "s" and the marker are fused into one group, hoisted whole with the barriers off
     {
         test_ctx     tc;
         ggml_cgraph * gf = build_fused_group(tc.ctx);

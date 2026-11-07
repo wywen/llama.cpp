@@ -720,9 +720,8 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        // Canonical model-wide source ordinal assigned by the model loader for
-        // tensors backed by a GGUF file, stored as the ordinal plus one so that
-        // a zeroed (memset/calloc'd) tensor reads as GGML_TENSOR_SRC_ORDINAL_NONE.
+        // model-wide ordinal of the GGUF tensor this tensor is loaded from, stored plus one so that a
+        // zeroed tensor reads as GGML_TENSOR_SRC_ORDINAL_NONE
         int32_t src_ordinal;
 
         char padding[4];

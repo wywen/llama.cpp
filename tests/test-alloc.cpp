@@ -1007,10 +1007,8 @@ static std::vector<std::pair<ggml_backend_buffer_t, size_t>> planned_placements(
     return placements;
 }
 
-// A graph that only shrank is planned again under replan_on_shrink, and a fresh plan of it can need
-// more of a chunk than the plan that sized the buffers left there. The allocator places the graph
-// by that plan instead: where the wide graph was, with no reserve offered, the buffers as they were,
-// and the extents what the graph addresses under that plan.
+// a graph that only shrank is replanned under replan_on_shrink; if the fresh plan needs more of a chunk than
+// the plan that sized the buffers, the graph is placed by the old plan instead
 static void test_shrink_replan_keeps_the_fitting_plan() {
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     GGML_ASSERT(backend);
@@ -1139,11 +1137,8 @@ static void test_shrink_replan_keeps_the_fitting_plan() {
     ggml_backend_sched_set_reserve_callback(sched.get(), nullptr, nullptr);
 }
 
-// The buffers are sized by a graph of one topology, and a reserve then names a graph of another
-// that fits them, as a context whose graphs change shape after its first reserve does. That
-// reserve's plan is the one a narrower graph of its topology falls back on: the narrow graph is
-// placed where the reserved graph was, with no reserve offered, though a fresh plan of it would grow
-// a chunk. A graph allocated without a reserve never takes that place.
+// the buffers are sized by a graph of one topology, then a reserve names a graph of another that fits them;
+// a narrower graph of the second topology falls back on that reserve's plan, one allocated without a reserve never does
 static void test_covering_reserve_names_the_graphs_to_hold() {
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     GGML_ASSERT(backend);
@@ -1209,10 +1204,8 @@ static void test_covering_reserve_names_the_graphs_to_hold() {
     }
 }
 
-// The buffers are sized by a wide graph of one topology, and a reserve then names a narrower graph
-// of another. That reserve's plan covers its own topology only: a narrower graph of the first
-// topology is still placed by the wide graph's plan, with no reserve offered, though a fresh plan of
-// it would grow a chunk; a narrower graph of the second topology is placed by the reserve's plan.
+// a reserve of a narrower graph of another topology covers its own topology only: a narrower graph of the first
+// topology is still placed by the wide graph's plan
 static void test_narrow_reserve_of_another_topology_keeps_the_plan() {
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     GGML_ASSERT(backend);
@@ -1362,10 +1355,8 @@ static int graph_node_index(ggml_cgraph * graph, const ggml_tensor * t) {
     return -1;
 }
 
-// The scheduler's graph copy (ggml_backend_sched_get_graph) gives every node of the original
-// graph its original use count, so that a fusion check over it decides as one over a split does,
-// and gives the nodes the scheduler inserts - split input copies, the views that keep their
-// sources alive, alloc dependencies - a count of 0.
+// the scheduler's graph copy (ggml_backend_sched_get_graph) keeps the original use count of every original node,
+// so a fusion check over it decides as one over a split does; nodes the scheduler inserts get a count of 0
 static void test_sched_graph_use_counts() {
     auto [ctx, graph, ctx_ptr] = make_context();
 

@@ -1235,8 +1235,7 @@ struct ggml_backend_sched {
     ggml_backend_sched_reserve_callback callback_reserve;
     void * callback_reserve_user_data;
 
-    // Fired once per graph compute (after split/alloc, before encode). Preserves fusion
-    // because it is not per-node. Zero-initialized with the rest of the sched struct.
+    // called once per graph compute, after split and alloc and before any split is computed
     ggml_backend_sched_graph_compute_callback callback_graph;
     void * callback_graph_user_data;
 
@@ -1926,14 +1925,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->graph.n_nodes = 0;
     sched->graph.n_leafs = 0;
 
-    // the copy borrows the use counts of the graph it was split from, as every split's
-    // ggml_graph_view does: a node of the original graph then has the same count here as in
-    // the split a backend computes, so a fusion check over this graph decides what the
-    // backend's check over its split decides. the nodes added below - the views that keep
-    // split inputs alive, the input copies and the alloc dependency views - are not in the
-    // original graph's hash set, so their count is 0 and they never satisfy a fusion check;
-    // the uses they add only extend lifetimes and are deliberately not counted. like the
-    // node pointers, the borrowed counts stay valid as long as the original graph does
+    // borrow the use counts of the original graph, as every split's ggml_graph_view does, so a fusion
+    // check over this copy decides what the check over a split decides. nodes added below have
+    // count 0 and never fuse. valid as long as the original graph is
     sched->graph.use_counts       = graph->use_counts;
     sched->graph.visited_hash_set = graph->visited_hash_set;
     sched->graph.order            = graph->order;
@@ -2151,9 +2145,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
 
-    // Fire the per-graph-compute callback once, now that the graph is split and
-    // allocated but before any split is encoded. Unlike callback_eval this does not
-    // run per node, so it does not disable op fusion. See ggml-backend.h.
+    // unlike callback_eval this is not per node, so it does not disable op fusion
     if (sched->callback_graph) {
         sched->callback_graph(sched, sched->callback_graph_user_data);
     }

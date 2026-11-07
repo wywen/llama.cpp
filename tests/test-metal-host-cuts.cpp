@@ -1,4 +1,4 @@
-// Tests for host cuts on the Metal paged compute path.
+// Tests for host cuts in the Metal backend's boundary-scheduled compute path.
 //
 // The correctness graph is a chain of layers. Layer k computes r_k = h_k + a_k, the host cut, and
 // h_{k+1} = r_k * s, where s is one tensor shared by every layer. The callback at cut k reads r_k

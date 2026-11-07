@@ -770,7 +770,7 @@ static llama_moe_slot_pool_params get_set_slot_count(int32_t il, int32_t n_exper
     return { it == n_slots.end() ? n_expert : it->second, counts->buft_set < 0 || counts->buft_set == set ? counts->buft : nullptr };
 }
 
-// the graphs a context prepares, and the compute buffer plans its scheduler admits
+// the graphs a context prepares, and the compute buffer plans its scheduler makes
 struct graph_log {
     int n_reserve = 0;
     int n_grow    = 0; // the plans that grow a compute buffer

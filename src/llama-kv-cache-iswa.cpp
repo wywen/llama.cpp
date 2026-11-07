@@ -148,7 +148,7 @@ llama_pos llama_kv_cache_iswa::seq_pos_min(llama_seq_id seq_id) const {
 llama_memory_cells_t llama_kv_cache_iswa::cells_snapshot(llama_seq_id seq_id) const {
     auto * res = new llama_kv_cache_cells();
 
-    // Order matters: restore walks the entries in exactly this sequence.
+    // cells_restore consumes the entries in this order
     kv_base->cells_snapshot_append(seq_id, *res);
     kv_swa ->cells_snapshot_append(seq_id, *res);
 
@@ -161,8 +161,7 @@ void llama_kv_cache_iswa::cells_restore(llama_seq_id seq_id, const llama_memory_
         return;
     }
 
-    // Both sub-caches or neither: a half-restored pair would leave the two
-    // searching from states that never coexisted.
+    // restore both sub-caches or neither
     if (s->entries.size() < 2) {
         return;
     }
