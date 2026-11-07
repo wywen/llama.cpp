@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-slots.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -22,6 +23,7 @@
 #include <cstring>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 
@@ -1507,6 +1509,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     moe_cache        (params.moe_cache),
+    moe_slots        (params.moe_slots),
+    moe_routers      (params.moe_routers),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     samplers         (params.samplers),
@@ -1645,13 +1649,13 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s,
-          ggml_tensor * slots) const {
+    const llm_graph_moe_slots * slots) const {
     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
-    // the experts in the MoE cache are selected by their slots
-    ggml_tensor * res = slots == nullptr ?
+    // experts read at slots are selected by their slots in the tensor that stands in for w
+    ggml_tensor * res = slots == nullptr || slots->slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
-        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur_mm, slots);
+        ggml_mul_mat_id(ctx0, slots->get(w), cur_mm, slots->slots);
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2162,6 +2166,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
+        const int il_ahead = moe_router_ahead_layer(il, gate_inp);
+        if (il_ahead >= 0) {
+            ggml_tensor * logits_ahead = build_lora_mm((*moe_routers)[il_ahead], cur); // [n_expert, n_tokens]
+            if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+                ggml_prec_set_acc(logits_ahead, GGML_PREC_F32);
+            }
+            build_moe_router_ahead(logits_ahead, il);
+        }
+
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
             ggml_prec_set_acc(logits, GGML_PREC_F32);
@@ -2299,8 +2312,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    // the experts of host-resident layers may be read from the MoE cache
-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    // the experts may be read at slots: from the layer's slots, or for host-resident layers from the MoE cache
+    const llm_graph_moe_slots moe_exps = build_moe_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    const llm_graph_moe_slots * slots = &moe_exps;
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2527,38 +2541,117 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     return moe_out;
 }
 
-ggml_tensor * llm_graph_context::build_moe_cache_slots(
+ggml_tensor * llm_graph_moe_slots::get(const ggml_tensor * w) const {
+    for (const auto & [stock, t] : weights) {
+        if (stock == w) {
+            return t;
+        }
+    }
+    GGML_ABORT("fatal error: expert weight %s has no stand-in", w->name);
+}
+
+int llm_graph_context::moe_router_ahead_layer(int il, const ggml_tensor * router) const {
+    if (moe_routers == nullptr || router == nullptr || il < 0 || il >= (int) moe_routers->size() ||
+        (*moe_routers)[il] != router) {
+        return -1;
+    }
+
+    for (int il_next = il + 1; il_next < (int) moe_routers->size(); ++il_next) {
+        if ((*moe_routers)[il_next] != nullptr) {
+            return il_next;
+        }
+    }
+
+    return -1;
+}
+
+void llm_graph_context::build_moe_router_ahead(ggml_tensor * logits_ahead, int il) const {
+    cb(logits_ahead, "ffn_moe_logits_ahead", il);
+    ggml_set_output(logits_ahead);
+    ggml_build_forward_expand(gf, logits_ahead);
+}
+
+llm_graph_moe_slots llm_graph_context::build_moe_slots(
          ggml_tensor * selected_experts,
          ggml_tensor * up_exps,
          ggml_tensor * gate_exps,
          ggml_tensor * down_exps,
          ggml_tensor * gate_up_exps,
                  int   il) const {
+    llm_graph_moe_slots res;
+
+    auto selected_ids = [&]() {
+        // always copy: whether the ids are contiguous depends on the token count of the layer, and the node list must
+        // not, so that a scheduler can reuse its allocation plan for graphs with any number of outputs
+        ggml_tensor * ids = ggml_cont(ctx0, selected_experts);
+        return ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
+    };
+
+    // the layer's caller-filled slots: the slot map is a device weight, so the lookup runs where the experts are read
+    const llama_moe_slot_layer * layer = nullptr;
+    if (moe_slots != nullptr) {
+        bool first = true;
+        for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
+            if (w == nullptr) {
+                continue;
+            }
+            const llama_moe_slot_layer * l = moe_slots->model_slots().of(w);
+            if (first) {
+                layer = l;
+                first = false;
+            } else if (l != layer) {
+                GGML_ABORT("fatal error: the expert weights of layer %d are not all read from the same MoE slots", il);
+            }
+        }
+    }
+    if (layer != nullptr) {
+        const llama_moe_slot_region * region = cparams.moe_slot_set == LLAMA_MOE_SLOT_SET_WIDEST ?
+            moe_slots->widest(layer->il) : moe_slots->region(cparams.moe_slot_set, layer->il);
+        if (region == nullptr) {
+            const std::string where = cparams.moe_slot_set == LLAMA_MOE_SLOT_SET_WIDEST ? "any set" : format("set %d", cparams.moe_slot_set);
+            throw std::runtime_error(format("layer %d reads its expert weights from MoE slots, but the context has no slots for it in %s",
+                layer->il, where.c_str()));
+        }
+        for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
+            if (w != nullptr) {
+                res.weights.emplace_back(w, region->get(w));
+            }
+        }
+
+        ggml_tensor * slots = ggml_get_rows(ctx0, region->slot_map, selected_ids()); // [1, n_expert_used*n_tokens]
+        cb(slots, "ffn_moe_slots", il);
+        ggml_build_forward_expand(gf, slots);
+
+        res.slots = ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
+        return res;
+    }
+
     if (moe_cache == nullptr) {
-        return nullptr;
+        return res;
     }
 
     ggml_tensor * slot_map = moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0]);
     if (slot_map == nullptr) {
-        return nullptr;
+        return res;
     }
     for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
-        if (w != nullptr && moe_cache->get_experts(w) == nullptr) {
-            return nullptr;
+        if (w == nullptr) {
+            continue;
         }
+        ggml_tensor * cached = moe_cache->get_experts(w);
+        if (cached == nullptr) {
+            res.weights.clear();
+            return res;
+        }
+        res.weights.emplace_back(w, cached);
     }
-
-    ggml_tensor * ids = selected_experts;
-    if (!ggml_is_contiguous(ids)) {
-        ids = ggml_cont(ctx0, ids);
-    }
-    ids = ggml_reshape_1d(ctx0, ids, ggml_nelements(ids));
 
     // the slot map is a host weight, so the scheduler starts a new split here and copies it with the copy callback
     // the callback reads the selected experts, uploads the missing ones and updates the slot map
-    ggml_tensor * slots = ggml_get_rows(ctx0, slot_map, ids); // [1, n_expert_used*n_tokens]
+    ggml_tensor * slots = ggml_get_rows(ctx0, slot_map, selected_ids()); // [1, n_expert_used*n_tokens]
     if (!ggml_backend_supports_op(moe_cache->backend(il), slots)) {
-        return nullptr;
+        res.weights.clear();
+        return res;
     }
     ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
     cb(slots, "ffn_moe_slots", il);
@@ -2566,7 +2659,8 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     // add the lookup now: the transform of a Hadamard-folded expert reads host weights and would start its split first
     ggml_build_forward_expand(gf, slots);
 
-    return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
+    res.slots = ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
+    return res;
 }
 
 // input embeddings with optional lora

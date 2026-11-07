@@ -660,7 +660,6 @@ static void test_reserve_refusal_preserves_published_layout() {
 
 struct sched_callback_state {
     int  n_prepare     = 0;
-    int  n_synchronize = 0;
     bool accept        = true;
     bool all_addressed = true;
 };
@@ -676,11 +675,7 @@ static bool sched_prepare_callback(ggml_backend_sched_t /*sched*/, ggml_cgraph *
     return state->accept;
 }
 
-static void sched_synchronize_callback(ggml_backend_sched_t /*sched*/, void * user_data) {
-    static_cast<sched_callback_state *>(user_data)->n_synchronize++;
-}
-
-static void test_sched_prepare_and_synchronize_callbacks() {
+static void test_sched_prepare_callback() {
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     GGML_ASSERT(backend);
 
@@ -699,7 +694,6 @@ static void test_sched_prepare_and_synchronize_callbacks() {
 
     sched_callback_state state;
     ggml_backend_sched_set_graph_prepare_callback(sched.get(), sched_prepare_callback, &state);
-    ggml_backend_sched_set_synchronize_callback(sched.get(), sched_synchronize_callback, &state);
 
     // fires once per allocation, after the tensors have addresses
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
@@ -714,11 +708,6 @@ static void test_sched_prepare_and_synchronize_callbacks() {
     GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched.get(), graph) == GGML_STATUS_SUCCESS);
     GGML_ASSERT(state.n_prepare == 2);
 
-    // fires after the backends synchronized
-    GGML_ASSERT(state.n_synchronize == 0);
-    ggml_backend_sched_synchronize(sched.get());
-    GGML_ASSERT(state.n_synchronize == 1);
-
     // a refusal fails the allocation
     state.accept = false;
     ggml_backend_sched_reset(sched.get());
@@ -727,13 +716,10 @@ static void test_sched_prepare_and_synchronize_callbacks() {
     GGML_ASSERT(!ggml_backend_sched_prepare_graph(sched.get(), graph));
     GGML_ASSERT(state.n_prepare == 4);
 
-    // cleared callbacks are no longer invoked
+    // a cleared callback is no longer invoked
     ggml_backend_sched_set_graph_prepare_callback(sched.get(), nullptr, nullptr);
-    ggml_backend_sched_set_synchronize_callback(sched.get(), nullptr, nullptr);
     GGML_ASSERT(ggml_backend_sched_prepare_graph(sched.get(), graph));
-    ggml_backend_sched_synchronize(sched.get());
     GGML_ASSERT(state.n_prepare == 4);
-    GGML_ASSERT(state.n_synchronize == 1);
 }
 
 // CPU buffer type with a small maximum buffer size, so that a graph spans several chunks
@@ -759,7 +745,6 @@ static bool small_chunk_buft_is_host(ggml_backend_buffer_type_t) {
 
 struct replan_callback_counts {
     int n_reserve     = 0;
-    int n_synchronize = 0;
     std::vector<size_t> last_sizes;
 };
 
@@ -771,10 +756,6 @@ static bool replan_reserve_callback(ggml_backend_sched_t, const ggml_backend_sch
         counts->last_sizes.push_back(r[i].size);
     }
     return true;
-}
-
-static void replan_synchronize_callback(ggml_backend_sched_t, void * user_data) {
-    static_cast<replan_callback_counts *>(user_data)->n_synchronize++;
 }
 
 // out = sum of n_branches scaled copies of one input of n_elements floats
@@ -880,7 +861,6 @@ static void test_sched_compute_extent() {
         }
         replan_callback_counts counts;
         ggml_backend_sched_set_reserve_callback(sched.get(), replan_reserve_callback, &counts);
-        ggml_backend_sched_set_synchronize_callback(sched.get(), replan_synchronize_callback, &counts);
         ggml_backend_sched_set_replan_on_shrink(sched.get(), true);
         ggml_backend_sched_reset(sched.get());
         auto [ctx, graph, ctx_ptr] = make_context();
@@ -891,11 +871,10 @@ static void test_sched_compute_extent() {
         printf("narrow replan extents: %zu %zu %zu %zu\n", extents[0], extents[1], extents[2], extents[3]);
         printf("replan reserve callbacks: %d (sizes:", counts.n_reserve);
         for (size_t v : counts.last_sizes) { printf(" %zu", v); }
-        printf("), synchronize callbacks: %d\n", counts.n_synchronize);
+        printf(")\n");
         GGML_ASSERT(counts.n_reserve == 1);
         GGML_ASSERT(counts.last_sizes.size() == 2 && counts.last_sizes[0] == sizes[0] && counts.last_sizes[1] == sizes[1]);
         ggml_backend_sched_set_reserve_callback(sched.get(), nullptr, nullptr);
-        ggml_backend_sched_set_synchronize_callback(sched.get(), nullptr, nullptr);
         GGML_ASSERT(extents[0] > 0 && extents[0] < wide_extents[0]);
         GGML_ASSERT(extents[1] == 0 && extents[2] == 0 && extents[3] == 0);
         for (int c = 0; c < 4; c++) {
@@ -956,7 +935,11 @@ struct block_graph {
     ggml_cgraph *         graph;
 };
 
-static block_graph build_block(int64_t n_tokens, int64_t n_outputs, int64_t n_cells) {
+// how a block's last step reads its rows: the outputs' rows gathered, or every row, as a graph that
+// keeps every row's hidden state does
+enum class block_rows { outputs, every };
+
+static block_graph build_block(int64_t n_tokens, int64_t n_outputs, int64_t n_cells, block_rows rows_read = block_rows::outputs) {
     const int64_t n_embd = 8, n_ff = 16, n_vocab = 32, n_head = 4, n_cells_max = 64;
     block_graph g;
     ggml_init_params wparams{};
@@ -985,9 +968,13 @@ static block_graph build_block(int64_t n_tokens, int64_t n_outputs, int64_t n_ce
     ggml_tensor * v  = ggml_view_2d(ctx, vals, n_cells, n_embd, vals->nb[1], 0);
     x = ggml_add(ctx, x, ggml_mul_mat(ctx, v, kq));
     x = ggml_add(ctx, x, ggml_mul_mat(ctx, down, ggml_gelu(ctx, ggml_mul_mat(ctx, up, ggml_rms_norm(ctx, x, 1e-6f)))));
-    ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_outputs);
-    ggml_set_input(rows);
-    ggml_tensor * out = ggml_mul_mat(ctx, head, ggml_get_rows(ctx, x, rows));
+    ggml_tensor * read = x;
+    if (rows_read == block_rows::outputs) {
+        ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_outputs);
+        ggml_set_input(rows);
+        read = ggml_get_rows(ctx, x, rows);
+    }
+    ggml_tensor * out = ggml_mul_mat(ctx, head, read);
     ggml_set_output(out);
     g.graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(g.graph, out);
@@ -1020,10 +1007,8 @@ static std::vector<std::pair<ggml_backend_buffer_t, size_t>> planned_placements(
     return placements;
 }
 
-// A graph that only shrank is planned again under replan_on_shrink, and a fresh plan of it can need
-// more of a chunk than the plan that sized the buffers left there. The allocator places the graph
-// by that plan instead: where the wide graph was, with no reserve offered, the buffers as they were,
-// and the extents what the graph addresses under that plan.
+// a graph that only shrank is replanned under replan_on_shrink; if the fresh plan needs more of a chunk than
+// the plan that sized the buffers, the graph is placed by the old plan instead
 static void test_shrink_replan_keeps_the_fitting_plan() {
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     GGML_ASSERT(backend);
@@ -1152,6 +1137,138 @@ static void test_shrink_replan_keeps_the_fitting_plan() {
     ggml_backend_sched_set_reserve_callback(sched.get(), nullptr, nullptr);
 }
 
+// the buffers are sized by a graph of one topology, then a reserve names a graph of another that fits them;
+// a narrower graph of the second topology falls back on that reserve's plan, one allocated without a reserve never does
+static void test_covering_reserve_names_the_graphs_to_hold() {
+    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    GGML_ASSERT(backend);
+
+    ggml_backend_buffer_type buft{};
+    buft.iface.get_name      = small_chunk_buft_get_name;
+    buft.iface.alloc_buffer  = small_chunk_buft_alloc_buffer;
+    buft.iface.get_alignment = small_chunk_buft_get_alignment;
+    buft.iface.get_max_size  = small_chunk_buft_get_max_size;
+    buft.iface.is_host       = small_chunk_buft_is_host;
+    buft.device              = ggml_backend_get_device(backend.get());
+
+    ggml_backend_t             backends[1] = { backend.get() };
+    ggml_backend_buffer_type_t bufts[1]    = { &buft };
+    const int                  n_chunks    = 4;
+
+    for (int covering = 0; covering < 2; covering++) {
+        ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 1, 64, false, false));
+        replan_callback_counts counts;
+        ggml_backend_sched_set_reserve_callback(sched.get(), replan_reserve_callback, &counts);
+        ggml_backend_sched_set_replan_on_shrink(sched.get(), true);
+
+        // the first topology sizes the buffers
+        block_graph first = build_block(4, 4, 64, block_rows::outputs);
+        GGML_ASSERT(ggml_backend_sched_reserve(sched.get(), first.graph));
+        std::vector<ggml_backend_buffer_t> buffers;
+        sched_extents(sched.get(), buffers, n_chunks);
+        std::vector<size_t> sizes;
+        for (int c = 0; c < n_chunks; c++) {
+            sizes.push_back(buffers[c] ? ggml_backend_buffer_get_size(buffers[c]) : 0);
+        }
+
+        // the second topology fits them
+        ggml_backend_sched_reset(sched.get());
+        block_graph second = build_block(4, 4, 64, block_rows::every);
+        if (covering) {
+            GGML_ASSERT(ggml_backend_sched_reserve(sched.get(), second.graph));
+            ggml_backend_sched_reset(sched.get());
+            second = build_block(4, 4, 64, block_rows::every);
+        }
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), second.graph));
+        sched_extents(sched.get(), buffers, n_chunks);
+        for (int c = 0; c < n_chunks; c++) {
+            GGML_ASSERT((buffers[c] ? ggml_backend_buffer_get_size(buffers[c]) : 0) == sizes[c] &&
+                        "the second topology grew the buffers");
+        }
+        const auto second_placements = node_placements(second.graph);
+        const int  before            = counts.n_reserve;
+
+        ggml_backend_sched_reset(sched.get());
+        block_graph narrow = build_block(4, 4, 16, block_rows::every);
+        const bool placed = ggml_backend_sched_alloc_graph(sched.get(), narrow.graph);
+        printf("covering reserve %d: narrow graph placed %d, reserves offered %d\n", covering, placed,
+               counts.n_reserve - before);
+        if (covering) {
+            GGML_ASSERT(placed);
+            GGML_ASSERT(counts.n_reserve == before && "the reserved graph's plan was not kept");
+            GGML_ASSERT(node_placements(narrow.graph) == second_placements);
+            check_no_overlap(narrow.graph);
+        } else {
+            GGML_ASSERT(counts.n_reserve > before && "a graph allocated without a reserve became a covering plan");
+        }
+    }
+}
+
+// a reserve of a narrower graph of another topology covers its own topology only: a narrower graph of the first
+// topology is still placed by the wide graph's plan
+static void test_narrow_reserve_of_another_topology_keeps_the_plan() {
+    ggml_backend_ptr backend(ggml_backend_cpu_init());
+    GGML_ASSERT(backend);
+
+    ggml_backend_buffer_type buft{};
+    buft.iface.get_name      = small_chunk_buft_get_name;
+    buft.iface.alloc_buffer  = small_chunk_buft_alloc_buffer;
+    buft.iface.get_alignment = small_chunk_buft_get_alignment;
+    buft.iface.get_max_size  = small_chunk_buft_get_max_size;
+    buft.iface.is_host       = small_chunk_buft_is_host;
+    buft.device              = ggml_backend_get_device(backend.get());
+
+    ggml_backend_t             backends[1] = { backend.get() };
+    ggml_backend_buffer_type_t bufts[1]    = { &buft };
+
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 1, 64, false, false));
+    replan_callback_counts counts;
+    ggml_backend_sched_set_reserve_callback(sched.get(), replan_reserve_callback, &counts);
+    ggml_backend_sched_set_replan_on_shrink(sched.get(), true);
+
+    // the wide graph of the first topology sizes the buffers
+    block_graph wide = build_block(4, 4, 64, block_rows::outputs);
+    GGML_ASSERT(ggml_backend_sched_reserve(sched.get(), wide.graph));
+    const std::vector<size_t> wide_sizes = counts.last_sizes;
+    const size_t              wide_size  = ggml_backend_sched_get_buffer_size(sched.get(), backend.get());
+    ggml_backend_sched_reset(sched.get());
+    wide = build_block(4, 4, 64, block_rows::outputs);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), wide.graph));
+    const auto wide_placements = node_placements(wide.graph);
+
+    // a narrower reserve of the second topology fits them
+    ggml_backend_sched_reset(sched.get());
+    block_graph other = build_block(4, 4, 48, block_rows::every);
+    GGML_ASSERT(ggml_backend_sched_reserve(sched.get(), other.graph));
+    // each reservation is max(current, planned) for one chunk
+    GGML_ASSERT(counts.last_sizes == wide_sizes && "the second topology's reserve grew the buffers");
+    ggml_backend_sched_reset(sched.get());
+    other = build_block(4, 4, 48, block_rows::every);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), other.graph));
+    const auto other_placements = node_placements(other.graph);
+    const int n_reserve = counts.n_reserve;
+
+    // a narrower graph of the first topology, whose fresh plan grows a chunk, keeps the wide plan
+    ggml_backend_sched_reset(sched.get());
+    block_graph narrow = build_block(4, 1, 16, block_rows::outputs);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), narrow.graph));
+    printf("narrow graph of the first topology: reserves offered %d\n", counts.n_reserve - n_reserve);
+    GGML_ASSERT(counts.n_reserve == n_reserve && "the other topology's reserve took the wide graph's plan");
+    GGML_ASSERT(node_placements(narrow.graph) == wide_placements);
+    GGML_ASSERT(ggml_backend_sched_get_buffer_size(sched.get(), backend.get()) == wide_size);
+    check_no_overlap(narrow.graph);
+
+    // the second topology still falls back on its reserve's plan
+    ggml_backend_sched_reset(sched.get());
+    block_graph other_narrow = build_block(4, 1, 16, block_rows::every);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), other_narrow.graph));
+    printf("narrow graph of the second topology: reserves offered %d\n", counts.n_reserve - n_reserve);
+    GGML_ASSERT(counts.n_reserve == n_reserve && "the second topology's reserve plan was not kept");
+    GGML_ASSERT(node_placements(other_narrow.graph) == other_placements);
+    check_no_overlap(other_narrow.graph);
+    ggml_backend_sched_set_reserve_callback(sched.get(), nullptr, nullptr);
+}
+
 // Test re-using gallocr for a different graph. The new graph has the same
 // total size, but one of the chunks is larger, so reallocation is required.
 static void test_reallocation() {
@@ -1220,6 +1337,86 @@ static bool graph_reuses_allocation(bool add_alloc_dep) {
 static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(graph_reuses_allocation(false));
     GGML_ASSERT(!graph_reuses_allocation(true));
+}
+
+// keeps the first node of the split alive until its last one
+static void keep_first_until_last(ggml_backend_t /*backend*/, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
+    if (graph->n_nodes >= 2) {
+        params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[graph->n_nodes - 1]);
+    }
+}
+
+static int graph_node_index(ggml_cgraph * graph, const ggml_tensor * t) {
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        if (ggml_graph_node(graph, i) == t) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// the scheduler's graph copy (ggml_backend_sched_get_graph) keeps the original use count of every original node,
+// so a fusion check over it decides as one over a split does; nodes the scheduler inserts get a count of 0
+static void test_sched_graph_use_counts() {
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    // x -> a -> b, and c = a + b on backend A; d reads c on backend B, so x and c are split
+    // inputs, and A keeps a alive until c
+    ggml_tensor * x = make_input_with_size(ctx, 16);
+    ggml_tensor * a = ggml_scale(ctx, x, 2.0f);
+    ggml_tensor * b = ggml_scale(ctx, a, 2.0f);
+    ggml_tensor * c = ggml_add(ctx, a, b);
+    ggml_tensor * d = ggml_scale(ctx, c, 2.0f);
+    assign_names(ctx);
+    ggml_set_output(d);
+    ggml_build_forward_expand(graph, d);
+
+    std::vector<ggml_tensor *> nodes;
+    std::vector<int32_t>       counts;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        nodes.push_back(ggml_graph_node(graph, i));
+        counts.push_back(ggml_node_get_use_count(graph, i));
+    }
+    GGML_ASSERT(counts[graph_node_index(graph, a)] == 2);
+
+    dummy_backend backend_a = dummy_backend_init(SIZE_MAX);
+    dummy_backend backend_b = dummy_backend_init(SIZE_MAX);
+    backend_a.context->backend.iface.graph_optimize = keep_first_until_last;
+
+    ggml_backend_t             backends[2] = { &backend_a.context->backend, &backend_b.context->backend };
+    ggml_backend_buffer_type_t bufts[2]    = { &backend_a.buffer_type, &backend_b.buffer_type };
+    ggml_backend_sched_ptr     sched(ggml_backend_sched_new(backends, bufts, 2, 16, false, false));
+    for (ggml_tensor * t : { a, b, c }) {
+        ggml_backend_sched_set_tensor_backend(sched.get(), t, backends[0]);
+    }
+    ggml_backend_sched_set_tensor_backend(sched.get(), d, backends[1]);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+    GGML_ASSERT(ggml_backend_sched_get_n_splits(sched.get()) == 2);
+
+    ggml_cgraph * scheduled = ggml_backend_sched_get_graph(sched.get());
+
+    int  n_original = 0;
+    int  n_inserted = 0;
+    bool has_dep    = false;
+    for (int i = 0; i < ggml_graph_n_nodes(scheduled); i++) {
+        ggml_tensor * node = ggml_graph_node(scheduled, i);
+        const int32_t count = ggml_node_get_use_count(scheduled, i);
+
+        const auto it = std::find(nodes.begin(), nodes.end(), node);
+        if (it != nodes.end()) {
+            GGML_ASSERT(count == counts[it - nodes.begin()]);
+            n_original++;
+        } else {
+            GGML_ASSERT(count == 0);
+            n_inserted++;
+            has_dep = has_dep || node->src[0] == a;
+        }
+    }
+
+    GGML_ASSERT(n_original == (int) nodes.size());
+    // x and c each add a source view and a copy, and A adds the dependency on a
+    GGML_ASSERT(n_inserted == 5);
+    GGML_ASSERT(has_dep);
 }
 
 // Check that the size reported by ggml_backend_alloc_ctx_tensors_from_buft_size
@@ -1665,11 +1862,14 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reserve_refusal_preserves_published_layout", test_reserve_refusal_preserves_published_layout);
-    run("test_sched_prepare_and_synchronize_callbacks", test_sched_prepare_and_synchronize_callbacks);
+    run("test_sched_prepare_callback", test_sched_prepare_callback);
     run("test_sched_compute_extent", test_sched_compute_extent);
     run("test_shrink_replan_keeps_the_fitting_plan", test_shrink_replan_keeps_the_fitting_plan);
+    run("test_covering_reserve_names_the_graphs_to_hold", test_covering_reserve_names_the_graphs_to_hold);
+    run("test_narrow_reserve_of_another_topology_keeps_the_plan", test_narrow_reserve_of_another_topology_keeps_the_plan);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_sched_graph_use_counts", test_sched_graph_use_counts);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
     run("test_buft_alloc_buffer_n_zero_size", test_buft_alloc_buffer_n_zero_size);

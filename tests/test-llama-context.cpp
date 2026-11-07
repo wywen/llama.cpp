@@ -329,10 +329,8 @@ int main(int argc, char ** argv) {
         params.model.path = models_dir;
     }
 
-    // a restore must continue bitwise like the uninterrupted run. a restore that puts cells elsewhere changes the logits at
-    // rounding level; CPU attention without flash attention over an F32 cache adds its terms in cell order and shows that,
-    // while with flash attention over an F16 cache some misplaced cells still give the same bits - the command line still
-    // overrides these defaults
+    // a restore must continue bitwise like the uninterrupted run; without flash attention over an F32 cache,
+    // CPU attention sums in cell order, so misplaced cells change the logits (the command line still overrides these)
     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     params.cache_type_k    = GGML_TYPE_F32;
     params.cache_type_v    = GGML_TYPE_F32;

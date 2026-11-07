@@ -35,10 +35,7 @@ struct llama_model_loader {
 
         ggml_tensor * tensor;
 
-        // Canonical model-wide ordinal, assigned once every shard has been indexed
-        // into weights_map. It follows weights_map's own iteration order
-        // (weight_name_comparer: layer number, then name), which is what makes it
-        // deterministic across equivalent loads.
+        // position in weights_map order, assigned once every shard is indexed
         uint32_t ordinal = 0;
 
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
@@ -167,9 +164,10 @@ struct llama_model_loader {
         FILE,      // the tensor's own range of the file, mapped or read
         LAZY,      // the tensor's own range of the file, read on demand
         ASSEMBLED, // the per-expert tensors of the file, copied into a buffer
+        SLOT_META, // none: an expert weight read from slots, metadata only (see moe_slot_plan)
     };
 
-    // lazy and assembled tensors need dedicated contexts: neither can be wrapped in place in a mapping
+    // lazy, assembled and slot tensors need dedicated contexts: none can be wrapped in place in a mapping
     struct ctx_key {
         ggml_backend_buffer_type_t buft;
         ctx_source source;
@@ -185,6 +183,33 @@ struct llama_model_loader {
     };
 
     std::map<ctx_key, ggml_context_ptr, ctx_key_comparator> ctx_map;
+
+    // a MoE layer whose expert weights are read from slots, see llama_model_params::moe_slots
+    // the members are the layer's expert weights in the file, in slot order; each is created as metadata only
+    struct moe_slot_plan {
+        struct member {
+            std::string   name;
+            size_t        size   = 0; // of one expert
+            size_t        offset = 0; // in a slot
+            ggml_tensor * stock  = nullptr; // set when the model creates it
+        };
+
+        int32_t n_expert  = 0;
+        bool    slots     = false; // false: the layer loads its expert weights
+        size_t  slot_size = 0;
+
+        std::vector<member> members;
+
+        ggml_backend_buffer_type_t buft = nullptr; // of the members, as selected for their slot tensors
+    };
+
+    llama_moe_slot_layer_callback moe_slots          = nullptr;
+    void *                        moe_slots_ud       = nullptr;
+    size_t                        moe_slot_alignment = 0;
+    std::map<int32_t, moe_slot_plan> moe_slot_plans; // by layer, for each MoE layer seen
+
+    // the plan of layer il, made with the callback when the first expert weight 'cur' of the layer is created
+    moe_slot_plan & get_moe_slot_plan(llm_arch arch, int32_t il, const ggml_tensor * cur);
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;

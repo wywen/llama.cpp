@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-slots.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -96,6 +97,9 @@ struct llama_context {
 
     llama_memory_t get_memory() const;
 
+    // the slots of the MoE layers that read their expert weights from slots, nullptr if the model has none
+    const llama_moe_slot_pool * get_moe_slots() const;
+
     // return true if the memory was updated
     bool memory_update(bool optimize);
 
@@ -141,9 +145,9 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
-    void set_ubatch_reserve(uint32_t n_tokens);
-    // grow the reservation to fit a batch about to be submitted
-    void widen_ubatch_reserve(uint32_t n_tokens);
+
+    // the MoE slot set that the following graphs read; false, keeping the current set, if `set` is out of range
+    bool set_moe_slot_set(int32_t set);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -339,6 +343,12 @@ private:
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
 
+    // the slots of this context, see llama_context_params.moe_slots
+    std::unique_ptr<llama_moe_slot_pool> moe_slots;
+
+    // [n_layer] the router weight of each MoE layer, empty unless llama_context_params.moe_router_ahead
+    std::vector<ggml_tensor *> moe_routers;
+
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 
@@ -461,6 +471,9 @@ private:
 
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;
+
+    // true after the check that no op reads an expert weight read from MoE slots passes on a reserved graph
+    bool moe_slots_verified = false;
 
     // perf
     mutable int64_t t_start_us  = 0;

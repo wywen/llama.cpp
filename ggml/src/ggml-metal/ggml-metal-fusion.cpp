@@ -1168,6 +1168,32 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
     return res;
 }
 
+bool ggml_metal_fusion_concurrent(
+        ggml_mem_ranges_t mrs,
+        const ggml_cgraph * gf,
+        const int * node_idxs,
+        int n_idxs,
+        int idx,
+        bool use_fusion) {
+    if (!ggml_mem_ranges_check(mrs, gf->nodes[node_idxs[idx]])) {
+        return false;
+    }
+
+    int n_fuse = 1;
+    if (!use_fusion || !ggml_metal_fusion_next(gf, node_idxs, n_idxs, idx, GGML_METAL_FUSION_FULL, &n_fuse)) {
+        return true;
+    }
+
+    // the fused kernel reads the sources of every node in the group and can write any of their dsts
+    for (int i = 1; i < n_fuse; ++i) {
+        if (!ggml_mem_ranges_check(mrs, gf->nodes[node_idxs[idx + i]])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // optimize phase: maximum number of nodes starting at idx (a raw sequential graph index) that
 // could be fused, chaining patterns back-to-back. matching runs on the same filtered (view
 // transparent) node sequence that the compute phase uses, so the returned count is the raw index

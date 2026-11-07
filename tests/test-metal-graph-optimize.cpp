@@ -1,13 +1,17 @@
 // checks the MUL_MAT+ADD packs of the Metal graph reorder (devices, pack readers, src1 rows), that the encoder fuses
-// no MUL_MAT+ADD the reorder leaves unpacked, and the reorder's boundary barriers
+// no MUL_MAT+ADD the reorder leaves unpacked, the reorder's boundary barriers and barrier name prefixes, and that the
+// encoder's concurrency check covers the middle nodes of a fused group
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-backend-impl.h"
 #include "ggml-impl.h"
+#include "ggml-metal.h"
 #include "ggml-metal-common.h"
 #include "ggml-metal-device.h"
 #include "ggml-metal-fusion.h"
 
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -103,7 +107,7 @@ static std::vector<int> reorder_mul_mat_add(int64_t rows, add_operand_kind kind)
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, add);
     ggml_build_forward_expand(graph, other);
-    ggml_graph_optimize(graph, false);
+    ggml_graph_optimize(graph, false, 0, nullptr);
     const std::vector<int> res = node_positions(graph, { mm, add, other });
 
     ggml_backend_buffer_free(weights);
@@ -207,6 +211,101 @@ static bool check_encoder_skips_weight_residual() {
     return ok;
 }
 
+// true if the encoder runs the MoE routing (fused SOFT_MAX + ARGSORT + GET_ROWS + norm) concurrently with a pending
+// node that reads r, when the argsort ids, which the fused kernel writes from a middle node, share r's memory if alias
+static bool encoder_runs_topk_moe_concurrently(bool alias, bool * group_ends_free) {
+    constexpr int64_t n_expert      = 8;
+    constexpr int64_t n_expert_used = 2;
+    constexpr int64_t n_tok         = 4;
+
+    ggml_init_params params = { n_tensors*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+
+    // the pending node reads r
+    ggml_tensor * r       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert, n_tok);
+    ggml_tensor * pending = ggml_scale(ctx, r, scale);
+
+    // the routing as the MoE graph builds it
+    ggml_tensor * logits  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert, n_tok);
+    ggml_tensor * probs   = ggml_soft_max(ctx, logits);
+    ggml_tensor * ids     = ggml_argsort_top_k(ctx, probs, n_expert_used);
+    ggml_tensor * weights = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, n_expert, n_tok), ids);
+    weights = ggml_reshape_2d(ctx, weights, n_expert_used, n_tok);
+    ggml_tensor * sum = ggml_clamp(ctx, ggml_sum_rows(ctx, weights), 6.103515625e-5f, INFINITY);
+    weights = ggml_reshape_3d(ctx, ggml_div(ctx, weights, sum), 1, n_expert_used, n_tok);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, pending);
+    ggml_build_forward_expand(gf, weights);
+
+    // each tensor gets memory of its own, except that the argsort may take r's
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU));
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+    std::vector<ggml_tensor *> owners;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->view_src == nullptr) {
+            owners.push_back(t);
+        }
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, owners.size()*GGML_PAD(ggml_nbytes(r), align) + align);
+    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buffer);
+    size_t offs = 0;
+    for (ggml_tensor * t : owners) {
+        if (alias && t == ids->view_src) {
+            continue;
+        }
+        GGML_ASSERT(ggml_nbytes(t) <= ggml_nbytes(r));
+        ggml_backend_tensor_alloc(buffer, t, base + offs);
+        offs += GGML_PAD(ggml_nbytes(r), align);
+    }
+    if (alias) {
+        ggml_backend_tensor_alloc(buffer, ids->view_src, r->data);
+    }
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->view_src != nullptr) {
+            ggml_backend_view_init(t);
+        }
+    }
+
+    // the nodes the encoder runs, the pending node first
+    std::vector<int> idxs;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        if (!ggml_op_is_empty(ggml_graph_node(gf, i)->op)) {
+            idxs.push_back(i);
+        }
+    }
+    GGML_ASSERT(ggml_graph_node(gf, idxs[0]) == pending);
+
+    ggml_mem_ranges_t mrs = ggml_mem_ranges_init(0);
+    ggml_mem_ranges_add(mrs, pending);
+
+    int n_fused = 1;
+    const ggml_metal_fusion * fusion = ggml_metal_fusion_next(gf, idxs.data(), (int) idxs.size(), 1, GGML_METAL_FUSION_FULL, &n_fused);
+    GGML_ASSERT(fusion != nullptr && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_TOPK_MOE && n_fused == (int) idxs.size() - 1);
+
+    *group_ends_free = ggml_mem_ranges_check(mrs, ggml_graph_node(gf, idxs[1])) &&
+        ggml_mem_ranges_check(mrs, ggml_graph_node(gf, idxs.back()));
+    const bool res = ggml_metal_fusion_concurrent(mrs, gf, idxs.data(), (int) idxs.size(), 1, true);
+
+    ggml_mem_ranges_free(mrs);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return res;
+}
+
+// a fused kernel writes the dst of a middle node, so the group needs a barrier when that dst is still being read
+static bool check_encoder_checks_fused_middle_nodes() {
+    bool ends_free_alias = false;
+    bool ends_free       = false;
+    const bool concurrent_alias = encoder_runs_topk_moe_concurrently(true,  &ends_free_alias);
+    const bool concurrent       = encoder_runs_topk_moe_concurrently(false, &ends_free);
+    const bool ok = ends_free_alias && ends_free && !concurrent_alias && concurrent;
+    std::printf("fused MoE routing next to a reader of the memory of its argsort ids: concurrent %d (expected 0), "
+        "of other memory: concurrent %d (expected 1), first and last node free %d %d (expected 1 1): %s\n",
+        concurrent_alias, concurrent, ends_free_alias, ends_free, ok ? "OK" : "FAIL");
+    return ok;
+}
+
 static ggml_context * graph_ctx() {
     ggml_init_params params = { n_tensors*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
     return ggml_init(params);
@@ -222,7 +321,7 @@ static void expand_all(ggml_cgraph * graph, const std::vector<ggml_tensor *> & o
 static ggml_cgraph * optimized_graph(ggml_context * ctx, const std::vector<ggml_tensor *> & outputs) {
     ggml_cgraph * graph = ggml_new_graph(ctx);
     expand_all(graph, outputs);
-    ggml_graph_optimize(graph, false);
+    ggml_graph_optimize(graph, false, 0, nullptr);
     return graph;
 }
 
@@ -274,16 +373,9 @@ static bool check_chained_pack_reader() {
     return report_reader("reader of a chained MUL_MAT+ADD sum", packed, after);
 }
 
-// the boundary barriers of the graph reorder
-//
-// ggml_graph_optimize hoists memory-concurrent nodes forward to widen the concurrent set.
-// A caller that installs a boundary-event schedule and an encode window cuts the graph at
-// the per-layer output markers, and the reorder runs before that schedule exists, so left
-// alone it can move a node out of the segment that is supposed to produce it. These tests
-// pin both halves of the fix: with the barriers off the hoist still happens (the reorder
-// is untouched), and with them on nothing crosses a marker.
-//
-// Every case is a hand-built graph: no device, no model, no allocation.
+// boundary barriers of the graph reorder: with the barriers off the reorder hoists nodes across a
+// per-layer output marker as usual, with them on nothing crosses a marker.
+// every case is a hand-built graph: no device, no model, no allocation
 
 static int g_n_fail = 0;
 
@@ -358,8 +450,7 @@ static ggml_tensor * named(ggml_tensor * t, const char * name) {
     return t;
 }
 
-// An independent lookup into a persistent cache: nothing in the graph anchors it, which is
-// exactly the node the reorder is free to hoist as far as it likes.
+// an independent lookup into a persistent cache; nothing anchors it, so the reorder may hoist it freely
 static ggml_tensor * cache_lookup(ggml_context * ctx, const char * name) {
     ggml_tensor * cache = leaf(ctx, "cache");
     ggml_tensor * ids   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
@@ -368,8 +459,7 @@ static ggml_tensor * cache_lookup(ggml_context * ctx, const char * name) {
     return named(ggml_get_rows(ctx, cache, ids), name);
 }
 
-// n0 writes "a", n1 reads it -- n1 therefore conflicts with the concurrent set n0 opened,
-// which is what makes the reorder look forward for something to hoist in front of n1.
+// b conflicts with the concurrent set a opened, so the reorder looks forward for a node to hoist in front of it
 //
 //   a  -> mul(x, y)
 //   b  -> mul(a, w)      conflicts with a
@@ -395,8 +485,7 @@ static ggml_cgraph * build_hoist_across(ggml_context * ctx, const char * marker_
     return gf;
 }
 
-// Same idea, but the marker is itself the node that opens the look-forward scan. Everything
-// the scan picks up is emitted BEFORE the marker, so the scan has to be skipped entirely.
+// the marker is itself the node that opens the look-forward scan, so the scan has to be skipped
 //
 //   a  -> mul(x, y)
 //   mk -> add(a, x)      the boundary marker, and the conflicting node
@@ -418,14 +507,14 @@ static ggml_cgraph * build_marker_anchor(ggml_context * ctx) {
     return gf;
 }
 
-// The marker packed into a fused group as a non-head member. The reorder moves whole groups,
-// so the marker rides along with "s" unless the barrier test looks past the group's head.
+// the marker is a non-head member of a fused group; the reorder moves whole groups, so the barrier test
+// has to look past the group's head
 //
 //   a  -> mul(x, y)
 //   b  -> mul(a, w)      conflicts with a
 //   s  -> add(p, q)      independent, fusable head
 //   mk -> add(s, v)      the boundary marker, fused onto s
-static ggml_cgraph * build_fused_group(ggml_context * ctx) {
+static ggml_cgraph * build_fused_group(ggml_context * ctx, const char * marker_name = "l_out-0") {
     ggml_tensor * x = leaf(ctx, "x");
     ggml_tensor * y = leaf(ctx, "y");
     ggml_tensor * w = leaf(ctx, "w");
@@ -436,7 +525,7 @@ static ggml_cgraph * build_fused_group(ggml_context * ctx) {
     ggml_tensor * a  = named(ggml_mul(ctx, x, y), "a");
     ggml_tensor * b  = named(ggml_mul(ctx, a, w), "b");
     ggml_tensor * s  = named(ggml_add(ctx, p, q), "s");
-    ggml_tensor * mk = named(ggml_add(ctx, s, v), "l_out-0");
+    ggml_tensor * mk = named(ggml_add(ctx, s, v), marker_name);
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
 
@@ -448,11 +537,219 @@ static ggml_cgraph * build_fused_group(ggml_context * ctx) {
     return gf;
 }
 
+// a router whose ops do not fuse, ending in the node a caller cuts at, followed by a lookup by expert ids
+// that reads memory the host fills at that cut; the graph records no dependency between the two
+//
+//   router_logits-0 -> mul_mat(w, x)
+//   router_probs-0  -> scale(router_logits-0)   conflicts with router_logits-0
+//   router_out-0    -> add(router_probs-0, x)   the cut node
+//   expert_rows-0   -> get_rows(slots, ids)     independent of the router
+//   expert_out-0    -> mul(expert_rows-0, router_out-0)
+static ggml_cgraph * build_router_lookup(ggml_context * ctx) {
+    ggml_tensor * x = leaf(ctx, "x");
+    ggml_tensor * w = leaf(ctx, "w");
+
+    ggml_tensor * logits = named(ggml_mul_mat(ctx, w, x), "router_logits-0");
+    ggml_tensor * probs  = named(ggml_scale(ctx, logits, scale), "router_probs-0");
+    ggml_tensor * out    = named(ggml_add(ctx, probs, x), "router_out-0");
+    ggml_tensor * rows   = cache_lookup(ctx, "expert_rows-0");
+    ggml_tensor * expert = named(ggml_mul(ctx, rows, out), "expert_out-0");
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+
+    ggml_build_forward_expand(gf, logits);
+    ggml_build_forward_expand(gf, probs);
+    ggml_build_forward_expand(gf, out);
+    ggml_build_forward_expand(gf, expert);
+
+    return gf;
+}
+
+// the cut node is independent of the node before it, so the reorder could run the cut first
+//
+//   a     -> mul(x, y)
+//   b     -> mul(a, w)        conflicts with a, belongs before the cut
+//   cut-0 -> get_rows(...)    the cut node, independent
+static ggml_cgraph * build_cut_hoisted(ggml_context * ctx) {
+    ggml_tensor * x = leaf(ctx, "x");
+    ggml_tensor * y = leaf(ctx, "y");
+    ggml_tensor * w = leaf(ctx, "w");
+
+    ggml_tensor * a   = named(ggml_mul(ctx, x, y), "a");
+    ggml_tensor * b   = named(ggml_mul(ctx, a, w), "b");
+    ggml_tensor * cut = cache_lookup(ctx, "cut-0");
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+
+    ggml_build_forward_expand(gf, a);
+    ggml_build_forward_expand(gf, b);
+    ggml_build_forward_expand(gf, cut);
+
+    return gf;
+}
+
+// the cases of caller-registered barrier name prefixes; failures count into g_n_fail
+static void run_barrier_prefix_cases() {
+    const char * router_cut[] = { "router_out-" };
+    const char * cut[]        = { "cut-" };
+    const char * other[]      = { "nothing-", "router_out-1" };
+
+    {
+        test_ctx      tc;
+        ggml_cgraph * gf = build_router_lookup(tc.ctx);
+
+        check_order("router: graph as built", gf,
+            { "router_logits-0", "router_probs-0", "router_out-0", "expert_rows-0", "expert_out-0" });
+    }
+
+    // positive control: without a barrier the lookup runs before the router's cut node
+    {
+        test_ctx      tc;
+        ggml_cgraph * gf = build_router_lookup(tc.ctx);
+
+        ggml_graph_optimize(gf, false, 0, nullptr);
+
+        check_order("no prefix: lookup hoists above the cut", gf,
+            { "router_logits-0", "expert_rows-0", "router_probs-0", "router_out-0", "expert_out-0" });
+    }
+
+    // the marker switch alone does not cover a cut at a node that is not a per-layer output
+    {
+        test_ctx      tc;
+        ggml_cgraph * gf = build_router_lookup(tc.ctx);
+
+        ggml_graph_optimize(gf, true, 0, nullptr);
+
+        check_order("markers only: lookup hoists above the cut", gf,
+            { "router_logits-0", "expert_rows-0", "router_probs-0", "router_out-0", "expert_out-0" });
+    }
+
+    // prefixes that match no node leave the reorder as it is
+    {
+        test_ctx      tc;
+        ggml_cgraph * gf = build_router_lookup(tc.ctx);
+
+        ggml_graph_optimize(gf, false, 2, other);
+
+        check_order("unmatched prefixes: reorder unchanged", gf,
+            { "router_logits-0", "expert_rows-0", "router_probs-0", "router_out-0", "expert_out-0" });
+    }
+
+    for (bool markers : { false, true }) {
+        test_ctx      tc;
+        ggml_cgraph * gf = build_router_lookup(tc.ctx);
+
+        ggml_graph_optimize(gf, markers, 1, router_cut);
+
+        check_order(markers ? "prefix + markers: lookup stays below" : "prefix: lookup stays below the cut", gf,
+            { "router_logits-0", "router_probs-0", "router_out-0", "expert_rows-0", "expert_out-0" });
+    }
+
+    // the cut node itself is not hoisted above a node before it
+    {
+        test_ctx      tc;
+        ggml_cgraph * gf = build_cut_hoisted(tc.ctx);
+
+        ggml_graph_optimize(gf, false, 0, nullptr);
+
+        check_order("no prefix: cut node hoists", gf, { "a", "cut-0", "b" });
+    }
+
+    {
+        test_ctx      tc;
+        ggml_cgraph * gf = build_cut_hoisted(tc.ctx);
+
+        ggml_graph_optimize(gf, false, 1, cut);
+
+        check_order("prefix: cut node holds", gf, { "a", "b", "cut-0" });
+    }
+
+    // the cut node opens the look-forward scan, which picks up nothing
+    {
+        test_ctx      tc;
+        ggml_cgraph * gf = build_hoist_across(tc.ctx, "cut-0");
+
+        ggml_graph_optimize(gf, false, 0, nullptr);
+
+        check_order("no prefix: hoists across the cut", gf, { "a", "c", "b", "cut-0" });
+    }
+
+    {
+        test_ctx      tc;
+        ggml_cgraph * gf = build_hoist_across(tc.ctx, "cut-0");
+
+        ggml_graph_optimize(gf, false, 1, cut);
+
+        check_order("prefix: nothing crosses the cut", gf, { "a", "b", "cut-0", "c" });
+    }
+
+    // a cut node fused onto the head of a group: the group stays packed in both runs, and
+    //   with the prefix it holds its place
+    {
+        test_ctx      tc;
+        ggml_cgraph * gf = build_fused_group(tc.ctx, "cut-0");
+
+        ggml_graph_optimize(gf, false, 0, nullptr);
+
+        check_order("no prefix: fused group hoists", gf, { "a", "s", "cut-0", "b" });
+    }
+
+    {
+        test_ctx      tc;
+        ggml_cgraph * gf = build_fused_group(tc.ctx, "cut-0");
+
+        ggml_graph_optimize(gf, false, 1, cut);
+
+        check_order("prefix: fused group holds", gf, { "a", "b", "s", "cut-0" });
+    }
+}
+
+static void ignore_alloc_dep(void * /*user_data*/, ggml_tensor * /*tensor*/, ggml_tensor * /*until*/) {}
+
+// the prefixes a caller registers on the backend reach the reorder the scheduler runs, are
+//   copied, and are gone once cleared
+static void run_backend_prefix_cases() {
+    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+    if (backend == nullptr || !ggml_backend_is_metal(backend)) {
+        printf("FAIL %-40s no Metal backend\n", "backend prefixes");
+        g_n_fail++;
+        if (backend != nullptr) {
+            ggml_backend_free(backend);
+        }
+        return;
+    }
+
+    ggml_backend_graph_optimize_params params = { ignore_alloc_dep, nullptr };
+
+    const auto optimize = [&](const char * scenario, const std::vector<std::string> & expected) {
+        test_ctx      tc;
+        ggml_cgraph * gf = build_router_lookup(tc.ctx);
+
+        backend->iface.graph_optimize(backend, gf, &params);
+
+        check_order(scenario, gf, expected);
+    };
+
+    {
+        // the strings die before the reorder runs
+        std::string prefix = "router_out-";
+        const char * prefixes[] = { prefix.c_str() };
+        ggml_backend_metal_set_reorder_barrier_prefixes(backend, 1, prefixes);
+        prefix.assign(prefix.size(), 'x');
+    }
+
+    optimize("backend prefix: lookup stays below", { "router_logits-0", "router_probs-0", "router_out-0", "expert_rows-0", "expert_out-0" });
+
+    ggml_backend_metal_set_reorder_barrier_prefixes(backend, 0, nullptr);
+
+    optimize("backend prefix cleared: lookup hoists", { "router_logits-0", "expert_rows-0", "router_probs-0", "router_out-0", "expert_out-0" });
+
+    ggml_backend_free(backend);
+}
+
 // the boundary barrier cases, returns the number of failed checks
 static int run_boundary_barrier_cases() {
-    // The reorder only ever has something to do when the graph it is given is in the order
-    // these builders lay it out, so check that first -- otherwise a change in how
-    // ggml_build_forward_expand walks the graph would quietly make every case below vacuous.
+    // the cases below are vacuous unless the builders lay the graph out in this order
     {
         test_ctx     tc;
         ggml_cgraph * gf = build_hoist_across(tc.ctx, "l_out-0");
@@ -460,14 +757,12 @@ static int run_boundary_barrier_cases() {
         check_order("graph as built", gf, { "a", "b", "l_out-0", "c" });
     }
 
-    // Positive control: with the barriers off, the reorder hoists the independent lookup
-    // across the marker. This is the behaviour every non-boundary-scheduling caller gets,
-    // and it must not change.
+    // control: with the barriers off, the reorder hoists the independent lookup across the marker
     {
         test_ctx     tc;
         ggml_cgraph * gf = build_hoist_across(tc.ctx, "l_out-0");
 
-        ggml_graph_optimize(gf, false);
+        ggml_graph_optimize(gf, false, 0, nullptr);
 
         check_order("barriers off: hoists across marker", gf, { "a", "c", "b", "l_out-0" });
     }
@@ -477,18 +772,17 @@ static int run_boundary_barrier_cases() {
         test_ctx     tc;
         ggml_cgraph * gf = build_hoist_across(tc.ctx, "l_out-0");
 
-        ggml_graph_optimize(gf, true);
+        ggml_graph_optimize(gf, true, 0, nullptr);
 
         check_order("barriers on: stops at marker", gf, { "a", "b", "l_out-0", "c" });
     }
 
-    // The barrier keys on the marker, not on the switch: a node that is not a marker is
-    // still hoisted with the barriers on, so turning them on is not a blanket "no reorder".
+    // only markers are barriers: a node that is not a marker is still hoisted with the barriers on
     {
         test_ctx     tc;
         ggml_cgraph * gf = build_hoist_across(tc.ctx, "ffn_out-0");
 
-        ggml_graph_optimize(gf, true);
+        ggml_graph_optimize(gf, true, 0, nullptr);
 
         check_order("barriers on: non-marker still hoists", gf, { "a", "c", "b", "ffn_out-0" });
     }
@@ -498,7 +792,7 @@ static int run_boundary_barrier_cases() {
         test_ctx     tc;
         ggml_cgraph * gf = build_marker_anchor(tc.ctx);
 
-        ggml_graph_optimize(gf, false);
+        ggml_graph_optimize(gf, false, 0, nullptr);
 
         check_order("barriers off: hoists in front of marker", gf, { "a", "c", "l_out-0" });
     }
@@ -507,19 +801,17 @@ static int run_boundary_barrier_cases() {
         test_ctx     tc;
         ggml_cgraph * gf = build_marker_anchor(tc.ctx);
 
-        ggml_graph_optimize(gf, true);
+        ggml_graph_optimize(gf, true, 0, nullptr);
 
         check_order("barriers on: marker takes nothing along", gf, { "a", "l_out-0", "c" });
     }
 
-    // Fusion packs "s" and the marker into one group. With the barriers off the group is
-    // hoisted whole, which moves the marker itself -- the two staying adjacent is what says
-    // they were really fused rather than reordered independently.
+    // "s" and the marker are fused into one group, hoisted whole with the barriers off
     {
         test_ctx     tc;
         ggml_cgraph * gf = build_fused_group(tc.ctx);
 
-        ggml_graph_optimize(gf, false);
+        ggml_graph_optimize(gf, false, 0, nullptr);
 
         check_order("barriers off: fused group hoists", gf, { "a", "s", "l_out-0", "b" });
     }
@@ -530,7 +822,7 @@ static int run_boundary_barrier_cases() {
         test_ctx     tc;
         ggml_cgraph * gf = build_fused_group(tc.ctx);
 
-        ggml_graph_optimize(gf, true);
+        ggml_graph_optimize(gf, true, 0, nullptr);
 
         check_order("barriers on: fused group holds", gf, { "a", "b", "s", "l_out-0" });
     }
@@ -564,6 +856,9 @@ static int run_boundary_barrier_cases() {
         g_n_fail += n_bad;
     }
 
+    run_barrier_prefix_cases();
+    run_backend_prefix_cases();
+
     return g_n_fail;
 }
 
@@ -573,7 +868,8 @@ int main() {
         { "probed or no simdgroup matrices", false, true },
     };
     const int failures = run_pack_cases(devices) + (check_chained_pack_reader() ? 0 : 1) + run_row_independent_pack_cases() +
-        (check_encoder_skips_weight_residual() ? 0 : 1) + run_boundary_barrier_cases();
+        (check_encoder_skips_weight_residual() ? 0 : 1) + (check_encoder_checks_fused_middle_nodes() ? 0 : 1) +
+        run_boundary_barrier_cases();
 
     return failures == 0 ? 0 : 1;
 }

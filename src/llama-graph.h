@@ -23,6 +23,7 @@ struct llama_prec_policy;
 struct llama_hadamard;
 
 class llama_moe_cache;
+class llama_moe_slot_pool;
 
 struct llama_memory_context_i;
 
@@ -806,6 +807,10 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    const llama_moe_slot_pool    * moe_slots;
+
+    // [n_layer] the router weight of each MoE layer, nullptr for the other layers; nullptr = no router lookahead
+    const std::vector<ggml_tensor *> * moe_routers = nullptr;
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -894,6 +899,11 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        // the slot sets have the same topology, but the graph reads the slot tensors of its set
+        if (cparams.moe_slot_set != other.cparams.moe_slot_set) {
             return false;
         }
 
@@ -1018,6 +1028,16 @@ struct llm_graph_amax_src1 {
     ggml_tensor * scale_s; // scale to undo on the matmul result, or nullptr
 };
 
+// the experts of a MoE layer read at slots: from caller-filled slots, or from the MoE cache
+struct llm_graph_moe_slots {
+    ggml_tensor * slots = nullptr; // [n_expert_used, n_tokens] the slot of each selected expert, nullptr: read the expert weights
+
+    // the tensor that stands in for each expert weight
+    std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> weights;
+
+    ggml_tensor * get(const ggml_tensor * w) const;
+};
+
 struct llm_graph_context {
     const llm_arch arch;
 
@@ -1064,6 +1084,9 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    const llama_moe_slot_pool    * moe_slots;
+
+    const std::vector<ggml_tensor *> * moe_routers; // see llm_graph_params::moe_routers
 
     const llama_prec_policy * prec_policy;
 
@@ -1113,13 +1136,14 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
-    // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
+    // if slots is set, the experts are read from the tensor that stands in for w at these slots (see build_moe_slots),
+    //     the scale and the LoRA still at ids
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
               ggml_tensor * w_s   = nullptr,
-              ggml_tensor * slots = nullptr) const;
+        const llm_graph_moe_slots * slots = nullptr) const;
 
     // rescale `cur` (the src1 of a matmul) by a power of two, computed from its maximum absolute
     // keep both individual values and Q8 activation block sums within F16 range
@@ -1225,8 +1249,19 @@ struct llm_graph_context {
              ggml_tensor * post_exp_norm = nullptr,
                    float   post_exp_norm_eps = 1e-5f) const;
 
-    // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
-    ggml_tensor * build_moe_cache_slots(
+    // the router lookahead (llama_context_params.moe_router_ahead) of MoE layer il, whose router weight is `router`:
+    //     the first MoE layer after il, or -1 if the lookahead is off, `router` is not layer il's router or il is the
+    //     last MoE layer
+    int moe_router_ahead_layer(int il, const ggml_tensor * router) const;
+
+    // names the router lookahead logits of layer il, marks them as an output and adds them to the graph, which must
+    //     happen before the router of layer il is built so that the router nodes stay adjacent
+    void build_moe_router_ahead(ggml_tensor * logits_ahead, int il) const;
+
+    // the slots of the selected experts and the tensors that stand in for the expert weights, from the caller-filled
+    //     slots of the layer in the context or from the MoE cache; no slots if the layer reads its expert weights
+    // throws if the layer reads its expert weights from slots and the context has none for it
+    llm_graph_moe_slots build_moe_slots(
              ggml_tensor * selected_experts,
              ggml_tensor * up_exps,
              ggml_tensor * gate_exps,

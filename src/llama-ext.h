@@ -42,27 +42,24 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
-// Reserves, on the current scheduler, the prompt graph a scheduler reserve sizes its compute
-// buffers for last: the widest graph at the reserve width. Valid as llama_graph_reserve's.
+// Reserves the widest prompt graph, the one a scheduler reserve sizes the compute buffers for last.
+// The result is valid as llama_graph_reserve's.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve_widest(struct llama_context * ctx);
 
-// Whether the next decode reserves the scheduler again: a setting changed since the last reserve (a
-// backend sampler, an adapter, the attention type, ...). That reserve plans the scheduler again,
-// recreating it only when the graph outgrows it, and may reallocate its compute buffers.
+// Whether the next decode reserves the scheduler again because a setting changed (a backend sampler,
+// an adapter, the attention type, ...); that reserve may reallocate the compute buffers.
 LLAMA_API bool llama_sched_reserve_pending(const struct llama_context * ctx);
 
-// Runs a pending scheduler reserve now, as the next decode would, so the compute buffers settle
-// before the first decode. Does nothing when none is pending. False when the reserve failed:
-// discard the context.
+// Runs a pending scheduler reserve now instead of at the next decode; does nothing when none is pending.
+// Returns false when the reserve failed: discard the context.
 LLAMA_API bool llama_sched_reserve_now(struct llama_context * ctx);
 
-// Constructor-phase reservation: call after final embedding/backend-sampler configuration and before decoding.
-// Rejects zero or rows beyond n_batch or n_outputs_max without changing the context.
-// A valid request returning false means allocation failed: discard the context, since its previous output
-// storage may have been released. Does not evaluate a graph or alter sequence state.
+// Reserves the output buffer for n_outputs rows, after the embedding and backend sampler setup and before decoding.
+// Rejects 0 or more than n_batch or n_outputs_max rows without changing the context. Returns false for a valid
+// request when the allocation failed: discard the context, its previous output buffer may have been released.
 LLAMA_API bool llama_output_reserve(struct llama_context * ctx, uint32_t n_outputs);
 
-// Borrowed output buffer for allocation accounting; invalidated by growth or context destruction.
+// The output buffer, valid until it grows or the context is freed.
 LLAMA_API ggml_backend_buffer_t llama_get_output_buffer(const struct llama_context * ctx);
 
 struct llama_fused_node_info {
@@ -70,9 +67,8 @@ struct llama_fused_node_info {
     int32_t layer;
 };
 
-// Copies flash-attention metadata for the last decoded graph. Tensor pointers are borrowed until
-// the next decode or graph reset. Returns the total available count whether or not `out` is null
-// or large enough; copies at most `capacity` entries.
+// Copies the flash-attention nodes of the last decoded graph and their layers, at most `capacity` entries, and
+// returns their total count. The tensors are valid until the next decode or graph reset.
 LLAMA_API size_t llama_get_fused_node_info(
     const struct llama_context * ctx,
     struct llama_fused_node_info * out,
@@ -184,8 +180,8 @@ struct llama_memory_plan_tensor {
 struct llama_memory_plan_buffer {
     llama_memory_plan_buffer_kind kind;
     ggml_backend_buffer_type_t    buft;
-    // bytes ggml's allocator places the tensors in: the sum of their sizes, each padded to the buffer type's
-    // alignment, as memory_breakdown reports; a backend may round the physical allocation up further (Metal rounds to pages)
+    // the sum of the tensor sizes, each padded to the buffer type's alignment, as memory_breakdown reports;
+    // a backend may round the allocation up further
     size_t                        size;
     std::vector<llama_memory_plan_tensor> tensors; // the tensors owning storage, in allocation order
 };
@@ -207,13 +203,10 @@ struct llama_memory_plan {
     std::vector<llama_memory_plan_buffer> buffers; // in allocation order
 };
 
-// Builds the memory module a context created from `params` would own, with every buffer allocation
-// replaced by a record of what it would allocate, then destroys it.
-// Allocates no tensor data, though host-side cell metadata proportional to the cell count is still built
-// and freed. Modifies neither the model nor params.ctx_other.
-// Throws std::runtime_error when the model is null, or when a parameter check of context creation refuses
-// the parameters; failures context creation meets later (backend, sampler, output or compute buffer
-// initialization) are not checked.
+// Builds the memory that a context created from `params` would own, recording its buffer allocations instead of
+// making them, then destroys it. Allocates no tensor data (the host-side cell metadata is still built).
+// Throws std::runtime_error for a null model or for parameters that context creation refuses; later failures of
+// context creation (backends, samplers, output and compute buffers) are not checked.
 LLAMA_API llama_memory_plan llama_model_memory_plan(const struct llama_model * model, const llama_context_params & params);
 
 // Set whether the context outputs nextn embeddings or not

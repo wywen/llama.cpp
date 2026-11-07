@@ -1235,8 +1235,7 @@ struct ggml_backend_sched {
     ggml_backend_sched_reserve_callback callback_reserve;
     void * callback_reserve_user_data;
 
-    // Fired once per graph compute (after split/alloc, before encode). Preserves fusion
-    // because it is not per-node. Zero-initialized with the rest of the sched struct.
+    // called once per graph compute, after split and alloc and before any split is computed
     ggml_backend_sched_graph_compute_callback callback_graph;
     void * callback_graph_user_data;
 
@@ -1245,9 +1244,6 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_graph_prepare_callback callback_graph_prepare;
     void * callback_graph_prepare_user_data;
-
-    ggml_backend_sched_synchronize_callback callback_synchronize;
-    void * callback_synchronize_user_data;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -1929,6 +1925,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->graph.n_nodes = 0;
     sched->graph.n_leafs = 0;
 
+    // borrow the use counts of the original graph, as every split's ggml_graph_view does, so a fusion
+    // check over this copy decides what the check over a split decides. nodes added below have
+    // count 0 and never fuse. valid as long as the original graph is
+    sched->graph.use_counts       = graph->use_counts;
+    sched->graph.visited_hash_set = graph->visited_hash_set;
+    sched->graph.order            = graph->order;
+
     struct ggml_cgraph * graph_copy = &sched->graph;
 
     int n_dep_nodes_added = 0;
@@ -2077,9 +2080,6 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         for (int i = 0; i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
-        if (sched->callback_synchronize != NULL) {
-            sched->callback_synchronize(sched, sched->callback_synchronize_user_data);
-        }
 
         if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
             GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
@@ -2145,9 +2145,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
 
-    // Fire the per-graph-compute callback once, now that the graph is split and
-    // allocated but before any split is encoded. Unlike callback_eval this does not
-    // run per node, so it does not disable op fusion. See ggml-backend.h.
+    // unlike callback_eval this is not per node, so it does not disable op fusion
     if (sched->callback_graph) {
         sched->callback_graph(sched, sched->callback_graph_user_data);
     }
@@ -2390,7 +2388,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
-    if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+    if (!ggml_gallocr_reserve_n_covering(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
     }
 
@@ -2443,9 +2441,6 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
-    }
-    if (sched->callback_synchronize != NULL) {
-        sched->callback_synchronize(sched, sched->callback_synchronize_user_data);
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
@@ -2501,12 +2496,6 @@ void ggml_backend_sched_set_graph_prepare_callback(ggml_backend_sched_t sched, g
     GGML_ASSERT(sched);
     sched->callback_graph_prepare = callback;
     sched->callback_graph_prepare_user_data = user_data;
-}
-
-void ggml_backend_sched_set_synchronize_callback(ggml_backend_sched_t sched, ggml_backend_sched_synchronize_callback callback, void * user_data) {
-    GGML_ASSERT(sched);
-    sched->callback_synchronize = callback;
-    sched->callback_synchronize_user_data = user_data;
 }
 
 void ggml_backend_sched_set_replan_on_shrink(ggml_backend_sched_t sched, bool replan) {

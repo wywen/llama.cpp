@@ -11,10 +11,7 @@ llama_memory_plan llama_model_memory_plan(const llama_model * model, const llama
     if (!model) {
         throw std::runtime_error("model cannot be NULL");
     }
-    // The plan sizes buffers by constructing placeholder-buffer memory, which
-    // replays the parameter-resolution and construction logs a real context
-    // construction emits; silence them on this thread so the real construction
-    // remains the single source of that log.
+    // the placeholder memory replays the construction logs; leave them to the real construction
     const llama_log_thread_quiet log_quiet;
 
     const llama_context_params resolved = llama_context_params_resolve(*model, params);

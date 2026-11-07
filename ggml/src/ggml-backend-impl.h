@@ -16,6 +16,15 @@ extern "C" {
     // when set, ggml_gallocr_alloc_graph plans again if any tensor size differs from the recorded plan (default: only if one grew)
     GGML_API void ggml_gallocr_set_replan_on_shrink(ggml_gallocr_t galloc, bool replan);
 
+    // as ggml_gallocr_reserve_n, for a graph the buffers must hold from now on: its plan becomes the covering plan of its
+    // topology, which a later re-plan of that topology falls back on rather than grow a chunk, unless a covering plan
+    // already holds the graph or the covering plan of its topology gives some tensor more room
+    GGML_API bool ggml_gallocr_reserve_n_covering(
+        ggml_gallocr_t galloc,
+        struct ggml_cgraph * graph,
+        const int * node_buffer_ids,
+        const int * leaf_buffer_ids);
+
     // bytes of chunk `chunk` of buffer `buffer_id` addressed by the graph last allocated with ggml_gallocr_alloc_graph;
     // stores the chunk's backend buffer in *chunk_buffer. Returns 0 (and NULL) past the last chunk or for a buffer id
     // that shares its allocator with an earlier one.

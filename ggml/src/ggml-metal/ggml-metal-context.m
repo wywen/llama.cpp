@@ -1,7 +1,3 @@
-// The encode waits for a segment's gate in slices, warning after each one. Exceeding the abort
-// limit fails the graph: encoding resolves each tensor's Metal buffer, and a buffer the caller
-// has not yet made (or is about to release) for this segment must not be bound by a command
-// buffer committed ahead of its gate.
 #import "ggml-metal-context.h"
 
 #import "ggml-impl.h"
@@ -25,8 +21,7 @@
 // max number of MTLCommandBuffer used to submit a graph for processing
 #define GGML_METAL_MAX_COMMAND_BUFFERS 8
 
-// One paged-encode segment's terminal state. `desc` is empty unless the buffer
-// reported an error with a description.
+// terminal state of one segment's command buffer; desc is empty unless an error was described
 struct ggml_metal_seg_result {
     int    status;
     char   desc[256];
@@ -36,7 +31,7 @@ struct ggml_metal_command_buffer {
     id<MTLCommandBuffer> obj;
 };
 
-// Paged compute gate wait: warning slice and default abort limit.
+// boundary-scheduled compute: gate wait warning slice and default abort limit
 #define GGML_METAL_PAGED_GATE_SLICE_MS 10000
 #define GGML_METAL_PAGED_GATE_ABORT_MS_DEFAULT 300000
 
@@ -59,6 +54,11 @@ struct ggml_metal {
 
     // stop the graph reorder at boundary marker nodes (see ggml_metal_set_reorder_barriers)
     bool use_reorder_barriers;
+
+    // node-name prefixes the graph reorder treats as barriers (see ggml_metal_set_reorder_barrier_prefixes)
+    // owned copies, replaced on each set
+    int     reorder_n_prefixes;
+    char ** reorder_prefixes;
 
     int debug_graph;
 
@@ -91,14 +91,9 @@ struct ggml_metal {
     // if Metal released them, it would do so on a Metal-internal thread without an autorelease pool, which could cause leaks
     NSMutableArray * buf_refs;
 
-    // Terminal state of each paged-encode segment, captured by that segment's
-    // completion handler rather than read back off the buffer afterwards.
-    //
-    // A failure ABANDONS the rest of the queue, and an abandoned buffer carries
-    // a bare status with no localizedDescription -- so reading state back after
-    // the fact can only find the first buffer that did not complete, which is
-    // usually not the one that failed. Capturing at completion records what
-    // each buffer actually reported, at the instant it reported it.
+    // terminal state of each segment, captured in its completion handler: a failure abandons the
+    // rest of the queue and abandoned buffers carry no error, so reading back later would find
+    // the first buffer that did not complete rather than the one that failed
     struct ggml_metal_seg_result * seg_results;
     int                            seg_results_cap;
     int                            seg_results_n;
@@ -113,22 +108,16 @@ struct ggml_metal {
     // error state - set when a command buffer fails during synchronize
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
-    // localizedDescription of the command buffer that carried the error putting this context
-    // into `has_error`, or an explicit note when the queue was abandoned without one. Owned
-    // copy: the command buffers it came from are released immediately after.
+    // description of the error that set has_error (a copy, the command buffers are released)
     char last_error[256];
 
-    // Paged compute: total time a segment may wait for its gate before the graph fails
-    // (0 = no limit). See ggml_backend_metal_set_paged_gate_abort_ms.
+    // total time a segment may wait for its gate before the graph fails (0 = no limit)
+    // see ggml_backend_metal_set_paged_gate_abort_ms
     uint32_t paged_gate_abort_ms;
 
-    // Paged-decode boundary-event schedule (PERSISTENT + pointer-keyed;
-    // see ggml_metal_set_boundary_schedule). Owned copies, replaced on each set
-    // and freed on clear/free. When bsched_n_cuts == 0 the stock n_cb encode
-    // path runs unchanged. Nodes are matched by pointer against each computed
-    // graph, so the schedule is NOT cleared after a graph_compute -- it stays in
-    // force across the splits of one decode (and the reused graph of later
-    // tokens) until the caller clears it.
+    // boundary-event schedule (see ggml_metal_set_boundary_schedule), owned copies
+    // nodes are matched by pointer against each computed graph and the schedule stays in force
+    // across computes until cleared; with bsched_n_cuts == 0 the stock n_cb path runs
     int                    bsched_n_cuts;
     struct ggml_tensor  ** bsched_cut_nodes;  // node ptrs; segment ends (signal after)
     ggml_metal_event_t  *  bsched_sig_ev;     // per cut; NULL entry => no signal there
@@ -137,26 +126,16 @@ struct ggml_metal {
     struct ggml_tensor  ** bsched_wait_nodes; // node ptrs; segment starts (wait before)
     ggml_metal_event_t  *  bsched_wait_ev;
     uint64_t *             bsched_wait_val;
-    // Signalled on completion of an empty command buffer committed ahead of the
-    // encode window's first segment; NULL for none.
+    // signaled on completion of an empty command buffer committed ahead of the first segment
     ggml_metal_event_t     bsched_entry_ev;
     uint64_t               bsched_entry_val;
 
-    // Encode window over the paged path (PERSISTENT + pointer-keyed, like the
-    // boundary schedule above; see ggml_metal_set_encode_window). While set,
-    // ggml_metal_graph_compute_paged encodes only the segments intersecting
-    // [first_node, last_node] and moves boundary tensors through ordered ingress
-    // copies before the first encoded segment and egress copies after the last.
-    // Copy arrays are owned copies; the tensors remain caller-owned. Every
-    // copy is stored as a byte range, a whole-tensor pair as the range
-    // [0, ggml_nbytes(src)) on both sides.
+    // encode window (see ggml_metal_set_encode_window): only segments intersecting
+    // [first_node, last_node] are encoded, with ingress copies before and egress copies after
+    // copy arrays are owned copies of byte ranges; the tensors remain caller-owned
     //
-    // ewin_out_of_band is the caller's assertion of which FULL-GRAPH nodes lie
-    // outside the active band. It is not used to select what to encode -- it is
-    // a guard: any split that would encode one of these nodes is rejected before
-    // a single command buffer exists (see ggml_metal_ewin_split_is_in_band).
-    // Empty (the default) makes the guard vacuous and the path byte-identical to
-    // one compiled without it. Owned copy of the array; nodes stay caller-owned.
+    // ewin_out_of_band is a guard, not a selector: a split that would encode one of these
+    // full-graph nodes is rejected before any command buffer exists
     bool                                  ewin_active;
     struct ggml_tensor                 *  ewin_first_node;
     struct ggml_tensor                 *  ewin_last_node;
@@ -166,10 +145,19 @@ struct ggml_metal {
     struct ggml_metal_tensor_range_copy * ewin_egress;
     size_t                                ewin_n_out_of_band;
     struct ggml_tensor                 ** ewin_out_of_band;
+
+    // host cuts (see ggml_metal_set_host_cuts): owned copy of the node array, caller-owned event
+    // the next host cut encoded signals hcut_val + 1
+    int                    hcut_n;
+    struct ggml_tensor  ** hcut_nodes;
+    ggml_metal_event_t     hcut_ev;
+    uint64_t               hcut_val;
+    bool                (* hcut_fn)(void * user_data, int i, struct ggml_tensor * node);
+    void                 * hcut_user_data;
 };
 
-// Boundary-event schedule helpers (definitions below).
 static void             ggml_metal_bsched_clear        (ggml_metal_t ctx);
+static void             ggml_metal_hcut_clear          (ggml_metal_t ctx);
 static enum ggml_status ggml_metal_graph_compute_paged (ggml_metal_t ctx, struct ggml_cgraph * gf);
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
@@ -246,8 +234,9 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
             res->n_cb = 0;
         }
 
-        // off unless a caller asks for it: the stock path must reorder exactly as before
         res->use_reorder_barriers = false;
+        res->reorder_n_prefixes   = 0;
+        res->reorder_prefixes     = NULL;
 
         GGML_LOG_INFO("%s: use fusion         = %s\n", __func__, ggml_metal_fusion_info_enabled(res->finfo) ? "true" : "false");
         GGML_LOG_INFO("%s: use concurrency    = %s\n", __func__, res->use_concurrency    ? "true" : "false");
@@ -337,6 +326,8 @@ void ggml_metal_free(ggml_metal_t ctx) {
 
     ggml_metal_bsched_clear(ctx);
     ggml_metal_clear_encode_window(ctx);
+    ggml_metal_hcut_clear(ctx);
+    ggml_metal_set_reorder_barrier_prefixes(ctx, 0, NULL);
 
     //[ctx->queue release]; // [TAG_QUEUE_PER_BACKEND]
 
@@ -356,18 +347,9 @@ ggml_metal_device_t ggml_metal_get_device(ggml_metal_t ctx) {
     return ctx->dev;
 }
 
-// Names the command buffer that actually FAILED, given the index of the first one found not
-// completed.
-//
-// Those are usually not the same buffer. A GPU fault or timeout abandons every command buffer
-// still queued behind the one that hit it, and an abandoned buffer sits at Scheduled with no
-// error attached -- so the first not-completed index names the first ABANDONED buffer, which
-// carries no information about what went wrong. Worse, the caller only prints an error
-// description when the status IS Error, so a fault reported through an abandoned index prints no
-// description at all and the run says only that some buffer "failed with status 3".
-//
-// Scanning on for a buffer carrying a real error is what turns that into a diagnosis: its
-// localizedDescription is the only place the actual cause is written down.
+// log the first command buffer, from index `from` on, that carries an error
+// a fault abandons the buffers queued behind it, so the first one not completed is not
+// necessarily the one that failed
 static void ggml_metal_log_cmd_buf_error(id<MTLCommandBuffer> (^at)(size_t), size_t n, size_t from,
         char * out, size_t out_size) {
     for (size_t j = from; j < n; ++j) {
@@ -423,10 +405,7 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
         }
     }
 
-    // Report from what the segments themselves recorded at completion. A failure
-    // abandons the rest of the queue, so reading state back off the buffers now
-    // finds the first ABANDONED one rather than the one that failed; these were
-    // captured at the instant each buffer reported.
+    // report from what the segments recorded at completion (see seg_results)
     for (int i = 0; i < ctx->seg_results_n; ++i) {
         if (ctx->seg_results[i].status == (int) MTLCommandBufferStatusCompleted) {
             continue;
@@ -642,9 +621,9 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
-// ---------------------------------------------------------------------------
-// paged-decode boundary-event schedule
-// ---------------------------------------------------------------------------
+//
+// boundary-event schedule
+//
 
 static void ggml_metal_bsched_clear(ggml_metal_t ctx) {
     free(ctx->bsched_cut_nodes);
@@ -680,7 +659,7 @@ void ggml_metal_set_boundary_schedule(
         int n_waits, struct ggml_tensor * const * wait_nodes, ggml_metal_event_t * wait_ev, const uint64_t * wait_val) {
     ggml_metal_bsched_clear(ctx);
     if (n_cuts <= 0) {
-        return; // cleared -> subsequent computes take the stock n_cb path
+        return; // cleared, computes take the stock n_cb path
     }
 
     ctx->bsched_n_cuts    = n_cuts;
@@ -702,7 +681,38 @@ void ggml_metal_set_boundary_schedule(
     }
 }
 
-// Owned whole-tensor ranges for a list of pairs: [0, ggml_nbytes(src)) on both sides.
+static void ggml_metal_hcut_clear(ggml_metal_t ctx) {
+    free(ctx->hcut_nodes);
+    ctx->hcut_n         = 0;
+    ctx->hcut_nodes     = NULL;
+    ctx->hcut_ev        = NULL;
+    ctx->hcut_val       = 0;
+    ctx->hcut_fn        = NULL;
+    ctx->hcut_user_data = NULL;
+}
+
+void ggml_metal_set_host_cuts(
+        ggml_metal_t ctx,
+        int n, struct ggml_tensor * const * nodes,
+        ggml_metal_event_t ev, uint64_t base_value,
+        bool (*fn)(void * user_data, int i, struct ggml_tensor * node), void * user_data) {
+    ggml_metal_hcut_clear(ctx);
+    if (n <= 0) {
+        return;
+    }
+    GGML_ASSERT(nodes != NULL && ev != NULL && fn != NULL);
+
+    ctx->hcut_nodes = malloc(sizeof(struct ggml_tensor *) * n);
+    GGML_ASSERT(ctx->hcut_nodes != NULL);
+    memcpy(ctx->hcut_nodes, nodes, sizeof(struct ggml_tensor *) * n);
+    ctx->hcut_n         = n;
+    ctx->hcut_ev        = ev;
+    ctx->hcut_val       = base_value;
+    ctx->hcut_fn        = fn;
+    ctx->hcut_user_data = user_data;
+}
+
+// owned whole-tensor ranges for a list of pairs: [0, ggml_nbytes(src)) on both sides
 static struct ggml_metal_tensor_range_copy * ggml_metal_ewin_whole_ranges(size_t n, const struct ggml_metal_tensor_copy_pair * pairs) {
     if (n == 0) {
         return NULL;
@@ -721,8 +731,7 @@ static struct ggml_metal_tensor_range_copy * ggml_metal_ewin_whole_ranges(size_t
     return res;
 }
 
-// Replaces the installed window. Takes ownership of `ingress` and `egress`, which must already
-// be validated; copies `out_of_band`.
+// replaces the installed window; takes ownership of the validated ingress and egress, copies out_of_band
 static void ggml_metal_ewin_install(
         ggml_metal_t ctx,
         struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
@@ -748,37 +757,12 @@ static void ggml_metal_ewin_install(
     ctx->ewin_out_of_band   = out_of_band_copy;
 }
 
-// The banded-prefill encode window. `first_node` is the EXCLUSIVE lower
-// boundary (the band-entry residual -- its own segment is outside the
-// window) and `last_node` the INCLUSIVE upper boundary; either may be NULL
-// for an open edge (from split start / to split end). Endpoints are matched
-// by pointer against each computed graph and PROJECTED per split: a split
-// containing only the lower boundary windows to its end, one containing
-// only the upper windows from its start, and one containing neither
-// non-NULL endpoint encodes in full -- which is exactly what the
-// input-processing splits outside the trunk need (masks/positions must be
-// recomputed every tile). Ordered ingress and egress copies fire only in the
-// split where their boundary node matched. Every pair must contain two tensors
-// of equal byte size because each blit copies the src's full extent onto the
-// dst's allocation; ggml_metal_set_encode_window_ranged is the byte-range form.
-// The context owns copies of the pair arrays, not the tensors.
-//
-// `out_of_band` closes the hole that per-split projection leaves open. Because
-// the window is resolved per split, a split holding NEITHER non-NULL endpoint
-// gets window_applies == false and encodes in full -- intended for the
-// input-processing splits, but indistinguishable from a TRUNK split that fell
-// after the boundary split and whose nodes are all out of band. The caller
-// therefore names the full-graph nodes it asserts lie OUTSIDE the active band
-// (a banded caller passes each out-of-band layer's `l_out-<il>` marker) and
-// ggml_metal_graph_compute_paged refuses -- with GGML_STATUS_FAILED, before any
-// command buffer is created -- to submit a split that would encode one of them.
-// The invariant enforced is: no submitted split may ever encode a node that
-// lies outside the active band. This is a GUARD, not a selector: it never
-// changes which segments are encoded, only whether the split is submitted at
-// all. Matching is by pointer against each computed graph, so a named node
-// absent from a split simply never fires. Pass n_out_of_band == 0 (the default
-// for every non-banded caller) and the guard is vacuous. The context owns a
-// copy of the array; the nodes remain caller-owned.
+// whole-tensor form of the encode window (see ggml_backend_metal_set_encode_window)
+// first_node is the exclusive lower endpoint and last_node the inclusive upper one, either may
+// be NULL for an open edge. endpoints are matched by pointer and projected per split: a split
+// holding neither endpoint is encoded in full
+// every pair must have equal byte sizes, ggml_metal_set_encode_window_ranged is the byte-range form
+// the context copies the arrays, the tensors remain caller-owned
 void ggml_metal_set_encode_window(
         ggml_metal_t ctx,
         struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
@@ -802,8 +786,7 @@ void ggml_metal_set_encode_window(
         GGML_ASSERT(ggml_nbytes(egress[i].src) == ggml_nbytes(egress[i].dst));
     }
     for (size_t i = 0; i < n_out_of_band; ++i) {
-        // A NULL entry would silently match nothing and quietly weaken the
-        // guard, so reject it at the door rather than at encode time.
+        // a NULL entry would silently match nothing and weaken the guard
         GGML_ASSERT(out_of_band[i] != NULL);
     }
 
@@ -813,8 +796,7 @@ void ggml_metal_set_encode_window(
     ggml_metal_ewin_install(ctx, first_node, last_node, n_ingress, ingress_copy, n_egress, egress_copy, n_out_of_band, out_of_band);
 }
 
-// The tensor whose allocation backs `t`, and the byte offset of `t`'s data within it. A view
-// records its root directly (ggml folds view-of-view chains at creation), so one step suffices.
+// the tensor whose allocation backs t, and the byte offset of t's data within it
 static const struct ggml_tensor * ggml_metal_ewin_storage(const struct ggml_tensor * t, size_t * offs) {
     if (t->view_src != NULL) {
         *offs = t->view_offs;
@@ -824,8 +806,7 @@ static const struct ggml_tensor * ggml_metal_ewin_storage(const struct ggml_tens
     return t;
 }
 
-// Checks one byte-range copy against the rules documented on
-// ggml_backend_metal_set_encode_window_ranged. Logs and returns false on the first violation.
+// checks one byte-range copy against the rules of ggml_backend_metal_set_encode_window_ranged
 static bool ggml_metal_ewin_range_is_valid(const char * list, size_t i, const struct ggml_metal_tensor_range_copy * r) {
     if (r->src == NULL || r->dst == NULL) {
         GGML_LOG_ERROR("%s: %s[%zu]: src and dst must be non-NULL\n", __func__, list, i);
@@ -838,7 +819,7 @@ static bool ggml_metal_ewin_range_is_valid(const char * list, size_t i, const st
 
     const size_t src_nbytes = ggml_nbytes(r->src);
     const size_t dst_nbytes = ggml_nbytes(r->dst);
-    // Written as two comparisons each so that offs + size cannot wrap.
+    // two comparisons each so that offs + size cannot wrap
     if (r->src_offs > src_nbytes || r->size > src_nbytes - r->src_offs) {
         GGML_LOG_ERROR("%s: %s[%zu]: source range [%zu, +%zu) exceeds '%s' (%zu bytes)\n",
                 __func__, list, i, r->src_offs, r->size, ggml_get_name(r->src), src_nbytes);
@@ -850,15 +831,14 @@ static bool ggml_metal_ewin_range_is_valid(const char * list, size_t i, const st
         return false;
     }
 
-    // MTLBlitCommandEncoder copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size: requires
-    // both offsets and the size to be multiples of 4 on macOS.
+    // MTLBlitCommandEncoder copyFromBuffer requires the offsets and size to be multiples of 4 on macOS
     if (r->src_offs % 4 != 0 || r->dst_offs % 4 != 0 || r->size % 4 != 0) {
         GGML_LOG_ERROR("%s: %s[%zu]: src_offs (%zu), dst_offs (%zu) and size (%zu) must be multiples of 4\n",
                 __func__, list, i, r->src_offs, r->dst_offs, r->size);
         return false;
     }
 
-    // Metal leaves a copy between overlapping regions of one buffer undefined.
+    // a copy between overlapping regions of one buffer is undefined in Metal
     size_t src_base = 0;
     size_t dst_base = 0;
     const struct ggml_tensor * src_root = ggml_metal_ewin_storage(r->src, &src_base);
@@ -942,15 +922,10 @@ void ggml_metal_clear_encode_window(ggml_metal_t ctx) {
     ctx->ewin_out_of_band   = NULL;
 }
 
-// One byte-range blit between two resident tensors, encoded into the given
-// command buffer -- the transport for the encode window's boundary
-// activation (device-side copy, no host round trip).
+// one byte-range device-side copy, encoded into cmd_buf
 //
-// Each copy gets its own blit encoder. Metal does not order commands within one
-// blit pass, but it does order passes that touch the same tracked resource (the
-// default for the buffers this backend allocates): a pass that reads or writes
-// bytes an earlier pass wrote waits for that write. One pass per copy is what
-// makes a list of copies run in list order.
+// each copy gets its own blit encoder: commands within one blit pass are unordered, while passes
+// touching the same tracked resource are ordered, which makes a list of copies run in list order
 static void ggml_metal_ewin_blit(id<MTLCommandBuffer> cmd_buf, const struct ggml_metal_tensor_range_copy * r) {
     struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(r->src);
     struct ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(r->dst);
@@ -960,8 +935,8 @@ static void ggml_metal_ewin_blit(id<MTLCommandBuffer> cmd_buf, const struct ggml
     const size_t src_offs = bid_src.offs + r->src_offs;
     const size_t dst_offs = bid_dst.offs + r->dst_offs;
 
-    // Validation rejected overlap between views of one tensor; this catches two
-    // distinct tensors that resolve to overlapping bytes of one device buffer.
+    // validation rejects overlap between views of one tensor, this catches distinct tensors
+    // that resolve to overlapping bytes of one device buffer
     GGML_ASSERT(bid_src.metal != bid_dst.metal || src_offs + r->size <= dst_offs || dst_offs + r->size <= src_offs);
 
     id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
@@ -973,35 +948,43 @@ static void ggml_metal_ewin_blit(id<MTLCommandBuffer> cmd_buf, const struct ggml
     [encoder endEncoding];
 }
 
-// Stop the graph reorder at boundary marker nodes. See
-// ggml_backend_metal_set_reorder_barriers for why a boundary-scheduling caller has to
-// set this, and ggml_graph_node_is_boundary_marker for what counts as a marker.
+// stop the graph reorder at boundary marker nodes, see ggml_backend_metal_set_reorder_barriers
 void ggml_metal_set_reorder_barriers(ggml_metal_t ctx, bool enable) {
     ctx->use_reorder_barriers = enable;
 }
 
-// The band invariant check: does this split encode ONLY in-band nodes?
+// replace the barrier name prefixes of the graph reorder, see ggml_backend_metal_set_reorder_barrier_prefixes
+void ggml_metal_set_reorder_barrier_prefixes(ggml_metal_t ctx, int n, const char * const * prefixes) {
+    for (int i = 0; i < ctx->reorder_n_prefixes; ++i) {
+        free(ctx->reorder_prefixes[i]);
+    }
+    free(ctx->reorder_prefixes);
+    ctx->reorder_n_prefixes = 0;
+    ctx->reorder_prefixes   = NULL;
+
+    if (n <= 0) {
+        return;
+    }
+    GGML_ASSERT(prefixes != NULL);
+
+    ctx->reorder_prefixes = malloc(sizeof(char *) * n);
+    GGML_ASSERT(ctx->reorder_prefixes != NULL);
+    for (int i = 0; i < n; ++i) {
+        // an empty prefix would match every node and turn the reorder off
+        GGML_ASSERT(prefixes[i] != NULL && prefixes[i][0] != '\0');
+        ctx->reorder_prefixes[i] = strdup(prefixes[i]);
+        GGML_ASSERT(ctx->reorder_prefixes[i] != NULL);
+    }
+    ctx->reorder_n_prefixes = n;
+}
+
+// does this split avoid encoding the nodes the caller named in out_of_band?
 //
-// The encode window is resolved per split, and that projection is lossy in one
-// direction. A split holding neither non-NULL endpoint windows to nothing
-// (window_applies == false) and therefore encodes in FULL -- correct for the
-// input-processing splits, whose masks/positions must be rebuilt for every
-// tile, but wrong for a trunk split that happened to land after the boundary
-// split, which would then quietly encode layers the band excludes. The window
-// alone cannot tell those two cases apart: both look like "no endpoint here".
+// a split holding no window endpoint is encoded in full, which cannot be told apart from a
+// split that lies entirely outside the window, so the caller names the nodes that must not be
+// encoded and this walks the split with the same skip rule as the encode loop
 //
-// So the caller supplies the discriminator -- the nodes it asserts are out of
-// band -- and this walks the split the way the encode loop will, segment by
-// segment, applying the SAME skip rule, and reports the first node that would
-// actually be encoded while sitting in that set. It is deliberately stronger
-// than a test on endpoint-free splits alone: a split that contains the lower
-// endpoint but runs past the band (first_found && !last_found windows to the
-// split's end) is caught here too.
-//
-// Returns true when the split is clean -- including the vacuous cases: no
-// window set, or no out-of-band nodes named. On false, *out_bad_node_idx holds
-// the offending node's index in `gf`. O(n_nodes * n_out_of_band), the same
-// shape as the is_cut/is_wait pass above and negligible beside the encode.
+// returns true when clean, otherwise *out_bad_node_idx is the offending node's index in gf
 static bool ggml_metal_ewin_split_is_in_band(
         ggml_metal_t         ctx,
         struct ggml_cgraph * gf,
@@ -1023,8 +1006,7 @@ static bool ggml_metal_ewin_split_is_in_band(
         if (seg_end <= seg_start) {
             continue;
         }
-        // Must mirror the encode loop's skip verbatim: anything this rule drops
-        // is never submitted, so it cannot violate the invariant.
+        // must mirror the encode loop's skip rule
         if (window_applies && (seg_end <= window_lo || seg_start > window_hi)) {
             continue;
         }
@@ -1042,23 +1024,87 @@ static bool ggml_metal_ewin_split_is_in_band(
     return true;
 }
 
-// Sequential per-boundary-committed encode (see ggml_metal_set_boundary_schedule).
-// Runs on the calling thread with NO dispatch_apply: deterministic submit order
-// is what makes the cross-command-buffer event signals monotonic and the waits
-// land on the right segment. Async like the stock path -- failures surface at
-// the next ggml_metal_synchronize (which drains cmd_bufs_ext), not here.
-// How long the encode waits for a segment's gate. Exceeding it fails the graph:
-// encoding resolves each tensor's Metal buffer, and a buffer the caller has not
-// yet made (or is about to release) for this segment must not be bound by a
-// command buffer committed ahead of its gate.
-#define GGML_METAL_PAGED_GATE_WAIT_MS 30000
+enum ggml_metal_paged_wait_status {
+    GGML_METAL_PAGED_WAIT_OK,
+    GGML_METAL_PAGED_WAIT_TIMED_OUT,
+    GGML_METAL_PAGED_WAIT_ABANDONED,
+};
 
+// host wait for ev to reach value, in slices of GGML_METAL_PAGED_GATE_SLICE_MS with a warning
+// after each, until paged_gate_abort_ms (0: no limit) has passed
+// a saturated event (UINT64_MAX while value is lower) means the producer abandoned the wait
+static enum ggml_metal_paged_wait_status ggml_metal_paged_host_wait(
+        ggml_metal_t ctx, ggml_metal_event_t ev, uint64_t value, bool spin,
+        const char * node_name, const char * what) {
+    uint64_t waited_ms = 0;
+    while (true) {
+        uint64_t slice_ms = GGML_METAL_PAGED_GATE_SLICE_MS;
+        if (ctx->paged_gate_abort_ms != 0 && ctx->paged_gate_abort_ms - waited_ms < slice_ms) {
+            slice_ms = ctx->paged_gate_abort_ms - waited_ms;
+        }
+        const bool reached = spin ? ggml_metal_event_host_spin(ev, value, slice_ms)
+                                  : ggml_metal_event_host_wait(ev, value, slice_ms);
+        if (reached) {
+            const bool abandoned = value != UINT64_MAX && ggml_metal_event_host_value(ev) == UINT64_MAX;
+            return abandoned ? GGML_METAL_PAGED_WAIT_ABANDONED : GGML_METAL_PAGED_WAIT_OK;
+        }
+        waited_ms += slice_ms;
+        if (ctx->paged_gate_abort_ms != 0 && waited_ms >= ctx->paged_gate_abort_ms) {
+            return GGML_METAL_PAGED_WAIT_TIMED_OUT;
+        }
+        GGML_LOG_WARN("%s: paged segment at node '%s' still waiting for %s after %llu s (event value %llu)\n",
+                __func__, node_name, what, (unsigned long long) (waited_ms / 1000), (unsigned long long) value);
+    }
+}
+
+// a host cut whose segment has been committed and whose callback has not yet run
+struct ggml_metal_hcut_pending {
+    bool                 active;
+    int                  i;     // index in the host cut list
+    struct ggml_tensor * node;
+    uint64_t             value; // signaled by the segment's command buffer
+};
+
+// spins until the pending host cut's segment has completed, then runs the callback
+// returns false, with the backend in its error state, on timeout, a saturated event or a failing callback
+static bool ggml_metal_hcut_resolve(ggml_metal_t ctx, struct ggml_metal_hcut_pending * p) {
+    if (!p->active) {
+        return true;
+    }
+    p->active = false;
+
+    const char * name = ggml_get_name(p->node);
+    switch (ggml_metal_paged_host_wait(ctx, ctx->hcut_ev, p->value, true, name, "its host cut")) {
+        case GGML_METAL_PAGED_WAIT_OK:
+            if (ctx->hcut_fn(ctx->hcut_user_data, p->i, p->node)) {
+                return true;
+            }
+            snprintf(ctx->last_error, sizeof(ctx->last_error),
+                    "host cut %d at node '%s': the callback failed the graph", p->i, name);
+            break;
+        case GGML_METAL_PAGED_WAIT_TIMED_OUT:
+            snprintf(ctx->last_error, sizeof(ctx->last_error),
+                    "host cut %d at node '%s': its segment did not complete within %u ms", p->i, name,
+                    ctx->paged_gate_abort_ms);
+            break;
+        case GGML_METAL_PAGED_WAIT_ABANDONED:
+            snprintf(ctx->last_error, sizeof(ctx->last_error),
+                    "host cut %d at node '%s': its event was abandoned (event value saturated)", p->i, name);
+            break;
+    }
+    GGML_LOG_ERROR("%s: %s\n", __func__, ctx->last_error);
+    ctx->has_error = true;
+    return false;
+}
+
+// segments are encoded and committed one at a time on the calling thread (no dispatch_apply), so
+// the submit order is deterministic and the event signals stay monotonic across command buffers
+// failures surface at the next ggml_metal_synchronize, as in the stock path
 static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     const int n_nodes = gf->n_nodes;
 
-    // The schedule persists (pointer-keyed; NOT cleared here) -- see
-    // ggml_metal_set_boundary_schedule. Cuts/waits are matched by node POINTER
-    // against THIS graph, which may be one split of a multi-split decode.
+    // the schedule is not cleared here, cuts and waits are matched by pointer against this graph
+    // (which may be one split of several)
     const int                    n_cuts     = ctx->bsched_n_cuts;
     struct ggml_tensor ** const  cut_nodes  = ctx->bsched_cut_nodes;
     ggml_metal_event_t * const   sig_ev     = ctx->bsched_sig_ev;
@@ -1076,12 +1122,10 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
 
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
 
-        // Per-node flags: which of THIS graph's nodes are cut ends / wait starts
-        // (a schedule node not present in this graph simply never matches). One
-        // pass over the graph, O(n_nodes * (n_cuts + n_waits)) -- both schedule
-        // sizes are ~n_layer, negligible next to the encode itself.
-        bool * is_cut  = (bool *) calloc((size_t) n_nodes, sizeof(bool));
-        bool * is_wait = (bool *) calloc((size_t) n_nodes, sizeof(bool));
+        // per-node flags: cut ends and wait starts in this graph; hcut_idx is the index in the host cut list or -1
+        bool * is_cut   = (bool *) calloc((size_t) n_nodes, sizeof(bool));
+        bool * is_wait  = (bool *) calloc((size_t) n_nodes, sizeof(bool));
+        int  * hcut_idx = (int  *) malloc(sizeof(int) * (size_t) n_nodes);
         for (int i = 0; i < n_nodes; ++i) {
             struct ggml_tensor * node = gf->nodes[i];
             for (int c = 0; c < n_cuts; ++c) {
@@ -1090,20 +1134,23 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             for (int w = 0; w < n_waits; ++w) {
                 if (wait_nodes[w] == node) { is_wait[i] = true; break; }
             }
+            hcut_idx[i] = -1;
+            for (int h = 0; h < ctx->hcut_n; ++h) {
+                if (ctx->hcut_nodes[h] == node) { hcut_idx[i] = h; break; }
+            }
         }
 
-        // Sorted-unique segment START indices: 0, every (cut index + 1), and
-        // every wait index (each in (0, n_nodes)). Consecutive starts delimit
-        // the segments; the last segment ends at n_nodes.
-        const int cap = 2 * n_nodes + 2;
+        // sorted unique segment start indices: 0, the node after every cut and host cut, every wait node
+        const int cap = 3 * n_nodes + 2;
         int * starts = (int *) malloc(sizeof(int) * (size_t) cap);
         int n_starts = 0;
         starts[n_starts++] = 0;
         for (int i = 0; i < n_nodes; ++i) {
             if (is_cut[i] && i + 1 < n_nodes) { starts[n_starts++] = i + 1; }
+            if (hcut_idx[i] >= 0 && i + 1 < n_nodes) { starts[n_starts++] = i + 1; }
             if (is_wait[i] && i > 0)          { starts[n_starts++] = i;     }
         }
-        // insertion sort (n_starts is small, ~2*n_layer) + dedup in place
+        // insertion sort (n_starts is small) + dedup in place
         for (int a = 1; a < n_starts; ++a) {
             const int key = starts[a];
             int b = a - 1;
@@ -1116,11 +1163,8 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
         }
         n_starts = m;
 
-        // Resolve the encode window against THIS split's graph (see
-        // ggml_metal_set_encode_window's doc for the per-split projection).
-        // `window_lo` is the first IN-window node index (the exclusive lower
-        // boundary's successor); blits fire only where their boundary node
-        // actually matched.
+        // resolve the encode window against this graph; window_lo is the first node in the window
+        // and the ingress/egress copies fire only where their endpoint matched
         int  window_lo      = 0;
         int  window_hi      = n_nodes - 1;
         bool window_applies = false;
@@ -1149,14 +1193,8 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
                 blit_out_here = last_found;
             }
         }
-        // Enforce the band invariant BEFORE anything is submitted: no split may
-        // encode a node the caller declared out of band. Rejecting here -- ahead
-        // of the first commandBufferWithUnretainedReferences -- is what makes
-        // the failure recoverable: nothing was enqueued, no event was signalled,
-        // and the pager's frozen plan is still consistent with the device. Hence
-        // a returned status and not a GGML_ASSERT; ggml_backend_sched_compute_splits
-        // short-circuits on a non-SUCCESS status, so the caller can fail this
-        // prefill and retry. Vacuous when no out-of-band nodes were named.
+        // reject before anything is submitted so the failure is recoverable: no command buffer
+        // was enqueued and no event signaled, hence a status and not a GGML_ASSERT
         {
             int bad_node_idx = -1;
             if (!ggml_metal_ewin_split_is_in_band(ctx, gf, starts, n_starts, window_lo, window_hi, window_applies, &bad_node_idx)) {
@@ -1169,6 +1207,7 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
                 free(starts);
                 free(is_cut);
                 free(is_wait);
+                free(hcut_idx);
 
                 return GGML_STATUS_FAILED;
             }
@@ -1176,15 +1215,14 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
 
         bool window_entered = false;
 
-        // Room for this graph's segments, grown ONLY while nothing is pending.
-        //
-        // Handlers hold a pointer into this array and run on a Metal thread, so
-        // reallocating while an earlier graph's handlers are still outstanding
-        // would move the storage under them. A token can span several graphs, so
-        // that is reachable: grow at the start of the token, and if a later
-        // graph in the same token would overflow, capture nothing for it rather
-        // than move the array. `ggml_metal_synchronize` waits on the last buffer
-        // before resetting the count, so every handler has run by then.
+        // the host cut whose callback has yet to run; it runs before the next segment's entry
+        // signal or gate wait (which it may open), or after that segment is encoded and before
+        // it is enqueued
+        struct ggml_metal_hcut_pending hcut_pending = { false, -1, NULL, 0 };
+
+        // grown only while no handler is outstanding: handlers hold pointers into this array and
+        // run on a Metal thread, so a later graph that would overflow captures nothing instead
+        // ggml_metal_synchronize resets the count after waiting on the last buffer
         if (ctx->seg_results_n == 0 && ctx->seg_results_cap < n_starts) {
             free(ctx->seg_results);
             ctx->seg_results = (struct ggml_metal_seg_result *) malloc(
@@ -1193,17 +1231,14 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             ctx->seg_results_cap = n_starts;
         }
 
-        // Encode each segment into its own command buffer, in order.
         for (int seg = 0; seg < n_starts; ++seg) {
             const int seg_start = starts[seg];
             const int seg_end   = (seg + 1 < n_starts) ? starts[seg + 1] : n_nodes;
             if (seg_end <= seg_start) {
                 continue;
             }
-            // Outside the encode window: the segment's command buffer is
-            // never created, so neither its ops nor its schedule signals ever
-            // fire (the pager's per-step wait/signal values come from the
-            // same frozen plan, so it never waits on a skipped layer).
+            // outside the encode window: no command buffer is created, so neither its ops nor
+            // its schedule signals fire
             if (window_applies && (seg_end <= window_lo || seg_start > window_hi)) {
                 continue;
             }
@@ -1211,11 +1246,24 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
             const bool window_last  = window_applies && seg_start <= window_hi && seg_end > window_hi;
             window_entered = true;
 
-            // Window entry signal: its own buffer, committed before the window's first
-            // segment is enqueued, so it completes after everything ahead of the window
-            // and depends on none of the window's waits -- nor on the host wait below,
-            // which may itself wait for the gates this signal lets the caller open.
-            if (window_first && blit_in_here && ctx->bsched_entry_ev != NULL) {
+            const bool entry_signal = window_first && blit_in_here && ctx->bsched_entry_ev != NULL;
+
+            // Pre-encode the segment behind a pending host cut when nothing has to wait on the
+            // host before encoding it. It is enqueued only after the callback, so the callback
+            // may commit work to this queue and wait for it.
+            const bool pre_encode = hcut_pending.active && !entry_signal && !is_wait[seg_start];
+            if (hcut_pending.active && !pre_encode && !ggml_metal_hcut_resolve(ctx, &hcut_pending)) {
+                free(starts);
+                free(is_cut);
+                free(is_wait);
+                free(hcut_idx);
+
+                return GGML_STATUS_FAILED;
+            }
+
+            // window entry signal: its own buffer, committed before the first segment so that it
+            // depends on none of the window's waits, nor on the host wait below
+            if (entry_signal) {
                 id<MTLCommandBuffer> entry_buf = [queue commandBufferWithUnretainedReferences];
                 [entry_buf retain];
                 [entry_buf enqueue];
@@ -1227,59 +1275,29 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
 
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
-            [cmd_buf enqueue]; // reserve the queue slot so execution order == creation order
+            if (!pre_encode) {
+                [cmd_buf enqueue]; // reserve the queue slot so execution order matches creation order
+            }
 
-            // Waits BEFORE this segment's ops. The segment begins exactly at a
-            // wait node (every wait node was injected as a segment start); more
-            // than one schedule wait can target the same node (a layer's K and V
-            // regions sharing a first-reader), so emit ALL that match.
+            // waits before this segment's ops; several waits can target the same node
             //
-            // The GPU-side waits below stay as the ordering guarantee, but the
-            // host waits for the same values FIRST, so the buffer is normally
-            // committed only once its data is already there.
+            // the host waits for the gate first and the GPU-side waits below remain the ordering
+            // guarantee: a committed buffer parked on an event holds a queue slot and is timed
+            // by the GPU, so it is committed only once its gate is satisfied
             //
-            // A committed buffer parked on an event is occupying a queue slot and
-            // being timed by the GPU for the whole park -- committing the whole
-            // chain up front is what let a late segment's timeout budget cover
-            // every read ahead of it. Committing when the gate is already
-            // satisfied means the buffer runs rather than waits, so a segment
-            // holds device resources only while it is executing.
-            //
-            // On timeout the graph fails with this segment unencoded: its slot,
-            // already enqueued, is committed empty so the queue moves on, and the
-            // backend enters its error state, since the schedule's later signals
-            // will never fire.
-            //
-            // A wait event signaled to UINT64_MAX (while the awaited value is
-            // lower) satisfies every wait but means the producer abandoned the
-            // schedule rather than delivered the data; that fails the graph the
-            // same way, with the segment unencoded.
+            // on timeout, or when an event is saturated to UINT64_MAX (the producer abandoned the
+            // schedule), the graph fails with this segment unencoded: its enqueued slot is
+            // committed empty so the queue moves on, and the backend enters its error state
             bool gate_timed_out = false;
             bool gate_abandoned = false;
             if (is_wait[seg_start]) {
                 struct ggml_tensor * wnode = gf->nodes[seg_start];
                 for (int w = 0; w < n_waits && !gate_timed_out && !gate_abandoned; ++w) {
                     if (wait_nodes[w] == wnode && wait_ev[w] != NULL) {
-                        uint64_t waited_ms = 0;
-                        while (true) {
-                            uint64_t slice_ms = GGML_METAL_PAGED_GATE_SLICE_MS;
-                            if (ctx->paged_gate_abort_ms != 0 && ctx->paged_gate_abort_ms - waited_ms < slice_ms) {
-                                slice_ms = ctx->paged_gate_abort_ms - waited_ms;
-                            }
-                            if (ggml_metal_event_host_wait(wait_ev[w], wait_val[w], slice_ms)) {
-                                gate_abandoned = wait_val[w] != UINT64_MAX &&
-                                        ggml_metal_event_host_value(wait_ev[w]) == UINT64_MAX;
-                                break;
-                            }
-                            waited_ms += slice_ms;
-                            if (ctx->paged_gate_abort_ms != 0 && waited_ms >= ctx->paged_gate_abort_ms) {
-                                gate_timed_out = true;
-                                break;
-                            }
-                            GGML_LOG_WARN("%s: paged segment at node '%s' still waiting for its gate after %llu s (event value %llu)\n",
-                                    __func__, ggml_get_name(wnode), (unsigned long long) (waited_ms / 1000),
-                                    (unsigned long long) wait_val[w]);
-                        }
+                        const enum ggml_metal_paged_wait_status st =
+                                ggml_metal_paged_host_wait(ctx, wait_ev[w], wait_val[w], false, ggml_get_name(wnode), "its gate");
+                        gate_timed_out = st == GGML_METAL_PAGED_WAIT_TIMED_OUT;
+                        gate_abandoned = st == GGML_METAL_PAGED_WAIT_ABANDONED;
                     }
                 }
             }
@@ -1303,6 +1321,7 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
                 free(starts);
                 free(is_cut);
                 free(is_wait);
+                free(hcut_idx);
 
                 return GGML_STATUS_FAILED;
             }
@@ -1316,18 +1335,15 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
                 }
             }
 
-            // Window entry: deliver the boundary activation into its
-            // producer's allocation before the first encoded segment's ops
-            // read it. After the schedule waits (the blit must not outrun an
-            // admit gate) and before the compute encoder.
+            // window entry: copy in before the first encoded segment reads it, and after the
+            // schedule waits so that the copy does not outrun its gate
             if (window_first && blit_in_here) {
                 for (size_t i = 0; i < ctx->ewin_n_ingress; ++i) {
                     ggml_metal_ewin_blit(cmd_buf, &ctx->ewin_ingress[i]);
                 }
             }
 
-            // Encode nodes [seg_start, seg_end) with fusion (one ggml_metal_op),
-            // exactly as the stock encode_async does over its slice.
+            // encode nodes [seg_start, seg_end) as the stock encode_async does over its slice
             ggml_metal_op_t op = ggml_metal_op_init(
                 ctx->dev,
                 (ggml_metal_cmd_buf_t) cmd_buf,
@@ -1336,7 +1352,7 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
                 seg_start,
                 seg_end,
                 ctx->use_concurrency,
-                false, // capture unsupported on the paged path
+                false, // capture is not supported on the boundary-scheduled path
                 ctx->debug_graph);
 
             for (int idx = 0; idx < ggml_metal_op_n_nodes(op); ++idx) {
@@ -1349,35 +1365,51 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
 
             ggml_metal_op_free(op);
 
-            // Window exit: capture the boundary activation after the last
-            // encoded segment's ops produced it. In-order queue => this blit
-            // completes before any later compute that re-enters the window
-            // blits it back in.
+            // window exit: copy out after the last encoded segment produced it
             if (window_last && blit_out_here) {
                 for (size_t i = 0; i < ctx->ewin_n_egress; ++i) {
                     ggml_metal_ewin_blit(cmd_buf, &ctx->ewin_egress[i]);
                 }
             }
 
-            // Signals AFTER this segment (it ends at seg_end-1, a cut node).
+            // signals after this segment, which ends at a cut node
             const int seg_last = seg_end - 1;
             if (is_cut[seg_last]) {
                 struct ggml_tensor * node = gf->nodes[seg_last];
                 for (int c = 0; c < n_cuts; ++c) {
                     if (cut_nodes[c] == node && sig_ev[c] != NULL) {
-                        // Signal on COMPLETION (not mid-stream): a host reclaim
-                        // thread waits this to spill the just-written KV to disk,
-                        // and must see coherent shared-storage bytes (see
-                        // ggml_metal_event_signal_on_complete's doc).
+                        // signal on completion so that a host waiter sees coherent shared-storage bytes
                         ggml_metal_event_signal_on_complete(sig_ev[c], (ggml_metal_cmd_buf_t) cmd_buf, sig_val[c]);
                     }
                 }
             }
 
-            // Capture this segment's outcome when it finishes, rather than
-            // reading it back later: by then a failure has abandoned the rest of
-            // the queue and the descriptions are gone. The slot is reserved
-            // before commit so the handler only ever writes its own index.
+            // A host cut signals from the device, at the end of the command buffer, rather than
+            // from a completion handler: the host spins on the value, and a completion handler
+            // adds a Metal thread's wake-up to every cut. The signal follows every encoder of the
+            // buffer, so the host reads what the segment wrote once it sees the value.
+            struct ggml_metal_hcut_pending hcut_next = { false, -1, NULL, 0 };
+            if (hcut_idx[seg_last] >= 0) {
+                hcut_next = (struct ggml_metal_hcut_pending) { true, hcut_idx[seg_last], gf->nodes[seg_last], ++ctx->hcut_val };
+                ggml_metal_event_encode_signal_value(ctx->hcut_ev, (ggml_metal_cmd_buf_t) cmd_buf, hcut_next.value);
+            }
+
+            // The pre-encoded segment's predecessor cut runs its callback now, before this
+            // segment is enqueued. On failure the segment is dropped unenqueued.
+            if (pre_encode && !ggml_metal_hcut_resolve(ctx, &hcut_pending)) {
+                [cmd_buf release];
+
+                free(starts);
+                free(is_cut);
+                free(is_wait);
+                free(hcut_idx);
+
+                return GGML_STATUS_FAILED;
+            }
+            hcut_pending = hcut_next;
+
+            // capture this segment's outcome on completion (see seg_results); the slot is reserved
+            // before commit so the handler only writes its own index
             if (ctx->seg_results_n < ctx->seg_results_cap) {
                 struct ggml_metal_seg_result * slot = &ctx->seg_results[ctx->seg_results_n++];
                 slot->status = -1;
@@ -1396,20 +1428,25 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
 
             [cmd_buf commit];
 
-            // Hand ownership to cmd_bufs_ext (drained by ggml_metal_synchronize,
-            // once per token) and track the last buffer for synchronize's wait.
+            // ownership passes to cmd_bufs_ext, drained by ggml_metal_synchronize
             [ctx->cmd_bufs_ext addObject:cmd_buf];
             ctx->cmd_buf_last = cmd_buf;
         }
 
+        // A host cut ending the last encoded segment runs its callback before the compute
+        // returns, so nothing committed later on this backend can overtake it.
+        const bool hcut_ok = ggml_metal_hcut_resolve(ctx, &hcut_pending);
+
         free(starts);
         free(is_cut);
         free(is_wait);
+        free(hcut_idx);
+
+        if (!hcut_ok) {
+            return GGML_STATUS_FAILED;
+        }
     }
 
-    // Persistent: do NOT clear the schedule here -- it stays in force for the
-    // remaining splits of this decode and the reused graph of later tokens,
-    // until the caller clears it (set_boundary_schedule with n_cuts == 0).
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1423,10 +1460,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         return GGML_STATUS_SUCCESS;
     }
 
-    // While a (persistent) paged-decode schedule is set, divert to the
-    // sequential per-boundary-committed encode with event signal/wait. It stays
-    // in force until the caller clears it, so it covers every split of a decode.
-    if (ctx->bsched_n_cuts > 0) {
+    // while a boundary schedule or host cut list is set, take the boundary-scheduled path
+    if (ctx->bsched_n_cuts > 0 || ctx->hcut_n > 0) {
         return ggml_metal_graph_compute_paged(ctx, gf);
     }
 
@@ -1628,7 +1663,8 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     //const int64_t t_start = ggml_time_us();
 
     if (ctx->use_graph_optimize) {
-        ggml_graph_optimize(gf, ctx->use_reorder_barriers);
+        ggml_graph_optimize(gf, ctx->use_reorder_barriers,
+            ctx->reorder_n_prefixes, (const char * const *) ctx->reorder_prefixes);
     }
 
     //printf("%s: graph optimize took %.3f ms\n", __func__, (ggml_time_us() - t_start) / 1000.0);

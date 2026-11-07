@@ -7,13 +7,15 @@
 
 #define LLAMA_MAX_SEQ 256
 
+// a reserve graph's MoE slot set: each slot layer reads the set with the most slots for it
+#define LLAMA_MOE_SLOT_SET_WIDEST -1
+
 // Parameters shared by context construction and memory planning.
 struct llama_memory_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;
     uint32_t n_ubatch;
-    uint32_t n_ubatch_reserve; // ubatch width graph reservations are sized for
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
 
@@ -34,6 +36,9 @@ struct llama_cparams : llama_memory_cparams {
     int32_t  n_threads_batch; // number of threads to use for batch processing
 
     int32_t  nextn_layer_offset = 0;
+
+    uint32_t moe_slot_sets = 1; // the number of MoE slot sets
+    int32_t  moe_slot_set  = 0; // the MoE slot set that the graph reads, or LLAMA_MOE_SLOT_SET_WIDEST
 
     float rope_freq_base;
     float rope_freq_scale;
@@ -65,6 +70,7 @@ struct llama_cparams : llama_memory_cparams {
     bool op_offload;
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
+    bool moe_router_ahead;   // add the router lookahead outputs of the MoE layers
 
     size_t moe_cache_size;
 
@@ -81,8 +87,6 @@ struct llama_cparams : llama_memory_cparams {
     void * cb_compute_buft_user_data;
     ggml_backend_sched_graph_prepare_callback cb_graph_prepare;
     void * cb_graph_prepare_user_data;
-    ggml_backend_sched_synchronize_callback cb_synchronize;
-    void * cb_synchronize_user_data;
     void (*cb_outputs_enqueued)(ggml_backend_sched_t sched, void * user_data);
     void * cb_outputs_enqueued_user_data;
 };

@@ -805,10 +805,7 @@ llama_model_loader::llama_model_loader(
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
-    // Assign a canonical model-wide ordinal to every weight, once all shards have
-    // been indexed. weights_map is keyed by tensor name across all shards and
-    // iterates in weight_name_comparer order (layer number, then name), so this
-    // ordinal is dense, unique, and deterministic across equivalent loads.
+    // number the weights in weights_map order, once all shards are indexed
     if (weights_map.size() > (size_t) INT32_MAX - 1) {
         throw std::runtime_error(format("%s: too many tensors (%zu) to assign a canonical ordinal", __func__, weights_map.size()));
     }
@@ -1238,6 +1235,59 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     return true;
 }
 
+static bool is_expert_weight(const LLM_TN_IMPL & tn) {
+    switch (tn.tensor) {
+        case LLM_TENSOR_FFN_GATE_UP_EXPS:
+        case LLM_TENSOR_FFN_UP_EXPS:
+        case LLM_TENSOR_FFN_GATE_EXPS:
+        case LLM_TENSOR_FFN_DOWN_EXPS:
+            return tn.bid >= 0 && tn.suffix != nullptr && strcmp(tn.suffix, "weight") == 0;
+        default:
+            return false;
+    }
+}
+
+llama_model_loader::moe_slot_plan & llama_model_loader::get_moe_slot_plan(llm_arch arch, int32_t il, const ggml_tensor * cur) {
+    const auto it = moe_slot_plans.find(il);
+    if (it != moe_slot_plans.end()) {
+        return it->second;
+    }
+
+    moe_slot_plan & plan = moe_slot_plans[il];
+    plan.n_expert = (int32_t) cur->ne[2];
+    if (moe_slots == nullptr) {
+        return plan;
+    }
+
+    if (!moe_slots(il, plan.n_expert, moe_slots_ud)) {
+        return plan;
+    }
+    plan.slots = true;
+
+    // the slot layout is the same whatever the order and layout of the file
+    const LLM_TN tn(arch);
+    for (llm_tensor kind : { LLM_TENSOR_FFN_GATE_UP_EXPS, LLM_TENSOR_FFN_UP_EXPS, LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_DOWN_EXPS }) {
+        const std::string name = tn(kind, "weight", il).str();
+        const ggml_tensor * t = get_tensor_meta(name.c_str());
+        if (t == nullptr) {
+            continue;
+        }
+        if (t->ne[2] != plan.n_expert || t->ne[3] != 1) {
+            throw std::runtime_error(format("tensor '%s' has %s experts, but the layer has %d experts",
+                name.c_str(), llama_format_tensor_shape(t).c_str(), plan.n_expert));
+        }
+        moe_slot_plan::member m;
+        m.name   = name;
+        m.size   = t->nb[2];
+        m.offset = plan.slot_size;
+        plan.slot_size += GGML_PAD(m.size, moe_slot_alignment);
+        plan.members.push_back(std::move(m));
+    }
+    GGML_ASSERT(!plan.members.empty() && plan.members.size() <= LLAMA_MOE_SLOT_MAX_MEMBERS);
+
+    return plan;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1468,7 +1518,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
-    if (assembly) {
+    // an expert weight of a layer that reads its experts from slots is metadata only
+    moe_slot_plan * slot_plan = nullptr;
+    if (is_expert_weight(tn) && !(flags & TENSOR_SKIP)) {
+        moe_slot_plan & plan = get_moe_slot_plan(tn.arch, tn.bid, cur);
+        if (plan.slots) {
+            slot_plan = &plan;
+        }
+    }
+
+    if (slot_plan) {
+        source = ctx_source::SLOT_META;
+    } else if (assembly) {
         // lazy reads need the tensor's own range of the file, which an assembled tensor does not have
         source = ctx_source::ASSEMBLED;
     } else if (flags & TENSOR_READ_LAZY) {
@@ -1494,9 +1555,36 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
 
-    ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+    moe_slot_plan::member * slot_member = nullptr;
+    if (slot_plan) {
+        for (auto & m : slot_plan->members) {
+            if (m.name == tn.str()) {
+                slot_member = &m;
+            }
+        }
+        if (slot_member == nullptr || slot_member->stock != nullptr || t_meta.ne[2] != slot_plan->n_expert || t_meta.nb[2] != slot_member->size) {
+            throw std::runtime_error(format("tensor '%s' %s does not fit the MoE slots of its layer", tn.str().c_str(), llama_format_tensor_shape(&t_meta).c_str()));
+        }
+    }
+
+    // the buffer type of a slot layer's expert weight must support the member's slot tensor, strided by the slot size
+    // (the number of slots is chosen by each context, the check takes one slot per expert)
+    ggml_tensor t_slots = t_meta;
+    if (slot_plan) {
+        t_slots.nb[2] = slot_plan->slot_size;
+        t_slots.nb[3] = t_slots.nb[2]*t_slots.ne[2];
+    }
+
+    ggml_backend_buffer_type_t buft = buft_for_tensor(slot_plan ? &t_slots : &t_meta);
     if (buft == nullptr) {
         return nullptr;
+    }
+    if (slot_plan) {
+        if (slot_plan->buft != nullptr && slot_plan->buft != buft) {
+            throw std::runtime_error(format("the expert weights of layer %d are read from MoE slots, but tensor '%s' is placed in %s and another in %s",
+                tn.bid, tn.str().c_str(), ggml_backend_buft_name(buft), ggml_backend_buft_name(slot_plan->buft)));
+        }
+        slot_plan->buft = buft;
     }
 
     ggml_context * ctx = ctx_for_buft(buft);
@@ -1514,11 +1602,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
 
-    // stamp the canonical model-wide ordinal so the engine can look up this
-    // tensor's GGUF source by a checked direct index instead of by name.
-    // Stored as ordinal + 1 so that a zeroed tensor reads as unset (see
-    // GGML_TENSOR_SRC_ORDINAL_NONE). An assembled tensor has no single source
-    // and stays unset; its per-expert tensors keep their own source records.
+    // stamp the weight's ordinal + 1 so that a zeroed tensor reads as unset (GGML_TENSOR_SRC_ORDINAL_NONE)
+    // an assembled tensor has no single source and stays unset
     const llama_tensor_weight * weight = get_weight(tn.str().c_str());
     if (weight) {
         tensor->src_ordinal = (int32_t) (weight->ordinal + 1);
@@ -1528,6 +1613,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         size_data += ggml_nbytes(&t_meta);
     } else {
         n_created += n_file_tensors;
+    }
+
+    if (slot_member) {
+        // the caller fills the slots, nothing of the tensor is loaded
+        slot_member->stock = tensor;
+        size_data -= ggml_nbytes(&t_meta);
     }
 
     return tensor;

@@ -2278,9 +2278,8 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
             add_cell = add_cell && !cells.is_empty(i);
             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
 
-            // a sequence state also keeps the cells its sliding window has masked. they no longer feed attention, but they
-            // are still occupied, so they decide which cells the next tokens take. without them a restored sequence
-            // places those tokens in other cells, and attention then sums in a different order and rounds differently
+            // keep the cells the sliding window has masked: they are still occupied, so they decide where the next
+            // tokens go, and a restored sequence must place them as the saved one would
 
             if (add_cell) {
                 ++cell_count;
@@ -2308,8 +2307,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
         io.write(&cell_count, sizeof(cell_count));
 
-        // the whole cache also records where its cells are and where the next search starts, so that a restore places
-        // later tokens in the same cells as the saved cache would
+        // a whole-cache state also records the cell layout and the head, so that a restore places later tokens as the saved cache would
         if (seq_id == -1) {
             state_write_layout(io, cr);
         }
@@ -2738,8 +2736,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             return false;
         }
 
-        // the cells go back where they were saved, and the head with them: later decodes then place their tokens in the
-        // same cells as the saved cache would have, and attention reads the cells in the same order
+        // the cells go back where they were saved, and the head with them
         // a cache too small for the saved layout takes the cells from cell 0 instead, in the saved order
         const bool layout_fits = layout_head <= cells.size() && (layout->data.empty() || layout->data.back().second <= cells.size());
 

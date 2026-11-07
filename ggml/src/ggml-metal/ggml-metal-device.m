@@ -12,6 +12,7 @@
 
 #include <os/lock.h>
 #include <stdatomic.h>
+#include <time.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -1500,6 +1501,31 @@ bool ggml_metal_event_host_wait(ggml_metal_event_t ev, uint64_t value, uint64_t 
     return [event waitUntilSignaledValue:value timeoutMS:timeout_ms];
 }
 
+// Polls signaledValue instead of blocking in waitUntilSignaledValue:timeoutMS:, whose wake-up
+// adds tens of microseconds once the value lands. The calling thread stays busy for the whole wait.
+bool ggml_metal_event_host_spin(ggml_metal_event_t ev, uint64_t value, uint64_t timeout_ms) {
+    id<MTLSharedEvent> event = (id<MTLSharedEvent>) ev->obj;
+    if (event.signaledValue >= value) {
+        return true;
+    }
+
+    const uint64_t start_ns   = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    const uint64_t timeout_ns = timeout_ms > UINT64_MAX / 1000000 ? UINT64_MAX : timeout_ms * 1000000;
+    while (true) {
+#if defined(__aarch64__)
+        __builtin_arm_yield();
+#elif defined(__x86_64__)
+        __builtin_ia32_pause();
+#endif
+        if (event.signaledValue >= value) {
+            return true;
+        }
+        if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start_ns >= timeout_ns) {
+            return false;
+        }
+    }
+}
+
 uint64_t ggml_metal_event_host_value(ggml_metal_event_t ev) {
     id<MTLSharedEvent> event = (id<MTLSharedEvent>) ev->obj;
     return event.signaledValue;
@@ -2058,10 +2084,10 @@ struct ggml_metal_buffer {
     // pointers to global device
     ggml_metal_device_t dev;
 
-    // A host-pointer buffer whose residency the caller took over (see ggml_metal_buffer_unwrap):
-    // rset is out of the device's keep-alive collection and only the caller requests or ends it.
-    // unwrapped: every buffers[i].metal is released and nil. The lock serializes the calls that
-    // change either, or the set.
+    // host-pointer buffers only (see ggml_metal_buffer_unwrap)
+    // caller_residency: rset is out of the device's keep-alive collection, the caller requests and ends it
+    // unwrapped: every buffers[i].metal is released and nil
+    // residency_lock serializes the calls that change either, or the set
     bool           caller_residency;
     atomic_bool    unwrapped;
     os_unfair_lock residency_lock;

@@ -7223,10 +7223,21 @@ static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_
     return nullptr;
 }
 
+// weights whose strides are not whole blocks of the type (e.g. padded expert slots) are unsupported:
+// the kernels index src0 in whole blocks
+static bool ggml_sycl_has_partial_block_strides(const ggml_tensor * t) {
+    const size_t ts = ggml_type_size(t->type);
+    return t->nb[1] % ts != 0 || t->nb[2] % ts != 0 || t->nb[3] % ts != 0;
+}
+
 static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_sycl_device_context *sycl_ctx =
         (ggml_backend_sycl_device_context *)dev->context;
     int device = sycl_ctx->device;
+
+    if ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID || op->op == GGML_OP_GET_ROWS) && ggml_sycl_has_partial_block_strides(op->src[0])) {
+        return false;
+    }
     switch (op->op) {
         case GGML_OP_CONV_TRANSPOSE_1D:
             {

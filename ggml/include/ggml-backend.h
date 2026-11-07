@@ -337,41 +337,28 @@ extern "C" {
     // `graph_size_changed` is true if the graph size changed since the last allocation
     typedef void (*ggml_backend_sched_realloc_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
-    // One independently allocated compute-buffer chunk in a reserve candidate.
-    // Shared buffer allocators appear once, under their first backend index.
+    // a compute buffer chunk that a reserve would allocate
+    // allocators shared by several backends are listed once, under the first backend index
     struct ggml_backend_sched_buffer_reservation {
         int    backend_index;
         size_t size;
     };
 
-    // Called after graph allocation planning but before the planned layout is
-    // published or any compute buffer is freed/reallocated. Each entry's size
-    // is max(current chunk size, newly required chunk size).
+    // Callback after a graph allocation has been planned, before any compute buffer is reallocated
+    // the size of each chunk is max(current size, required size); returning false fails the allocation
     typedef bool (*ggml_backend_sched_reserve_callback)(ggml_backend_sched_t sched, const struct ggml_backend_sched_buffer_reservation * reservations, size_t n_reservations, void * user_data);
 
-    // Per-graph-compute callback (set with ggml_backend_sched_set_graph_compute_callback).
-    // Fired exactly once per graph compute, after the graph has been split and allocated
-    // but before any split is encoded -- NOT per node, so it does not force the per-node
-    // dispatch loop that ggml_backend_sched_eval_callback does and therefore preserves op
-    // fusion. Intended for one-shot, whole-graph setup (e.g. installing a Metal boundary
-    // schedule) that needs the finalized graph but no per-node observation.
+    // Callback once per graph compute, after the graph is split and allocated and before any split is computed
+    // unlike the eval callback it does not run per node, so it does not prevent op fusion
     typedef void (*ggml_backend_sched_graph_compute_callback)(ggml_backend_sched_t sched, void * user_data);
 
-    // Per-graph-submission callback. Fired after the first split is submitted, or when a
-    // submission fails before any split was submitted.
+    // Callback once per graph compute, after the first split is submitted or when the submission fails before that
     typedef void (*ggml_backend_sched_graph_submit_callback)(ggml_backend_sched_t sched, enum ggml_status status, void * user_data);
 
-    // Graph-prepare callback (set with ggml_backend_sched_set_graph_prepare_callback).
-    // Fired once per allocated graph, after every tensor of the graph has its final address
-    // and before the caller writes inputs. Returning false makes ggml_backend_sched_alloc_graph
-    // fail. A caller that runs a graph without ggml_backend_sched_alloc_graph (graph reuse)
-    // calls ggml_backend_sched_prepare_graph itself before writing inputs.
+    // Callback once per allocated graph, after every tensor has its address and before the inputs are set
+    // returning false fails ggml_backend_sched_alloc_graph
+    // a graph that is computed again without ggml_backend_sched_alloc_graph needs ggml_backend_sched_prepare_graph
     typedef bool (*ggml_backend_sched_graph_prepare_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * user_data);
-
-    // Synchronize callback (set with ggml_backend_sched_set_synchronize_callback).
-    // Fired after every backend of the scheduler has been synchronized. When it fires, no work
-    // submitted through this scheduler is pending, including async tensor copies queued on its backends.
-    typedef void (*ggml_backend_sched_synchronize_callback)(ggml_backend_sched_t sched, void * user_data);
 
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
@@ -416,24 +403,18 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_graph_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_compute_callback callback, void * user_data);
     GGML_API void                 ggml_backend_sched_set_graph_submit_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_submit_callback callback, void * user_data);
     GGML_API void                 ggml_backend_sched_set_graph_prepare_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_prepare_callback callback, void * user_data);
-    GGML_API void                 ggml_backend_sched_set_synchronize_callback(ggml_backend_sched_t sched, ggml_backend_sched_synchronize_callback callback, void * user_data);
 
-    // When set, allocating a graph whose tensors are smaller than the previous plan plans the placement again
-    // (default: false, the previous placement is kept while every tensor still fits). The new placement starts at
-    // offset 0 of chunk 0, so chunks the graph does not need stay untouched. Existing compute buffers are never
-    // shrunk or reallocated by a plan that fits them; the reserve callback and the synchronize callback still fire
-    // as for any plan, and the reserve callback sees the current chunk sizes for a plan that needs no growth.
+    // Plan the allocation again when the tensors of a graph shrink, not only when they grow (default: false)
+    // the new plan starts at offset 0 of the first chunk; compute buffers that fit the plan are not reallocated,
+    // but the reserve callback still fires with their current sizes
     GGML_API void                 ggml_backend_sched_set_replan_on_shrink(ggml_backend_sched_t sched, bool replan);
 
-    // Bytes of chunk `chunk` of the compute buffer of backend `backend_index` that the current graph's allocation uses,
-    // which is at most the chunk's buffer size. The chunk's backend buffer is stored in *chunk_buffer (NULL if none).
-    // Returns 0 and NULL past the last chunk, and for a backend that shares its allocator with an earlier backend
-    // (the chunks are reported under the first index). Valid after ggml_backend_sched_reserve or
-    // ggml_backend_sched_alloc_graph, including inside the graph-prepare callback. After a reserve it is the planned
-    // extent, an upper bound of what an alloc of the same graph addresses.
+    // Bytes of chunk `chunk` of the compute buffer of a backend that the last allocated or reserved graph uses
+    // the chunk's buffer is returned in *chunk_buffer; returns 0 and NULL past the last chunk, and for a backend
+    // that shares its allocator with an earlier backend
     GGML_API size_t               ggml_backend_sched_get_compute_extent(ggml_backend_sched_t sched, int backend_index, int chunk, ggml_backend_buffer_t * chunk_buffer);
 
-    // Invoke the graph-prepare callback for a graph that already has addresses (returns true if none is set)
+    // Call the graph-prepare callback for a graph that is already allocated (returns true if none is set)
     GGML_API bool                 ggml_backend_sched_prepare_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
     // Set a callback to be called when the inputs weights of a split are being copied

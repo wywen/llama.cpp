@@ -251,6 +251,28 @@ extern "C" {
     // into `tensor`; `data` is valid only for the duration of the call
     typedef void (*llama_kv_rot_set_callback)(struct ggml_tensor * tensor, const void * data, size_t size, void * user_data);
 
+    // called during loading once for each MoE layer il, with the number of experts of its expert weights
+    // returns true if the layer reads its expert weights from slots, see llama_model_params.moe_slots
+    typedef bool (*llama_moe_slot_layer_callback)(int32_t il, int32_t n_expert, void * user_data);
+
+    // the slots of a MoE layer in one slot set of a context, see llama_context_params.moe_slots
+    struct llama_moe_slot_pool_params {
+        int32_t n_slots;
+
+        // the buffer type of the layer's slot buffer, NULL = the buffer type of the layer's expert weights
+        // it must be on the same device, with an alignment of at most llama_model_params.moe_slot_alignment; the
+        // context allocates one buffer of map_size + n_slots*slot_size bytes from it (none with no_alloc)
+        // the ops that read the slots run on the backend that supports the type of the returned buffer
+        // the buffers of one layer in all slot sets must be of buffer types that every device supports alike (all or
+        // none of them, not necessarily one type object), so that a change of set keeps the graph's splits
+        ggml_backend_buffer_type_t buft;
+    };
+
+    // called during context initialization once for each MoE layer il that reads its expert weights from slots and
+    // each slot set `set` in [0, llama_context_params.moe_slot_sets)
+    // returns the slots of the layer in that set, see llama_context_params.moe_slots
+    typedef struct llama_moe_slot_pool_params (*llama_moe_slot_pool_callback)(int32_t il, int32_t n_expert, int32_t set, void * user_data);
+
     // Input data for llama_encode/llama_decode
     // A llama_batch object can contain input about one or many sequences
     // The provided arrays (i.e. token, embd, pos, etc.) must have size of n_tokens
@@ -353,6 +375,16 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // if set, the MoE layers for which it returns true read their expert weights from slots that the caller
+        // fills, instead of loading them; NULL = every layer loads its expert weights
+        // each context allocates the slots of these layers, see llama_context_params.moe_slots
+        llama_moe_slot_layer_callback moe_slots;
+        void * moe_slots_user_data;
+
+        // the padding unit of the members and slots of a slot layer, see llama_context_moe_slot_layout
+        // a power of two, at least the alignment of the layer's buffer type; 0 = 16384
+        size_t moe_slot_alignment;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap_prefetch; // prefetch the mmap'd model file
@@ -402,25 +434,18 @@ extern "C" {
         ggml_backend_sched_reserve_callback cb_reserve;
         void * cb_reserve_user_data;
 
-        // Given the compute buffer type chosen for a backend, returns the buffer type to use instead
-        // (return buft to keep it). Called once per backend when the context builds its scheduler.
+        // returns the compute buffer type to use for a backend in place of buft (return buft to keep it)
+        // called once per backend when the context creates its scheduler
         ggml_backend_buffer_type_t (*cb_compute_buft)(ggml_backend_t backend, ggml_backend_buffer_type_t buft, void * user_data);
         void * cb_compute_buft_user_data;
 
-        // Scheduler callbacks, see ggml_backend_sched_set_graph_prepare_callback and
-        // ggml_backend_sched_set_synchronize_callback
+        // see ggml_backend_sched_set_graph_prepare_callback
         ggml_backend_sched_graph_prepare_callback cb_graph_prepare;
         void * cb_graph_prepare_user_data;
-        ggml_backend_sched_synchronize_callback cb_synchronize;
-        void * cb_synchronize_user_data;
 
-        // Called once per graph that llama computes successfully on the context's scheduler (each
-        // ubatch of decode and encode, and each K-shift graph), after every asynchronous copy of that
-        // graph's outputs out of compute tensors (logits, embeddings, nextn hidden state, layer inputs,
-        // backend-sampler tensors) has been enqueued on its backend, and before llama allocates or
-        // writes the inputs of any later graph on the scheduler. A caller may record backend events
-        // here to observe when those copies complete. It is called even if the graph enqueues no
-        // output copies.
+        // called once per graph computed on the context's scheduler (each ubatch of encode and decode, each K-shift),
+        // after the asynchronous copies of its outputs have been enqueued and before the inputs of a later graph are
+        // written, so that a caller can record backend events that complete with those copies
         void (*cb_outputs_enqueued)(ggml_backend_sched_t sched, void * user_data);
         void * cb_outputs_enqueued_user_data;
 
@@ -428,15 +453,23 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         // buffer type for the KV cache attention rotation matrices, NULL = the buffer type of each layer's cache [EXPERIMENTAL]
-        // for a cache buffer type that cannot take host writes, or that should hold only cache cells
         ggml_backend_buffer_type_t kv_rot_buft;
 
         // receives the contents of each KV cache attention rotation matrix instead of llama writing them, NULL = llama writes them [EXPERIMENTAL]
-        // for a rotation buffer that cannot take host writes: the callback owns putting the bytes into `tensor`
+        // for a buffer type that cannot take host writes: the callback puts the bytes into `tensor`
         llama_kv_rot_set_callback cb_kv_rot_set;
         void *                    cb_kv_rot_set_user_data;
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+
+        // the slots of each MoE layer that reads its expert weights from slots, see "MoE expert slots"; NULL = none
+        // n_slots 0 = the set has no slots for the layer, e.g. for a context that computes only the MTP layers;
+        // a graph that reads the layer then fails to build
+        llama_moe_slot_pool_callback moe_slots;
+        void *                       moe_slots_user_data;
+
+        // the number of slot sets, each with its own slots for each slot layer, see llama_set_moe_slot_set; at least 1
+        uint32_t moe_slot_sets;
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -455,6 +488,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool moe_router_ahead; // add the router lookahead outputs of the MoE layers to the graph, see "MoE router lookahead" [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -718,6 +752,114 @@ extern "C" {
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
 
+    //
+    // MoE expert slots
+    //
+    // A MoE layer that reads its experts from slots (see llama_model_params.moe_slots) does not load its expert
+    // weights; the caller fills the slots. A slot holds one expert's weights in compute order, each member at a
+    // multiple of llama_model_params.moe_slot_alignment.
+    //
+    // Each context allocates one buffer per slot layer and slot set (see llama_context_params.moe_slots):
+    //
+    //   offset 0          map_size          map_size + slot_size
+    //   | slot map | pad | slot 0          | slot 1          | ... n_slots slots
+    //
+    // The slot map is an I32 [1, n_expert] tensor holding the slot of each expert. The graph remaps the router's
+    // expert ids through it and reads each expert weight from its member tensor; per-expert scales and biases are
+    // still indexed by the expert ids. Slots are not shared between contexts and are not part of the context state.
+    //
+    // llama never accesses the slots or the slot map after allocation: the caller writes them (e.g. from the runs of
+    // llama_model_moe_expert_runs), outside the graph computations that read them. The slot map starts zeroed, the
+    // slots uninitialized. Every expert the router can select must map to a slot that holds it.
+    //
+    // Each graph reads the slot set chosen with llama_set_moe_slot_set (initially 0), e.g. a small set for decode and
+    // a full one for prompt processing. A change of set rebuilds the graph with the same nodes and splits and does not
+    // reserve the scheduler again: the compute buffers are reserved for the largest slot count of each layer.
+    //
+    // A member tensor strides its experts by slot_size, which need not be a whole number of blocks: a device that
+    // cannot read such a tensor does not support it, and the layer falls back to the next buffer type.
+    //
+
+#define LLAMA_MOE_SLOT_MAX_MEMBERS 3
+
+    // one expert weight of a slot layer
+    struct llama_moe_slot_member {
+        const char         * name;   // the stock expert weight, e.g. blk.0.ffn_down_exps.weight
+        struct ggml_tensor * tensor; // [ne0, ne1, n_slots] over the region at map_size + offset, nb[2] = slot_size
+        size_t               offset; // of the member in a slot
+        size_t               size;   // of one expert's weight, nb[2] of the stock tensor
+    };
+
+    struct llama_moe_slot_layout {
+        int32_t n_expert;
+        int32_t n_slots;
+        size_t  alignment; // llama_model_params.moe_slot_alignment
+        size_t  map_size;  // the offset of slot 0 in the region, a multiple of alignment
+        size_t  slot_size; // a multiple of alignment
+
+        ggml_backend_buffer_t buffer;   // holds the region from its base, and nothing else
+        struct ggml_tensor *  region;   // I8 [map_size + n_slots*slot_size], the whole region with the slot map
+        struct ggml_tensor *  slot_map; // I32 [1, n_expert] at offset 0 of the region
+
+        int32_t n_members;
+        struct llama_moe_slot_member members[LLAMA_MOE_SLOT_MAX_MEMBERS]; // in slot order
+    };
+
+    // a range of a model file that holds part of an expert's slot contents
+    struct llama_moe_expert_run {
+        const char * path;        // the model file, NULL if the model was not loaded from files
+        uint32_t     file;        // index of the file among the model's files (splits)
+        uint64_t     offset;      // in the file
+        uint64_t     size;
+        uint64_t     slot_offset; // in the slot, from the start of the slot (slot p starts at map_size + p*slot_size in the region)
+    };
+
+    // the slots of layer il in slot set `set` of the context; returns false, leaving `layout` untouched, if the layer does
+    // not read its experts from slots, `set` is out of range or the set has no slots for the layer
+    LLAMA_API bool llama_context_moe_slot_layout(const struct llama_context * ctx, int32_t il, int32_t set, struct llama_moe_slot_layout * layout);
+
+    // the slot set that the following graphs read, in [0, llama_context_params.moe_slot_sets)
+    // returns false, keeping the current set, if `set` is out of range
+    LLAMA_API bool llama_set_moe_slot_set(struct llama_context * ctx, int32_t set);
+
+    // the slot geometry of layer il, as llama_context_moe_slot_layout reports it for every context; returns false,
+    // leaving the outputs untouched, if the layer does not read its experts from slots
+    LLAMA_API bool llama_model_moe_slot_geometry(
+            const struct llama_model * model,
+                             int32_t   il,
+                              size_t * slot_size,
+                              size_t * map_size,
+                             int32_t * n_expert);
+
+    // the file ranges that fill a slot with expert `expert` of layer il, in slot order, covering every member
+    // a run spans several members when the file stores them with the same gaps as the slot
+    // writes up to n_max runs and returns their number, or -1 if layer il has no slots or `expert` is out of range
+    LLAMA_API int32_t llama_model_moe_expert_runs(
+            const struct llama_model * model,
+                             int32_t   il,
+                             int32_t   expert,
+              struct llama_moe_expert_run * runs,
+                             int32_t   n_max);
+
+    //
+    // MoE router lookahead [EXPERIMENTAL]
+    //
+    // With llama_context_params.moe_router_ahead, the graph of every MoE layer il that has a following MoE layer also
+    // computes "ffn_moe_logits_ahead-<il>": the router logits ("ffn_moe_logits", before bias and gating) that the next
+    // MoE layer would compute on layer il's router input. F32 [n_expert, n_tokens], a graph output, so a caller that
+    // loads experts on demand can predict the next layer's choice while layer il runs.
+    //
+    // As graph outputs the lookaheads are kept alive together: up to n_expert * n_ubatch * 4 bytes more compute buffer
+    // per such layer. The lookahead runs on the device that holds the next layer's router weights.
+    //
+    // Supported for the architectures that use the shared MoE FFN router and for gemma4; architectures that build
+    // their own router have no lookahead tensors.
+    //
+
+    // the MoE layer that follows MoE layer il, whose router the lookahead of layer il predicts, or -1 if il is not a MoE
+    // layer or is the last one (the next-token prediction layers are not counted)
+    LLAMA_API int32_t llama_model_moe_router_ahead_layer(const struct llama_model * model, int32_t il);
+
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(
             const char * fname_inp,
@@ -866,26 +1008,18 @@ extern "C" {
 
     // Where the sliding-window cache of a memory places a sequence's positions in its ring of cells.
     //
-    // With position_modular, a decode writes position p of the sequence to cell p % n_cells. When that cell
-    // still holds a position the window attends to, or a ubatch needs it for two of its tokens, the decode
-    // fails (llama_decode returns 1) instead of using another cell. Removing positions (llama_memory_seq_rm)
-    // frees their cells, and the next write of a position still goes to its own cell. A caller that saves
-    // and restores a sub-range of the ring can then find any position's cell from the position alone.
-    // With a standard or chunked window, a ubatch of n_ubatch tokens that follows its sequence never needs
-    // a cell the window still needs while n_swa + n_ubatch <= n_cells + 1, which the cache size guarantees
-    // unless the context is smaller than the window.
+    // With position_modular, position p is written to cell p % n_cells; a decode that would need a cell still in use
+    // by the window, or the same cell twice in one ubatch, fails (llama_decode returns 1). A caller can then find the
+    // cell of any position from the position alone. A ubatch that follows its sequence never conflicts while
+    // n_swa + n_ubatch <= n_cells + 1, which the cache size ensures unless the context is smaller than the window.
     //
-    // position_modular is fixed when the memory is built. It is set for the sliding-window cache of an
-    // interleaved sliding-window memory whose sequences each own a stream of cells (n_seq_max == 1, or
-    // kv_unified == false), for positions of one component. Sequences sharing one unified stream would
-    // want the same cells for the same positions, so such a cache keeps its former placement. Setting
-    // LLAMA_KV_SWA_POS_PLACEMENT_DISABLE=1 when the context is created turns it off.
+    // position_modular is fixed when the memory is built: it is set for the SWA cache of an iSWA memory whose
+    // sequences each own a stream (n_seq_max == 1 or kv_unified == false) and whose positions have one component.
+    // LLAMA_KV_SWA_POS_PLACEMENT_DISABLE=1 at context creation turns it off.
     //
-    // in_force is position_modular and, at the time of the call, every cell of the sequence's stream holds
-    // a position p at cell p % n_cells. llama_memory_seq_add and llama_memory_seq_div move positions
-    // without moving cells, and a sequence state saved by a cache that did not place by position may
-    // restore off the placement. While in_force is false the cache searches for free cells as it does
-    // without position_modular; in_force returns once every cell off the placement has been removed.
+    // in_force is position_modular and every cell of the stream currently at its position's cell. Shifting positions
+    // (llama_memory_seq_add/div) or loading a state saved without the placement can break it; until the cells off the
+    // placement are removed, the cache searches for free cells as usual.
     //
     // All zero when the memory has no sliding-window cache.
     struct llama_memory_swa_placement {
@@ -899,27 +1033,13 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
-    // Snapshot / restore a sequence's CELL METADATA (positions, sequence
-    // membership, slot-search cursor) without touching cell DATA.
+    // Snapshot and restore the cell metadata of a sequence (positions, sequence membership, search cursor), not the
+    // cell data, so that the same ubatches can be submitted again and placed identically, e.g. to compute different
+    // layers of the graph in several passes. Removing the positions is not enough: a sliding-window cache reuses the
+    // cells of positions that leave the window.
     //
-    // For a caller that submits the same ubatches more than once and needs
-    // every pass placed identically -- e.g. writing a graph's layers in
-    // several passes, one band at a time. Removing the span and re-submitting
-    // is not enough on its own: a windowed (SWA) cache RECYCLES cells as
-    // positions scroll out, so the first pass destroys earlier positions the
-    // next pass still needs, and the search cursor the removal rewinds to is
-    // unrelated to where the pass began.
-    //
-    // Metadata only: cell DATA is untouched, so passes writing disjoint layers
-    // still find each layer's data intact under the restored positions.
-    //
-    // Recurrent state keeps one set of cells for all sequences, so for a
-    // recurrent or hybrid memory the recurrent part of the snapshot covers
-    // every sequence whatever seq_id is, and includes a partial removal
-    // (llama_memory_seq_rm) not yet consumed by a decode.
-    //
-    // Returns NULL for memory types that have no such state. The handle is
-    // owned by the caller -- release it with llama_memory_cells_free.
+    // For a recurrent or hybrid memory the recurrent part covers every sequence, including a pending partial removal.
+    // Returns NULL for memory types without such state; free the snapshot with llama_memory_cells_free.
     LLAMA_API llama_memory_cells_t llama_memory_cells_snapshot(
             llama_memory_t mem,
               llama_seq_id seq_id);
@@ -1222,11 +1342,6 @@ extern "C" {
     // Set whether the context outputs embeddings or not
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
-
-    // Set the ubatch width that graph reservations are sized for, clamped to [1, n_ubatch].
-    // Compute buffers are sized for the widest graph the context can run, so narrowing this before a decode loop releases the prefill width. Takes effect on the next encode/decode.
-    // A wider batch widens the reservation again on its own, so this is a hint and never a constraint.
-    LLAMA_API void llama_set_ubatch_reserve(struct llama_context * ctx, uint32_t n_tokens);
 
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens

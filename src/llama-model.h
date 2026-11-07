@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
+#include "llama-moe-slots.h"
 #include "llama-vocab.h"
 
 #include <algorithm>
@@ -732,9 +733,8 @@ struct llama_hadamard {
     llama_hadamard_rotations inv; // latent lookup table -> inverse transform
 };
 
-/// Resolved source location retained for each tensor after model loading.
-/// `name` is kept for diagnostics and for the ordinal validation done in
-/// retain_tensor_sources(); it is never used for lookup.
+/// source location retained for each tensor after model loading
+/// `name` is for diagnostics and for the ordinal validation in retain_tensor_sources()
 struct llama_tensor_source_info {
     std::string name;
     uint16_t    source_idx = 0;
@@ -749,9 +749,7 @@ struct llama_model {
     std::string name = "n/a";
     /// Resolved GGUF source paths, indexed by llama_tensor_source_info::source_idx.
     std::vector<std::string>              source_paths;
-    /// Tensor source records indexed by the canonical model-wide tensor ordinal
-    /// (the UNBIASED ordinal; ggml_tensor::src_ordinal stores that ordinal plus
-    /// one, see tensor_source_at()), NOT sorted by name.
+    /// tensor source records indexed by tensor ordinal (ggml_tensor::src_ordinal stores the ordinal plus one, see tensor_source_at())
     std::vector<llama_tensor_source_info> tensor_sources;
 
     llama_hparams hparams = {};
@@ -904,6 +902,9 @@ struct llama_model {
     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
     std::unordered_set<const ggml_tensor *> can_prefetch;
 
+    // the MoE layers that read their expert weights from slots, see llama_model_params::moe_slots
+    llama_moe_slots moe_slots;
+
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 
@@ -945,12 +946,8 @@ struct llama_model {
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
-    /// Return the resolved source record for a STAMPED tensor ordinal (i.e. a
-    /// ggml_tensor::src_ordinal value, which is the canonical ordinal plus one),
-    /// or nullptr when the stamp is GGML_TENSOR_SRC_ORDINAL_NONE or out of range.
-    /// A dense expert tensor assembled from per-expert GGUF tensors has no single
-    /// file range, so it stays at GGML_TENSOR_SRC_ORDINAL_NONE; the record of each
-    /// per-expert tensor is kept in tensor_sources under that tensor's own name.
+    /// the source record for a ggml_tensor::src_ordinal value, or nullptr if it is GGML_TENSOR_SRC_ORDINAL_NONE or out of range
+    /// an expert tensor assembled from per-expert tensors has no single file range and stays unset
     [[nodiscard]] const llama_tensor_source_info * tensor_source_at(int32_t stamped_ordinal) const noexcept {
         if (stamped_ordinal <= GGML_TENSOR_SRC_ORDINAL_NONE) {
             return nullptr;
@@ -959,12 +956,12 @@ struct llama_model {
         return ordinal < tensor_sources.size() ? &tensor_sources[ordinal] : nullptr;
     }
 
-    /// Return a resolved source path by its canonical source index, or nullptr when out of bounds.
+    /// the source path of a source index, or nullptr if out of range
     [[nodiscard]] const std::string * source_path(uint16_t source_idx) const noexcept {
         return source_idx < source_paths.size() ? &source_paths[source_idx] : nullptr;
     }
 
-    /// Move resolved source paths and loader metadata into the model's durable source index.
+    /// keep the source paths and per-tensor source records of the loader in the model
     void retain_tensor_sources(llama_model_loader & loader, std::vector<std::string> source_paths);
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
@@ -1041,6 +1038,9 @@ struct llama_model_base : public llama_model {
 
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
+
+    // helper: the slot geometry and file runs of the MoE layers that read their expert weights from slots
+    void load_tensors_moe_slots(llama_model_loader & ml);
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);

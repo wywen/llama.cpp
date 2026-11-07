@@ -84,9 +84,8 @@ struct common_speculative_draft_params {
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
 
-    // optional observer of each draft step, called after the step's decode and before its token is
-    // sampled, with the draft context, the output row holding the step's logits and the step index;
-    // only the MTP draft calls it
+    // optional observer called after each draft step's decode and before its token is sampled, with
+    // the output row holding the step's logits; only the MTP draft calls it
     common_speculative_draft_step_cb on_step      = nullptr;
     void *                           on_step_user = nullptr;
 };
@@ -96,8 +95,7 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
-// forget the state carried across process() calls for seq_id, so that the next generation drafts
-// as it would on a freshly initialized context; call it whenever the sequence's memory is cleared
+// forget the state carried across process() calls for seq_id; call when the sequence's memory is cleared
 void common_speculative_reset(common_speculative * spec, llama_seq_id seq_id);
 
 // process the batch and update the internal state of the speculative context
@@ -113,14 +111,14 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
-// Owned MTP execution buffers on the host, excluding model/context buffers and control objects.
+// host buffers owned by the MTP draft, excluding model/context buffers
 struct common_speculative_mtp_buffer_sizes {
     size_t hidden_bytes   = 0;
     size_t batch_bytes    = 0;
     size_t sampling_bytes = 0;
     size_t sequence_bytes = 0;
 
-    // Saturates when the category sum cannot be represented.
+    // saturates if the sum is not representable
     size_t total() const {
         size_t result = hidden_bytes;
         for (const size_t bytes : { batch_bytes, sampling_bytes, sequence_bytes }) {
@@ -133,7 +131,7 @@ struct common_speculative_mtp_buffer_sizes {
     }
 };
 
-// False for non-MTP compositions or unrepresentable category totals; out is unchanged on failure.
+// returns false for non-MTP compositions or if a total overflows; out is unchanged on failure
 bool common_speculative_get_mtp_buffer_sizes(const common_speculative *            spec,
                                              common_speculative_mtp_buffer_sizes & out);
 
