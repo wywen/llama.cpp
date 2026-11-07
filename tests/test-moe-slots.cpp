@@ -5,7 +5,8 @@
 //   - permuted: one slot per expert and a spare, slot p holds expert perm[p], the spare holds garbage
 //   - reduced:  fewer slots than experts, holding exactly the experts the router selects for a short prompt, and a
 //               spare holding garbage that every other expert maps to
-// each from the stock file and from a copy that stores the expert weights one tensor per expert
+// each from the stock file and from a copy that stores the expert weights one tensor per expert; identity and permuted
+//     also decode a batch wide enough for a GPU backend to take the expert matmuls of slots in host memory
 // and that two contexts on one model have their own slots, that the slots can be of a buffer type that the caller
 //     chooses, that the model reports the geometry of the slots of every context, that a non-default alignment
 //     computes the same, and that a context without the slots of a layer that its graph reads fails to initialize
@@ -29,6 +30,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -342,11 +344,31 @@ static std::vector<float> get_logits(llama_context * lctx, size_t n_tokens, size
 
 static constexpr size_t N_TOKENS_LONG  = 16;
 static constexpr size_t N_BATCH_LONG   = 12;
+// a batch wide enough for a GPU backend to take the expert matmuls of experts in host memory: the scheduler copies
+//     the experts that the batch reads to the GPU, which for slots are runs of experts with their members interleaved
+static constexpr size_t N_TOKENS_WIDE  = 34;
+static constexpr size_t N_BATCH_WIDE   = 32;
 static constexpr size_t N_TOKENS_SHORT = 3;
 static constexpr size_t N_BATCH_SHORT  = 2;
 
 static bool same_bits(const std::vector<float> & a, const std::vector<float> & b) {
     return a.size() == b.size() && memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0;
+}
+
+// the logits of a wide batch: on a GPU, the slot lookup runs on the host and can move a neighboring op, such as the
+//     norm of the MoE input, to the CPU, which rounds differently; a wrong or partly copied expert changes the logits
+//     by far more than the rounding
+static bool close_logits(const std::vector<float> & a, const std::vector<float> & ref) {
+    if (a.size() != ref.size()) {
+        return false;
+    }
+    float max_ref  = 0.0f;
+    float max_diff = 0.0f;
+    for (size_t i = 0; i < a.size(); ++i) {
+        max_ref  = std::max(max_ref,  std::fabs(ref[i]));
+        max_diff = std::max(max_diff, std::fabs(a[i] - ref[i]));
+    }
+    return max_diff <= 1e-2f*max_ref;
 }
 
 struct checker {
@@ -491,8 +513,8 @@ static assignment identity(const slot_layers & layers) {
 }
 
 static void test_file(const std::string & path, bool per_expert_file, const std::vector<ggml_backend_dev_t> & devs,
-        const std::vector<float> & ref_long, const std::vector<float> & ref_short, const selection & sel,
-        const std::string & stem, expert_bytes & bytes_identity, checker & check) {
+        const std::vector<float> & ref_long, const std::vector<float> & ref_wide, const std::vector<float> & ref_short,
+        const selection & sel, const std::string & stem, expert_bytes & bytes_identity, checker & check) {
     const std::string label = stem + (per_expert_file ? " (per-expert file)" : " (stock file)");
 
     // identity: slot e holds expert e; then the experts move to other slots of the same context
@@ -505,6 +527,8 @@ static void test_file(const std::string & path, bool per_expert_file, const std:
         check(maps_zeroed(lctx.get(), layers), label + ", identity: the slot maps start out zeroed");
         bytes_identity = fill_slots(lctx.get(), identity(layers), per_expert_file, DEFAULT_ALIGNMENT, label + ", identity", check);
         check(same_bits(get_logits(lctx.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long), label + ", identity: logits are bitwise identical");
+        check(close_logits(get_logits(lctx.get(), N_TOKENS_WIDE, N_BATCH_WIDE), ref_wide),
+            label + ", identity: logits of a batch of " + std::to_string(N_BATCH_WIDE) + " tokens match up to rounding");
 
         assignment moved = identity(layers);
         for (auto & [_, slots] : moved) {
@@ -530,6 +554,8 @@ static void test_file(const std::string & path, bool per_expert_file, const std:
         }
         fill_slots(lctx.get(), assign, per_expert_file, DEFAULT_ALIGNMENT, label + ", permuted", check);
         check(same_bits(get_logits(lctx.get(), N_TOKENS_LONG, N_BATCH_LONG), ref_long), label + ", permuted: logits are bitwise identical");
+        check(close_logits(get_logits(lctx.get(), N_TOKENS_WIDE, N_BATCH_WIDE), ref_wide),
+            label + ", permuted: logits of a batch of " + std::to_string(N_BATCH_WIDE) + " tokens match up to rounding");
     }
 
     // reduced: only the selected experts have slots, every other expert reads a spare that holds garbage
@@ -744,12 +770,14 @@ static void test_model(const std::string & path, const std::string & dir, const 
     printf("%s\n", stem.c_str());
 
     std::vector<float> ref_long;
+    std::vector<float> ref_wide;
     std::vector<float> ref_short;
     selection sel;
     {
         llama_model_ptr model = load_model(path, devs, nullptr);
         llama_context_ptr lctx = new_context(model.get(), nullptr);
         ref_long  = get_logits(lctx.get(), N_TOKENS_LONG, N_BATCH_LONG);
+        ref_wide  = get_logits(lctx.get(), N_TOKENS_WIDE, N_BATCH_WIDE);
         ref_short = get_logits(lctx.get(), N_TOKENS_SHORT, N_BATCH_SHORT);
         llama_context_ptr lctx_observed = new_context(model.get(), nullptr, &sel);
         const std::vector<float> routed = get_logits(lctx_observed.get(), N_TOKENS_SHORT, N_BATCH_SHORT);
@@ -765,8 +793,8 @@ static void test_model(const std::string & path, const std::string & dir, const 
 
     expert_bytes bytes_stock;
     expert_bytes bytes_parts;
-    test_file(path,       false, devs, ref_long, ref_short, sel, stem, bytes_stock, check);
-    test_file(path_parts, true,  devs, ref_long, ref_short, sel, stem, bytes_parts, check);
+    test_file(path,       false, devs, ref_long, ref_wide, ref_short, sel, stem, bytes_stock, check);
+    test_file(path_parts, true,  devs, ref_long, ref_wide, ref_short, sel, stem, bytes_parts, check);
     check(!bytes_stock.empty() && bytes_stock == bytes_parts, stem + ": the stock and the per-expert file fill identical slots");
 
     // a slot that holds the wrong expert changes the logits only if the experts differ
