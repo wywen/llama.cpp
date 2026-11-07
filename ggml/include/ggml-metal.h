@@ -90,12 +90,6 @@ GGML_BACKEND_API void     ggml_backend_metal_event_host_signal(ggml_metal_event_
 GGML_BACKEND_API bool     ggml_backend_metal_event_host_wait  (ggml_metal_event_t ev, uint64_t value, uint64_t timeout_ms);
 GGML_BACKEND_API uint64_t ggml_backend_metal_event_host_value (ggml_metal_event_t ev);
 
-// Like ggml_backend_metal_event_host_wait, but polls the event's value on the calling thread
-// instead of blocking in Metal's wait, which returns tens of microseconds later once the value
-// is reached. The thread stays busy for the whole wait. True once the value is >= `value`, false
-// when `timeout_ms` passes first; 0 checks once.
-GGML_BACKEND_API bool     ggml_backend_metal_event_host_spin  (ggml_metal_event_t ev, uint64_t value, uint64_t timeout_ms);
-
 // Set `ev` to `value` once everything committed on this backend's queue before the call has completed, e.g. the async tensor copies of the last graph.
 GGML_BACKEND_API void ggml_backend_metal_event_signal(ggml_backend_t backend, ggml_metal_event_t ev, uint64_t value);
 
@@ -336,7 +330,6 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_metal_compute_buft_new(
         size_t max_size,
         void * user_data);
 GGML_BACKEND_API void   ggml_backend_metal_compute_buft_free(ggml_backend_buffer_type_t buft);
-GGML_BACKEND_API void * ggml_backend_metal_compute_buft_user_data(ggml_backend_buffer_type_t buft);
 
 #ifdef __cplusplus
 }
