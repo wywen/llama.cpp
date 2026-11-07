@@ -148,9 +148,6 @@ struct llama_context {
 
     // the MoE slot set that the following graphs read; false, keeping the current set, if `set` is out of range
     bool set_moe_slot_set(int32_t set);
-    void set_ubatch_reserve(uint32_t n_tokens);
-    // grow the reservation to fit a batch about to be submitted
-    void widen_ubatch_reserve(uint32_t n_tokens);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 

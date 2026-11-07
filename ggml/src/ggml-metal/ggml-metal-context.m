@@ -1128,7 +1128,6 @@ static bool ggml_metal_ewin_split_is_in_band(
 // encoding resolves each tensor's Metal buffer, and a buffer the caller has not
 // yet made (or is about to release) for this segment must not be bound by a
 // command buffer committed ahead of its gate.
-#define GGML_METAL_PAGED_GATE_WAIT_MS 30000
 
 enum ggml_metal_paged_wait_status {
     GGML_METAL_PAGED_WAIT_OK,

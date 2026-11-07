@@ -16,7 +16,6 @@ struct llama_memory_cparams {
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;
     uint32_t n_ubatch;
-    uint32_t n_ubatch_reserve; // ubatch width graph reservations are sized for
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
 
@@ -88,8 +87,6 @@ struct llama_cparams : llama_memory_cparams {
     void * cb_compute_buft_user_data;
     ggml_backend_sched_graph_prepare_callback cb_graph_prepare;
     void * cb_graph_prepare_user_data;
-    ggml_backend_sched_synchronize_callback cb_synchronize;
-    void * cb_synchronize_user_data;
     void (*cb_outputs_enqueued)(ggml_backend_sched_t sched, void * user_data);
     void * cb_outputs_enqueued_user_data;
 };

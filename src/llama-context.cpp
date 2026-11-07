@@ -329,7 +329,6 @@ llama_memory_cparams llama_cparams_memory_shape(const llama_model & model, const
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
-    cparams.n_ubatch_reserve = cparams.n_ubatch;
 
     cparams.kv_unified = params.kv_unified;
 
@@ -431,8 +430,6 @@ llama_context::llama_context(
     cparams.cb_compute_buft_user_data  = params.cb_compute_buft_user_data;
     cparams.cb_graph_prepare           = params.cb_graph_prepare;
     cparams.cb_graph_prepare_user_data = params.cb_graph_prepare_user_data;
-    cparams.cb_synchronize             = params.cb_synchronize;
-    cparams.cb_synchronize_user_data   = params.cb_synchronize_user_data;
     cparams.cb_outputs_enqueued           = params.cb_outputs_enqueued;
     cparams.cb_outputs_enqueued_user_data = params.cb_outputs_enqueued_user_data;
 
@@ -893,7 +890,6 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_graph_prepare_callback(sched.get(), cparams.cb_graph_prepare, cparams.cb_graph_prepare_user_data);
     // a caller that tracks per-graph extents wants each graph placed tightly
     ggml_backend_sched_set_replan_on_shrink(sched.get(), cparams.cb_graph_prepare != nullptr);
-    ggml_backend_sched_set_synchronize_callback(sched.get(), cparams.cb_synchronize, cparams.cb_synchronize_user_data);
 }
 
 void llama_context::sched_reserve() {
@@ -910,7 +906,7 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch_reserve);
+    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -1048,7 +1044,7 @@ bool llama_context::sched_reserve_pending() const {
 }
 
 ggml_cgraph * llama_context::graph_reserve_widest(const llama_memory_context_i * mctx, bool split_only) {
-    const uint32_t n_tokens  = std::min(cparams.n_ctx, cparams.n_ubatch_reserve);
+    const uint32_t n_tokens  = std::min(cparams.n_ctx, cparams.n_ubatch);
     const uint32_t n_outputs = std::min(n_tokens, cparams.n_outputs_max);
 
     // TODO: the worst case graph is not always reached for `n_seqs > 1`
@@ -1572,30 +1568,6 @@ bool llama_context::set_moe_slot_set(int32_t set) {
     return true;
 }
 
-void llama_context::set_ubatch_reserve(uint32_t n_tokens) {
-    LLAMA_LOG_DEBUG("%s: n_tokens = %u\n", __func__, n_tokens);
-
-    const uint32_t width = std::clamp(n_tokens, 1u, cparams.n_ubatch);
-
-    if (cparams.n_ubatch_reserve == width) {
-        return;
-    }
-
-    cparams.n_ubatch_reserve = width;
-
-    sched_need_reserve = true;
-}
-
-void llama_context::widen_ubatch_reserve(uint32_t n_tokens) {
-    const uint32_t needed = std::min(cparams.n_ubatch, n_tokens);
-
-    if (cparams.n_ubatch_reserve >= needed) {
-        return;
-    }
-
-    set_ubatch_reserve(needed);
-}
-
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1859,8 +1831,6 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     // [TAG_NO_CACHE_PAD]
     // TODO: add new split mode where we pad the input sequences so that ubatch.equal_seqs == true
     const llama_ubatch ubatch = balloc->split_simple(n_tokens);
-
-    widen_ubatch_reserve(n_tokens);
 
     // micro-batching is not possible for non-causal encoding, so we process the batch in a single shot
     GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens");
@@ -2171,8 +2141,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     output_swaps.clear();
     embd_batch_idxs.clear();
-
-    widen_ubatch_reserve(n_tokens_all);
 
     sched_reserve();
 
@@ -4348,8 +4316,6 @@ llama_context_params llama_context_default_params() {
         /*.cb_compute_buft_user_data   =*/ nullptr,
         /*.cb_graph_prepare            =*/ nullptr,
         /*.cb_graph_prepare_user_data  =*/ nullptr,
-        /*.cb_synchronize              =*/ nullptr,
-        /*.cb_synchronize_user_data    =*/ nullptr,
         /*.cb_outputs_enqueued         =*/ nullptr,
         /*.cb_outputs_enqueued_user_data =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
@@ -4505,10 +4471,6 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
-}
-
-void llama_set_ubatch_reserve(llama_context * ctx, uint32_t n_tokens) {
-    ctx->set_ubatch_reserve(n_tokens);
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {

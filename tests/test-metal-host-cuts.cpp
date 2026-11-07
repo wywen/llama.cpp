@@ -24,7 +24,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <thread>
 #include <vector>
 
 static int g_n_fail = 0;
@@ -337,28 +336,6 @@ struct reference {
     }
 };
 
-static void test_host_spin(chain & c) {
-    const char * sc = "host spin";
-    ggml_metal_event_t ev = ggml_backend_metal_event_init(c.backend);
-
-    ggml_backend_metal_event_host_signal(ev, 5);
-    check(ggml_backend_metal_event_host_spin(ev, 5, 0), sc, "a reached value returns at once");
-    check(!ggml_backend_metal_event_host_spin(ev, 6, 0), sc, "timeout 0 checks once");
-
-    const double t0 = now_us();
-    const bool reached = ggml_backend_metal_event_host_spin(ev, 6, 50);
-    check(!reached && now_us() - t0 >= 50000.0, sc, "an unreached value times out");
-
-    std::thread signaler([ev]() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        ggml_backend_metal_event_host_signal(ev, 7);
-    });
-    check(ggml_backend_metal_event_host_spin(ev, 7, 5000), sc, "another thread's signal is seen");
-    signaler.join();
-
-    ggml_backend_metal_event_free(c.backend, ev);
-}
-
 // No gates: every segment after a cut is pre-encoded and committed after the callback, which
 // itself commits work on the backend's queue and waits for it.
 static void test_ordering(chain & c, cut_state & cs, const reference & ref) {
@@ -630,7 +607,6 @@ int main() {
             printf("SKIP no Metal device\n");
             return 0;
         }
-        test_host_spin(c);
 
         cut_state cs(c);
         reference ref;

@@ -445,12 +445,9 @@ extern "C" {
         ggml_backend_buffer_type_t (*cb_compute_buft)(ggml_backend_t backend, ggml_backend_buffer_type_t buft, void * user_data);
         void * cb_compute_buft_user_data;
 
-        // Scheduler callbacks, see ggml_backend_sched_set_graph_prepare_callback and
-        // ggml_backend_sched_set_synchronize_callback
+        // see ggml_backend_sched_set_graph_prepare_callback
         ggml_backend_sched_graph_prepare_callback cb_graph_prepare;
         void * cb_graph_prepare_user_data;
-        ggml_backend_sched_synchronize_callback cb_synchronize;
-        void * cb_synchronize_user_data;
 
         // Called once per graph that llama computes successfully on the context's scheduler (each
         // ubatch of decode and encode, and each K-shift graph), after every asynchronous copy of that
@@ -1408,11 +1405,6 @@ extern "C" {
     // Set whether the context outputs embeddings or not
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
-
-    // Set the ubatch width that graph reservations are sized for, clamped to [1, n_ubatch].
-    // Compute buffers are sized for the widest graph the context can run, so narrowing this before a decode loop releases the prefill width. Takes effect on the next encode/decode.
-    // A wider batch widens the reservation again on its own, so this is a hint and never a constraint.
-    LLAMA_API void llama_set_ubatch_reserve(struct llama_context * ctx, uint32_t n_tokens);
 
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens

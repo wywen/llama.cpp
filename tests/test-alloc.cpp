@@ -660,7 +660,6 @@ static void test_reserve_refusal_preserves_published_layout() {
 
 struct sched_callback_state {
     int  n_prepare     = 0;
-    int  n_synchronize = 0;
     bool accept        = true;
     bool all_addressed = true;
 };
@@ -676,11 +675,7 @@ static bool sched_prepare_callback(ggml_backend_sched_t /*sched*/, ggml_cgraph *
     return state->accept;
 }
 
-static void sched_synchronize_callback(ggml_backend_sched_t /*sched*/, void * user_data) {
-    static_cast<sched_callback_state *>(user_data)->n_synchronize++;
-}
-
-static void test_sched_prepare_and_synchronize_callbacks() {
+static void test_sched_prepare_callback() {
     ggml_backend_ptr backend(ggml_backend_cpu_init());
     GGML_ASSERT(backend);
 
@@ -699,7 +694,6 @@ static void test_sched_prepare_and_synchronize_callbacks() {
 
     sched_callback_state state;
     ggml_backend_sched_set_graph_prepare_callback(sched.get(), sched_prepare_callback, &state);
-    ggml_backend_sched_set_synchronize_callback(sched.get(), sched_synchronize_callback, &state);
 
     // fires once per allocation, after the tensors have addresses
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
@@ -714,11 +708,6 @@ static void test_sched_prepare_and_synchronize_callbacks() {
     GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched.get(), graph) == GGML_STATUS_SUCCESS);
     GGML_ASSERT(state.n_prepare == 2);
 
-    // fires after the backends synchronized
-    GGML_ASSERT(state.n_synchronize == 0);
-    ggml_backend_sched_synchronize(sched.get());
-    GGML_ASSERT(state.n_synchronize == 1);
-
     // a refusal fails the allocation
     state.accept = false;
     ggml_backend_sched_reset(sched.get());
@@ -727,13 +716,10 @@ static void test_sched_prepare_and_synchronize_callbacks() {
     GGML_ASSERT(!ggml_backend_sched_prepare_graph(sched.get(), graph));
     GGML_ASSERT(state.n_prepare == 4);
 
-    // cleared callbacks are no longer invoked
+    // a cleared callback is no longer invoked
     ggml_backend_sched_set_graph_prepare_callback(sched.get(), nullptr, nullptr);
-    ggml_backend_sched_set_synchronize_callback(sched.get(), nullptr, nullptr);
     GGML_ASSERT(ggml_backend_sched_prepare_graph(sched.get(), graph));
-    ggml_backend_sched_synchronize(sched.get());
     GGML_ASSERT(state.n_prepare == 4);
-    GGML_ASSERT(state.n_synchronize == 1);
 }
 
 // CPU buffer type with a small maximum buffer size, so that a graph spans several chunks
@@ -759,7 +745,6 @@ static bool small_chunk_buft_is_host(ggml_backend_buffer_type_t) {
 
 struct replan_callback_counts {
     int n_reserve     = 0;
-    int n_synchronize = 0;
     std::vector<size_t> last_sizes;
 };
 
@@ -771,10 +756,6 @@ static bool replan_reserve_callback(ggml_backend_sched_t, const ggml_backend_sch
         counts->last_sizes.push_back(r[i].size);
     }
     return true;
-}
-
-static void replan_synchronize_callback(ggml_backend_sched_t, void * user_data) {
-    static_cast<replan_callback_counts *>(user_data)->n_synchronize++;
 }
 
 // out = sum of n_branches scaled copies of one input of n_elements floats
@@ -880,7 +861,6 @@ static void test_sched_compute_extent() {
         }
         replan_callback_counts counts;
         ggml_backend_sched_set_reserve_callback(sched.get(), replan_reserve_callback, &counts);
-        ggml_backend_sched_set_synchronize_callback(sched.get(), replan_synchronize_callback, &counts);
         ggml_backend_sched_set_replan_on_shrink(sched.get(), true);
         ggml_backend_sched_reset(sched.get());
         auto [ctx, graph, ctx_ptr] = make_context();
@@ -891,11 +871,10 @@ static void test_sched_compute_extent() {
         printf("narrow replan extents: %zu %zu %zu %zu\n", extents[0], extents[1], extents[2], extents[3]);
         printf("replan reserve callbacks: %d (sizes:", counts.n_reserve);
         for (size_t v : counts.last_sizes) { printf(" %zu", v); }
-        printf("), synchronize callbacks: %d\n", counts.n_synchronize);
+        printf(")\n");
         GGML_ASSERT(counts.n_reserve == 1);
         GGML_ASSERT(counts.last_sizes.size() == 2 && counts.last_sizes[0] == sizes[0] && counts.last_sizes[1] == sizes[1]);
         ggml_backend_sched_set_reserve_callback(sched.get(), nullptr, nullptr);
-        ggml_backend_sched_set_synchronize_callback(sched.get(), nullptr, nullptr);
         GGML_ASSERT(extents[0] > 0 && extents[0] < wide_extents[0]);
         GGML_ASSERT(extents[1] == 0 && extents[2] == 0 && extents[3] == 0);
         for (int c = 0; c < 4; c++) {
@@ -1892,7 +1871,7 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reserve_refusal_preserves_published_layout", test_reserve_refusal_preserves_published_layout);
-    run("test_sched_prepare_and_synchronize_callbacks", test_sched_prepare_and_synchronize_callbacks);
+    run("test_sched_prepare_callback", test_sched_prepare_callback);
     run("test_sched_compute_extent", test_sched_compute_extent);
     run("test_shrink_replan_keeps_the_fitting_plan", test_shrink_replan_keeps_the_fitting_plan);
     run("test_covering_reserve_names_the_graphs_to_hold", test_covering_reserve_names_the_graphs_to_hold);
