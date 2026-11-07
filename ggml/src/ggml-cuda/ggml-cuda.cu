@@ -5744,8 +5744,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 }
 
 // TODO: move these functions here
-// a weight that indexes its rows or matrices by byte strides that are not whole blocks of its type, e.g. one
-// expert per padded slot of a region; the kernels index src0 in whole blocks
+// weights whose strides are not whole blocks of the type (e.g. padded expert slots) are unsupported:
+// the kernels index src0 in whole blocks
 static bool ggml_cuda_has_partial_block_strides(const ggml_tensor * t) {
     const size_t ts = ggml_type_size(t->type);
     return t->nb[1] % ts != 0 || t->nb[2] % ts != 0 || t->nb[3] % ts != 0;

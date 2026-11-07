@@ -809,6 +809,9 @@ struct llm_graph_params {
     const llama_moe_cache        * moe_cache;
     const llama_moe_slot_pool    * moe_slots;
 
+    // [n_layer] the router weight of each MoE layer, nullptr for the other layers; nullptr = no router lookahead
+    const std::vector<ggml_tensor *> * moe_routers = nullptr;
+
     const llama_prec_policy * prec_policy = nullptr;
 
     const llama_hadamard * hdmd = nullptr;
@@ -896,6 +899,11 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        // the slot sets have the same topology, but the graph reads the slot tensors of its set
+        if (cparams.moe_slot_set != other.cparams.moe_slot_set) {
             return false;
         }
 
@@ -1078,6 +1086,8 @@ struct llm_graph_context {
     const llama_moe_cache        * moe_cache;
     const llama_moe_slot_pool    * moe_slots;
 
+    const std::vector<ggml_tensor *> * moe_routers; // see llm_graph_params::moe_routers
+
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
@@ -1238,6 +1248,15 @@ struct llm_graph_context {
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
                    float   post_exp_norm_eps = 1e-5f) const;
+
+    // the router lookahead (llama_context_params.moe_router_ahead) of MoE layer il, whose router weight is `router`:
+    //     the first MoE layer after il, or -1 if the lookahead is off, `router` is not layer il's router or il is the
+    //     last MoE layer
+    int moe_router_ahead_layer(int il, const ggml_tensor * router) const;
+
+    // names the router lookahead logits of layer il, marks them as an output and adds them to the graph, which must
+    //     happen before the router of layer il is built so that the router nodes stay adjacent
+    void build_moe_router_ahead(ggml_tensor * logits_ahead, int il) const;
 
     // the slots of the selected experts and the tensors that stand in for the expert weights, from the caller-filled
     //     slots of the layer in the context or from the MoE cache; no slots if the layer reads its expert weights

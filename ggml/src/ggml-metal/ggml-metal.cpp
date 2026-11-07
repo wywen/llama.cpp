@@ -637,12 +637,6 @@ void ggml_backend_metal_compute_buft_free(ggml_backend_buffer_type_t buft) {
     delete buft;
 }
 
-void * ggml_backend_metal_compute_buft_user_data(ggml_backend_buffer_type_t buft) {
-    GGML_ASSERT(buft->iface.get_name == ggml_backend_metal_buffer_type_compute_get_name);
-
-    return ((ggml_backend_metal_compute_buft_context *)buft->context)->user_data;
-}
-
 // backend
 
 static const char * ggml_backend_metal_name(ggml_backend_t backend) {
@@ -823,10 +817,6 @@ void ggml_backend_metal_event_host_signal(ggml_metal_event_t ev, uint64_t value)
 
 bool ggml_backend_metal_event_host_wait(ggml_metal_event_t ev, uint64_t value, uint64_t timeout_ms) {
     return ggml_metal_event_host_wait(ev, value, timeout_ms);
-}
-
-bool ggml_backend_metal_event_host_spin(ggml_metal_event_t ev, uint64_t value, uint64_t timeout_ms) {
-    return ggml_metal_event_host_spin(ev, value, timeout_ms);
 }
 
 uint64_t ggml_backend_metal_event_host_value(ggml_metal_event_t ev) {

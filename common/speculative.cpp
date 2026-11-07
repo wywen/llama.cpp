@@ -218,8 +218,7 @@ struct common_speculative_impl {
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
 
-    // forget per-seq state carried from one process() call into the next; a no-op for
-    // implementations that carry none
+    // forget per-seq state carried between process() calls; no-op if there is none
     virtual void reset(llama_seq_id /*seq_id*/) {}
 };
 
@@ -1577,7 +1576,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_speculative_get_devices_str(this->params.devices).c_str());
 
         batch = common_batch(ctx_dft);
-        // a draft step adds at most n_batch entries, so the entry list never grows while drafting
+        // a draft step adds at most n_batch entries, so the list does not grow while drafting
         batch.tokens.reserve(llama_n_batch(ctx_dft));
 
         smpls.resize(n_seq);
@@ -1676,8 +1675,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    // the zero row is the carry a freshly constructed context pairs with its first token; the
-    // verification rows are dropped too, so a later accept() cannot reload the old history's row
+    // restore the zero row a fresh context pairs with its first token and drop the verification
+    // rows so a later accept() cannot reload the old history
     void reset(llama_seq_id seq_id) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
@@ -3043,8 +3042,7 @@ bool common_speculative_get_mtp_buffer_sizes(const common_speculative *         
         return false;
     }
 
-    // the draft batch holds views of the hidden rows, not copies; the entries the context renders them into are
-    // owned by the library and not counted here
+    // the draft batch holds views of the hidden rows, not copies; the library-owned entries are not counted
     if (!add_product(sizes.batch_bytes, mtp.batch.tokens.capacity(), sizeof(common_batch::token))) {
         return false;
     }
@@ -3122,9 +3120,8 @@ void common_speculative_draft(common_speculative * spec) {
     }
 
     for (auto & impl : spec->impls) {
-        // a maximum draft length of zero disables drafting for the implementation:
-        // the target context reserves outputs for at most n_max drafted tokens per
-        // sequence, and the draft loops sample a token before checking their limit
+        // n_max <= 0 disables drafting: the target context reserves outputs for at most n_max
+        // drafted tokens, and the draft loops sample a token before checking their limit
         if (impl->n_max <= 0) {
             continue;
         }

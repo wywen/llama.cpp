@@ -1373,13 +1373,11 @@ llama_model::~llama_model() {
 void llama_model::retain_tensor_sources(llama_model_loader & loader, std::vector<std::string> paths) {
     source_paths = std::move(paths);
     tensor_sources.clear();
-    // Metadata and FILE* loads have no disk source paths.
+    // metadata and FILE* loads have no source paths
     if (source_paths.empty()) {
         return;
     }
-    // loader.weights_map assigns ordinal densely over its own iteration order
-    // (weight_name_comparer: layer number, then name), so writing each weight
-    // at its ordinal here reproduces that same deterministic order.
+    // the ordinals are dense over loader.weights_map
     tensor_sources.resize(loader.weights_map.size());
     std::vector<bool> filled(tensor_sources.size(), false);
     for (const auto & [name, weight] : loader.weights_map) {
@@ -1396,8 +1394,7 @@ void llama_model::retain_tensor_sources(llama_model_loader & loader, std::vector
                                             name.c_str(), weight.ordinal));
         }
         filled[weight.ordinal] = true;
-        // Indexed by the UNBIASED ordinal (weight.ordinal), unlike the stamp on
-        // ggml_tensor::src_ordinal itself, which is that ordinal plus one.
+        // indexed by weight.ordinal; ggml_tensor::src_ordinal stores that plus one
         tensor_sources[weight.ordinal] = {
             name,
             weight.idx,
@@ -1406,12 +1403,9 @@ void llama_model::retain_tensor_sources(llama_model_loader & loader, std::vector
         };
     }
 
-    // Fail loudly here, at model initialization, rather than let the engine
-    // resolve a mismatched or stale ordinal later.
+    // check that each stamp resolves to its tensor
     for (const auto & [name, tensor] : tensors_by_name) {
-        // a tensor llama synthesized itself or assembled from per-expert tensors
-        // (not backed by a single GGUF weight) is left at the sentinel ordinal and
-        // has nothing to validate against
+        // a tensor not backed by a single GGUF weight is left unset
         if (tensor->src_ordinal == GGML_TENSOR_SRC_ORDINAL_NONE && loader.get_weight(name.c_str()) == nullptr) {
             continue;
         }
@@ -4020,6 +4014,19 @@ bool llama_model_moe_slot_geometry(const struct llama_model * model, int32_t il,
     *map_size  = layer->map_size();
     *n_expert  = layer->n_expert;
     return true;
+}
+
+int32_t llama_model_moe_router_ahead_layer(const struct llama_model * model, int32_t il) {
+    const int32_t n_layer = model->hparams.n_layer();
+    if (il < 0 || il >= n_layer || model->layers[il].ffn_gate_inp == nullptr) {
+        return -1;
+    }
+    for (int32_t il_next = il + 1; il_next < n_layer; ++il_next) {
+        if (model->layers[il_next].ffn_gate_inp != nullptr) {
+            return il_next;
+        }
+    }
+    return -1;
 }
 
 int32_t llama_model_moe_expert_runs(const struct llama_model * model, int32_t il, int32_t expert, struct llama_moe_expert_run * runs, int32_t n_max) {

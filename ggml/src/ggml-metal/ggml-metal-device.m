@@ -2084,10 +2084,10 @@ struct ggml_metal_buffer {
     // pointers to global device
     ggml_metal_device_t dev;
 
-    // A host-pointer buffer whose residency the caller took over (see ggml_metal_buffer_unwrap):
-    // rset is out of the device's keep-alive collection and only the caller requests or ends it.
-    // unwrapped: every buffers[i].metal is released and nil. The lock serializes the calls that
-    // change either, or the set.
+    // host-pointer buffers only (see ggml_metal_buffer_unwrap)
+    // caller_residency: rset is out of the device's keep-alive collection, the caller requests and ends it
+    // unwrapped: every buffers[i].metal is released and nil
+    // residency_lock serializes the calls that change either, or the set
     bool           caller_residency;
     atomic_bool    unwrapped;
     os_unfair_lock residency_lock;

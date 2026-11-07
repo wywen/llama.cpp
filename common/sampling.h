@@ -43,7 +43,7 @@ struct common_sampler * common_sampler_init(
 
 void common_sampler_free(struct common_sampler * gsmpl);
 
-// Allocated candidate and token-history buffers; excludes sampler-chain and grammar state.
+// bytes allocated for candidates and token history; excludes sampler-chain and grammar state
 size_t common_sampler_buffer_size(const struct common_sampler * gsmpl);
 
 // if is_generated is true, the token is accepted by the sampling chain, the reasoning budget sampler, and the grammar sampler

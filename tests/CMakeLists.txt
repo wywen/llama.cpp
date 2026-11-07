@@ -253,6 +253,11 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_test(test-moe-slots LABEL "main behavior backend"
         ARGS --models "${PER_EXPERT_MODEL_DIR}")
     set_tests_properties(test-moe-slots PROPERTIES FIXTURES_REQUIRED per-expert-models)
+
+    llama_build(test-moe-router-ahead.cpp)
+    llama_test(test-moe-router-ahead LABEL "main behavior backend"
+        ARGS --models "${PER_EXPERT_MODEL_DIR}")
+    set_tests_properties(test-moe-router-ahead PROPERTIES FIXTURES_REQUIRED per-expert-models)
 endif()
 
 set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")

@@ -70,9 +70,7 @@ void write_single_file(const std::filesystem::path & path, const std::vector<con
     }
     require(gguf_write_to_file(context.get(), path.c_str(), true), "could not write GGUF metadata");
 
-    // the freshly-built context never had its data-section offset resolved (that only
-    // happens when reading a real file), so re-read the file we just wrote to learn the
-    // actual on-disk offsets before writing each tensor's data at its own offset
+    // re-read the file to learn the on-disk offsets; a freshly built context has none resolved
     struct gguf_init_params read_params { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
     gguf_context_ptr written(gguf_init_from_file(path.c_str(), read_params));
     require(written != nullptr, "could not re-read GGUF metadata");
@@ -124,9 +122,8 @@ int main() {
     require(second_weight != nullptr && second_weight->idx == 1 && second_weight->offs > 0,
             "second tensor was not assigned shard one");
 
-    // weights_map iterates in weight_name_comparer order (layer number, then name); neither
-    // tensor has a "blk.N." prefix, so this falls back to plain name order: "output.weight"
-    // sorts before "token_embd.weight" even though it is the *second* shard on disk.
+    // weights_map iterates in weight_name_comparer order; neither tensor has a "blk.N." prefix, so it is
+    // plain name order and "output.weight" sorts before "token_embd.weight", the first shard on disk
     require(second_weight->ordinal == 0, "output.weight (shard 1) did not get the first ordinal");
     require(first_weight->ordinal == 1, "token_embd.weight (shard 0) did not get the second ordinal");
 
@@ -142,9 +139,8 @@ int main() {
     require(model->tensor_sources[0].name == "output.weight" && model->tensor_sources[1].name == "token_embd.weight",
             "model tensor records were not indexed by ordinal");
 
-    // every captured tensor must resolve, by its own stamped ordinal (ordinal + 1, per
-    // GGML_TENSOR_SRC_ORDINAL_NONE), to the source shard and offset that the loader
-    // recorded for that same tensor
+    // every captured tensor resolves, by its stamped ordinal (ordinal + 1, per GGML_TENSOR_SRC_ORDINAL_NONE),
+    // to the shard and offset the loader recorded for it
     const auto * first_source  = model->tensor_source_at(static_cast<int32_t>(first_weight->ordinal + 1));
     const auto * second_source = model->tensor_source_at(static_cast<int32_t>(second_weight->ordinal + 1));
     require(first_source != nullptr && first_source->name == "token_embd.weight" && first_source->source_idx == 0 &&
@@ -178,11 +174,8 @@ int main() {
     require(model->source_paths.empty() && model->tensor_sources.empty(),
             "source-less load retained disk tensor sources");
 
-    // retain_tensor_sources() cross-checks every tensors_by_name entry's stamped ordinal
-    // against the source table it just built from the loader; that is the entire safety
-    // argument for dropping name-based lookup, and llama_model_create() alone (without
-    // load_tensors) leaves tensors_by_name empty, so it otherwise never runs. Populate it
-    // directly, one case at a time, to exercise all three outcomes.
+    // retain_tensor_sources() cross-checks the stamped ordinal of every tensors_by_name entry against the
+    // source table; llama_model_create() alone leaves tensors_by_name empty, so populate it directly
     {
         struct ggml_init_params ictx_params { /*.mem_size   =*/ ggml_tensor_overhead() * 4,
                                                /*.mem_buffer =*/ nullptr,

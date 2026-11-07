@@ -762,8 +762,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 // and still make these values available when setting the inputs
                 cells[i].src0 = cells[i].src;
             }
-            // the cells of other sequences in the range only get their state copied to snapshot 0, from another cell or
-            // from the snapshot of a pending rollback, which leaves the other snapshots of a moved or rolled back cell stale
+            // a moved or rolled back cell only gets snapshot 0 refreshed, so its other snapshots are stale
             if (i >= min + (int) n_seqs) {
                 bool rolled_back = false;
                 for (const llama_seq_id seq_id : cells[i].seq_id) {

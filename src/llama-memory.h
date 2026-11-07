@@ -102,16 +102,15 @@ struct llama_memory_context_i {
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
 
-// general concept of LLM memory
-// the KV cache is a type of LLM memory, but there can be other types
-// Opaque owner of a sequence's saved cell metadata (see cells_snapshot).
-// Owned by the caller; release with llama_memory_cells_free.
+// opaque owner of a sequence's saved cell metadata (see cells_snapshot), released with llama_memory_cells_free
 struct llama_memory_cells_i {
     virtual ~llama_memory_cells_i() = default;
 };
 
 using llama_memory_cells_t = llama_memory_cells_i *;
 
+// general concept of LLM memory
+// the KV cache is a type of LLM memory, but there can be other types
 struct llama_memory_i {
     // this callback is used to filter out layers that should not be included in the cache
     using layer_filter_cb = std::function<bool(int32_t il)>;
@@ -162,25 +161,11 @@ struct llama_memory_i {
     // see llama_memory_seq_swa_placement; all zero for a memory without a sliding-window cache
     virtual llama_memory_swa_placement swa_placement(llama_seq_id /*seq_id*/) const { return {}; }
 
-    // Snapshot / restore a sequence's CELL METADATA (positions, sequence
-    // membership and the slot-search cursor) without touching cell DATA.
-    //
-    // Exists for a caller that submits the same ubatches more than once and
-    // needs every pass placed identically -- e.g. writing a graph's layers in
-    // several passes, one band of layers at a time. Removing the span and
-    // re-submitting does not achieve that on its own: a windowed cache
-    // RECYCLES cells as positions scroll out, so the first pass destroys
-    // earlier positions the next pass still needs, and the cursor the removal
-    // rewinds to is unrelated to where the pass began. Restoring the snapshot
-    // puts both back.
-    //
-    // Metadata only, by design: cell DATA is left alone, so a caller whose
-    // passes write disjoint layers still finds each layer's data intact under
-    // the restored positions.
-    //
-    // Restore reports no failure. The recurrent and hybrid memories log a
-    // snapshot they cannot take (another memory type or size) and leave their
-    // cells unchanged.
+    // snapshot / restore a sequence's cell metadata (positions, sequence membership and the slot-search cursor), not the cell data
+    // for a caller that submits the same ubatches in several passes and needs each pass placed identically, e.g. one
+    // range of layers at a time: removing the span and submitting it again does not do that, because a sliding-window
+    // cache recycles cells as positions scroll out
+    // restore reports no failure; the recurrent and hybrid memories log a snapshot they cannot take and leave their cells unchanged
     virtual llama_memory_cells_t cells_snapshot(llama_seq_id /*seq_id*/) const { return nullptr; }
     virtual void cells_restore(llama_seq_id /*seq_id*/, const llama_memory_cells_i * /*snap*/) {}
 

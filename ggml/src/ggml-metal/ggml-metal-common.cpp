@@ -33,13 +33,8 @@ bool ggml_metal_op_mul_mat_use_fwht(const struct ggml_tensor * op, size_t max_tg
            ggml_metal_fwht_supported_size(op->src[1]->ne[0], max_tg_mem);
 }
 
-// the per-layer output tensors are named "l_out-<il>" by the graph builder, and that name
-//   is what a boundary-scheduling caller resolves its cut nodes and window endpoints by
-//
-// matching the name is not elegant, but at optimize time it is the only handle there is:
-//   the schedule that would otherwise name the cuts is installed later (see the header),
-//   and a tensor carries no field a caller could mark ahead of time without also owning
-//   the graph build. keeping the match here means there is exactly one string to change
+// the per-layer output tensors are named "l_out-<il>"; matching the name is the only handle
+// available at optimize time, before a boundary schedule is installed
 static const char GGML_GRAPH_BOUNDARY_MARKER_PREFIX[] = "l_out-";
 
 bool ggml_graph_node_is_boundary_marker(const struct ggml_tensor * node) {
@@ -55,8 +50,7 @@ bool ggml_graph_node_is_boundary_marker(const struct ggml_tensor * node) {
         return false;
     }
 
-    // the suffix is the layer index: require at least one digit and nothing else, so that
-    //   only the generated per-layer names match
+    // the suffix is the layer index: at least one digit and nothing else
     const char * suffix = name + len;
 
     if (*suffix == '\0') {
@@ -532,10 +526,9 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(
     };
 
     // helper to check if a node is a barrier that nothing may be moved across: a boundary
-    //   marker when stop_at_boundary_markers is set, or a node with a barrier name prefix
+    // marker when stop_at_boundary_markers is set, or a node with a barrier name prefix
     //
-    // fusion never reorders anything by itself, but it does make a marker travel with the
-    //   group it was packed into, so a group is a barrier when ANY of its nodes is one
+    // a fused group is a barrier if any of its nodes is one
     const auto & h_is_barrier = [&](const ggml_tensor * t) {
         if (stop_at_boundary_markers && ggml_graph_node_is_boundary_marker(t)) {
             return true;
@@ -593,8 +586,7 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(
             // that many nodes forward to search for a concurrent node
             constexpr int N_FORWARD = 64;
 
-            // every node this scan selects is emitted BEFORE node0, so when node0 is a
-            //   barrier there is nothing it may legally pick up
+            // selected nodes are emitted before node0, so a barrier node0 picks up nothing
             const int i1_end = h_barrier(node0) ? i0 + 1 : (i0 + N_FORWARD < n ? i0 + N_FORWARD : n);
 
             for (int i1 = i0 + 1; i1 < i1_end; i1++) {
@@ -661,14 +653,6 @@ void ggml_graph_optimize(ggml_cgraph * gf, bool stop_at_boundary_markers, int n_
     //
     // the fusable sequences are declared in the fusion table (ggml-metal-fuse.cpp), so the
     // packing here is driven by the same patterns that the op encoders will later use
-    //
-    // the packing itself moves nothing: a group is contiguous, and the unfuse below writes
-    //   its members back in their original relative order. so a group may straddle a
-    //   barrier without any work crossing it - all the barrier has to do is make the group
-    //   it landed in immovable, which is what h_barrier above does. a barrier therefore
-    //   neither creates nor removes a fusion: the packing is the same with or without it,
-    //   and the encoder fuses over the order this function leaves, which differs only in
-    //   that the barrier's neighbours were not moved
     for (int i = 0; i < n; i++) {
         node_info node = {
             /*.node =*/ gf->nodes[i],

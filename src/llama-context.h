@@ -145,9 +145,9 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
-    void set_ubatch_reserve(uint32_t n_tokens);
-    // grow the reservation to fit a batch about to be submitted
-    void widen_ubatch_reserve(uint32_t n_tokens);
+
+    // the MoE slot set that the following graphs read; false, keeping the current set, if `set` is out of range
+    bool set_moe_slot_set(int32_t set);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -345,6 +345,9 @@ private:
 
     // the slots of this context, see llama_context_params.moe_slots
     std::unique_ptr<llama_moe_slot_pool> moe_slots;
+
+    // [n_layer] the router weight of each MoE layer, empty unless llama_context_params.moe_router_ahead
+    std::vector<ggml_tensor *> moe_routers;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
