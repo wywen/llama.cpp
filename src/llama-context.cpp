@@ -3044,8 +3044,15 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         return true;
     }
 
-    const int64_t n_expert    = src->ne[2];
-    const size_t  expert_size = src->nb[2];
+    // the experts can lie further apart than their size, as in MoE slots, which interleave the members of an expert
+    // (llama_moe_slot_layout); a run of experts [a, b) spans from the start of a to the end of b - 1, which for the
+    // last expert is the end of the tensor
+    const int64_t n_expert      = src->ne[2];
+    const size_t  expert_stride = src->nb[2];
+    const size_t  expert_size   = (src->ne[1] - 1)*src->nb[1] + ggml_row_size(src->type, src->ne[0]);
+    const auto    experts_bytes = [&](int64_t a, int64_t b) -> size_t {
+        return a < b ? (b - a - 1)*expert_stride + expert_size : 0;
+    };
 
     if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
@@ -3084,16 +3091,16 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                 continue;
             }
             if (next < e) {
-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_stride, next*expert_stride, experts_bytes(next, e));
             }
             e   += n;
             next = e;
         }
 
         // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
-        const size_t offset  = next*expert_size;
+        const size_t offset  = next*expert_stride;
         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
-        const size_t size    = (last + 1 - next)*expert_size + padding;
+        const size_t size    = experts_bytes(next, last + 1) + padding;
         if (size > 0) {
             ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
         }
