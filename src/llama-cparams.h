@@ -65,6 +65,8 @@ struct llama_cparams : llama_memory_cparams {
     bool auto_fhc;
     bool fused_top_k_mask;   // use fused top-k sparse attention mask
     bool auto_ftkm;
+    bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
+    bool auto_fkvr;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
@@ -73,8 +75,10 @@ struct llama_cparams : llama_memory_cparams {
     bool moe_router_ahead;   // add the router lookahead outputs of the MoE layers
 
     size_t moe_cache_size;
+    float  moe_cache_cpu_share;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host
 
     enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;

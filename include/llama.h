@@ -460,7 +460,8 @@ extern "C" {
         llama_kv_rot_set_callback cb_kv_rot_set;
         void *                    cb_kv_rot_set_user_data;
 
-        size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        size_t moe_cache_size;      // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        float  moe_cache_cpu_share; // share of the MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]
 
         // the slots of each MoE layer that reads its expert weights from slots, see "MoE expert slots"; NULL = none
         // n_slots 0 = the set has no slots for the layer, e.g. for a context that computes only the MTP layers;
