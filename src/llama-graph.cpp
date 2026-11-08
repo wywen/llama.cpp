@@ -1587,6 +1587,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     moe_cache        (params.moe_cache),
     moe_slots        (params.moe_slots),
+    lookup_rows      (params.lookup_rows),
     moe_routers      (params.moe_routers),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),

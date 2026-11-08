@@ -273,6 +273,16 @@ extern "C" {
     // returns the slots of the layer in that set, see llama_context_params.moe_slots
     typedef struct llama_moe_slot_pool_params (*llama_moe_slot_pool_callback)(int32_t il, int32_t n_expert, int32_t set, void * user_data);
 
+    // called during loading once for each lookup table whose rows the caller can serve, with its tensor name, number of
+    // rows and the bytes of one row
+    // returns true if the caller serves the table's rows, see llama_model_params.lookup_tables
+    typedef bool (*llama_lookup_table_callback)(const char * name, int64_t n_rows, size_t row_size, void * user_data);
+
+    // called when a computation reads rows of served lookup table `table`, see "Lookup tables served by the caller"
+    // writes the bytes of row rows[i], as the model file stores them, at dst + i*row_size for each i in [0, n_rows)
+    // returns false to fail the computation
+    typedef bool (*llama_lookup_rows_callback)(int32_t table, const int32_t * rows, int32_t n_rows, void * dst, size_t row_size, void * user_data);
+
     // Input data for llama_encode/llama_decode
     // A llama_batch object can contain input about one or many sequences
     // The provided arrays (i.e. token, embd, pos, etc.) must have size of n_tokens
@@ -385,6 +395,11 @@ extern "C" {
         // a power of two, at least the alignment of the layer's buffer type; 0 = 16384
         size_t moe_slot_alignment;
 
+        // if set, the lookup tables for which it returns true are not loaded: the caller serves their rows to each
+        // context, see "Lookup tables served by the caller"; NULL = every table is loaded
+        llama_lookup_table_callback lookup_tables;
+        void * lookup_tables_user_data;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap_prefetch; // prefetch the mmap'd model file
@@ -471,6 +486,11 @@ extern "C" {
 
         // the number of slot sets, each with its own slots for each slot layer, see llama_set_moe_slot_set; at least 1
         uint32_t moe_slot_sets;
+
+        // reads the rows of the served lookup tables, see "Lookup tables served by the caller"; NULL = none, and a graph
+        // that reads a served table then fails to build
+        llama_lookup_rows_callback lookup_rows;
+        void *                     lookup_rows_user_data;
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -841,6 +861,39 @@ extern "C" {
                              int32_t   expert,
               struct llama_moe_expert_run * runs,
                              int32_t   n_max);
+
+    //
+    // Lookup tables served by the caller
+    //
+    // A lookup table whose rows the caller serves (see llama_model_params.lookup_tables) is not loaded. Only tables
+    // that the graph reads by row with ids known on the host can be served, e.g. per-layer token embeddings; a graph
+    // that reads a served table otherwise fails to build.
+    //
+    // When the context sets the inputs of a ubatch, it asks the caller (llama_context_params.lookup_rows) for the rows
+    // that the ubatch reads, in token order, repeats included: the same rows that the loaded table would be read at. A
+    // ubatch of input embeddings reads the row that the architecture uses in place of a token's (row 0 for the
+    // per-layer token embeddings). The caller writes the bytes of each row as the model file stores them, e.g. read
+    // from the file at offset + row*row_size (see llama_model_lookup_table_info), into a host input of the graph; the
+    // graph then reads them as it would read the table.
+    //
+
+    // a lookup table whose rows the caller serves
+    struct llama_lookup_table_info {
+        const char *   name;     // the stock tensor, e.g. per_layer_token_embd.weight
+        enum ggml_type type;
+        int64_t        n_cols;   // the elements of one row
+        int64_t        n_rows;
+        size_t         row_size; // the bytes of one row
+        const char *   path;     // the model file that holds the table, NULL if the model was not loaded from files
+        uint32_t       file;     // index of the file among the model's files (splits)
+        uint64_t       offset;   // of row 0 in the file; row r is at offset + r*row_size
+    };
+
+    // the number of served lookup tables of the model; table indices are in [0, n)
+    LLAMA_API int32_t llama_model_n_lookup_tables(const struct llama_model * model);
+
+    // the served lookup table `table`; returns false, leaving `info` untouched, if `table` is out of range
+    LLAMA_API bool llama_model_lookup_table_info(const struct llama_model * model, int32_t table, struct llama_lookup_table_info * info);
 
     //
     // MoE router lookahead [EXPERIMENTAL]

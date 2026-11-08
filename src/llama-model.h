@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
+#include "llama-lookup-tables.h"
 #include "llama-moe-slots.h"
 #include "llama-vocab.h"
 
@@ -966,6 +967,9 @@ struct llama_model {
     // the MoE layers that read their expert weights from slots, see llama_model_params::moe_slots
     llama_moe_slots moe_slots;
 
+    // the lookup tables whose rows the caller serves, see llama_model_params::lookup_tables
+    llama_lookup_tables lookup_tables;
+
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 
@@ -1075,6 +1079,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_SKIP_IF_VIRTUAL;
     const int TENSOR_ALLOW_RESHAPE;
     const int TENSOR_READ_LAZY;
+    const int TENSOR_PAGEABLE;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;
@@ -1108,6 +1113,9 @@ struct llama_model_base : public llama_model {
 
     // helper: the slot geometry and file runs of the MoE layers that read their expert weights from slots
     void load_tensors_moe_slots(llama_model_loader & ml);
+
+    // helper: the file range of the lookup tables whose rows the caller serves
+    void load_tensors_lookup_tables(llama_model_loader & ml);
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);

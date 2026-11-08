@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -80,6 +81,7 @@ struct llama_model_loader {
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
+    static const int TENSOR_PAGEABLE        = 1 << 6; // a table that the graph reads only by rows with ids known on the host; can be served by the caller
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -165,6 +167,7 @@ struct llama_model_loader {
         LAZY,      // the tensor's own range of the file, read on demand
         ASSEMBLED, // the per-expert tensors of the file, copied into a buffer
         SLOT_META, // none: an expert weight read from slots, metadata only (see moe_slot_plan)
+        TABLE_META, // none: a lookup table whose rows the caller serves, metadata only (see lookup_table_plan)
     };
 
     // lazy, assembled and slot tensors need dedicated contexts: none can be wrapped in place in a mapping
@@ -210,6 +213,19 @@ struct llama_model_loader {
 
     // the plan of layer il, made with the callback when the first expert weight 'cur' of the layer is created
     moe_slot_plan & get_moe_slot_plan(llm_arch arch, int32_t il, const ggml_tensor * cur);
+
+    // a lookup table whose rows the caller serves, see llama_model_params::lookup_tables; created as metadata only
+    struct lookup_table_plan {
+        std::string   name;
+        ggml_tensor * stock = nullptr; // set when the model creates it
+    };
+
+    llama_lookup_table_callback    lookup_tables    = nullptr;
+    void *                         lookup_tables_ud = nullptr;
+    std::deque<lookup_table_plan>  lookup_table_plans; // in creation order, stable addresses
+
+    // asks the callback whether the caller serves the rows of the pageable table 'cur'; nullptr if it is loaded
+    lookup_table_plan * get_lookup_table_plan(const std::string & name, const ggml_tensor * cur);
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;

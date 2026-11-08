@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -1738,6 +1739,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if ((ml.moe_slot_alignment & (ml.moe_slot_alignment - 1)) != 0) {
         throw std::runtime_error(format("the MoE slot alignment %zu is not a power of two", ml.moe_slot_alignment));
     }
+    ml.lookup_tables    = params.lookup_tables;
+    ml.lookup_tables_ud = params.lookup_tables_user_data;
 
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
         for (const auto & dev : devices) {
@@ -2066,6 +2069,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             moe_slots.own_meta(std::move(ctx_ptr));
             continue;
         }
+        // nor do the lookup tables whose rows the caller serves
+        if (ctx_key.source == llama_model_loader::ctx_source::TABLE_META) {
+            lookup_tables.own_meta(std::move(ctx_ptr));
+            continue;
+        }
 
         // check if it is possible to use buffer_from_host_ptr with this buffer type
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
@@ -2157,6 +2165,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_moe_slots(ml);
+    load_tensors_lookup_tables(ml);
 
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, n_layer_all);
@@ -2276,6 +2285,32 @@ void llama_model_base::load_tensors_moe_slots(llama_model_loader & ml) {
     }
 
     moe_slots.index();
+}
+
+// the lookup tables whose rows the caller serves, and the range of the file that holds each
+void llama_model_base::load_tensors_lookup_tables(llama_model_loader & ml) {
+    for (const auto & plan : ml.lookup_table_plans) {
+        if (plan.stock == nullptr) {
+            throw std::runtime_error(format("table '%s' is served by the caller, but the model does not use it", plan.name.c_str()));
+        }
+
+        llama_lookup_table & table = lookup_tables.add();
+        table.name     = plan.name;
+        table.stock    = plan.stock;
+        table.n_rows   = plan.stock->ne[1];
+        table.row_size = plan.stock->nb[1];
+
+        if (const llama_model_loader::llama_tensor_weight * w = ml.get_weight(plan.name.c_str())) {
+            table.has_file = true;
+            table.file     = w->idx;
+            table.offset   = w->offs;
+        }
+
+        LLAMA_LOG_INFO("%s: %s: %" PRId64 " rows of %zu bytes served by the caller\n", __func__, table.name.c_str(),
+            table.n_rows, table.row_size);
+    }
+
+    lookup_tables.index();
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
@@ -3671,6 +3706,8 @@ llama_model_params llama_model_default_params() {
         /*.moe_slots                   =*/ nullptr,
         /*.moe_slots_user_data         =*/ nullptr,
         /*.moe_slot_alignment          =*/ 0,
+        /*.lookup_tables               =*/ nullptr,
+        /*.lookup_tables_user_data     =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.use_mmap_prefetch           =*/ true,
         /*.check_tensors               =*/ false,
@@ -4167,6 +4204,31 @@ int32_t llama_model_moe_expert_runs(const struct llama_model * model, int32_t il
     return (int32_t) src.size();
 }
 
+int32_t llama_model_n_lookup_tables(const struct llama_model * model) {
+    return model->lookup_tables.size();
+}
+
+bool llama_model_lookup_table_info(const struct llama_model * model, int32_t i, struct llama_lookup_table_info * info) {
+    const llama_lookup_table * table = model->lookup_tables.get(i);
+    if (table == nullptr) {
+        return false;
+    }
+
+    const std::string * path = table->has_file ? model->source_path((uint16_t) table->file) : nullptr;
+
+    llama_lookup_table_info res = {};
+    res.name     = table->name.c_str();
+    res.type     = table->stock->type;
+    res.n_cols   = table->stock->ne[0];
+    res.n_rows   = table->n_rows;
+    res.row_size = table->row_size;
+    res.path     = path ? path->c_str() : nullptr;
+    res.file     = table->file;
+    res.offset   = table->offset;
+    *info = res;
+    return true;
+}
+
 int32_t llama_model_n_devices(const struct llama_model * model) {
     return (int32_t)model->devices.size();
 }
@@ -4192,7 +4254,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
     TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
-    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
+    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY),
+    TENSOR_PAGEABLE       (llama_model_loader::TENSOR_PAGEABLE) {}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);
