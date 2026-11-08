@@ -73,7 +73,7 @@ llama_kv_cache_dsa_iswa::llama_kv_cache_dsa_iswa(
             model, no_alloc, hparams, type_k, type_v,
             v_trans, offload, unified, size_swa, n_seq_max,
             hparams.n_swa, hparams.swa_type, nullptr, filter_swa, reuse, nullptr,
-            /*name_tag =*/ "", /*place_by_position =*/ true);
+            /*name_tag =*/ "", /*is_indexer =*/ false, /*place_by_position =*/ true);
 }
 
 void llama_kv_cache_dsa_iswa::clear(bool data) {

@@ -606,7 +606,7 @@ struct case_cells_snapshot : ctx_test {
         llama_model_meta_val_str(mr.model, "general.architecture", arch_name, sizeof(arch_name));
         const llm_arch arch = llama_arch_from_string(arch_name);
         const bool no_snapshot = arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_QWEN4EXP ||
-                                 arch == LLM_ARCH_GLM5_NEXT || llama_model_n_swa(mr.model) > 0;
+                                 arch == LLM_ARCH_KIMI_K31 || arch == LLM_ARCH_GLM5_NEXT || llama_model_n_swa(mr.model) > 0;
 
         const auto make_ctx = [&](uint32_t n_seq_max, uint32_t n_rs_seq) {
             ctx_opts opts;
