@@ -1658,6 +1658,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // the caller serves the rows, nothing of the table is loaded
         table_plan->stock = tensor;
         size_data -= ggml_nbytes(&t_meta);
+        if (const llama_tensor_weight * w = get_weight(tn.str().c_str())) {
+            lookup_table_ranges[w->idx].emplace_back(w->offs, w->offs + ggml_nbytes(&t_meta));
+        }
     }
 
     return tensor;
@@ -1679,6 +1682,15 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
             __func__, first_tensor_moved_name.c_str(), first_tensor_moved_type_name.c_str(), n_tensors_moved - 1,
             ggml_backend_buft_name(first_moved_from_buft), ggml_backend_buft_name(first_moved_to_buft));
     }
+}
+
+llama_mmap::ranges llama_model_loader::unread_ranges(uint32_t idx) const {
+    llama_mmap::ranges res = lazy.for_file(idx);
+    const auto it = lookup_table_ranges.find(idx);
+    if (it != lookup_table_ranges.end()) {
+        res.insert(res.end(), it->second.begin(), it->second.end());
+    }
+    return res;
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
@@ -1703,11 +1715,13 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+                    unread_ranges(idx));
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
-                mlock_mmap->init(mapping->addr());
+                // a later tensor locks the file up to its end, but not the served tables
+                const auto it = lookup_table_ranges.find(idx);
+                mlock_mmap->init(mapping->addr(), it == lookup_table_ranges.end() ? llama_mmap::ranges() : it->second);
                 mlock_mmaps->emplace_back(std::move(mlock_mmap));
             }
             mappings.emplace_back(std::move(mapping));
@@ -2173,6 +2187,13 @@ bool llama_model_loader::load_all_data(
                 mapping->unmap_fragment(0, mmap_used.first);
                 if (mmap_used.second != 0) {
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
+                }
+                // the served tables lie outside every buffer that wraps the mapping
+                const auto it = lookup_table_ranges.find(idx);
+                if (it != lookup_table_ranges.end()) {
+                    for (const auto & range : it->second) {
+                        mapping->unmap_fragment(range.first, range.second);
+                    }
                 }
             }
         }

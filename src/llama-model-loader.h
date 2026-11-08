@@ -224,6 +224,13 @@ struct llama_model_loader {
     void *                         lookup_tables_ud = nullptr;
     std::deque<lookup_table_plan>  lookup_table_plans; // in creation order, stable addresses
 
+    // by file, the ranges of the served tables: llama never reads them, so they are not prefetched, not locked, and
+    // unmapped once loading is done
+    std::map<uint32_t, llama_mmap::ranges> lookup_table_ranges;
+
+    // the ranges of file idx that loading does not read whole: the lazy tables and the served tables
+    llama_mmap::ranges unread_ranges(uint32_t idx) const;
+
     // asks the callback whether the caller serves the rows of the pageable table 'cur'; nullptr if it is loaded
     lookup_table_plan * get_lookup_table_plan(const std::string & name, const ggml_tensor * cur);
 
