@@ -870,11 +870,13 @@ extern "C" {
     // that reads a served table otherwise fails to build.
     //
     // When the context sets the inputs of a ubatch, it asks the caller (llama_context_params.lookup_rows) for the rows
-    // that the ubatch reads, in token order, repeats included: the same rows that the loaded table would be read at. A
-    // ubatch of input embeddings reads the row that the architecture uses in place of a token's (row 0 for the
-    // per-layer token embeddings). The caller writes the bytes of each row as the model file stores them, e.g. read
-    // from the file at offset + row*row_size (see llama_model_lookup_table_info), into a host input of the graph; the
-    // graph then reads them as it would read the table.
+    // that the ubatch reads, in token order, rows_per_token per token, repeats included: the same rows that the loaded
+    // table would be read at. A token's rows can depend on the tokens before it in its sequence (e.g. the n-gram hashes
+    // of qwen4exp); llama_model_lookup_table_rows names them ahead of a decode. A ubatch of input embeddings reads the
+    // rows that the architecture uses in place of a token's (row 0 once for gemma4, the rows of the image token for
+    // qwen4exp). The caller writes the bytes of each row as the model file stores them, e.g. read from the file at
+    // offset + row*row_size (see llama_model_lookup_table_info), into a host input of the graph; the graph then reads
+    // them as it would read the table.
     //
 
     // a lookup table whose rows the caller serves

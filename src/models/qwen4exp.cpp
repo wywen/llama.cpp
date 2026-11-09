@@ -214,7 +214,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
 
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY | TENSOR_PAGEABLE);
     }
 
     auto load_block = [&](int il, int flags) {
@@ -1275,6 +1275,43 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
 //   mixed_n = (t[p]*m[0]) ^ ... ^ (t[p-n+1]*m[n-1]);  row = mixed_n % vocab[h] + offset[h]
 // The hash runs host-side because ggml has no int64 and no xor. EOS resets the window.
 
+// the rows that one token reads, one per head: tok is the token, prev its ple_ngram_size - 1 predecessors oldest first,
+//     LLAMA_TOKEN_NULL where there is none
+static void qwen4exp_ple_rows(const llama_hparams & hparams,
+                              llama_token           tok,
+                              const llama_token *   prev,
+                              int32_t *             rows) {
+    const int64_t n_gram   = hparams.ple_ngram_size;
+    const int64_t per_gram = hparams.ple_heads_per_ngram;
+    const int64_t eos      = hparams.ple_eos_token_id;
+    const int64_t n_prev   = n_gram - 1;
+
+    // an EOS in the window resets everything at or before it
+    // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
+    // the EOS of the token itself does not cut its own context, as in the reference
+    std::vector<int64_t> ctx(n_gram);
+    ctx[0] = tok;
+    bool cut = false;
+    for (int64_t s = 1; s < n_gram; ++s) {
+        // predecessor s positions back
+        const llama_token t = cut ? LLAMA_TOKEN_NULL : prev[n_prev - s];
+        cut = cut || t < 0 || t == eos;
+        ctx[s] = cut ? eos : t;
+    }
+
+    for (int64_t n = 2; n <= n_gram; ++n) {
+        uint64_t mixed = (uint64_t) ctx[0] * hparams.ple_layer_multipliers[0];
+        for (int64_t j = 1; j < n; ++j) {
+            mixed ^= (uint64_t) ctx[j] * hparams.ple_layer_multipliers[j];
+        }
+        const int64_t base = (n - 2) * per_gram;
+        for (int64_t g = 0; g < per_gram; ++g) {
+            const int64_t h_i = base + g;
+            rows[h_i] = (int32_t) (mixed % hparams.ple_head_vocab_sizes[h_i] + hparams.ple_head_offsets[h_i]);
+        }
+    }
+}
+
 class llm_graph_input_qwen4exp_ple : public llm_graph_input_i {
 public:
     llm_graph_input_qwen4exp_ple(const llama_model & model,
@@ -1285,10 +1322,14 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+        const int64_t n_ids = served.table ? served.n_ids() : rows->ne[0];
+        return n_ids == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+
+    // with the table served by the caller: the rows that the stock gather reads, in order
+    llm_graph_lookup_rows served;
 
     const llama_model & model;
 
@@ -1314,11 +1355,8 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     };
 
     const int64_t n_tokens = ubatch->n_tokens;
-    const int64_t n_gram   = hparams.ple_ngram_size;
     const int64_t n_heads  = hparams.ple_n_heads;
-    const int64_t per_gram = hparams.ple_heads_per_ngram;
-    const int64_t eos      = hparams.ple_eos_token_id;
-    const int64_t n_prev   = n_gram - 1;
+    const int64_t n_prev   = hparams.ple_ngram_size - 1;
 
     std::vector<int32_t> idx(n_heads * n_tokens);
 
@@ -1333,31 +1371,12 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
 
     for (int64_t i = 0; i < n_tokens; ++i) {
-        // an EOS in the window resets everything at or before it
-        // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
-        // the EOS of the token itself does not cut its own context, as in the reference
-        std::vector<int64_t> ctx(n_gram);
-        ctx[0] = tok_of(i);
-        bool cut = false;
-        for (int64_t s = 1; s < n_gram; ++s) {
-            // predecessor s positions back; prev[] is oldest-first, missing entries are LLAMA_TOKEN_NULL
-            const llama_token t = cut ? LLAMA_TOKEN_NULL : prev[i*n_prev + (n_prev - s)];
-            cut = cut || t < 0 || t == eos;
-            ctx[s] = cut ? eos : t;
-        }
+        qwen4exp_ple_rows(hparams, tok_of(i), prev.data() + i*n_prev, idx.data() + i*n_heads);
+    }
 
-        for (int64_t n = 2; n <= n_gram; ++n) {
-            uint64_t mixed = (uint64_t) ctx[0] * hparams.ple_layer_multipliers[0];
-            for (int64_t j = 1; j < n; ++j) {
-                mixed ^= (uint64_t) ctx[j] * hparams.ple_layer_multipliers[j];
-            }
-            const int64_t base = (n - 2) * per_gram;
-            for (int64_t g = 0; g < per_gram; ++g) {
-                const int64_t h_i = base + g;
-                idx[i * n_heads + h_i] =
-                    (int32_t) (mixed % hparams.ple_head_vocab_sizes[h_i] + hparams.ple_head_offsets[h_i]);
-            }
-        }
+    if (served.table) {
+        served.set(idx.data());
+        return;
     }
 
     {
@@ -1370,6 +1389,33 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+}
+
+int32_t llama_model_qwen4exp::lookup_rows_per_token(const llama_lookup_table & table) const {
+    return table.stock == per_layer_tok_embd ? (int32_t) hparams.ple_n_heads : 0;
+}
+
+bool llama_model_qwen4exp::lookup_table_rows(const llama_lookup_table & table,
+                                             const llama_token *        tokens,
+                                             int32_t                    n_tokens,
+                                             int32_t                    n_context,
+                                             int32_t *                  rows) const {
+    if (table.stock != per_layer_tok_embd) {
+        return false;
+    }
+    const int64_t n_prev  = hparams.ple_ngram_size - 1;
+    const int64_t n_heads = hparams.ple_n_heads;
+
+    // the window of each token, oldest first, as the KV cells would give it
+    std::vector<llama_token> prev(n_prev);
+    for (int64_t k = n_context; k < n_tokens; ++k) {
+        for (int64_t j = 0; j < n_prev; ++j) {
+            const int64_t p = k - n_prev + j;
+            prev[j]         = p >= 0 ? tokens[p] : LLAMA_TOKEN_NULL;
+        }
+        qwen4exp_ple_rows(hparams, tokens[k], prev.data(), rows + (k - n_context) * n_heads);
+    }
+    return true;
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.
@@ -1410,13 +1456,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
 
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-    ggml_set_input(ple_inp->rows);
-    ggml_tensor * rows = ple_inp->rows;
+    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
+    ggml_tensor * emb;
+    if (const llama_lookup_table * table = model.lookup_tables.of(model.per_layer_tok_embd)) {
+        emb = build_lookup_rows(ple_inp->served, *table, n_heads * n_tokens);
+    } else {
+        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->rows);
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, ple_inp->rows);
+    }
     res->add_input(std::move(ple_inp));
 
-    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 
