@@ -1289,7 +1289,8 @@ static void qwen4exp_ple_rows(const llama_hparams & hparams,
     // an EOS in the window resets everything at or before it
     // a missing predecessor (before the sequence start, or no cached cell) reads as EOS
     // the EOS of the token itself does not cut its own context, as in the reference
-    std::vector<int64_t> ctx(n_gram);
+    GGML_ASSERT(n_gram >= 2 && n_gram <= LLAMA_MAX_PLE_NGRAM);
+    std::array<int64_t, LLAMA_MAX_PLE_NGRAM> ctx;
     ctx[0] = tok;
     bool cut = false;
     for (int64_t s = 1; s < n_gram; ++s) {
@@ -1407,7 +1408,9 @@ bool llama_model_qwen4exp::lookup_table_rows(const llama_lookup_table & table,
     const int64_t n_heads = hparams.ple_n_heads;
 
     // the window of each token, oldest first, as the KV cells would give it
-    std::vector<llama_token> prev(n_prev);
+    // this query runs on the caller's hot path and does not allocate
+    GGML_ASSERT(n_prev >= 1 && n_prev < LLAMA_MAX_PLE_NGRAM);
+    std::array<llama_token, LLAMA_MAX_PLE_NGRAM - 1> prev;
     for (int64_t k = n_context; k < n_tokens; ++k) {
         for (int64_t j = 0; j < n_prev; ++j) {
             const int64_t p = k - n_prev + j;
