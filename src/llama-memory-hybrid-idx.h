@@ -110,6 +110,7 @@ public:
 
     const stale_pos_t & mem_idx_stale_get() const { return mem_idx_stale; }
     void mem_idx_stale_clear() { mem_idx_stale.fill(POS_CLEAN); }
+    void mem_idx_stale_clear(llama_seq_id seq_id) { mem_idx_stale[seq_id] = POS_CLEAN; }
 
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
@@ -145,7 +146,8 @@ public:
     private:
         friend class llama_memory_hybrid_idx_context;
 
-        kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd);
+        // rows [row0, row0 + n_rows) of the cache storage k, which holds kv_size rows per stream
+        kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd, int64_t row0, int64_t n_rows);
 
         ggml_context * ctx;
         ggml_tensor  * key_gate;
@@ -209,8 +211,9 @@ private:
     // declared first, so it is initialised while sinfos_idx is still intact
     const std::vector<uint32_t> ns_ubatch;
 
-    // the indexer cells of each ubatch, kept for pools in cache order (qwen4exp): token s*n + i of ubatch u
-    // sits in cell idxs[s][i] of stream strm[s] of sinfos_kpool[u], and several cells can share a position
+    // the indexer cells of each ubatch, kept for a k-pool indexer: token s*n + i of ubatch u sits in cell idxs[s][i]
+    // of stream strm[s] of sinfos_kpool[u], and several cells can share a position. Pools in cache order (qwen4exp)
+    // rank tokens by them, and the k-pool views cover the streams s0..s1 like get_k.
     const slot_info_vec_t sinfos_kpool;
 
     // null unless the model has an indexer
@@ -234,6 +237,13 @@ private:
     // Whether this context tracks k-pool states.
     bool kpool_track() const;
 
-    // Positions each sequence must re-pool from, cleared only after the first ubatch succeeds
+    // Whether a stream of the indexer cache is in the current ubatch's k-pool views.
+    bool kpool_in_view(uint32_t strm) const;
+
+    // Positions each sequence must still re-pool from. A ubatch re-pools a sequence only when the sequence's stream is
+    // in its views; one whose stream is not keeps them for a later ubatch, or batch, that reads its pools.
     llama_memory_hybrid_idx::stale_pos_t mem_idx_stale_batch = llama_memory_hybrid_idx::stale_pos_clean();
+
+    // The sequences whose stale pools the current ubatch re-pools, cleared in the memory once it succeeds.
+    std::array<uint8_t, LLAMA_MAX_SEQ> kpool_repooled = {};
 };
