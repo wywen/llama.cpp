@@ -100,6 +100,9 @@ struct llama_context {
     // the slots of the MoE layers that read their expert weights from slots, nullptr if the model has none
     const llama_moe_slot_pool * get_moe_slots() const;
 
+    // the caller's reader of the rows of the served lookup tables, nullptr if none
+    const llama_lookup_row_reader * get_lookup_rows() const;
+
     // return true if the memory was updated
     bool memory_update(bool optimize);
 
@@ -357,6 +360,9 @@ private:
     // the slots of this context, see llama_context_params.moe_slots
     std::unique_ptr<llama_moe_slot_pool> moe_slots;
 
+    // see llama_context_params.lookup_rows
+    std::unique_ptr<llama_lookup_row_reader> lookup_rows;
+
     // [n_layer] the router weight of each MoE layer, empty unless llama_context_params.moe_router_ahead
     std::vector<ggml_tensor *> moe_routers;
 
@@ -499,6 +505,9 @@ private:
 
     // true after the check that no op reads an expert weight read from MoE slots passes on a reserved graph
     bool moe_slots_verified = false;
+
+    // true after the check that no op reads a lookup table served by the caller passes on a reserved graph
+    bool lookup_tables_verified = false;
 
     // perf
     mutable int64_t t_start_us  = 0;

@@ -1288,6 +1288,31 @@ llama_model_loader::moe_slot_plan & llama_model_loader::get_moe_slot_plan(llm_ar
     return plan;
 }
 
+llama_model_loader::lookup_table_plan * llama_model_loader::get_lookup_table_plan(const std::string & name, const ggml_tensor * cur) {
+    if (lookup_tables == nullptr) {
+        return nullptr;
+    }
+    if (cur->ne[2] != 1 || cur->ne[3] != 1) {
+        throw std::runtime_error(format("pageable table '%s' %s is not a matrix", name.c_str(), llama_format_tensor_shape(cur).c_str()));
+    }
+    GGML_ASSERT(cur->nb[1] == ggml_row_size(cur->type, cur->ne[0]));
+
+    if (!lookup_tables(name.c_str(), cur->ne[1], cur->nb[1], lookup_tables_ud)) {
+        return nullptr;
+    }
+
+    for (const auto & plan : lookup_table_plans) {
+        if (plan.name == name) {
+            throw std::runtime_error(format("table '%s' is created twice", name.c_str()));
+        }
+    }
+
+    lookup_table_plan plan;
+    plan.name = name;
+    lookup_table_plans.push_back(std::move(plan));
+    return &lookup_table_plans.back();
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1387,7 +1412,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        if (source == ctx_source::LAZY) {
+        // a lazy table is gathered on the host, a served one has no buffer
+        if (source == ctx_source::LAZY || source == ctx_source::TABLE_META) {
             return lazy_read::buft();
         }
 
@@ -1527,8 +1553,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
     }
 
+    // a pageable table whose rows the caller serves is metadata only
+    lookup_table_plan * table_plan = nullptr;
+    if ((flags & TENSOR_PAGEABLE) && !(flags & (TENSOR_SKIP | TENSOR_DUPLICATED | TENSOR_ALLOW_RESHAPE)) && !assembly) {
+        table_plan = get_lookup_table_plan(tn.str(), cur);
+    }
+
     if (slot_plan) {
         source = ctx_source::SLOT_META;
+    } else if (table_plan) {
+        source = ctx_source::TABLE_META;
     } else if (assembly) {
         // lazy reads need the tensor's own range of the file, which an assembled tensor does not have
         source = ctx_source::ASSEMBLED;
@@ -1620,6 +1654,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         slot_member->stock = tensor;
         size_data -= ggml_nbytes(&t_meta);
     }
+    if (table_plan) {
+        // the caller serves the rows, nothing of the table is loaded
+        table_plan->stock = tensor;
+        size_data -= ggml_nbytes(&t_meta);
+        if (const llama_tensor_weight * w = get_weight(tn.str().c_str())) {
+            lookup_table_ranges[w->idx].emplace_back(w->offs, w->offs + ggml_nbytes(&t_meta));
+        }
+    }
 
     return tensor;
 }
@@ -1640,6 +1682,15 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
             __func__, first_tensor_moved_name.c_str(), first_tensor_moved_type_name.c_str(), n_tensors_moved - 1,
             ggml_backend_buft_name(first_moved_from_buft), ggml_backend_buft_name(first_moved_to_buft));
     }
+}
+
+llama_mmap::ranges llama_model_loader::unread_ranges(uint32_t idx) const {
+    llama_mmap::ranges res = lazy.for_file(idx);
+    const auto it = lookup_table_ranges.find(idx);
+    if (it != lookup_table_ranges.end()) {
+        res.insert(res.end(), it->second.begin(), it->second.end());
+    }
+    return res;
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
@@ -1664,11 +1715,13 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+                    unread_ranges(idx));
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
-                mlock_mmap->init(mapping->addr());
+                // a later tensor locks the file up to its end, but not the served tables
+                const auto it = lookup_table_ranges.find(idx);
+                mlock_mmap->init(mapping->addr(), it == lookup_table_ranges.end() ? llama_mmap::ranges() : it->second);
                 mlock_mmaps->emplace_back(std::move(mlock_mmap));
             }
             mappings.emplace_back(std::move(mapping));
@@ -2134,6 +2187,13 @@ bool llama_model_loader::load_all_data(
                 mapping->unmap_fragment(0, mmap_used.first);
                 if (mmap_used.second != 0) {
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
+                }
+                // the served tables lie outside every buffer that wraps the mapping
+                const auto it = lookup_table_ranges.find(idx);
+                if (it != lookup_table_ranges.end()) {
+                    for (const auto & range : it->second) {
+                        mapping->unmap_fragment(range.first, range.second);
+                    }
                 }
             }
         }

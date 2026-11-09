@@ -25,6 +25,7 @@ struct llama_hadamard;
 
 class llama_moe_cache;
 class llama_moe_slot_pool;
+struct llama_lookup_row_reader;
 
 struct llama_memory_context_i;
 
@@ -807,6 +808,7 @@ struct llm_graph_params {
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
     const llama_moe_slot_pool    * moe_slots;
+    const llama_lookup_row_reader * lookup_rows; // nullptr if the caller serves no lookup table rows
 
     // [n_layer] the router weight of each MoE layer, nullptr for the other layers; nullptr = no router lookahead
     const std::vector<ggml_tensor *> * moe_routers = nullptr;
@@ -1093,6 +1095,7 @@ struct llm_graph_context {
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
     const llama_moe_slot_pool    * moe_slots;
+    const llama_lookup_row_reader * lookup_rows;
 
     const std::vector<ggml_tensor *> * moe_routers; // see llm_graph_params::moe_routers
 

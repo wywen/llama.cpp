@@ -260,6 +260,11 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_test(test-moe-router-ahead LABEL "main behavior backend"
         ARGS --models "${PER_EXPERT_MODEL_DIR}")
     set_tests_properties(test-moe-router-ahead PROPERTIES FIXTURES_REQUIRED per-expert-models)
+
+    llama_build(test-lookup-pages.cpp)
+    llama_test(test-lookup-pages LABEL "main behavior backend"
+        ARGS --models "${PER_EXPERT_MODEL_DIR}")
+    set_tests_properties(test-lookup-pages PROPERTIES FIXTURES_REQUIRED per-expert-models)
 endif()
 
 set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")

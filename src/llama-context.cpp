@@ -691,6 +691,13 @@ llama_context::llama_context(
         moe_slots = std::make_unique<llama_moe_slot_pool>(model.moe_slots, cparams.moe_slot_sets, params.moe_slots, params.moe_slots_user_data, model.no_alloc());
     }
 
+    // the caller's reader of the rows of the lookup tables that it serves
+    if (!model.lookup_tables.empty() && params.lookup_rows != nullptr) {
+        lookup_rows = std::make_unique<llama_lookup_row_reader>();
+        lookup_rows->read      = params.lookup_rows;
+        lookup_rows->user_data = params.lookup_rows_user_data;
+    }
+
     if (cparams.moe_router_ahead && !hparams.vocab_only) {
         const int32_t n_layer = hparams.n_layer();
         for (int32_t il = 0; il < n_layer; ++il) {
@@ -1200,6 +1207,10 @@ llama_memory_t llama_context::get_memory() const {
 
 const llama_moe_slot_pool * llama_context::get_moe_slots() const {
     return moe_slots.get();
+}
+
+const llama_lookup_row_reader * llama_context::get_lookup_rows() const {
+    return lookup_rows.get();
 }
 
 bool llama_context::memory_update(bool optimize) {
@@ -1937,7 +1948,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
-        res->set_inputs(&ubatch);
+        try {
+            res->set_inputs(&ubatch);
+        } catch (const std::exception & err) {
+            // e.g. the caller failed to read the lookup table rows that the ubatch reads
+            LLAMA_LOG_ERROR("%s: failed to set the graph inputs: %s\n", __func__, err.what());
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -3114,6 +3132,10 @@ ggml_cgraph * llama_context::graph_reserve(
         llama_verify_moe_slots_graph(gf, model.moe_slots);
         moe_slots_verified = true;
     }
+    if (!lookup_tables_verified && gf && !model.lookup_tables.empty()) {
+        llama_verify_lookup_tables_graph(gf, model.lookup_tables);
+        lookup_tables_verified = true;
+    }
 
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;
@@ -3153,6 +3175,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
         /*.moe_slots   =*/ moe_slots.get(),
+        /*.lookup_rows =*/ lookup_rows.get(),
         /*.moe_routers =*/ moe_routers.empty() ? nullptr : &moe_routers,
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
@@ -4418,7 +4441,13 @@ void llama_context::opt_epoch_iter(
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
             ggml_opt_alloc(opt_ctx, train);
 
-            res->set_inputs(&ubatch);
+            try {
+                res->set_inputs(&ubatch);
+            } catch (const std::exception & err) {
+                // e.g. the caller failed to read the lookup table rows that the ubatch reads
+                LLAMA_LOG_ERROR("%s: failed to set the graph inputs: %s\n", __func__, err.what());
+                return;
+            }
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
                 GGML_ASSERT(labels->ne[1] == n_ubatch);
@@ -4538,6 +4567,8 @@ llama_context_params llama_context_default_params() {
         /*.moe_slots                   =*/ nullptr,
         /*.moe_slots_user_data         =*/ nullptr,
         /*.moe_slot_sets               =*/ 1,
+        /*.lookup_rows                 =*/ nullptr,
+        /*.lookup_rows_user_data       =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

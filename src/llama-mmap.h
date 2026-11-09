@@ -69,7 +69,8 @@ struct llama_mlock {
     llama_mlock();
     ~llama_mlock();
 
-    void init(void * ptr);
+    // skip: byte ranges from ptr that grow_to leaves unlocked, except for pages that they share with other data
+    void init(void * ptr, const llama_mmap::ranges & skip = {});
     void grow_to(size_t target_size);
 
     static const bool SUPPORTED;
