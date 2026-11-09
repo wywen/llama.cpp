@@ -21,6 +21,8 @@ struct llama_lookup_table {
     int64_t n_rows   = 0;
     size_t  row_size = 0; // of one row in the file
 
+    int32_t rows_per_token = 0; // the rows that one token reads
+
     // the range of the file that holds the table, rows in order
     bool     has_file = false;
     uint32_t file     = 0;

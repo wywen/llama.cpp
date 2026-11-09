@@ -883,7 +883,8 @@ extern "C" {
         enum ggml_type type;
         int64_t        n_cols;   // the elements of one row
         int64_t        n_rows;
-        size_t         row_size; // the bytes of one row
+        size_t         row_size;       // the bytes of one row
+        int32_t        rows_per_token; // the rows that one token reads, e.g. to size the rows of n tokens
         const char *   path;     // the model file that holds the table, NULL if the model was not loaded from files
         uint32_t       file;     // index of the file among the model's files (splits)
         uint64_t       offset;   // of row 0 in the file; row r is at offset + r*row_size
@@ -894,6 +895,20 @@ extern "C" {
 
     // the served lookup table `table`; returns false, leaving `info` untouched, if `table` is out of range
     LLAMA_API bool llama_model_lookup_table_info(const struct llama_model * model, int32_t table, struct llama_lookup_table_info * info);
+
+    // the rows of served lookup table `table` that tokens[n_context, n_tokens) of one sequence read, with
+    //     tokens[0, n_context) as their predecessors: rows_per_token rows per token, in the order in which
+    //     llama_context_params.lookup_rows is asked for them, e.g. to name the rows of draft tokens ahead of a decode
+    // a predecessor before tokens[0] reads as missing, as at the start of the sequence
+    // rows holds (n_tokens - n_context)*rows_per_token entries; returns false, leaving `rows` unspecified, if `table` is
+    //     out of range, the arguments are invalid or a row is out of range
+    LLAMA_API bool llama_model_lookup_table_rows(
+            const struct llama_model * model,
+                             int32_t   table,
+                   const llama_token * tokens,
+                             int32_t   n_tokens,
+                             int32_t   n_context,
+                             int32_t * rows);
 
     //
     // MoE router lookahead [EXPERIMENTAL]

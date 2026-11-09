@@ -920,6 +920,13 @@ struct llama_model_gemma4 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    int32_t lookup_rows_per_token(const llama_lookup_table & table) const override;
+    bool    lookup_table_rows(const llama_lookup_table & table,
+                              const llama_token *        tokens,
+                              int32_t                    n_tokens,
+                              int32_t                    n_context,
+                              int32_t *                  rows) const override;
+
     struct graph : public llm_graph_context {
         const int64_t n_embd_per_layer;
 

@@ -1,6 +1,8 @@
 #include "models.h"
 #include "llama-impl.h"
 
+#include <algorithm>
+
 void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
     ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
@@ -470,6 +472,23 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+}
+
+// each token reads the row of its id
+int32_t llama_model_gemma4::lookup_rows_per_token(const llama_lookup_table & table) const {
+    return table.stock == per_layer_tok_embd ? 1 : 0;
+}
+
+bool llama_model_gemma4::lookup_table_rows(const llama_lookup_table & table,
+                                           const llama_token *        tokens,
+                                           int32_t                    n_tokens,
+                                           int32_t                    n_context,
+                                           int32_t *                  rows) const {
+    if (table.stock != per_layer_tok_embd) {
+        return false;
+    }
+    std::copy(tokens + n_context, tokens + n_tokens, rows);
+    return true;
 }
 
 class llm_graph_input_gemma4_ple : public llm_graph_input_i {
