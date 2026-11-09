@@ -26,6 +26,7 @@ struct llama_hadamard;
 class llama_moe_cache;
 class llama_moe_slot_pool;
 struct llama_lookup_row_reader;
+struct llama_lookup_table;
 
 struct llama_memory_context_i;
 
@@ -134,6 +135,23 @@ protected:
 };
 
 using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
+
+// the rows of a lookup table served by the caller that one graph gathers, see llm_graph_context::build_lookup_rows
+// the input of the graph that knows the row ids owns it and calls set from its set_input
+struct llm_graph_lookup_rows {
+    const llama_lookup_row_reader * reader = nullptr;
+    const llama_lookup_table *      table  = nullptr;
+
+    ggml_tensor * staging = nullptr; // [n_cols, n_ids] the rows that the caller writes, in id order
+    ggml_tensor * iota    = nullptr; // I32 [n_ids] the identity index that gathers them
+
+    std::vector<uint8_t> scratch; // the rows, when staging is not in host memory
+
+    int64_t n_ids() const;
+
+    // asks the caller for the rows ids[0, n_ids()); throws if a row is out of range or the caller fails
+    void set(const int32_t * ids);
+};
 
 class llm_graph_input_embd : public llm_graph_input_i {
 public:
@@ -1292,6 +1310,10 @@ struct llm_graph_context {
     // tok_scale: applied to token rows only
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
     ggml_tensor * build_inp_pos() const;
+
+    // n_ids rows of the served lookup table, gathered on the CPU from the rows that the caller writes into `rows`, as
+    //     the loaded table would be gathered; throws if the context has no row reader
+    ggml_tensor * build_lookup_rows(llm_graph_lookup_rows & rows, const llama_lookup_table & table, int64_t n_ids) const;
 
     // applies the RoPE of layer il, cur is returned as is if the layer has none
     ggml_tensor * build_rope(ggml_tensor * cur, ggml_tensor * pos, int il) const;
