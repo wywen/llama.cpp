@@ -870,11 +870,13 @@ extern "C" {
     // that reads a served table otherwise fails to build.
     //
     // When the context sets the inputs of a ubatch, it asks the caller (llama_context_params.lookup_rows) for the rows
-    // that the ubatch reads, in token order, repeats included: the same rows that the loaded table would be read at. A
-    // ubatch of input embeddings reads the row that the architecture uses in place of a token's (row 0 for the
-    // per-layer token embeddings). The caller writes the bytes of each row as the model file stores them, e.g. read
-    // from the file at offset + row*row_size (see llama_model_lookup_table_info), into a host input of the graph; the
-    // graph then reads them as it would read the table.
+    // that the ubatch reads, in token order, rows_per_token per token, repeats included: the same rows that the loaded
+    // table would be read at. A token's rows can depend on the tokens before it in its sequence (e.g. the n-gram hashes
+    // of qwen4exp); llama_model_lookup_table_rows names them ahead of a decode. A ubatch of input embeddings reads the
+    // rows that the architecture uses in place of a token's (row 0 once for gemma4, the rows of the image token for
+    // qwen4exp). The caller writes the bytes of each row as the model file stores them, e.g. read from the file at
+    // offset + row*row_size (see llama_model_lookup_table_info), into a host input of the graph; the graph then reads
+    // them as it would read the table.
     //
 
     // a lookup table whose rows the caller serves
@@ -883,7 +885,8 @@ extern "C" {
         enum ggml_type type;
         int64_t        n_cols;   // the elements of one row
         int64_t        n_rows;
-        size_t         row_size; // the bytes of one row
+        size_t         row_size;       // the bytes of one row
+        int32_t        rows_per_token; // the rows that one token reads, e.g. to size the rows of n tokens
         const char *   path;     // the model file that holds the table, NULL if the model was not loaded from files
         uint32_t       file;     // index of the file among the model's files (splits)
         uint64_t       offset;   // of row 0 in the file; row r is at offset + r*row_size
@@ -894,6 +897,20 @@ extern "C" {
 
     // the served lookup table `table`; returns false, leaving `info` untouched, if `table` is out of range
     LLAMA_API bool llama_model_lookup_table_info(const struct llama_model * model, int32_t table, struct llama_lookup_table_info * info);
+
+    // the rows of served lookup table `table` that tokens[n_context, n_tokens) of one sequence read, with
+    //     tokens[0, n_context) as their predecessors: rows_per_token rows per token, in the order in which
+    //     llama_context_params.lookup_rows is asked for them, e.g. to name the rows of draft tokens ahead of a decode
+    // a predecessor before tokens[0] reads as missing, as at the start of the sequence
+    // rows holds (n_tokens - n_context)*rows_per_token entries; returns false, leaving `rows` unspecified, if `table` is
+    //     out of range, the arguments are invalid or a row is out of range
+    LLAMA_API bool llama_model_lookup_table_rows(
+            const struct llama_model * model,
+                             int32_t   table,
+                   const llama_token * tokens,
+                             int32_t   n_tokens,
+                             int32_t   n_context,
+                             int32_t * rows);
 
     //
     // MoE router lookahead [EXPERIMENTAL]

@@ -1,6 +1,8 @@
 #include "models.h"
 #include "llama-impl.h"
 
+#include <algorithm>
+
 void llama_model_gemma4::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
     ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
@@ -472,6 +474,23 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
     res->t_logits = cur;
 }
 
+// each token reads the row of its id
+int32_t llama_model_gemma4::lookup_rows_per_token(const llama_lookup_table & table) const {
+    return table.stock == per_layer_tok_embd ? 1 : 0;
+}
+
+bool llama_model_gemma4::lookup_table_rows(const llama_lookup_table & table,
+                                           const llama_token *        tokens,
+                                           int32_t                    n_tokens,
+                                           int32_t                    n_context,
+                                           int32_t *                  rows) const {
+    if (table.stock != per_layer_tok_embd) {
+        return false;
+    }
+    std::copy(tokens + n_context, tokens + n_tokens, rows);
+    return true;
+}
+
 class llm_graph_input_gemma4_ple : public llm_graph_input_i {
 public:
     llm_graph_input_gemma4_ple(const llama_model & model) : model(model) {}
@@ -479,26 +498,10 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         ggml_tensor * ple = model.per_layer_tok_embd;
 
-        if (reader) {
-            // the caller writes the rows that the loaded table would be read at: the token ids, or the padding row
-            const int32_t   padding = 0;
-            const int32_t * ids     = ubatch->token ? ubatch->token : &padding;
-            const int64_t   n_ids   = iota->ne[0];
-
-            const size_t size = ggml_nbytes(staging);
-            if (ggml_backend_buffer_is_host(staging->buffer)) {
-                reader->read_rows(*table, ids, n_ids, staging->data);
-            } else {
-                rows.resize(size);
-                reader->read_rows(*table, ids, n_ids, rows.data());
-                ggml_backend_tensor_set(staging, rows.data(), 0, size);
-            }
-
-            std::vector<int32_t> seq(n_ids);
-            for (int64_t i = 0; i < n_ids; ++i) {
-                seq[i] = (int32_t) i;
-            }
-            ggml_backend_tensor_set(iota, seq.data(), 0, n_ids*ggml_element_size(iota));
+        if (served.table) {
+            // the rows that the loaded table would be read at: the token ids, or the padding row
+            const int32_t padding = 0;
+            served.set(ubatch->token ? ubatch->token : &padding);
             return;
         }
 
@@ -520,8 +523,8 @@ public:
     }
 
     bool can_reuse(const llm_graph_params & params) override {
-        if (reader) {
-            return params.ubatch.token ? by_token && iota->ne[0] == params.ubatch.n_tokens : !by_token;
+        if (served.table) {
+            return params.ubatch.token ? by_token && served.n_ids() == params.ubatch.n_tokens : !by_token;
         }
         return params.ubatch.token ? tokens && tokens->ne[0] == params.ubatch.n_tokens : tokens == nullptr;
     }
@@ -529,13 +532,9 @@ public:
     ggml_tensor * tokens = nullptr;
     ggml_tensor * token0 = nullptr;
 
-    // with the table served by the caller: its rows for the tokens or the padding row, in order, and their indices
-    const llama_lookup_row_reader * reader  = nullptr;
-    const llama_lookup_table *      table   = nullptr;
-    ggml_tensor *                   staging = nullptr;
-    ggml_tensor *                   iota    = nullptr;
-    bool                            by_token = false;
-    std::vector<uint8_t>            rows;
+    // with the table served by the caller: its rows for the tokens, or the padding row
+    llm_graph_lookup_rows served;
+    bool                  by_token = false;
 
     const llama_model & model;
 };
@@ -548,23 +547,10 @@ ggml_tensor * llama_model_gemma4::graph::build_inp_per_layer() {
     // a table whose rows the caller serves is gathered from the rows that the caller writes, in order: the same
     //     gather on the same backend as from the loaded table
     if (const llama_lookup_table * table = model.lookup_tables.of(model.per_layer_tok_embd)) {
-        if (lookup_rows == nullptr) {
-            throw std::runtime_error(format("lookup table '%s' is served by the caller, but the context has no row reader",
-                model.per_layer_tok_embd->name));
-        }
         // mixed ubatch: embd rows read the padding row, as below
-        inp->reader   = lookup_rows;
-        inp->table    = table;
         inp->by_token = ubatch.token != nullptr;
 
-        const int64_t n_ids = inp->by_token ? ubatch.n_tokens : 1;
-        inp->staging = ggml_new_tensor_2d(ctx0, model.per_layer_tok_embd->type, model.per_layer_tok_embd->ne[0], n_ids);
-        ggml_set_input(inp->staging);
-        inp->iota = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_ids);
-        ggml_set_input(inp->iota);
-
-        ggml_tensor * inp_per_layer = ggml_get_rows(ctx0, inp->staging, inp->iota);
-        ggml_backend_sched_set_tensor_backend(sched, inp_per_layer, backend_cpu);
+        ggml_tensor * inp_per_layer = build_lookup_rows(inp->served, *table, inp->by_token ? ubatch.n_tokens : 1);
         cb(inp_per_layer, inp->by_token ? "inp_per_layer_selected" : "inp_per_layer_multimodal", -1);
 
         res->add_input(std::move(inp));

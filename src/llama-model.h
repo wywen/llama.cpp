@@ -1035,6 +1035,17 @@ struct llama_model {
     // same, for the keys of the lightning indexer
     virtual llama_rope_params get_rope_params_indexer(const llama_cparams & cparams, int il) const;
 
+    // the rows of the served lookup table `table` that one token reads; 0 if the architecture cannot name them
+    virtual int32_t lookup_rows_per_token(const llama_lookup_table & table) const;
+
+    // the rows that tokens[n_context, n_tokens) read, see llama_model_lookup_table_rows; returns false if the
+    //     architecture cannot name them
+    virtual bool lookup_table_rows(const llama_lookup_table & table,
+                                   const llama_token *        tokens,
+                                   int32_t                    n_tokens,
+                                   int32_t                    n_context,
+                                   int32_t *                  rows) const;
+
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
 
