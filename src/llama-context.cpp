@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -43,9 +44,11 @@ static void llama_verify_hadamard_graph(
             forward.emplace(cached, t);
         }
     }
-    // so do the slot tensors read in place of the expert weights
+    // so do the slot tensors read in place of the expert weights, which the ops of slot ranges read through views
+    std::set<const ggml_tensor *> slot_tensors;
     if (moe_slots) {
         for (const auto & [w, slots] : moe_slots->substitutes()) {
+            slot_tensors.insert(slots);
             const auto it = rotations.find(w);
             if (it != rotations.end()) {
                 forward.emplace(slots, it->second);
@@ -82,7 +85,11 @@ static void llama_verify_hadamard_graph(
             continue;
         }
 
-        const auto it = forward.find(node->src[0]);
+        const ggml_tensor * as = node->src[0];
+        if (as->view_src != nullptr && slot_tensors.count(as->view_src) > 0) {
+            as = as->view_src;
+        }
+        const auto it = forward.find(as);
         if (it == forward.end()) {
             if (inverses.count(node->src[0])) {
                 throw std::runtime_error(format(
@@ -3324,6 +3331,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
             for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
                 const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
+                // -1 reads no expert, as for the ids local to a MoE slot range
+                if (id == -1) {
+                    continue;
+                }
                 GGML_ASSERT(id >= 0 && id < n_expert);
                 st.used[id] = true;
             }
@@ -4862,6 +4873,10 @@ bool llama_context_moe_slot_layout(const struct llama_context * ctx, int32_t il,
     for (size_t i = 0; i < layer.members.size(); ++i) {
         const auto & m = layer.members[i];
         res.members[i] = { m.name.c_str(), region->members[i], m.offset, m.size };
+    }
+    res.n_range_splits = region->n_ranges() - 1;
+    for (int32_t r = 0; r < res.n_range_splits; ++r) {
+        res.range_splits[r] = region->bounds[r + 1];
     }
     *layout = res;
     return true;

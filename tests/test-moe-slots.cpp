@@ -205,7 +205,10 @@ struct slot_counts {
 static llama_moe_slot_pool_params get_slot_count(int32_t il, int32_t n_expert, int32_t /*set*/, void * ud) {
     const auto * counts = (const slot_counts *) ud;
     const auto it = counts->n_slots.find(il);
-    return { it == counts->n_slots.end() ? n_expert + counts->n_spare : it->second, counts->buft };
+    llama_moe_slot_pool_params res = {};
+    res.n_slots = it == counts->n_slots.end() ? n_expert + counts->n_spare : it->second;
+    res.buft    = counts->buft;
+    return res;
 }
 
 // a caller's buffer type that wraps another one and recognizes the slot buffers at their allocation: it records each
@@ -793,7 +796,10 @@ static llama_moe_slot_pool_params get_set_slot_count(int32_t il, int32_t n_exper
     const auto * counts = (const set_counts *) ud;
     const auto & n_slots = counts->n_slots.at(set);
     const auto it = n_slots.find(il);
-    return { it == n_slots.end() ? n_expert : it->second, counts->buft_set < 0 || counts->buft_set == set ? counts->buft : nullptr };
+    llama_moe_slot_pool_params res = {};
+    res.n_slots = it == n_slots.end() ? n_expert : it->second;
+    res.buft    = counts->buft_set < 0 || counts->buft_set == set ? counts->buft : nullptr;
+    return res;
 }
 
 // the graphs a context prepares, and the compute buffer plans its scheduler makes

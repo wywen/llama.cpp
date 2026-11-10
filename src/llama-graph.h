@@ -1119,6 +1119,14 @@ struct llm_graph_moe_slots {
     // the tensor that stands in for each expert weight
     std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> weights;
 
+    // the slot ranges of a region split into more than one, else empty (see llama_moe_slot_pool_params)
+    struct range {
+        int32_t       start = 0;       // the first slot
+        int32_t       n     = 0;       // the number of slots
+        ggml_tensor * ids   = nullptr; // [n_expert_used, n_tokens] the slots made local to the range, -1 outside it
+    };
+    std::vector<range> ranges;
+
     ggml_tensor * get(const ggml_tensor * w) const;
 };
 
@@ -1226,12 +1234,16 @@ struct llm_graph_context {
     // do mat_mul_id, while optionally apply lora and per-expert scale
     // if slots is set, the experts are read from the tensor that stands in for w at these slots (see build_moe_slots),
     //     the scale and the LoRA still at ids
+    // with slot ranges, one mul_mat_id per range reads a view of the stand-in limited to the range's slots, at the
+    //     range's local ids, and the results are summed; each is named <name>_r<range> for layer il if name is set
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
               ggml_tensor * w_s   = nullptr,
-        const llm_graph_moe_slots * slots = nullptr) const;
+        const llm_graph_moe_slots * slots = nullptr,
+               const char * name  = nullptr,
+                       int   il    = -1) const;
 
     // rescale `cur` (the src1 of a matmul) by a power of two, computed from its maximum absolute
     // keep both individual values and Q8 activation block sums within F16 range
