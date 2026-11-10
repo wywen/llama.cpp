@@ -334,6 +334,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_layer = 22; // hparams.n_layer_kv_from_start = 20 is hardcoded
     } else if (arch == LLM_ARCH_LFM3) {
         n_layer = 3;
+    } else if (arch == LLM_ARCH_QWEN4EXP) {
+        n_layer = 4; // two linear attention layers and two QSA layers, so the PLE layer can follow another
     } else if (arch == LLM_ARCH_DEEPSEEK4) {
         // head size 64 so that GPU flash attention kernels support the model
         n_embd  = 512;
@@ -619,8 +621,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
             ple_head_offsets[h] = uint64_t(h)*n_vocab;
         }
 
-        // the PLE history lives in the recurrent cache, so it must sit on a linear attention layer
-        ms.add_kv(LLM_KV_PLE_LAYERS,                  std::vector<uint32_t>({ 0 }));
+        // the PLE history lives in the recurrent cache, so it must sit on a linear attention layer; qwen4exp's
+        // is the second one, after a layer of each kind, as a real model's PLE layer follows others
+        ms.add_kv(LLM_KV_PLE_LAYERS,                  std::vector<uint32_t>({ arch == LLM_ARCH_QWEN4EXP ? 2u : 0u }));
         ms.add_kv(LLM_KV_PLE_NGRAM_SIZE,              ple_ngram_size);
         ms.add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,         ple_heads_per_ngram);
         ms.add_kv(LLM_KV_PLE_CONV_KERNEL,             uint32_t(4));

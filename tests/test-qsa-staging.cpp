@@ -434,10 +434,16 @@ static void check_calls(const row_server & server, const scenario & sc, int32_t 
     }
 }
 
-// whether the rows that the caller stores match, byte for byte, those of the stock cache
+// whether the rows that the caller stores match those of the stock cache: byte for byte for the first QSA layer, whose
+// input does not depend on another QSA layer, and near them for the later ones, which read the float noise of the layers
+// before them (the logits are near the stock path, not bitwise)
 static bool same_rows(const row_server & server, const graph_scan & stock) {
     if (server.stores.empty()) {
         return false;
+    }
+    int32_t first = server.stores.begin()->first.first;
+    for (const auto & [key, st] : server.stores) {
+        first = std::min(first, key.first);
     }
     for (const auto & [key, st] : server.stores) {
         const auto & caches = key.second ? stock.v : stock.k;
@@ -446,14 +452,33 @@ static bool same_rows(const row_server & server, const graph_scan & stock) {
             return false;
         }
         std::vector<uint8_t> row(st.row_size);
+        std::vector<float> got;
+        std::vector<float> ref;
+        const ggml_type_traits * tt = ggml_get_type_traits(it->second->type);
         for (size_t c = 0; c < st.stored.size(); ++c) {
             if (!st.stored[c]) {
                 return false;
             }
             ggml_backend_tensor_get(it->second, row.data(), c*st.row_size, st.row_size);
-            if (memcmp(row.data(), st.rows.data() + c*st.row_size, st.row_size) != 0) {
+            const uint8_t * mine = st.rows.data() + c*st.row_size;
+            if (key.first == first) {
+                if (memcmp(row.data(), mine, st.row_size) != 0) {
+                    return false;
+                }
+                continue;
+            }
+            const size_t n = (size_t) it->second->ne[0];
+            got.resize(got.size() + n);
+            ref.resize(ref.size() + n);
+            if (tt->to_float) {
+                tt->to_float(mine, got.data() + got.size() - n, (int64_t) n);
+                tt->to_float(row.data(), ref.data() + ref.size() - n, (int64_t) n);
+            } else {
                 return false;
             }
+        }
+        if (key.first != first && nmse(got, ref) > NMSE_MAX) {
+            return false;
         }
     }
     return true;
@@ -499,7 +524,7 @@ static void test_top_k(const std::string & path, const std::vector<ggml_backend_
 
         const int32_t n_sel = top_k > 0 ? KPOOL*(top_k/KPOOL) + KPOOL - 1 : 0;
         check_calls(server, sc, n_sel, n_layers, what, check);
-        check(same_rows(server, stock), what + ": the rows that the caller stores are byte-identical to the stock cache's");
+        check(same_rows(server, stock), what + ": the rows that the caller stores are those of the stock cache");
 
         if (&sc != &scs.front()) {
             continue;
