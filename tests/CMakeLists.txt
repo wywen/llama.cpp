@@ -495,6 +495,10 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp  LABEL "behavior backend"  LINK ggml)
+
+    # rewrites graphs in the backend scheduler on the CPU and, when the machine has one, on a Metal device
+    # reads the use counts of the rewritten graph from the non-public ggml-impl.h
+    llama_build_and_test(test-sched-graph-rewrite.cpp  LABEL "main behavior backend"  LINK ggml)
 endif()
 
 llama_build(test-export-graph-ops.cpp)

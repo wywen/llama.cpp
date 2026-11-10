@@ -1245,6 +1245,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_graph_prepare_callback callback_graph_prepare;
     void * callback_graph_prepare_user_data;
 
+    ggml_backend_sched_graph_rewrite_callback callback_graph_rewrite;
+    void * callback_graph_rewrite_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -1493,7 +1496,7 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
-void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+static void ggml_backend_sched_split_graph_impl(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -2445,27 +2448,160 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     sched->is_alloc = false;
 }
 
-void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
+// restores the invariants of a graph that a rewrite callback changed: the node list has no NULL entries, every node
+// follows the nodes it reads, and the use count of each tensor counts the nodes of the graph that read it
+// the nodes the graph had keep their relative order; a node that is out of order moves to just before its first reader
+// returns false if a node reads a tensor that is neither a node nor a leaf of the graph, or if the nodes form a cycle
+static bool ggml_backend_sched_normalize_graph(struct ggml_cgraph * graph) {
+    const int n_nodes = graph->n_nodes;
+
+    struct ggml_hash_set in_graph = ggml_hash_set_new(n_nodes);
+    struct ggml_hash_set visiting = ggml_hash_set_new(n_nodes);
+    struct ggml_hash_set emitted  = ggml_hash_set_new(n_nodes);
+
+    for (int i = 0; i < n_nodes; i++) {
+        if (graph->nodes[i]) {
+            ggml_hash_find_or_insert(&in_graph, graph->nodes[i]);
+        }
+    }
+
+    std::vector<ggml_tensor *> order;
+    order.reserve(n_nodes);
+
+    // depth-first, iterative: a deep chain of nodes must not exhaust the stack
+    std::vector<std::pair<ggml_tensor *, int>> stack;
+
+    bool ok = true;
+    for (int i = 0; i < n_nodes && ok; i++) {
+        ggml_tensor * root = graph->nodes[i];
+        if (root == nullptr || ggml_hash_contains(&emitted, root)) {
+            continue;
+        }
+        stack.emplace_back(root, 0);
+        ggml_hash_insert(&visiting, root);
+        while (!stack.empty() && ok) {
+            auto & [node, next_src] = stack.back();
+            if (next_src == GGML_MAX_SRC) {
+                order.push_back(node);
+                ggml_hash_insert(&emitted, node);
+                stack.pop_back();
+                continue;
+            }
+            ggml_tensor * src = node->src[next_src++];
+            if (src == nullptr || ggml_hash_contains(&emitted, src)) {
+                continue;
+            }
+            if (!ggml_hash_contains(&in_graph, src)) {
+                const bool is_leaf = src->op == GGML_OP_NONE && !(src->flags & GGML_TENSOR_FLAG_PARAM);
+                if (!is_leaf || graph->visited_hash_set.size == 0 || !ggml_hash_contains(&graph->visited_hash_set, src)) {
+                    GGML_LOG_ERROR("%s: node %s reads %s, which is not in the graph\n", __func__, node->name, src->name);
+                    ok = false;
+                }
+                continue;
+            }
+            if (ggml_hash_contains(&visiting, src)) {
+                GGML_LOG_ERROR("%s: node %s is part of a cycle\n", __func__, src->name);
+                ok = false;
+                continue;
+            }
+            ggml_hash_insert(&visiting, src);
+            stack.emplace_back(src, 0);
+        }
+    }
+
+    ggml_hash_set_free(&in_graph);
+    ggml_hash_set_free(&visiting);
+    ggml_hash_set_free(&emitted);
+
+    if (!ok) {
+        return false;
+    }
+
+    // a removed node leaves the list, a node listed twice is emitted once
+    graph->n_nodes = (int) order.size();
+    std::copy(order.begin(), order.end(), graph->nodes);
+
+    // a graph view has no hash set and no use counts
+    if (graph->visited_hash_set.size == 0) {
+        return true;
+    }
+
+    for (size_t i = 0; i < graph->visited_hash_set.size; i++) {
+        graph->use_counts[i] = 0;
+    }
+    for (int i = 0; i < graph->n_leafs; i++) {
+        ggml_hash_find_or_insert(&graph->visited_hash_set, graph->leafs[i]);
+    }
+    for (int i = 0; i < graph->n_nodes; i++) {
+        ggml_hash_find_or_insert(&graph->visited_hash_set, graph->nodes[i]);
+    }
+    for (int i = 0; i < graph->n_nodes; i++) {
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            ggml_tensor * src = graph->nodes[i]->src[j];
+            if (src) {
+                graph->use_counts[ggml_hash_find(&graph->visited_hash_set, src)]++;
+            }
+        }
+    }
+
+    return true;
+}
+
+// runs the rewrite callback, if one is set, on a graph that is about to be split
+static bool ggml_backend_sched_rewrite_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    if (sched->callback_graph_rewrite == NULL) {
+        return true;
+    }
+    if (!sched->callback_graph_rewrite(sched, graph, sched->callback_graph_rewrite_user_data)) {
+        return false;
+    }
+    return ggml_backend_sched_normalize_graph(graph);
+}
+
+bool ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
-    GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
+
+    if (!ggml_backend_sched_rewrite_graph(sched, graph)) {
+        return false;
+    }
+    GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
+
+    ggml_backend_sched_split_graph_impl(sched, graph);
+
+    return true;
+}
+
+bool ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
+    GGML_ASSERT(sched);
     GGML_ASSERT(sizes);
+
+    if (!ggml_backend_sched_rewrite_graph(sched, measure_graph)) {
+        return false;
+    }
+    GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
 
     ggml_backend_sched_reset(sched);
 
     ggml_backend_sched_synchronize(sched);
 
-    ggml_backend_sched_split_graph(sched, measure_graph);
+    ggml_backend_sched_split_graph_impl(sched, measure_graph);
 
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+
+    return true;
 }
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
     GGML_ASSERT(sched);
+
+    if (!ggml_backend_sched_rewrite_graph(sched, measure_graph)) {
+        return false;
+    }
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
 
     ggml_backend_sched_synchronize(sched);
 
-    ggml_backend_sched_split_graph(sched, measure_graph);
+    ggml_backend_sched_split_graph_impl(sched, measure_graph);
 
     if (!ggml_gallocr_reserve_n_covering(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
@@ -2478,13 +2614,17 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
-    GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
+
+    if (!ggml_backend_sched_rewrite_graph(sched, graph)) {
+        return false;
+    }
+    GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
 
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
-    ggml_backend_sched_split_graph(sched, graph);
+    ggml_backend_sched_split_graph_impl(sched, graph);
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
@@ -2575,6 +2715,12 @@ void ggml_backend_sched_set_graph_prepare_callback(ggml_backend_sched_t sched, g
     GGML_ASSERT(sched);
     sched->callback_graph_prepare = callback;
     sched->callback_graph_prepare_user_data = user_data;
+}
+
+void ggml_backend_sched_set_graph_rewrite_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_rewrite_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_graph_rewrite = callback;
+    sched->callback_graph_rewrite_user_data = user_data;
 }
 
 void ggml_backend_sched_set_replan_on_shrink(ggml_backend_sched_t sched, bool replan) {
