@@ -492,6 +492,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
     ggml_build_forward_expand(gf, res_hc);
 
     for (int il = 0; il < n_layer; ++il) {
+        // the previous layer's output goes into the graph before any node of this layer: a PLE layer
+        // gathers its conv state before it reads the residual, and would otherwise land among the
+        // previous layer's nodes
+        ggml_build_forward_expand(gf, res_hc);
+
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = hc_stream_mean(ctx0, res_hc);
             cb(res->t_layer_inp[il], "layer_inp", il);
