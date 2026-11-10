@@ -216,11 +216,41 @@ GGML_BACKEND_API bool ggml_backend_metal_buffer_end_residency     (ggml_backend_
 // a buffer over host memory like one from ggml_backend_dev_buffer_from_host_ptr, but wrapped in disjoint Metal buffers
 // split at split_offsets, for a caller that binds sub-ranges of one host allocation independently: a kernel that uses a
 // tensor inside one sub-range wires only that sub-range's pages. A tensor or view that crosses a split point is in no
-// Metal buffer, and encoding a kernel that uses it aborts. Unwrap, rewrap and the residency set calls work as above, over the same
-// sub-ranges. ptr must be page aligned; the offsets must be strictly increasing, page aligned and inside (0, size);
-// there are at most 63 of them and no sub-range may be larger than the device's max buffer size. NULL on bad input
+// Metal buffer, and encoding a kernel that uses it aborts. Unwrap, rewrap and the residency set calls work as above on
+// every sub-range at once, and per sub-range as below. ptr must be page aligned; the offsets must be strictly
+// increasing, page aligned and inside (0, size); there are at most 63 of them and no sub-range may be larger than the
+// device's max buffer size. NULL on bad input
 GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_metal_buffer_from_host_ptr_split(
         ggml_backend_dev_t dev, void * ptr, size_t size, const size_t * split_offsets, int n_splits);
+
+//
+// sub-ranges of a split buffer, released and recreated one at a time
+//
+// For a caller that holds and replaces sub-ranges of one host allocation independently. A buffer from
+// ggml_backend_metal_buffer_from_host_ptr_split has one residency set per sub-range, holding that sub-range's Metal
+// buffer alone, and each sub-range is wrapped or unwrapped on its own. Sub-range i, 0 <= i <= n_splits, starts at
+// split_offsets[i - 1] (0 for i == 0). The calls below act on sub-range i as the whole-buffer calls above act on a
+// buffer. On a split buffer the whole-buffer calls act on every sub-range; they change nothing and return false when
+// one sub-range refuses: unwrap when a sub-range is already unwrapped, rewrap when one is wrapped, request_residency
+// when one is unwrapped.
+//
+// Handoff: the first call, per sub-range or whole-buffer, that names a sub-range hands that sub-range's residency set
+// to the caller; a whole-buffer call names every sub-range. From then on the backend neither requests nor keeps alive
+// that set, so the sub-range is resident only while the caller requests it. The sets of sub-ranges no call has named
+// yet stay with the backend. A refused call hands nothing over.
+//
+// Calls on one buffer, per sub-range or whole-buffer, are serialized and may run on any thread; a call on one
+// sub-range never changes another. Before unwrapping sub-range i the caller ends its residency and ensures no command
+// buffer in flight binds sub-range i; work that binds other sub-ranges may be in flight, and may be encoded while
+// sub-range i is unwrapped. Encoding a kernel that uses a tensor in an unwrapped sub-range aborts, naming the tensor.
+//
+// Each returns false, with a log line, when the buffer is not from ggml_backend_metal_buffer_from_host_ptr_split or i
+// is not one of its sub-ranges, and otherwise when its whole-buffer counterpart would for that sub-range
+//
+GGML_BACKEND_API bool ggml_backend_metal_buffer_unwrap_range            (ggml_backend_buffer_t buffer, int i);
+GGML_BACKEND_API bool ggml_backend_metal_buffer_rewrap_range            (ggml_backend_buffer_t buffer, int i);
+GGML_BACKEND_API bool ggml_backend_metal_buffer_request_residency_range (ggml_backend_buffer_t buffer, int i);
+GGML_BACKEND_API bool ggml_backend_metal_buffer_end_residency_range     (ggml_backend_buffer_t buffer, int i);
 
 // buffer type for compute buffers that the caller places in memory it manages, for ggml_backend_sched_new
 // alloc_buffer must return a buffer whose tensors resolve to Metal buffers, e.g. one from

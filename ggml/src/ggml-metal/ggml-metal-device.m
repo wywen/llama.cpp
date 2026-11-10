@@ -2111,6 +2111,19 @@ struct ggml_metal_buffer_wrapper {
     id<MTLBuffer> metal;
 };
 
+// a residency set and the state of the Metal buffers it holds
+struct ggml_metal_buffer_set {
+    // optional MTLResidencySet
+    // note: cannot use explicitly "id<MTLResidencySet>" here because it is not available on certain OSes
+    id rset;
+
+    // host-pointer buffers only (see ggml_metal_buffer_unwrap)
+    // caller_residency: rset is out of the device's keep-alive collection, the caller requests and ends it
+    // unwrapped: the Metal buffers the set holds are released and nil
+    bool        caller_residency;
+    atomic_bool unwrapped;
+};
+
 struct ggml_metal_buffer {
     void * all_data;
     size_t all_size;
@@ -2128,19 +2141,15 @@ struct ggml_metal_buffer {
 
     bool use_residency_sets;
 
-    // optional MTLResidencySet
-    // note: cannot use explicitly "id<MTLResidencySet>" here because it is not available on certain OSes
-    id rset;
+    // the residency sets and the lifecycle state of the Metal buffers they hold: for a split buffer, sets[i] holds
+    // buffers[i] alone; for any other buffer, sets[0] holds every buffer
+    int n_sets;
+    struct ggml_metal_buffer_set sets[GGML_METAL_MAX_BUFFERS];
 
     // pointers to global device
     ggml_metal_device_t dev;
 
-    // host-pointer buffers only (see ggml_metal_buffer_unwrap)
-    // caller_residency: rset is out of the device's keep-alive collection, the caller requests and ends it
-    // unwrapped: every buffers[i].metal is released and nil
-    // residency_lock serializes the calls that change either, or the set
-    bool           caller_residency;
-    atomic_bool    unwrapped;
+    // serializes the calls that change a set, its state or its Metal buffers (see ggml_metal_buffer_unwrap)
     os_unfair_lock residency_lock;
 };
 
@@ -2169,9 +2178,65 @@ static void ggml_metal_log_allocated_size(id<MTLDevice> device, size_t size_alig
     GGML_UNUSED(size_aligned);
 }
 
-// rset init
+// the Metal buffers [*i0, *i1) that sets [s0, s1) hold
+static void ggml_metal_buffer_wrappers_of_sets(ggml_metal_buffer_t buf, int s0, int s1, int * i0, int * i1) {
+    if (buf->split) {
+        *i0 = s0;
+        *i1 = s1;
+    } else {
+        *i0 = 0;
+        *i1 = s1 > s0 ? buf->n_buffers : 0;
+    }
+}
+
+// the set that holds Metal buffer i
+static int ggml_metal_buffer_set_of(ggml_metal_buffer_t buf, int i) {
+    return buf->split ? i : 0;
+}
+
+#if defined(GGML_METAL_HAS_RESIDENCY_SETS)
+// a committed residency set that holds the Metal buffers of set s, or nil with a log line
+static id ggml_metal_buffer_rset_new(ggml_metal_buffer_t buf, int s, NSString * label) API_AVAILABLE(macos(15.0), ios(18.0), tvos(18.0), visionos(2.0)) {
+    int i0 = 0;
+    int i1 = 0;
+    ggml_metal_buffer_wrappers_of_sets(buf, s, s + 1, &i0, &i1);
+
+    MTLResidencySetDescriptor * desc = [[MTLResidencySetDescriptor alloc] init];
+    if (label != nil) {
+        desc.label = label;
+    }
+    desc.initialCapacity = i1 - i0;
+
+    NSError * error = nil;
+    id<MTLResidencySet> rset = [buf->dev->mtl_device newResidencySetWithDescriptor:desc error:&error];
+    [desc release];
+    if (rset == nil) {
+        GGML_LOG_ERROR("%s: failed to create a residency set: %s\n", __func__,
+                error ? [[error description] UTF8String] : "nil");
+        return nil;
+    }
+
+    for (int i = i0; i < i1; ++i) {
+        if (buf->buffers[i].metal != nil) {
+            [rset addAllocation:buf->buffers[i].metal];
+        }
+    }
+    [rset commit];
+
+    return rset;
+}
+#endif
+
+// rset init: one set per sub-range of a split buffer, else one set; with the device's residency sets, each set is made
+// and requests residency here
 static bool ggml_metal_buffer_rset_init(ggml_metal_buffer_t buf) {
-    buf->rset = nil;
+    buf->n_sets = buf->split ? buf->n_buffers : 1;
+
+    for (int s = 0; s < buf->n_sets; ++s) {
+        buf->sets[s].rset             = nil;
+        buf->sets[s].caller_residency = false;
+        atomic_init(&buf->sets[s].unwrapped, false);
+    }
 
     if (!buf->use_residency_sets) {
         return true;
@@ -2179,26 +2244,18 @@ static bool ggml_metal_buffer_rset_init(ggml_metal_buffer_t buf) {
 
 #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
     if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
-        MTLResidencySetDescriptor * desc = [[MTLResidencySetDescriptor alloc] init];
-        desc.label = @"ggml_metal";
-        desc.initialCapacity = buf->n_buffers;
-
-        NSError * error;
-        buf->rset = [buf->dev->mtl_device newResidencySetWithDescriptor:desc error:&error];
-        if (error) {
-            GGML_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
-            [desc release];
-            return false;
+        for (int s = 0; s < buf->n_sets; ++s) {
+            buf->sets[s].rset = ggml_metal_buffer_rset_new(buf, s, @"ggml_metal");
+            if (buf->sets[s].rset == nil) {
+                for (int k = 0; k < s; ++k) {
+                    [buf->sets[k].rset endResidency];
+                    [buf->sets[k].rset release];
+                    buf->sets[k].rset = nil;
+                }
+                return false;
+            }
+            [buf->sets[s].rset requestResidency];
         }
-
-        [desc release];
-
-        for (int i = 0; i < buf->n_buffers; i++) {
-            [buf->rset addAllocation:buf->buffers[i].metal];
-        }
-
-        [buf->rset commit];
-        [buf->rset requestResidency];
 
         return true;
     }
@@ -2207,15 +2264,33 @@ static bool ggml_metal_buffer_rset_init(ggml_metal_buffer_t buf) {
     return true;
 }
 
+// the sets that are not handed over to the caller join, or leave, the device's keep-alive collection
+static void ggml_metal_buffer_rsets_add(ggml_metal_buffer_t buf) {
+    for (int s = 0; s < buf->n_sets; ++s) {
+        ggml_metal_device_rsets_add(buf->dev, buf->sets[s].rset);
+    }
+}
+
+static void ggml_metal_buffer_rsets_rm(ggml_metal_buffer_t buf) {
+    for (int s = 0; s < buf->n_sets; ++s) {
+        if (!buf->sets[s].caller_residency) {
+            ggml_metal_device_rsets_rm(buf->dev, buf->sets[s].rset);
+        }
+    }
+}
+
 // rset free
 static void ggml_metal_buffer_rset_free(ggml_metal_buffer_t buf) {
 #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
     if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
-        if (buf->rset) {
-            [buf->rset endResidency];
-            [buf->rset removeAllAllocations];
-            [buf->rset commit];
-            [buf->rset release];
+        for (int s = 0; s < buf->n_sets; ++s) {
+            id rset = buf->sets[s].rset;
+            if (rset) {
+                [rset endResidency];
+                [rset removeAllAllocations];
+                [rset commit];
+                [rset release];
+            }
         }
     }
 #else
@@ -2298,7 +2373,7 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
         return NULL;
     }
 
-    ggml_metal_device_rsets_add(dev, res->rset);
+    ggml_metal_buffer_rsets_add(res);
 
     //ggml_metal_log_allocated_size(device, size_aligned);
 
@@ -2317,7 +2392,6 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
     res->owned = false;
 
     res->residency_lock = OS_UNFAIR_LOCK_INIT;
-    atomic_init(&res->unwrapped, false);
 
     res->n_buffers = 0;
 
@@ -2398,7 +2472,7 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
         return NULL;
     }
 
-    ggml_metal_device_rsets_add(dev, res->rset);
+    ggml_metal_buffer_rsets_add(res);
 
     return res;
 }
@@ -2446,7 +2520,6 @@ ggml_metal_buffer_t ggml_metal_buffer_map_split(ggml_metal_device_t dev, void * 
     res->split = true;
 
     res->residency_lock = OS_UNFAIR_LOCK_INIT;
-    atomic_init(&res->unwrapped, false);
 
     for (int i = 0; i <= n_splits; ++i) {
         const size_t beg = i == 0        ? 0    : split_offsets[i - 1];
@@ -2482,16 +2555,14 @@ ggml_metal_buffer_t ggml_metal_buffer_map_split(ggml_metal_device_t dev, void * 
         return NULL;
     }
 
-    ggml_metal_device_rsets_add(dev, res->rset);
+    ggml_metal_buffer_rsets_add(res);
 
     return res;
 }
 
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
     @autoreleasepool {
-        if (!buf->caller_residency) {
-            ggml_metal_device_rsets_rm(buf->dev, buf->rset);
-        }
+        ggml_metal_buffer_rsets_rm(buf);
 
         for (int i = 0; i < buf->n_buffers; i++) {
             [buf->buffers[i].metal release];
@@ -2527,39 +2598,81 @@ static bool ggml_metal_buffer_is_host_ptr(ggml_metal_buffer_t buf, const char * 
     return false;
 }
 
-// Takes the buffer's residency set out of the device's keep-alive collection and ends what it
-// requested, or makes the buffer a set when the device keeps none; false when this OS has no
-// residency sets. With the buffer's residency lock held.
-static bool ggml_metal_buffer_take_residency_locked(ggml_metal_buffer_t buf) {
-    if (buf->caller_residency) {
+// The sets a lifecycle call names: every set for a whole-buffer call, or the set of sub-range `range` of a split
+// buffer. False, with a log line, when the buffer is not over host memory, or a per-range call names no sub-range of a
+// split buffer.
+static bool ggml_metal_buffer_sets_of_call(ggml_metal_buffer_t buf, bool whole, int range, int * s0, int * s1, const char * caller) {
+    if (!ggml_metal_buffer_is_host_ptr(buf, caller)) {
+        return false;
+    }
+    if (whole) {
+        *s0 = 0;
+        *s1 = buf->n_sets;
+        return true;
+    }
+    if (!buf->split) {
+        GGML_LOG_ERROR("%s: not a buffer from ggml_backend_metal_buffer_from_host_ptr_split\n", caller);
+        return false;
+    }
+    if (range < 0 || range >= buf->n_sets) {
+        GGML_LOG_ERROR("%s: sub-range %d is not in [0, %d)\n", caller, range, buf->n_sets);
+        return false;
+    }
+    *s0 = range;
+    *s1 = range + 1;
+    return true;
+}
+
+// for a log line: "the buffer" or "sub-range <s> of the buffer"
+static const char * ggml_metal_buffer_set_name(ggml_metal_buffer_t buf, int s, char * name, size_t n) {
+    if (buf->split) {
+        snprintf(name, n, "sub-range %d of the buffer", s);
+    } else {
+        snprintf(name, n, "the buffer");
+    }
+    return name;
+}
+
+// Takes sets [s0, s1) out of the device's keep-alive collection and ends what it requested for them, or makes a set
+// for each that the device keeps none of; false when this OS has no residency sets or a set cannot be made, and then
+// no set is handed over. With the buffer's residency lock held.
+static bool ggml_metal_buffer_take_residency_locked(ggml_metal_buffer_t buf, int s0, int s1) {
+    bool taken = true;
+    for (int s = s0; s < s1; ++s) {
+        taken = taken && buf->sets[s].caller_residency;
+    }
+    if (taken) {
         return true;
     }
 #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
     if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
-        if (buf->rset != nil) {
-            ggml_metal_device_rsets_rm(buf->dev, buf->rset);
-            [buf->rset endResidency];
-        } else {
-            MTLResidencySetDescriptor * desc = [[MTLResidencySetDescriptor alloc] init];
-            desc.initialCapacity = buf->n_buffers;
-
-            NSError * error = nil;
-            id<MTLResidencySet> rset = [buf->dev->mtl_device newResidencySetWithDescriptor:desc error:&error];
-            [desc release];
-            if (rset == nil) {
-                GGML_LOG_ERROR("%s: failed to create a residency set: %s\n", __func__,
-                        error ? [[error description] UTF8String] : "nil");
+        // make the missing sets before handing any over, so that a failure leaves every set where it was
+        id made[GGML_METAL_MAX_BUFFERS] = { nil };
+        for (int s = s0; s < s1; ++s) {
+            if (buf->sets[s].caller_residency || buf->sets[s].rset != nil) {
+                continue;
+            }
+            made[s] = ggml_metal_buffer_rset_new(buf, s, NULL);
+            if (made[s] == nil) {
+                for (int k = s0; k < s; ++k) {
+                    [made[k] release];
+                }
                 return false;
             }
-            for (int i = 0; i < buf->n_buffers; ++i) {
-                if (buf->buffers[i].metal != nil) {
-                    [rset addAllocation:buf->buffers[i].metal];
-                }
-            }
-            [rset commit];
-            buf->rset = rset;
         }
-        buf->caller_residency = true;
+        for (int s = s0; s < s1; ++s) {
+            struct ggml_metal_buffer_set * set = &buf->sets[s];
+            if (set->caller_residency) {
+                continue;
+            }
+            if (set->rset != nil) {
+                ggml_metal_device_rsets_rm(buf->dev, set->rset);
+                [set->rset endResidency];
+            } else {
+                set->rset = made[s];
+            }
+            set->caller_residency = true;
+        }
         return true;
     }
 #endif
@@ -2567,8 +2680,10 @@ static bool ggml_metal_buffer_take_residency_locked(ggml_metal_buffer_t buf) {
     return false;
 }
 
-bool ggml_metal_buffer_unwrap(ggml_metal_buffer_t buf) {
-    if (!ggml_metal_buffer_is_host_ptr(buf, __func__)) {
+static bool ggml_metal_buffer_unwrap_sets(ggml_metal_buffer_t buf, bool whole, int range, const char * caller) {
+    int s0 = 0;
+    int s1 = 0;
+    if (!ggml_metal_buffer_sets_of_call(buf, whole, range, &s0, &s1, caller)) {
         return false;
     }
 
@@ -2576,22 +2691,35 @@ bool ggml_metal_buffer_unwrap(ggml_metal_buffer_t buf) {
 
     os_unfair_lock_lock(&buf->residency_lock);
 
-    if (atomic_load_explicit(&buf->unwrapped, memory_order_relaxed)) {
-        GGML_LOG_ERROR("%s: the buffer is already unwrapped\n", __func__);
-    } else if (ggml_metal_buffer_take_residency_locked(buf)) {
-        // the set holds what it was given, so it lets go of the Metal buffers before they are
-        // released
+    int s_bad = -1;
+    for (int s = s0; s < s1 && s_bad < 0; ++s) {
+        if (atomic_load_explicit(&buf->sets[s].unwrapped, memory_order_relaxed)) {
+            s_bad = s;
+        }
+    }
+
+    if (s_bad >= 0) {
+        char name[64];
+        GGML_LOG_ERROR("%s: %s is already unwrapped\n", caller, ggml_metal_buffer_set_name(buf, s_bad, name, sizeof(name)));
+    } else if (ggml_metal_buffer_take_residency_locked(buf, s0, s1)) {
+        for (int s = s0; s < s1; ++s) {
+            struct ggml_metal_buffer_set * set = &buf->sets[s];
+            // the set holds what it was given, so it lets go of the Metal buffers before they are released
 #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
-        if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
-            [buf->rset removeAllAllocations];
-            [buf->rset commit];
-        }
+            if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
+                [set->rset removeAllAllocations];
+                [set->rset commit];
+            }
 #endif
-        for (int i = 0; i < buf->n_buffers; ++i) {
-            [buf->buffers[i].metal release];
-            buf->buffers[i].metal = nil;
+            int i0 = 0;
+            int i1 = 0;
+            ggml_metal_buffer_wrappers_of_sets(buf, s, s + 1, &i0, &i1);
+            for (int i = i0; i < i1; ++i) {
+                [buf->buffers[i].metal release];
+                buf->buffers[i].metal = nil;
+            }
+            atomic_store_explicit(&set->unwrapped, true, memory_order_relaxed);
         }
-        atomic_store_explicit(&buf->unwrapped, true, memory_order_relaxed);
         res = true;
     }
 
@@ -2600,8 +2728,10 @@ bool ggml_metal_buffer_unwrap(ggml_metal_buffer_t buf) {
     return res;
 }
 
-bool ggml_metal_buffer_rewrap(ggml_metal_buffer_t buf) {
-    if (!ggml_metal_buffer_is_host_ptr(buf, __func__)) {
+static bool ggml_metal_buffer_rewrap_sets(ggml_metal_buffer_t buf, bool whole, int range, const char * caller) {
+    int s0 = 0;
+    int s1 = 0;
+    if (!ggml_metal_buffer_sets_of_call(buf, whole, range, &s0, &s1, caller)) {
         return false;
     }
 
@@ -2609,44 +2739,62 @@ bool ggml_metal_buffer_rewrap(ggml_metal_buffer_t buf) {
 
     os_unfair_lock_lock(&buf->residency_lock);
 
-    if (!atomic_load_explicit(&buf->unwrapped, memory_order_relaxed)) {
-        GGML_LOG_ERROR("%s: the buffer is not unwrapped\n", __func__);
+    int s_bad = -1;
+    for (int s = s0; s < s1 && s_bad < 0; ++s) {
+        if (!atomic_load_explicit(&buf->sets[s].unwrapped, memory_order_relaxed)) {
+            s_bad = s;
+        }
+    }
+
+    if (s_bad >= 0) {
+        char name[64];
+        GGML_LOG_ERROR("%s: %s is not unwrapped\n", caller, ggml_metal_buffer_set_name(buf, s_bad, name, sizeof(name)));
     } else {
         const size_t size_page = sysconf(_SC_PAGESIZE);
 
         // the same ranges ggml_metal_buffer_map or ggml_metal_buffer_map_split wrapped, each page aligned at its start and
-        // rounded up to pages at its end
-        int n_wrapped = 0;
-        for (; n_wrapped < buf->n_buffers; ++n_wrapped) {
-            struct ggml_metal_buffer_wrapper * view = &buf->buffers[n_wrapped];
+        // rounded up to pages at its end; all of them are wrapped before any set changes, so that a failure leaves the
+        // sets unwrapped
+        int i0 = 0;
+        int i1 = 0;
+        ggml_metal_buffer_wrappers_of_sets(buf, s0, s1, &i0, &i1);
+
+        int i_wrapped = i0;
+        for (; i_wrapped < i1; ++i_wrapped) {
+            struct ggml_metal_buffer_wrapper * view = &buf->buffers[i_wrapped];
             const size_t length = ((view->size + size_page - 1) / size_page) * size_page;
             if (length == 0) {
                 continue;
             }
             view->metal = [buf->dev->mtl_device newBufferWithBytesNoCopy:view->data length:length options:MTLResourceStorageModeShared deallocator:nil];
             if (view->metal == nil) {
-                GGML_LOG_ERROR("%s: failed to wrap %8.2f MiB\n", __func__, length / 1024.0 / 1024.0);
+                GGML_LOG_ERROR("%s: failed to wrap %8.2f MiB\n", caller, length / 1024.0 / 1024.0);
                 break;
             }
         }
 
-        if (n_wrapped < buf->n_buffers) {
-            for (int i = 0; i < n_wrapped; ++i) {
+        if (i_wrapped < i1) {
+            for (int i = i0; i < i_wrapped; ++i) {
                 [buf->buffers[i].metal release];
                 buf->buffers[i].metal = nil;
             }
         } else {
+            for (int s = s0; s < s1; ++s) {
 #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
-            if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
-                for (int i = 0; i < buf->n_buffers; ++i) {
-                    if (buf->buffers[i].metal != nil) {
-                        [buf->rset addAllocation:buf->buffers[i].metal];
+                if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
+                    int j0 = 0;
+                    int j1 = 0;
+                    ggml_metal_buffer_wrappers_of_sets(buf, s, s + 1, &j0, &j1);
+                    for (int i = j0; i < j1; ++i) {
+                        if (buf->buffers[i].metal != nil) {
+                            [buf->sets[s].rset addAllocation:buf->buffers[i].metal];
+                        }
                     }
+                    [buf->sets[s].rset commit];
                 }
-                [buf->rset commit];
-            }
 #endif
-            atomic_store_explicit(&buf->unwrapped, false, memory_order_relaxed);
+                atomic_store_explicit(&buf->sets[s].unwrapped, false, memory_order_relaxed);
+            }
             res = true;
         }
     }
@@ -2654,53 +2802,123 @@ bool ggml_metal_buffer_rewrap(ggml_metal_buffer_t buf) {
     os_unfair_lock_unlock(&buf->residency_lock);
 
     return res;
+}
+
+static bool ggml_metal_buffer_request_residency_sets(ggml_metal_buffer_t buf, bool whole, int range, const char * caller) {
+    int s0 = 0;
+    int s1 = 0;
+    if (!ggml_metal_buffer_sets_of_call(buf, whole, range, &s0, &s1, caller)) {
+        return false;
+    }
+
+    bool res = false;
+
+    os_unfair_lock_lock(&buf->residency_lock);
+
+    int s_bad = -1;
+    for (int s = s0; s < s1 && s_bad < 0; ++s) {
+        if (atomic_load_explicit(&buf->sets[s].unwrapped, memory_order_relaxed)) {
+            s_bad = s;
+        }
+    }
+
+    if (s_bad >= 0) {
+        char name[64];
+        GGML_LOG_ERROR("%s: %s is unwrapped\n", caller, ggml_metal_buffer_set_name(buf, s_bad, name, sizeof(name)));
+    } else if (ggml_metal_buffer_take_residency_locked(buf, s0, s1)) {
+#if defined(GGML_METAL_HAS_RESIDENCY_SETS)
+        if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
+            for (int s = s0; s < s1; ++s) {
+                [buf->sets[s].rset requestResidency];
+            }
+            res = true;
+        }
+#endif
+    }
+
+    os_unfair_lock_unlock(&buf->residency_lock);
+
+    return res;
+}
+
+static bool ggml_metal_buffer_end_residency_sets(ggml_metal_buffer_t buf, bool whole, int range, const char * caller) {
+    int s0 = 0;
+    int s1 = 0;
+    if (!ggml_metal_buffer_sets_of_call(buf, whole, range, &s0, &s1, caller)) {
+        return false;
+    }
+
+    bool res = false;
+
+    os_unfair_lock_lock(&buf->residency_lock);
+
+    if (ggml_metal_buffer_take_residency_locked(buf, s0, s1)) {
+#if defined(GGML_METAL_HAS_RESIDENCY_SETS)
+        if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
+            for (int s = s0; s < s1; ++s) {
+                [buf->sets[s].rset endResidency];
+            }
+            res = true;
+        }
+#endif
+    }
+
+    os_unfair_lock_unlock(&buf->residency_lock);
+
+    return res;
+}
+
+bool ggml_metal_buffer_unwrap(ggml_metal_buffer_t buf) {
+    return ggml_metal_buffer_unwrap_sets(buf, true, 0, __func__);
+}
+
+bool ggml_metal_buffer_rewrap(ggml_metal_buffer_t buf) {
+    return ggml_metal_buffer_rewrap_sets(buf, true, 0, __func__);
 }
 
 bool ggml_metal_buffer_request_residency(ggml_metal_buffer_t buf) {
-    if (!ggml_metal_buffer_is_host_ptr(buf, __func__)) {
-        return false;
-    }
-
-    bool res = false;
-
-    os_unfair_lock_lock(&buf->residency_lock);
-
-    if (atomic_load_explicit(&buf->unwrapped, memory_order_relaxed)) {
-        GGML_LOG_ERROR("%s: the buffer is unwrapped\n", __func__);
-    } else if (ggml_metal_buffer_take_residency_locked(buf)) {
-#if defined(GGML_METAL_HAS_RESIDENCY_SETS)
-        if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
-            [buf->rset requestResidency];
-            res = true;
-        }
-#endif
-    }
-
-    os_unfair_lock_unlock(&buf->residency_lock);
-
-    return res;
+    return ggml_metal_buffer_request_residency_sets(buf, true, 0, __func__);
 }
 
 bool ggml_metal_buffer_end_residency(ggml_metal_buffer_t buf) {
-    if (!ggml_metal_buffer_is_host_ptr(buf, __func__)) {
-        return false;
+    return ggml_metal_buffer_end_residency_sets(buf, true, 0, __func__);
+}
+
+bool ggml_metal_buffer_unwrap_range(ggml_metal_buffer_t buf, int i) {
+    return ggml_metal_buffer_unwrap_sets(buf, false, i, __func__);
+}
+
+bool ggml_metal_buffer_rewrap_range(ggml_metal_buffer_t buf, int i) {
+    return ggml_metal_buffer_rewrap_sets(buf, false, i, __func__);
+}
+
+bool ggml_metal_buffer_request_residency_range(ggml_metal_buffer_t buf, int i) {
+    return ggml_metal_buffer_request_residency_sets(buf, false, i, __func__);
+}
+
+bool ggml_metal_buffer_end_residency_range(ggml_metal_buffer_t buf, int i) {
+    return ggml_metal_buffer_end_residency_sets(buf, false, i, __func__);
+}
+
+uint64_t ggml_metal_buffer_rset_members(ggml_metal_buffer_t buf, int s) {
+    uint64_t res = 0;
+    if (s < 0 || s >= buf->n_sets) {
+        return res;
     }
-
-    bool res = false;
-
     os_unfair_lock_lock(&buf->residency_lock);
-
-    if (ggml_metal_buffer_take_residency_locked(buf)) {
 #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
-        if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
-            [buf->rset endResidency];
-            res = true;
+    if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
+        id<MTLResidencySet> rset = buf->sets[s].rset;
+        if (rset != nil) {
+            for (int i = 0; i < buf->n_buffers; ++i) {
+                if (buf->buffers[i].metal != nil && [rset containsAllocation:buf->buffers[i].metal]) {
+                    res |= (uint64_t) 1 << i;
+                }
+            }
         }
-#endif
     }
-
+#endif
     os_unfair_lock_unlock(&buf->residency_lock);
-
     return res;
 }
 
@@ -3103,7 +3321,8 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
     }
 }
 
-bool ggml_metal_buffer_find_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t, struct ggml_metal_buffer_id * res) {
+// the index of the Metal buffer that fully contains t, and t's offset in it, or -1 when none does
+static int ggml_metal_buffer_find_index(ggml_metal_buffer_t buf, const struct ggml_tensor * t, struct ggml_metal_buffer_id * res) {
     const int64_t tsize = ggml_nbytes(t);
 
     // find the view that contains the tensor fully
@@ -3113,20 +3332,31 @@ bool ggml_metal_buffer_find_id(ggml_metal_buffer_t buf, const struct ggml_tensor
         if (ioffs >= 0 && ioffs + tsize <= (int64_t) buf->buffers[i].size) {
             res->metal = buf->buffers[i].metal;
             res->offs  = (size_t) ioffs;
-            return true;
+            return i;
         }
     }
 
     res->metal = nil;
     res->offs  = 0;
-    return false;
+    return -1;
+}
+
+bool ggml_metal_buffer_find_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t, struct ggml_metal_buffer_id * res) {
+    return ggml_metal_buffer_find_index(buf, t, res) >= 0;
 }
 
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {
     struct ggml_metal_buffer_id res = { nil, 0 };
 
-    if (ggml_metal_buffer_find_id(buf, t, &res)) {
-        if (res.metal == nil && atomic_load_explicit(&buf->unwrapped, memory_order_relaxed)) {
+    const int i = ggml_metal_buffer_find_index(buf, t, &res);
+
+    if (i >= 0) {
+        if (res.metal == nil && atomic_load_explicit(&buf->sets[ggml_metal_buffer_set_of(buf, i)].unwrapped, memory_order_relaxed)) {
+            if (buf->split) {
+                GGML_ABORT("%s: tensor '%s' is in sub-range %d of a split buffer, whose Metal buffer was released by "
+                        "ggml_backend_metal_buffer_unwrap or ggml_backend_metal_buffer_unwrap_range; rewrap it before "
+                        "encoding work that uses it", __func__, t->name, i);
+            }
             GGML_ABORT("%s: tensor '%s' is in a buffer whose Metal buffers were released by "
                     "ggml_backend_metal_buffer_unwrap; rewrap it before encoding work that uses it",
                     __func__, t->name);

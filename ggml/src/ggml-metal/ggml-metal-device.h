@@ -382,6 +382,14 @@ bool ggml_metal_buffer_unwrap            (ggml_metal_buffer_t buf);
 bool ggml_metal_buffer_rewrap            (ggml_metal_buffer_t buf);
 bool ggml_metal_buffer_request_residency (ggml_metal_buffer_t buf);
 bool ggml_metal_buffer_end_residency     (ggml_metal_buffer_t buf);
+// sub-range i of a buffer from ggml_metal_buffer_map_split: see ggml_backend_metal_buffer_unwrap_range
+bool ggml_metal_buffer_unwrap_range            (ggml_metal_buffer_t buf, int i);
+bool ggml_metal_buffer_rewrap_range            (ggml_metal_buffer_t buf, int i);
+bool ggml_metal_buffer_request_residency_range (ggml_metal_buffer_t buf, int i);
+bool ggml_metal_buffer_end_residency_range     (ggml_metal_buffer_t buf, int i);
+// the Metal buffers residency set s holds, as a mask of their indices (bit i for buffers[i]); 0 when there is no such
+// set, it is not made yet, or the OS has no residency sets. A split buffer has one set per sub-range, any other one set
+uint64_t ggml_metal_buffer_rset_members(ggml_metal_buffer_t buf, int s);
 
 void   ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size);
 void   ggml_metal_buffer_set_tensor   (ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
