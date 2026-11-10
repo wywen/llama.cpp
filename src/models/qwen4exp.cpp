@@ -993,33 +993,40 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     const auto * mctx_cur = inp->mctx;
 
-    // store to KV cache, ahead of the cut that stages the rows the caller serves: a token can select the new rows
-    {
-        const auto & k_idxs = inp->get_k_idxs();
-        const auto & v_idxs = inp->get_v_idxs();
-
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
-    }
-
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = nullptr;
+    ggml_tensor * v = nullptr;
 
     ggml_tensor * sel = qsel.mask;
     if (sel == nullptr) {
-        // after the stores, the cut stages the selected rows: the graph reads them, not the views of the cache
+        // the caller stores the layer's K/V rows: no cache tensors, the graph outputs the new rows and attends over the
+        // staging of the cut
         if (!cparams.flash_attn) {
             throw std::runtime_error(format("layer %d reads its K/V rows from the caller, which requires flash attention", il));
         }
-        GGML_ASSERT(k->ne[2] == inp_kpool->n_kv);
+        GGML_ASSERT(mctx_cur->get_n_kv() == inp_kpool->n_kv);
+        // the input sets the V store indices, which no op reads here, so keep them allocated
+        ggml_build_forward_expand(gf, inp->get_v_idxs());
 
         const llm_graph_kv_staging st = build_attn_kv_rows(inp_kpool->kv_rows, qsel.top_k, qsel.top_score,
-                inp_kpool->pool_idxs, inp_kpool->tail_idxs, k, v, n_sel, il);
+                inp_kpool->pool_idxs, inp_kpool->tail_idxs, inp->get_k_idxs(), k_cur, v_cur,
+                mctx_cur->type_k(), mctx_cur->type_v(), inp_kpool->n_kv, n_sel, il);
         k   = st.k;
         v   = st.v;
         sel = st.mask;
     } else {
+        // store to KV cache
+        {
+            const auto & k_idxs = inp->get_k_idxs();
+            const auto & v_idxs = inp->get_v_idxs();
+
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        }
+
+        k = mctx_cur->get_k(ctx0, il);
+        v = mctx_cur->get_v(ctx0, il);
+
         // the selection replaces the kq_mask: split it into the streams of the K view
         const int64_t n_stream = k->ne[3];
         GGML_ASSERT(sel->ne[0] == k->ne[2] && sel->ne[1] % n_stream == 0);

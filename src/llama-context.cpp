@@ -394,6 +394,15 @@ llama_memory_i * llama_context_create_memory(
         /*.set_user_data =*/ params.cb_kv_rot_set_user_data,
     });
 
+    // the sparse attention layers whose K/V rows the caller stores get no K/V tensors
+    llama_kv_cache_rows_params rows_params;
+    if (params.kv_rows != nullptr) {
+        rows_params.caller_rows = [&model](uint32_t il) {
+            return llama_model_kv_rows_layer(model, il);
+        };
+    }
+    const llama_kv_cache_rows_scope rows_scope(rows_params);
+
     return model.create_memory(params_mem, cparams);
 }
 
@@ -467,6 +476,9 @@ llama_context::llama_context(
         }
         if (!params.kv_unified && params.n_seq_max > 1) {
             throw std::runtime_error("kv_rows requires one KV stream (kv_unified or n_seq_max == 1)");
+        }
+        if (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+            throw std::runtime_error("kv_rows requires a default context type");
         }
     }
 
@@ -1984,9 +1996,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the host ops of the graph have run once the compute returns: the CPU computes its splits synchronously
     try {
-        res->check_computed();
+        res->after_compute(sched.get());
     } catch (const std::exception & err) {
-        // e.g. the caller failed to read the K/V rows of a sparse attention layer
+        // e.g. the caller failed to read or write the K/V rows of a sparse attention layer
         LLAMA_LOG_ERROR("%s: failed to compute graph: %s\n", __func__, err.what());
         ret = GGML_STATUS_FAILED;
         return nullptr;

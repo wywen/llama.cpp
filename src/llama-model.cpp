@@ -1002,6 +1002,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     GGML_UNUSED(userdata);
 }
 
+bool llama_model_kv_rows_layer(const llama_model & model, uint32_t il) {
+    const llama_hparams & hp = model.hparams;
+    return llm_arch_supports_kv_rows(model.arch) && il < hp.n_layer() && !hp.is_recr(il) && hp.dsv4_compress_ratios[il] > 0;
+}
+
 const char * llm_type_name(llm_type type) {
     switch (type) {
         case LLM_TYPE_14M:           return "14M";

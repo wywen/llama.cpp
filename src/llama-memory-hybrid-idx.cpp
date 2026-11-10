@@ -219,6 +219,12 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    // the caller stores the attention K rows of some layers, which cannot be shifted: shift none of the caches
+    if (shift != 0 && get_mem_attn()->has_caller_rows()) {
+        LLAMA_LOG_ERROR("%s: the caller stores the K rows of some layers (kv_rows), which cannot be shifted: refusing the shift\n", __func__);
+        return;
+    }
+
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
 
     if (mem_idx) {
@@ -230,6 +236,12 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
 }
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    // the caller stores the attention K rows of some layers, which cannot be shifted: shift none of the caches
+    if (d != 1 && get_mem_attn()->has_caller_rows()) {
+        LLAMA_LOG_ERROR("%s: the caller stores the K rows of some layers (kv_rows), which cannot be shifted: refusing the shift\n", __func__);
+        return;
+    }
+
     llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
 
     if (mem_idx) {

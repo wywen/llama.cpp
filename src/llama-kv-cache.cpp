@@ -78,6 +78,24 @@ const llama_kv_cache_rot_params & llama_kv_cache_rot_scope::current() {
 }
 
 //
+// llama_kv_cache_rows_scope
+//
+
+static thread_local llama_kv_cache_rows_params kv_cache_rows_params;
+
+llama_kv_cache_rows_scope::llama_kv_cache_rows_scope(const llama_kv_cache_rows_params & params) : outer(kv_cache_rows_params) {
+    kv_cache_rows_params = params;
+}
+
+llama_kv_cache_rows_scope::~llama_kv_cache_rows_scope() {
+    kv_cache_rows_params = outer;
+}
+
+const llama_kv_cache_rows_params & llama_kv_cache_rows_scope::current() {
+    return kv_cache_rows_params;
+}
+
+//
 // llama_kv_cache
 //
 
@@ -108,6 +126,8 @@ llama_kv_cache::llama_kv_cache(
     // a plan must leave the source cache's cells alone, so it sizes a private copy instead
     v_cells_impl(other && !llama_memory_alloc_planning() ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
+    cache_type_k = type_k;
+    cache_type_v = type_v;
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -183,6 +203,12 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    // the attention cache of a context whose caller stores the K/V rows of some layers
+    const auto & rows_params = llama_kv_cache_rows_scope::current();
+    const auto caller_rows_of = [&](uint32_t il) {
+        return name_tag[0] == 0 && !is_indexer && !other && rows_params.caller_rows && rows_params.caller_rows(il);
+    };
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -243,6 +269,16 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
+        if (caller_rows_of(il)) {
+            LLAMA_LOG_DEBUG("%s: layer %3d: the caller stores the K/V rows\n", __func__, il);
+
+            caller_rows = true;
+            map_layer_ids[il] = layers.size();
+            layers.push_back({ il, nullptr, nullptr, std::vector<ggml_tensor *>(n_stream, nullptr), std::vector<ggml_tensor *>(n_stream, nullptr), });
+            layers.back().buft = buft;
+            continue;
+        }
+
         ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
             throw std::runtime_error("failed to create ggml context for kv cache");
@@ -268,6 +304,7 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.back().buft = buft;
     }
 
     if (reuse) {
@@ -423,11 +460,13 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
         for (bool is_k : { true, false }) {
             const uint32_t n_rot = is_k ? n_rot_k : n_rot_v;
             auto * cache = is_k ? layer.k : layer.v;
-            if (!n_rot || !cache) {
+            // a layer whose rows the caller stores still rotates them as its cache would
+            const bool rotates = cache != nullptr || (layer.buft != nullptr && layer.k == nullptr && layer.v == nullptr && (is_k || !hparams.is_mla()));
+            if (!n_rot || !rotates) {
                 continue;
             }
 
-            const auto buft = rot_buft ? rot_buft : ggml_backend_buffer_get_type(cache->buffer);
+            const auto buft = rot_buft ? rot_buft : cache ? ggml_backend_buffer_get_type(cache->buffer) : layer.buft;
             auto & ctx = ctx_map[buft];
             if (!ctx) {
                 ggml_init_params params = { 2*layers.size()*ggml_tensor_overhead(), nullptr, true };
@@ -674,6 +713,11 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         return;
     }
 
+    if (caller_rows && shift != 0) {
+        LLAMA_LOG_ERROR("%s: the caller stores the K rows of some layers, which cannot be shifted: refusing the shift\n", __func__);
+        return;
+    }
+
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
 
@@ -721,6 +765,11 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
+        return;
+    }
+
+    if (caller_rows && d != 1) {
+        LLAMA_LOG_ERROR("%s: the caller stores the K rows of some layers, which cannot be shifted: refusing the shift\n", __func__);
         return;
     }
 
@@ -1011,7 +1060,9 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             for (uint32_t il = 0; il < layers.size(); ++il) {
                 const auto & layer = layers[il];
 
-                ggml_backend_tensor_copy(layer.k_stream[ssrc], layer.k_stream[sdst]);
+                if (layer.k_stream[ssrc]) {
+                    ggml_backend_tensor_copy(layer.k_stream[ssrc], layer.k_stream[sdst]);
+                }
 
                 if (layer.v_stream[ssrc]) {
                     ggml_backend_tensor_copy(layer.v_stream[ssrc], layer.v_stream[sdst]);
@@ -1414,6 +1465,10 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
+    // the caller stores some K rows, so they cannot be rotated here
+    if (caller_rows) {
+        return false;
+    }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
@@ -1449,11 +1504,15 @@ bool llama_kv_cache::get_has_shift() const {
 }
 
 ggml_type llama_kv_cache::type_k() const {
-    return layers[0].k->type;
+    return cache_type_k;
 }
 
 ggml_type llama_kv_cache::type_v() const {
-    return layers[0].v->type;
+    return cache_type_v;
+}
+
+bool llama_kv_cache::has_caller_rows() const {
+    return caller_rows;
 }
 
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
@@ -2253,7 +2312,7 @@ size_t llama_kv_cache::size_k_bytes() const {
     size_t size_k_bytes = 0;
 
     for (const auto & layer : layers) {
-        size_k_bytes += ggml_nbytes(layer.k);
+        size_k_bytes += layer.k ? ggml_nbytes(layer.k) : 0;
     }
 
     return size_k_bytes;
@@ -2398,6 +2457,10 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
+    if (caller_rows) {
+        throw std::runtime_error("the caller stores the K/V rows of some layers (kv_rows), so the state cannot hold them");
+    }
+
     io.write(&n_stream, sizeof(n_stream));
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -2478,6 +2541,10 @@ const slot_info_vec_t *   sinfos_in) {
 
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && swa_type == LLAMA_SWA_TYPE_NONE) {
         return;
+    }
+
+    if (caller_rows) {
+        throw std::runtime_error("the caller stores the K/V rows of some layers (kv_rows), so the state cannot hold them");
     }
 
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]

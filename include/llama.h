@@ -283,10 +283,13 @@ extern "C" {
     // returns false to fail the computation
     typedef bool (*llama_lookup_rows_callback)(int32_t table, const int32_t * rows, int32_t n_rows, void * dst, size_t row_size, void * user_data);
 
-    // called at the cut of a sparse attention layer il, see "Sparse attention K/V rows served by the caller"
-    // writes the bytes of row cells[i] of the layer's K cache (v == false) or V cache (v == true), as the context stores
-    // it, at dst + i*row_size for each i in [0, n_cells); returns false to fail the computation
-    typedef bool (*llama_kv_rows_callback)(int32_t il, bool v, const int32_t * cells, int32_t n_cells, void * dst, size_t row_size, void * user_data);
+    // reads or writes the K/V rows of sparse attention layer il, which the caller stores, see "Sparse attention K/V rows
+    // stored by the caller"; the rows of K (v == false) or V (v == true) of cells[i], as the cache would store them, are
+    // at rows + i*row_size for each i in [0, n_cells)
+    // write == false: at the layer's cut, writes the rows of cells that it stored before into `rows`
+    // write == true:  after the graph computes, copies the ubatch's new rows from `rows` to its store
+    // returns false to fail the computation
+    typedef bool (*llama_kv_rows_callback)(int32_t il, bool v, bool write, const int32_t * cells, int32_t n_cells, void * rows, size_t row_size, void * user_data);
 
     // Input data for llama_encode/llama_decode
     // A llama_batch object can contain input about one or many sequences
@@ -497,8 +500,8 @@ extern "C" {
         llama_lookup_rows_callback lookup_rows;
         void *                     lookup_rows_user_data;
 
-        // reads the K/V rows that the sparse attention layers attend to, see "Sparse attention K/V rows served by the
-        // caller"; NULL = the layers read their K/V cache [EXPERIMENTAL]
+        // stores the K/V rows of the sparse attention layers in place of the context, see "Sparse attention K/V rows
+        // stored by the caller"; NULL = the layers have K/V caches [EXPERIMENTAL]
         llama_kv_rows_callback kv_rows;
         void *                 kv_rows_user_data;
 
@@ -923,21 +926,32 @@ extern "C" {
                              int32_t * rows);
 
     //
-    // Sparse attention K/V rows served by the caller [EXPERIMENTAL]
+    // Sparse attention K/V rows stored by the caller [EXPERIMENTAL]
     //
     // A sparse attention layer (the QSA layers of qwen4exp) attends to the cells that its indexer selects for each
     // token. Without llama_context_params.kv_rows its attention reads the whole K/V cache view of the layer, masked to
-    // the selection. With it, the graph of layer il:
-    //   - computes the selection, "indexer_top_k-<il>", and stores the ubatch's new K/V rows in the cache;
-    //   - then, at the cut "qsa_cut-<il>", a host op on the CPU backend takes the union of the cells that the ubatch's
-    //     tokens select, in ascending cell order, and asks the caller for their K rows ("qsa_k_sel-<il>"), then their
-    //     V rows ("qsa_v_sel-<il>"); the union includes the new rows that a token selects;
-    //   - attends over these rows only, with a mask [n_union, n_tokens] that keeps each token's own selection.
-    // No op of the graph reads the layer's K/V cache except the stores. A row is the cell's cache row as the context
-    // stores it: in the cache type (type_k, type_v), rotated when the context rotates its K/V, so the caller copies
-    // the bytes, e.g. from where it keeps the cache. The callback runs on the thread that computes the graph.
-    // Requires flash attention and one KV stream (kv_unified or n_seq_max == 1); a context that cannot use it fails
-    // to initialize.
+    // the selection. With it, the caller stores the layer's K/V rows, and the context has no K/V tensors for the layer
+    // (the indexer cache, and the cell metadata of the attention cache, stay in the context). The graph of layer il:
+    //   - computes the selection ("indexer_top_k-<il>") and the ubatch's new K/V rows as the cache would store them,
+    //     in the cache type (type_k, type_v), rotated when the context rotates its K/V: the graph outputs
+    //     "qsa_k_new-<il>" and "qsa_v_new-<il>" [row, n_tokens];
+    //   - at the cut "qsa_cut-<il>", a host op on the CPU backend takes the union of the cells that the ubatch's
+    //     tokens select, and asks the caller (write == false) for the K rows ("qsa_k_sel-<il>"), then the V rows
+    //     ("qsa_v_sel-<il>") of the cells of the union other than the ubatch's own, in ascending order: cells that
+    //     earlier graphs gave the caller; the ubatch's own cells, selected or not, read the new rows;
+    //   - attends over these rows only, with a mask [n_stage, n_tokens] that keeps each token's own selection.
+    // After the graph computes, before the next graph, the context gives the caller (write == true) the new K rows,
+    // then the new V rows of each such layer, for the cells of the ubatch's tokens in token order; the context
+    // synchronizes its backends first. The callback runs on the thread that calls llama_decode.
+    //
+    // Requires flash attention, one KV stream (kv_unified or n_seq_max == 1) and a default context type; a context
+    // that cannot use it fails to initialize. Without K/V tensors the context refuses:
+    //   - shifting positions (llama_memory_seq_add, llama_memory_seq_div): logged and nothing changes, and
+    //     llama_memory_can_shift is false;
+    //   - saving or loading the state (llama_state_*, llama_state_seq_*), except partial-only sequence states,
+    //     which hold no attention K/V: they fail with an error.
+    // Removing, copying and keeping sequences change the cell metadata only: a copied cell names the same rows, which
+    // the caller keeps by cell.
     //
 
     //
