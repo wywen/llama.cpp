@@ -213,6 +213,15 @@ GGML_BACKEND_API bool ggml_backend_metal_buffer_rewrap            (ggml_backend_
 GGML_BACKEND_API bool ggml_backend_metal_buffer_request_residency (ggml_backend_buffer_t buffer);
 GGML_BACKEND_API bool ggml_backend_metal_buffer_end_residency     (ggml_backend_buffer_t buffer);
 
+// a buffer over host memory like one from ggml_backend_dev_buffer_from_host_ptr, but wrapped in disjoint Metal buffers
+// split at split_offsets, for a caller that binds sub-ranges of one host allocation independently: a kernel that uses a
+// tensor inside one sub-range wires only that sub-range's pages. A tensor or view that crosses a split point is in no
+// Metal buffer, and encoding a kernel that uses it aborts. Unwrap, rewrap and the residency set calls work as above, over the same
+// sub-ranges. ptr must be page aligned; the offsets must be strictly increasing, page aligned and inside (0, size);
+// there are at most 63 of them and no sub-range may be larger than the device's max buffer size. NULL on bad input
+GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_metal_buffer_from_host_ptr_split(
+        ggml_backend_dev_t dev, void * ptr, size_t size, const size_t * split_offsets, int n_splits);
+
 // buffer type for compute buffers that the caller places in memory it manages, for ggml_backend_sched_new
 // alloc_buffer must return a buffer whose tensors resolve to Metal buffers, e.g. one from
 // ggml_backend_dev_buffer_from_host_ptr on the Metal device; max_size bounds each buffer the scheduler requests
