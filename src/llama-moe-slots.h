@@ -92,6 +92,13 @@ struct llama_moe_slot_region {
 
     std::vector<ggml_tensor *> members; // as layer->members: [ne0, ne1, n_slots] at map_size + offset, nb[2] = slot_size
 
+    // the slot ranges: range r holds the slots [bounds[r], bounds[r + 1]); one range [0, n_slots) if not split
+    std::vector<int32_t> bounds;
+
+    int32_t n_ranges() const {
+        return (int32_t) bounds.size() - 1;
+    }
+
     // the member tensor that stands in for the stock expert weight w, nullptr if w is not a member
     ggml_tensor * get(const ggml_tensor * w) const;
 };

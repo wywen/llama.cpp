@@ -255,6 +255,9 @@ extern "C" {
     // returns true if the layer reads its expert weights from slots, see llama_model_params.moe_slots
     typedef bool (*llama_moe_slot_layer_callback)(int32_t il, int32_t n_expert, void * user_data);
 
+    // the most slot ranges of a slot layer in one slot set, see llama_moe_slot_pool_params
+#define LLAMA_MOE_SLOT_MAX_RANGES 64
+
     // the slots of a MoE layer in one slot set of a context, see llama_context_params.moe_slots
     struct llama_moe_slot_pool_params {
         int32_t n_slots;
@@ -266,6 +269,13 @@ extern "C" {
         // the buffers of one layer in all slot sets must be of buffer types that every device supports alike (all or
         // none of them, not necessarily one type object), so that a change of set keeps the graph's splits
         ggml_backend_buffer_type_t buft;
+
+        // slot ranges, see "MoE expert slots": n_range_splits slots, strictly increasing in (0, n_slots), split the
+        // slots into n_range_splits + 1 ranges, range r holding the slots [range_splits[r - 1], range_splits[r])
+        // (from 0 for r == 0, to n_slots for r == n_range_splits); 0 = one range of all the slots
+        // every set with slots for a layer must have the same number of ranges for it
+        int32_t n_range_splits;
+        int32_t range_splits[LLAMA_MOE_SLOT_MAX_RANGES - 1];
     };
 
     // called during context initialization once for each MoE layer il that reads its expert weights from slots and
@@ -813,6 +823,26 @@ extern "C" {
     // A member tensor strides its experts by slot_size, which need not be a whole number of blocks: a device that
     // cannot read such a tensor does not support it, and the layer falls back to the next buffer type.
     //
+    // Slot ranges (llama_moe_slot_pool_params.n_range_splits) split the slots of a layer in a set into ranges of
+    // consecutive slots, for a buffer that a device binds in disjoint parts, such as one from
+    // ggml_backend_metal_buffer_from_host_ptr_split. With more than one range, every op of the graph that reads a
+    // member tensor reads a view of it limited to the slots of one range (named <member>.r<range>, e.g.
+    // blk.0.ffn_up_exps.slots.r1): each expert weight is read by one mul_mat_id per range (named as the unranged node
+    // with a suffix _r<range>, e.g. ffn_moe_up_r1-<il>), whose ids are the slots of the selected experts made local to
+    // the range (ffn_moe_slots_r<range>-<il>), -1 for slots outside it, and the per-range results are summed. Each
+    // selected expert is read in exactly one range, the others give it zero rows, so the router weights and the
+    // expert selection are those of the unranged graph.
+    //
+    // A range [s0, s1) spans the bytes [map_size + s0*slot_size, map_size + s1*slot_size) of the region, and the slot
+    // map the bytes [0, n_expert*4). A buffer split at map_size and at the start of each range keeps the slot map and
+    // each range in its own part; the offsets are multiples of llama_model_params.moe_slot_alignment, so an alignment
+    // that is a multiple of the page size makes them page aligned.
+    //
+    // Every range is read by every graph that computes the layer, whichever experts the router selects: the op of a
+    // range none of whose slots are selected still binds the range (on Metal, wiring its pages), and the range must be
+    // readable, e.g. a sub-range of a split Metal buffer must be wrapped. Skipping the ranges that no selected expert
+    // reads is not supported yet.
+    //
 
 #define LLAMA_MOE_SLOT_MAX_MEMBERS 3
 
@@ -837,6 +867,10 @@ extern "C" {
 
         int32_t n_members;
         struct llama_moe_slot_member members[LLAMA_MOE_SLOT_MAX_MEMBERS]; // in slot order
+
+        // the slot ranges, as in llama_moe_slot_pool_params; 0 = one range
+        int32_t n_range_splits;
+        int32_t range_splits[LLAMA_MOE_SLOT_MAX_RANGES - 1];
     };
 
     // a range of a model file that holds part of an expert's slot contents

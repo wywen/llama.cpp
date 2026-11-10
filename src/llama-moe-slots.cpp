@@ -70,7 +70,7 @@ llama_moe_slot_pool::llama_moe_slot_pool(const llama_moe_slots & slots, uint32_t
 void llama_moe_slot_pool::add_region(int32_t set, const llama_moe_slot_layer * layer, llama_moe_slot_pool_callback get_params, void * user_data, bool no_alloc) {
     const int32_t il = layer->il;
 
-    const llama_moe_slot_pool_params pp = get_params ? get_params(il, layer->n_expert, set, user_data) : llama_moe_slot_pool_params{ 0, nullptr };
+    const llama_moe_slot_pool_params pp = get_params ? get_params(il, layer->n_expert, set, user_data) : llama_moe_slot_pool_params{};
     const int32_t n = pp.n_slots;
     if (n < 0) {
         throw std::runtime_error(format("layer %d, set %d: invalid number of MoE slots %d", il, set, n));
@@ -78,6 +78,29 @@ void llama_moe_slot_pool::add_region(int32_t set, const llama_moe_slot_layer * l
     // the context never computes this layer while it reads this set
     if (n == 0) {
         return;
+    }
+
+    if (pp.n_range_splits < 0 || pp.n_range_splits > LLAMA_MOE_SLOT_MAX_RANGES - 1) {
+        throw std::runtime_error(format("layer %d, set %d: invalid number of MoE slot range splits %d, at most %d",
+            il, set, pp.n_range_splits, LLAMA_MOE_SLOT_MAX_RANGES - 1));
+    }
+    std::vector<int32_t> bounds = { 0 };
+    for (int32_t r = 0; r < pp.n_range_splits; ++r) {
+        const int32_t s = pp.range_splits[r];
+        if (s <= bounds.back() || s >= n) {
+            throw std::runtime_error(format("layer %d, set %d: MoE slot range split %d at slot %d is not after the previous one and before slot %d",
+                il, set, r, s, n));
+        }
+        bounds.push_back(s);
+    }
+    bounds.push_back(n);
+    // the graph reads each range with its own ops, and a change of set must keep the graph's nodes
+    for (int32_t s = 0; s < set; ++s) {
+        const auto it = regions[s].find(il);
+        if (it != regions[s].end() && it->second.n_ranges() != (int32_t) bounds.size() - 1) {
+            throw std::runtime_error(format("layer %d, set %d: %d MoE slot ranges, set %d has %d; every set of a layer must have the same number of ranges",
+                il, set, (int32_t) bounds.size() - 1, s, it->second.n_ranges()));
+        }
     }
 
     const size_t map_size = layer->map_size();
@@ -105,6 +128,7 @@ void llama_moe_slot_pool::add_region(int32_t set, const llama_moe_slot_layer * l
     region.layer    = layer;
     region.n_slots  = n;
     region.map_size = map_size;
+    region.bounds   = std::move(bounds);
 
     ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead()*(layer->members.size() + 2),
@@ -179,7 +203,8 @@ void llama_moe_slot_pool::add_region(int32_t set, const llama_moe_slot_layer * l
 
     ctxs.push_back(std::move(ctx));
 
-    LLAMA_LOG_INFO("%s: layer %3d, set %d: %d slots of %zu bytes in %s\n", __func__, il, set, n, layer->slot_size, ggml_backend_buft_name(buft));
+    const std::string ranges = region.n_ranges() > 1 ? format(" in %d ranges", region.n_ranges()) : "";
+    LLAMA_LOG_INFO("%s: layer %3d, set %d: %d slots of %zu bytes in %s%s\n", __func__, il, set, n, layer->slot_size, ggml_backend_buft_name(buft), ranges.c_str());
 }
 
 const llama_moe_slot_region * llama_moe_slot_pool::region(int32_t set, int32_t il) const {

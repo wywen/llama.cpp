@@ -1768,20 +1768,47 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s,
-    const llm_graph_moe_slots * slots) const {
+    const llm_graph_moe_slots * slots,
+           const char * name,
+                   int   il) const {
     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
-    // experts read at slots are selected by their slots in the tensor that stands in for w
-    ggml_tensor * res = slots == nullptr || slots->slots == nullptr ?
-        ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
-        ggml_mul_mat_id(ctx0, slots->get(w), cur_mm, slots->slots);
 
-    if (prec_policy) {
-        prec_policy->apply(res);
-    }
+    auto mm = [&](ggml_tensor * as, ggml_tensor * mm_ids) {
+        ggml_tensor * res = ggml_mul_mat_id(ctx0, as, cur_mm, mm_ids);
 
-    if (w->type == GGML_TYPE_NVFP4) {
-        ggml_prec_set_acc(res, GGML_PREC_BF16);
+        if (prec_policy) {
+            prec_policy->apply(res);
+        }
+
+        if (w->type == GGML_TYPE_NVFP4) {
+            ggml_prec_set_acc(res, GGML_PREC_BF16);
+        }
+
+        return res;
+    };
+
+    ggml_tensor * res = nullptr;
+    if (slots == nullptr || slots->slots == nullptr) {
+        res = mm(w, ids);
+    } else if (slots->ranges.empty()) {
+        // experts read at slots are selected by their slots in the tensor that stands in for w
+        res = mm(slots->get(w), slots->slots);
+    } else {
+        // each range reads only its own slots: the other experts' rows are zero, so the sum is the unranged result
+        ggml_tensor * t = slots->get(w);
+        for (size_t r = 0; r < slots->ranges.size(); ++r) {
+            const llm_graph_moe_slots::range & rg = slots->ranges[r];
+            ggml_tensor * as = ggml_view_3d(ctx0, t, t->ne[0], t->ne[1], rg.n, t->nb[1], t->nb[2], (size_t) rg.start*t->nb[2]);
+            ggml_format_name(as, "%s.r%zu", t->name, r);
+            // a weight view: the scheduler places (and offloads) the op by the buffer of its weight, as for t
+            as->buffer = t->buffer;
+            ggml_tensor * part = mm(as, rg.ids);
+            if (name != nullptr) {
+                cb(part, format("%s_r%zu", name, r).c_str(), il);
+            }
+            res = res == nullptr ? part : ggml_add(ctx0, res, part);
+        }
     }
 
     if (w_s) {
@@ -2458,7 +2485,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         if (gate_up_exps) {
             // merged gate_up path: one mul_mat_id, then split into gate and up views
-            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, up_exps_s, slots); // [n_ff*2, n_expert_used, n_tokens]
+            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, up_exps_s, slots, "ffn_moe_gate_up", il); // [n_ff*2, n_expert_used, n_tokens]
             cb(gate_up, "ffn_moe_gate_up", il);
 
             if (up_exps_s) {
@@ -2477,7 +2504,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(up, "ffn_moe_up", il);
         } else {
             // separate gate and up path
-            up = build_lora_mm_id(up_exps, cur, ids, up_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
+            up = build_lora_mm_id(up_exps, cur, ids, up_exps_s, slots, "ffn_moe_up", il); // [n_ff, n_expert_used, n_tokens]
             cb(up, "ffn_moe_up", il);
 
             if (up_exps_s) {
@@ -2490,7 +2517,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
 
             if (gate_exps) {
-                cur = build_lora_mm_id(gate_exps, cur, ids, gate_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
+                cur = build_lora_mm_id(gate_exps, cur, ids, gate_exps_s, slots, "ffn_moe_gate", il); // [n_ff, n_expert_used, n_tokens]
                 cb(cur, "ffn_moe_gate", il);
             } else {
                 cur = up;
@@ -2602,7 +2629,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = amax_src1.res;
         }
 
-        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
+        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, down_exps_s, slots, "ffn_moe_down", il); // [n_embd, n_expert_used, n_tokens]
         //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
         cb(experts, "ffn_moe_down", il);
 
@@ -2772,6 +2799,26 @@ llm_graph_moe_slots llm_graph_context::build_moe_slots(
         ggml_build_forward_expand(gf, slots);
 
         res.slots = ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
+
+        // with slot ranges, the slots local to each range: for a = slot - start + 1, a - 1 inside [start, start + n)
+        // and -1 outside, as min(max(a, 0), 1)*min(max(n + 1 - a, 0), 1)*a - 1, exact for slot counts below 2^24
+        if (region->n_ranges() > 1) {
+            ggml_tensor * f = ggml_cast(ctx0, res.slots, GGML_TYPE_F32);
+            for (int32_t r = 0; r < region->n_ranges(); ++r) {
+                const int32_t start = region->bounds[r];
+                const int32_t n     = region->bounds[r + 1] - start;
+
+                ggml_tensor * a      = ggml_scale_bias(ctx0, f, 1.0f, (float) (1 - start));
+                ggml_tensor * above  = ggml_clamp(ctx0, a, 0.0f, 1.0f);
+                ggml_tensor * below  = ggml_clamp(ctx0, ggml_scale_bias(ctx0, a, -1.0f, (float) (n + 1)), 0.0f, 1.0f);
+                ggml_tensor * local  = ggml_scale_bias(ctx0, ggml_mul(ctx0, ggml_mul(ctx0, above, below), a), 1.0f, -1.0f);
+                ggml_tensor * ids    = ggml_cast(ctx0, local, GGML_TYPE_I32);
+                cb(ids, format("ffn_moe_slots_r%d", r).c_str(), il);
+                ggml_build_forward_expand(gf, ids);
+
+                res.ranges.push_back({ start, n, ids });
+            }
+        }
         return res;
     }
 
