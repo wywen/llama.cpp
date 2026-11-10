@@ -590,6 +590,9 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_FLASH_ATTN_EXT_PARTIAL,
+        GGML_OP_FLASH_ATTN_EXT_MERGE,
+        GGML_OP_FLASH_ATTN_EXT_FINALIZE,
 
         GGML_OP_UNARY,
 
@@ -2559,6 +2562,48 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // Chunked flash attention: attention over a long KV split into disjoint KV ranges.
+    //
+    // ggml_flash_attn_ext_partial takes the same inputs as ggml_flash_attn_ext, restricted to one KV range
+    // (views of K, V and of the matching mask columns), and returns the unnormalized online-softmax state
+    // of each (head, query) row instead of the normalized output:
+    //
+    //   part: [n_embd_v + 2, n_head, n_batch, ne3] F32 !! permuted like res !!
+    //     part[0 .. n_embd_v-1] = O = sum_i exp(s_i - M)*v_i
+    //     part[n_embd_v + 0]    = S = sum_i exp(s_i - M)
+    //     part[n_embd_v + 1]    = M = max_i s_i
+    //
+    // where s_i = scale*q*k_i (with logit_softcap applied), plus slope*mask_i. A row without a finite
+    // score (all of its mask entries are -inf) has O = 0, S = 0 and M = -inf, and merges as the identity.
+    //
+    // The mask view may select columns of a larger mask: its rows must be contiguous (nb[0] == sizeof(f16))
+    // but its row stride may be that of the full mask. Sinks and ggml_flash_attn_ext_set_n_kv_max are not
+    // supported on the partial op: pass the sinks to ggml_flash_attn_ext_finalize.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_partial(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
+
+    // combine two partials of disjoint KV ranges of the same queries (same shape as a and b):
+    //   M = max(Ma, Mb), O = Oa*exp(Ma - M) + Ob*exp(Mb - M), S = Sa*exp(Ma - M) + Sb*exp(Mb - M)
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_merge(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
+    // normalize a partial into the output of ggml_flash_attn_ext: [n_embd_v, n_head, n_batch, ne3] F32
+    // sinks (optional, F32 [n_head]) add exp(sink - M) to the denominator, as ggml_flash_attn_ext_add_sinks does
+    // finalize(partial(range)) equals ggml_flash_attn_ext over that range within numerical tolerance
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_finalize(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * sinks);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
