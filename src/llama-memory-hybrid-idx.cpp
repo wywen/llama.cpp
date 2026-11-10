@@ -375,6 +375,79 @@ int64_t kpool_rank(const std::vector<std::pair<llama_pos, uint32_t>> & cells, ll
 
 llama_memory_hybrid_idx::~llama_memory_hybrid_idx() = default;
 
+struct llama_memory_hybrid_idx_cells::indexer {
+    // null while no ubatch has built a layout yet
+    std::unique_ptr<llama_memory_hybrid_idx::kpool_layout> lay;
+
+    llama_memory_hybrid_idx::stale_pos_t stale = llama_memory_hybrid_idx::stale_pos_clean();
+};
+
+llama_memory_hybrid_idx_cells::llama_memory_hybrid_idx_cells() : pools(std::make_unique<indexer>()) {}
+
+llama_memory_hybrid_idx_cells::~llama_memory_hybrid_idx_cells() = default;
+
+llama_memory_cells_t llama_memory_hybrid_idx::cells_snapshot(llama_seq_id seq_id) const {
+    auto * res = new llama_memory_hybrid_idx_cells();
+
+    get_mem_attn()->cells_snapshot_append(seq_id, res->attn);
+    get_mem_recr()->cells_snapshot_to(res->recr);
+
+    if (mem_idx) {
+        mem_idx->cells_snapshot_append(seq_id, res->idx);
+        if (kpool_lay) {
+            res->pools->lay = std::make_unique<kpool_layout>(*kpool_lay);
+        }
+        res->pools->stale = mem_idx_stale;
+    }
+
+    return res;
+}
+
+void llama_memory_hybrid_idx::cells_restore(llama_seq_id seq_id, const llama_memory_cells_i * snap) {
+    const auto * s = dynamic_cast<const llama_memory_hybrid_idx_cells *>(snap);
+
+    // check every part first, so that a refused snapshot changes nothing
+    const auto fits = [](const llama_kv_cache_cells & cells, const llama_kv_cache * cache) {
+        return cells.entries.size() == 1 && cells.entries[0].cells.size() == cache->get_size();
+    };
+    const bool ok = s && fits(s->attn, get_mem_attn()) && get_mem_recr()->cells_can_restore(s->recr) &&
+                    (mem_idx ? fits(s->idx, mem_idx.get()) : s->idx.entries.empty());
+    if (!ok) {
+        LLAMA_LOG_ERROR("%s: the snapshot was not taken from an indexer hybrid memory of this size, memory left unchanged\n", __func__);
+        return;
+    }
+
+    size_t idx_attn = 0;
+    get_mem_attn()->cells_restore_at(seq_id, s->attn, idx_attn);
+    get_mem_recr()->cells_restore_from(s->recr);
+
+    if (!mem_idx) {
+        return;
+    }
+
+    size_t idx_idx = 0;
+    mem_idx->cells_restore_at(seq_id, s->idx, idx_idx);
+
+    // the restored cells are the stream's, so are the layouts and stale positions of the sequences living in it:
+    // every sequence of a unified cache, else seq_id alone
+    const bool unified = mem_idx->get_n_stream() == 1;
+    const auto & saved = *s->pools;
+    for (llama_seq_id sq = 0; sq < (llama_seq_id) LLAMA_MAX_SEQ; ++sq) {
+        if (!unified && sq != seq_id) {
+            continue;
+        }
+        mem_idx_stale[sq] = saved.stale[sq];
+        if (saved.lay) {
+            if (!kpool_lay) {
+                kpool_lay = std::make_unique<kpool_layout>();
+            }
+            kpool_lay->seqs[sq] = saved.lay->seqs[sq];
+        } else if (kpool_lay) {
+            kpool_lay->seqs[sq] = kpool_layout::seq();
+        }
+    }
+}
+
 const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_layout_get() const {
     GGML_ASSERT(kpool_lay != nullptr);
 
