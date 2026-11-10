@@ -427,6 +427,9 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-metal-encode-window.cpp  LABEL "main behavior backend"  LINK ggml ggml-metal)
     # drives host cuts through the public Metal API on a real device and prints the cost of a cut; skips without one
     llama_build_and_test(test-metal-host-cuts.cpp  LABEL "main behavior backend"  LINK ggml ggml-metal)
+    # resolves views of a split host-pointer buffer through the Metal buffer lookup and computes on them; skips without a device
+    llama_build_and_test(test-metal-split-host-buffer.cpp  LABEL "main behavior backend"  LINK ggml ggml-metal)
+    target_include_directories(test-metal-split-host-buffer PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
 endif()
 
 if (NOT GGML_BACKEND_DL AND GGML_CPU)
