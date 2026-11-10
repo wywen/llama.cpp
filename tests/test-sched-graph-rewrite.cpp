@@ -86,7 +86,7 @@ struct test_graph {
 
 static test_graph build_graph(ggml_tensor * x) {
     ggml_init_params params = {
-        /*.mem_size   =*/ 8*ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false),
+        /*.mem_size   =*/ 9*ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -289,6 +289,23 @@ static void test_backend(ggml_backend_t backend) {
         ggml_free(g.ctx);
     }
     state.dangling = false;
+
+    // a node that names itself as a source, as ggml_cast does, is not a cycle
+    {
+        test_graph g = build_graph(x);
+        ggml_tensor * c = ggml_cast(g.ctx, g.y, GGML_TYPE_F32);
+        CHECK(c->src[1] == c);
+        ggml_set_output(c);
+        ggml_build_forward_expand(g.graph, c);
+        std::vector<float> y, z;
+        compute(g, y, z);
+        std::vector<float> cs(N_X);
+        ggml_backend_tensor_get(c, cs.data(), 0, sizeof(float)*N_X);
+        CHECK(y == y_ref);
+        CHECK(cs == y_ref);
+        ggml_backend_sched_reset(sched);
+        ggml_free(g.ctx);
+    }
 
     // a cleared callback leaves the graph as llama built it
     ggml_backend_sched_set_graph_rewrite_callback(sched, nullptr, nullptr);
