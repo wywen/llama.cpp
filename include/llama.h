@@ -466,6 +466,18 @@ extern "C" {
         ggml_backend_sched_graph_prepare_callback cb_graph_prepare;
         void * cb_graph_prepare_user_data;
 
+        // see ggml_backend_sched_graph_rewrite_callback; runs on every graph that the context's scheduler reserves,
+        // measures or allocates, each time after llama builds it; a graph that llama reuses without building it
+        // again keeps its rewritten nodes and is not passed to the callback again
+        // the callback must not replace the input tensors or the output tensors (logits, embeddings, sampled tokens)
+        // that llama reads and writes: it may rewire their readers, or change such a tensor's op and srcs in place
+        ggml_backend_sched_graph_rewrite_callback cb_graph_rewrite;
+        void * cb_graph_rewrite_user_data;
+
+        // node capacity that each graph and the scheduler reserve beyond the nodes llama builds, for the nodes that
+        // cb_graph_rewrite adds; 0 = no capacity is reserved for a rewrite
+        uint32_t n_graph_nodes_extra;
+
         // called once per graph computed on the context's scheduler (each ubatch of encode and decode, each K-shift),
         // after the asynchronous copies of its outputs have been enqueued and before the inputs of a later graph are
         // written, so that a caller can record backend events that complete with those copies

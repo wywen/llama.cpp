@@ -91,6 +91,9 @@ struct llama_cparams : llama_memory_cparams {
     void * cb_compute_buft_user_data;
     ggml_backend_sched_graph_prepare_callback cb_graph_prepare;
     void * cb_graph_prepare_user_data;
+    ggml_backend_sched_graph_rewrite_callback cb_graph_rewrite;
+    void * cb_graph_rewrite_user_data;
+    uint32_t n_graph_nodes_extra;
     void (*cb_outputs_enqueued)(ggml_backend_sched_t sched, void * user_data);
     void * cb_outputs_enqueued_user_data;
 

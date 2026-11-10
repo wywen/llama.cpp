@@ -461,6 +461,9 @@ llama_context::llama_context(
     cparams.cb_compute_buft_user_data  = params.cb_compute_buft_user_data;
     cparams.cb_graph_prepare           = params.cb_graph_prepare;
     cparams.cb_graph_prepare_user_data = params.cb_graph_prepare_user_data;
+    cparams.cb_graph_rewrite           = params.cb_graph_rewrite;
+    cparams.cb_graph_rewrite_user_data = params.cb_graph_rewrite_user_data;
+    cparams.n_graph_nodes_extra        = params.n_graph_nodes_extra;
     cparams.cb_outputs_enqueued           = params.cb_outputs_enqueued;
     cparams.cb_outputs_enqueued_user_data = params.cb_outputs_enqueued_user_data;
     cparams.kv_rows                       = params.kv_rows;
@@ -981,6 +984,7 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
     ggml_backend_sched_set_reserve_callback(sched.get(), cparams.cb_reserve, cparams.cb_reserve_user_data);
     ggml_backend_sched_set_graph_prepare_callback(sched.get(), cparams.cb_graph_prepare, cparams.cb_graph_prepare_user_data);
+    ggml_backend_sched_set_graph_rewrite_callback(sched.get(), cparams.cb_graph_rewrite, cparams.cb_graph_rewrite_user_data);
     // a caller that tracks per-graph extents wants each graph placed tightly
     ggml_backend_sched_set_replan_on_shrink(sched.get(), cparams.cb_graph_prepare != nullptr);
 }
@@ -3042,6 +3046,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res *= 4;
     }
 
+    // the estimate above covers the nodes that llama builds, not the nodes that a graph rewrite adds
+    res += cparams.n_graph_nodes_extra;
+
     return res;
 }
 
@@ -3179,10 +3186,10 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // initialize scheduler with the specified graph
     if (split_only) {
-        if (sizes) {
-            ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
-        } else {
-            ggml_backend_sched_split_graph(sched.get(), gf);
+        const bool ok = sizes ? ggml_backend_sched_reserve_size(sched.get(), gf, sizes) : ggml_backend_sched_split_graph(sched.get(), gf);
+        if (!ok) {
+            LLAMA_LOG_ERROR("%s: failed to rewrite the graph\n", __func__);
+            return nullptr;
         }
     } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
         GGML_ASSERT(!sizes);
@@ -4592,6 +4599,9 @@ llama_context_params llama_context_default_params() {
         /*.cb_compute_buft_user_data   =*/ nullptr,
         /*.cb_graph_prepare            =*/ nullptr,
         /*.cb_graph_prepare_user_data  =*/ nullptr,
+        /*.cb_graph_rewrite            =*/ nullptr,
+        /*.cb_graph_rewrite_user_data  =*/ nullptr,
+        /*.n_graph_nodes_extra         =*/ 0,
         /*.cb_outputs_enqueued         =*/ nullptr,
         /*.cb_outputs_enqueued_user_data =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
