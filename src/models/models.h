@@ -2774,22 +2774,30 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * inp_pos,
                             int   il);
 
-        // dense self-attention over the cells the QSA mask keeps
+        // the QSA selection of one layer
+        struct qsa_sel {
+            ggml_tensor * mask      = nullptr; // [n_kv, n_tokens] the additive mask, nullptr when the caller serves the rows
+            ggml_tensor * top_k     = nullptr; // [n_top_pool, n_tokens] the picked blocks
+            ggml_tensor * top_score = nullptr; // [n_top_pool, n_tokens] their scores, -inf for the invisible ones; with no mask only
+        };
+
+        // dense self-attention over the cells the QSA mask keeps, or over their rows served by the caller
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
+          llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
-                    ggml_tensor * sel,
-                        int64_t   n_sel,
+                  const qsa_sel & qsel,
                           float   kq_scale,
                             int   il);
 
         // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
         llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
 
-        // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail
-        ggml_tensor * build_qsa_sel(
+        // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail, or the picks alone when the caller
+        // serves the rows
+        qsa_sel build_qsa_sel(
   const llama_memory_hybrid_idx_context * mctx_hyb,
           llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,
