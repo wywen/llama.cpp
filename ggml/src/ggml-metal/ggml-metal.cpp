@@ -1394,4 +1394,24 @@ bool ggml_backend_metal_buffer_end_residency(ggml_backend_buffer_t buffer) {
     return buf != NULL && ggml_metal_buffer_end_residency(buf);
 }
 
+bool ggml_backend_metal_buffer_unwrap_range(ggml_backend_buffer_t buffer, int i) {
+    ggml_metal_buffer_t buf = ggml_backend_metal_buffer_of(buffer);
+    return buf != NULL && ggml_metal_buffer_unwrap_range(buf, i);
+}
+
+bool ggml_backend_metal_buffer_rewrap_range(ggml_backend_buffer_t buffer, int i) {
+    ggml_metal_buffer_t buf = ggml_backend_metal_buffer_of(buffer);
+    return buf != NULL && ggml_metal_buffer_rewrap_range(buf, i);
+}
+
+bool ggml_backend_metal_buffer_request_residency_range(ggml_backend_buffer_t buffer, int i) {
+    ggml_metal_buffer_t buf = ggml_backend_metal_buffer_of(buffer);
+    return buf != NULL && ggml_metal_buffer_request_residency_range(buf, i);
+}
+
+bool ggml_backend_metal_buffer_end_residency_range(ggml_backend_buffer_t buffer, int i) {
+    ggml_metal_buffer_t buf = ggml_backend_metal_buffer_of(buffer);
+    return buf != NULL && ggml_metal_buffer_end_residency_range(buf, i);
+}
+
 GGML_BACKEND_DL_IMPL(ggml_backend_metal_reg)
