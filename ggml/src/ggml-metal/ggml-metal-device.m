@@ -2112,6 +2112,9 @@ struct ggml_metal_buffer {
     int n_buffers;
     struct ggml_metal_buffer_wrapper buffers[GGML_METAL_MAX_BUFFERS];
 
+    // the buffers are disjoint ranges at caller-given offsets (see ggml_metal_buffer_map_split)
+    bool split;
+
     bool use_residency_sets;
 
     // optional MTLResidencySet
@@ -2389,6 +2392,90 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
     return res;
 }
 
+ggml_metal_buffer_t ggml_metal_buffer_map_split(ggml_metal_device_t dev, void * ptr, size_t size, const size_t * split_offsets, int n_splits) {
+    const size_t size_page = sysconf(_SC_PAGESIZE);
+
+    const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(dev);
+
+    if (ptr == NULL || size == 0 || (uintptr_t) ptr % size_page != 0) {
+        GGML_LOG_ERROR("%s: the range must be non-empty and start at a page boundary\n", __func__);
+        return NULL;
+    }
+    if (n_splits < 0 || n_splits + 1 > GGML_METAL_MAX_BUFFERS || (n_splits > 0 && split_offsets == NULL)) {
+        GGML_LOG_ERROR("%s: %d split offsets, at most %d are allowed\n", __func__, n_splits, GGML_METAL_MAX_BUFFERS - 1);
+        return NULL;
+    }
+    for (int i = 0; i <= n_splits; ++i) {
+        const size_t beg = i == 0        ? 0    : split_offsets[i - 1];
+        const size_t end = i == n_splits ? size : split_offsets[i];
+        if (i < n_splits && (end == 0 || end >= size || end % size_page != 0)) {
+            GGML_LOG_ERROR("%s: split offset %d (%zu) is not a page boundary inside the range\n", __func__, i, end);
+            return NULL;
+        }
+        if (end <= beg) {
+            GGML_LOG_ERROR("%s: split offsets are not strictly increasing at %d\n", __func__, i);
+            return NULL;
+        }
+        if (((end - beg + size_page - 1) / size_page) * size_page > props_dev->max_buffer_size) {
+            GGML_LOG_ERROR("%s: sub-range %d (%zu bytes) is larger than the device's max buffer size (%zu)\n",
+                    __func__, i, end - beg, props_dev->max_buffer_size);
+            return NULL;
+        }
+    }
+
+    ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
+
+    res->dev = dev;
+
+    res->all_data = ptr;
+    res->all_size = size;
+
+    res->is_shared = true;
+    res->owned = false;
+    res->split = true;
+
+    res->residency_lock = OS_UNFAIR_LOCK_INIT;
+    atomic_init(&res->unwrapped, false);
+
+    for (int i = 0; i <= n_splits; ++i) {
+        const size_t beg = i == 0        ? 0    : split_offsets[i - 1];
+        const size_t end = i == n_splits ? size : split_offsets[i];
+
+        struct ggml_metal_buffer_wrapper * view = &res->buffers[i];
+        view->data = (uint8_t *) ptr + beg;
+        view->size = end - beg;
+
+        const size_t length = ((view->size + size_page - 1) / size_page) * size_page;
+        view->metal = [dev->mtl_device newBufferWithBytesNoCopy:view->data length:length options:MTLResourceStorageModeShared deallocator:nil];
+        if (view->metal == nil) {
+            GGML_LOG_ERROR("%s: error: failed to wrap sub-range %d, size = %8.2f MiB\n", __func__, i, length / 1024.0 / 1024.0);
+            for (int j = 0; j < i; ++j) {
+                [res->buffers[j].metal release];
+            }
+            free(res);
+            return NULL;
+        }
+
+        ggml_metal_log_allocated_size(dev->mtl_device, length);
+    }
+    res->n_buffers = n_splits + 1;
+
+    res->use_residency_sets = props_dev->use_residency_sets;
+
+    if (!ggml_metal_buffer_rset_init(res)) {
+        GGML_LOG_ERROR("%s: error: failed to initialize residency set\n", __func__);
+        for (int i = 0; i < res->n_buffers; ++i) {
+            [res->buffers[i].metal release];
+        }
+        free(res);
+        return NULL;
+    }
+
+    ggml_metal_device_rsets_add(dev, res->rset);
+
+    return res;
+}
+
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
     @autoreleasepool {
         if (!buf->caller_residency) {
@@ -2516,7 +2603,7 @@ bool ggml_metal_buffer_rewrap(ggml_metal_buffer_t buf) {
     } else {
         const size_t size_page = sysconf(_SC_PAGESIZE);
 
-        // the same ranges ggml_metal_buffer_map wrapped, each page aligned at its start and
+        // the same ranges ggml_metal_buffer_map or ggml_metal_buffer_map_split wrapped, each page aligned at its start and
         // rounded up to pages at its end
         int n_wrapped = 0;
         for (; n_wrapped < buf->n_buffers; ++n_wrapped) {
@@ -3005,30 +3092,42 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
     }
 }
 
-struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {
-    struct ggml_metal_buffer_id res = { nil, 0 };
-
+bool ggml_metal_buffer_find_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t, struct ggml_metal_buffer_id * res) {
     const int64_t tsize = ggml_nbytes(t);
 
     // find the view that contains the tensor fully
     for (int i = 0; i < buf->n_buffers; ++i) {
         const int64_t ioffs = (int64_t) t->data - (int64_t) buf->buffers[i].data;
 
-        //GGML_LOG_INFO("ioffs = %10ld, tsize = %10ld, sum = %10ld, buf->buffers[%d].size = %10ld\n", ioffs, tsize, ioffs + tsize, i, buf->buffers[i].size);
         if (ioffs >= 0 && ioffs + tsize <= (int64_t) buf->buffers[i].size) {
-            res.metal = buf->buffers[i].metal;
-            res.offs  = (size_t) ioffs;
-
-            if (res.metal == nil && atomic_load_explicit(&buf->unwrapped, memory_order_relaxed)) {
-                GGML_ABORT("%s: tensor '%s' is in a buffer whose Metal buffers were released by "
-                        "ggml_backend_metal_buffer_unwrap; rewrap it before encoding work that uses it",
-                        __func__, t->name);
-            }
-
-            //GGML_LOG_INFO("%s: tensor '%16s', offs = %8ld\n", __func__, t->name, *offs);
-
-            return res;
+            res->metal = buf->buffers[i].metal;
+            res->offs  = (size_t) ioffs;
+            return true;
         }
+    }
+
+    res->metal = nil;
+    res->offs  = 0;
+    return false;
+}
+
+struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {
+    struct ggml_metal_buffer_id res = { nil, 0 };
+
+    if (ggml_metal_buffer_find_id(buf, t, &res)) {
+        if (res.metal == nil && atomic_load_explicit(&buf->unwrapped, memory_order_relaxed)) {
+            GGML_ABORT("%s: tensor '%s' is in a buffer whose Metal buffers were released by "
+                    "ggml_backend_metal_buffer_unwrap; rewrap it before encoding work that uses it",
+                    __func__, t->name);
+        }
+
+        return res;
+    }
+
+    if (buf->split) {
+        GGML_ABORT("%s: tensor '%s' crosses a split point of a buffer from "
+                "ggml_backend_metal_buffer_from_host_ptr_split; no single Metal buffer contains it",
+                __func__, t->name);
     }
 
     GGML_LOG_ERROR("%s: error: tensor '%s' buffer is nil\n", __func__, t->name);

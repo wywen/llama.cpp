@@ -1353,6 +1353,26 @@ static ggml_metal_buffer_t ggml_backend_metal_buffer_of(ggml_backend_buffer_t bu
     return (ggml_metal_buffer_t) buffer->context;
 }
 
+ggml_backend_buffer_t ggml_backend_metal_buffer_from_host_ptr_split(
+        ggml_backend_dev_t dev, void * ptr, size_t size, const size_t * split_offsets, int n_splits) {
+    if (dev == NULL || dev->iface.buffer_from_host_ptr != ggml_backend_metal_device_buffer_mapped) {
+        GGML_LOG_ERROR("%s: not a Metal device\n", __func__);
+        return NULL;
+    }
+
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+
+    ggml_metal_buffer_t res = ggml_metal_buffer_map_split(ctx_dev, ptr, size, split_offsets, n_splits);
+
+    if (res == NULL) {
+        return NULL;
+    }
+
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
+
+    return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_mapped(props_dev->device), ggml_backend_metal_buffer_shared_i, res, size);
+}
+
 bool ggml_backend_metal_buffer_unwrap(ggml_backend_buffer_t buffer) {
     ggml_metal_buffer_t buf = ggml_backend_metal_buffer_of(buffer);
     return buf != NULL && ggml_metal_buffer_unwrap(buf);

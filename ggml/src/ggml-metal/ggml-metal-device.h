@@ -367,6 +367,8 @@ typedef struct ggml_metal_buffer * ggml_metal_buffer_t;
 
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared);
 ggml_metal_buffer_t ggml_metal_buffer_map (ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size);
+// see ggml_backend_metal_buffer_from_host_ptr_split
+ggml_metal_buffer_t ggml_metal_buffer_map_split(ggml_metal_device_t dev, void * ptr, size_t size, const size_t * split_offsets, int n_splits);
 
 void   ggml_metal_buffer_free     (ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_base (ggml_metal_buffer_t buf);
@@ -392,6 +394,8 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 // Metal buffer based on the host memory pointer
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
+// the Metal buffer that fully contains t and t's offset in it, or false when none does; never logs or aborts
+bool ggml_metal_buffer_find_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t, struct ggml_metal_buffer_id * res);
 
 #ifdef __cplusplus
 }
