@@ -20,6 +20,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <algorithm>
 #include <array>
@@ -1447,6 +1448,12 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_result::after_compute(ggml_backend_sched_t sched) {
+    for (auto & input : inputs) {
+        input->after_compute(sched);
+    }
+}
+
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
@@ -2811,6 +2818,241 @@ llm_graph_moe_slots llm_graph_context::build_moe_slots(
 
     res.slots = ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
     return res;
+}
+
+void llm_graph_input_kv_rows::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    for (auto & layer : layers) {
+        layer->error.clear();
+    }
+}
+
+void llm_graph_input_kv_rows::after_compute(ggml_backend_sched_t sched) {
+    for (const auto & layer : layers) {
+        if (!layer->error.empty()) {
+            throw std::runtime_error(layer->error);
+        }
+    }
+    if (layers.empty()) {
+        return;
+    }
+
+    // the new rows are graph outputs: read them once the graph has completed
+    ggml_backend_sched_synchronize(sched);
+
+    for (auto & layer : layers) {
+        const int32_t n_new = (int32_t) layer->new_cells.size();
+        for (const bool v : { false, true }) {
+            const ggml_tensor * rows = v ? layer->v_new : layer->k_new;
+            GGML_ASSERT(rows->ne[1] == n_new);
+
+            const size_t size = ggml_nbytes(rows);
+            const void * data = nullptr;
+            if (ggml_backend_buffer_is_host(rows->buffer)) {
+                data = rows->data;
+            } else {
+                layer->scratch.resize(size);
+                ggml_backend_tensor_get(rows, layer->scratch.data(), 0, size);
+                data = layer->scratch.data();
+            }
+            if (!layer->cb(layer->il, v, true, layer->new_cells.data(), n_new, const_cast<void *>(data), rows->nb[1], layer->user_data)) {
+                throw std::runtime_error(format("layer %d: the caller failed to write %d new %s rows", layer->il, n_new, v ? "V" : "K"));
+            }
+        }
+    }
+}
+
+llm_graph_input_kv_rows * llm_graph_context::build_inp_kv_rows() const {
+    return (llm_graph_input_kv_rows *) res->add_input(std::make_unique<llm_graph_input_kv_rows>());
+}
+
+// the cut: the union of the selections of the ubatch's tokens and their own cells, and the mask of each token's
+//     selection over its staging (see llm_graph_kv_staging)
+// src: top_k [n_top, n_tokens] I32, top_score [n_top, n_tokens] F32, blocks [n_blk, n_pick] I32, extra [n_extra, n_tokens] I32,
+//      new_cells [n_tokens] I64
+// dst: F16 [n_stage, n_tokens]
+static void llm_kv_rows_cut(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    auto & st = *(llm_graph_kv_rows *) userdata;
+
+    const ggml_tensor * top_k     = dst->src[0];
+    const ggml_tensor * score     = dst->src[1];
+    const ggml_tensor * blocks    = dst->src[2];
+    const ggml_tensor * extra     = dst->src[3];
+    const ggml_tensor * new_cells = dst->src[4];
+
+    const int64_t n_tokens = dst->ne[1];
+    const int64_t n_stage  = dst->ne[0];
+    const int64_t n_top    = top_k->ne[0];
+    const int64_t n_blk    = blocks->ne[0];
+    const int64_t n_pick   = blocks->ne[1];
+    const int64_t n_extra  = extra->ne[0];
+
+    auto at = [](const ggml_tensor * t, int64_t i0, int64_t i1) {
+        return (const char *) t->data + i0*t->nb[0] + i1*t->nb[1];
+    };
+
+    // visits the cells that token t selects, repeats included
+    auto for_each_cell = [&](int64_t t, auto && fn) {
+        for (int64_t j = 0; j < n_top; ++j) {
+            const int32_t p = *(const int32_t *) at(top_k, j, t);
+            if (p < 0 || p >= n_pick || !(*(const float *) at(score, j, t) > -INFINITY)) {
+                continue;
+            }
+            for (int64_t k = 0; k < n_blk; ++k) {
+                const int32_t c = *(const int32_t *) at(blocks, k, p);
+                if (c >= 0 && c < st.n_kv) {
+                    fn(c);
+                }
+            }
+        }
+        for (int64_t j = 0; j < n_extra; ++j) {
+            const int32_t c = *(const int32_t *) at(extra, j, t);
+            if (c >= 0 && c < st.n_kv) {
+                fn(c);
+            }
+        }
+    };
+
+    // the tokens' own cells come first, in token order: their rows are the new ones
+    st.slot.assign(st.n_kv, -1);
+    st.new_cells.resize(n_tokens);
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        const int64_t c = *(const int64_t *) at(new_cells, t, 0);
+        GGML_ASSERT(c >= 0 && c < st.n_kv && st.slot[c] < 0);
+        st.slot[c] = (int32_t) t;
+        st.new_cells[t] = (int32_t) c;
+    }
+
+    // then the other selected cells, ascending, which the caller serves
+    constexpr int32_t SELECTED = -2;
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for_each_cell(t, [&](int32_t c) {
+            if (st.slot[c] == -1) {
+                st.slot[c] = SELECTED;
+            }
+        });
+    }
+    st.cells.clear();
+    for (int32_t c = 0; c < (int32_t) st.n_kv; ++c) {
+        if (st.slot[c] == SELECTED) {
+            st.slot[c] = (int32_t) (n_tokens + st.cells.size());
+            st.cells.push_back(c);
+        }
+    }
+    // the staging holds n_tokens rows and at most n_tokens*n_sel and n_kv more
+    GGML_ASSERT(n_tokens + (int64_t) st.cells.size() <= n_stage);
+
+    const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        ggml_fp16_t * row = (ggml_fp16_t *) ((char *) dst->data + t*dst->nb[1]);
+        std::fill(row, row + n_stage, drop);
+        for_each_cell(t, [&](int32_t c) { row[st.slot[c]] = keep; });
+    }
+}
+
+// the staged K (V for the V op) rows: the new rows (src 1), then the rows of the other cells of the union, from the
+//     caller; the rows past them are zero
+template <bool V>
+static void llm_kv_rows_stage(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    auto & st = *(llm_graph_kv_rows *) userdata;
+
+    const ggml_tensor * rows_new = dst->src[1];
+
+    const size_t  row_size = dst->nb[1];
+    const int64_t n_new    = rows_new->ne[1];
+    const int64_t n_cells  = (int64_t) st.cells.size();
+
+    GGML_ASSERT(rows_new->nb[1] == row_size && ggml_is_contiguous(rows_new));
+    memcpy(dst->data, rows_new->data, n_new*row_size);
+
+    char * rows_old = (char *) dst->data + n_new*row_size;
+    bool ok = st.error.empty();
+    if (ok && n_cells > 0) {
+        ok = st.cb(st.il, V, false, st.cells.data(), (int32_t) n_cells, rows_old, row_size, st.user_data);
+        if (!ok) {
+            st.error = format("layer %d: the caller failed to read %" PRId64 " %s rows", st.il, n_cells, V ? "V" : "K");
+        }
+    }
+    const int64_t n_zero_from = n_new + (ok ? n_cells : 0);
+    memset((char *) dst->data + n_zero_from*row_size, 0, (dst->ne[1] - n_zero_from)*row_size);
+}
+
+llm_graph_kv_staging llm_graph_context::build_attn_kv_rows(
+        llm_graph_input_kv_rows * inp,
+                ggml_tensor * top_k,
+                ggml_tensor * top_score,
+                ggml_tensor * blocks,
+                ggml_tensor * extra,
+                ggml_tensor * new_cells,
+                ggml_tensor * k_cur,
+                ggml_tensor * v_cur,
+                  ggml_type   type_k,
+                  ggml_type   type_v,
+                    int64_t   n_kv,
+                    int64_t   n_sel,
+                        int   il) const {
+    GGML_ASSERT(cparams.kv_rows != nullptr && inp != nullptr);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32 && top_score->type == GGML_TYPE_F32);
+    GGML_ASSERT(blocks->type == GGML_TYPE_I32 && extra->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_are_same_shape(top_k, top_score) && extra->ne[1] == top_k->ne[1]);
+
+    const int64_t n_tokens = top_k->ne[1];
+    if (new_cells->type != GGML_TYPE_I64 || ggml_nelements(new_cells) != n_tokens) {
+        throw std::runtime_error(format("layer %d reads its K/V rows from the caller, which needs one KV stream", il));
+    }
+    GGML_ASSERT(k_cur->ne[2] == n_tokens && v_cur->ne[2] == n_tokens);
+
+    const int64_t n_stage = n_tokens + std::min(n_tokens*n_sel, n_kv);
+
+    auto st = std::make_unique<llm_graph_kv_rows>();
+    st->cb        = cparams.kv_rows;
+    st->user_data = cparams.kv_rows_user_data;
+    st->il        = il;
+    st->n_kv      = n_kv;
+    llm_graph_kv_rows * state = st.get();
+    inp->layers.push_back(std::move(st));
+
+    // the new rows, as the cache would store them; the caller writes them to their cells after the compute
+    auto rows_new = [&](ggml_tensor * cur, ggml_type type, const char * name) {
+        cur = ggml_cast(ctx0, ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur), type);
+        cb(cur, name, il);
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf, cur);
+        return ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], n_tokens);
+    };
+    state->k_new = rows_new(k_cur, type_k, "qsa_k_new");
+    state->v_new = rows_new(v_cur, type_v, "qsa_v_new");
+
+    ggml_tensor * args[] = { top_k, top_score, blocks, extra, new_cells };
+    ggml_tensor * mask = ggml_custom_4d(ctx0, GGML_TYPE_F16, n_stage, n_tokens, 1, 1, args, 5, llm_kv_rows_cut, 1, state);
+    ggml_backend_sched_set_tensor_backend(sched, mask, backend_cpu);
+    cb(mask, "qsa_cut", il);
+
+    auto rows = [&](ggml_tensor * cur, ggml_tensor * rows_new, ggml_custom_op_t fn, const char * name) {
+        ggml_tensor * deps[] = { mask, rows_new };
+        ggml_tensor * sel = ggml_custom_4d(ctx0, rows_new->type, rows_new->ne[0], n_stage, 1, 1, deps, 2, fn, 1, state);
+        ggml_backend_sched_set_tensor_backend(sched, sel, backend_cpu);
+        cb(sel, name, il);
+
+        return ggml_view_4d(ctx0, sel, cur->ne[0], cur->ne[1], n_stage, 1,
+                ggml_row_size(sel->type, cur->ne[0]), sel->nb[1], sel->nb[1]*n_stage, 0);
+    };
+
+    llm_graph_kv_staging res_st;
+    res_st.k    = rows(k_cur, state->k_new, llm_kv_rows_stage<false>, "qsa_k_sel");
+    res_st.v    = rows(v_cur, state->v_new, llm_kv_rows_stage<true>,  "qsa_v_sel");
+    res_st.mask = ggml_reshape_4d(ctx0, mask, n_stage, n_tokens, 1, 1);
+
+    return res_st;
 }
 
 // input embeddings with optional lora

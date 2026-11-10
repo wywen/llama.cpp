@@ -394,6 +394,15 @@ llama_memory_i * llama_context_create_memory(
         /*.set_user_data =*/ params.cb_kv_rot_set_user_data,
     });
 
+    // the sparse attention layers whose K/V rows the caller stores get no K/V tensors
+    llama_kv_cache_rows_params rows_params;
+    if (params.kv_rows != nullptr) {
+        rows_params.caller_rows = [&model](uint32_t il) {
+            return llama_model_kv_rows_layer(model, il);
+        };
+    }
+    const llama_kv_cache_rows_scope rows_scope(rows_params);
+
     return model.create_memory(params_mem, cparams);
 }
 
@@ -454,6 +463,24 @@ llama_context::llama_context(
     cparams.cb_graph_prepare_user_data = params.cb_graph_prepare_user_data;
     cparams.cb_outputs_enqueued           = params.cb_outputs_enqueued;
     cparams.cb_outputs_enqueued_user_data = params.cb_outputs_enqueued_user_data;
+    cparams.kv_rows                       = params.kv_rows;
+    cparams.kv_rows_user_data             = params.kv_rows_user_data;
+
+    if (cparams.kv_rows != nullptr) {
+        if (!llm_arch_supports_kv_rows(model.arch)) {
+            throw std::runtime_error(format("kv_rows is set, but %s has no sparse attention layers that read K/V rows from the caller",
+                llm_arch_name(model.arch)));
+        }
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            throw std::runtime_error("kv_rows requires flash attention");
+        }
+        if (!params.kv_unified && params.n_seq_max > 1) {
+            throw std::runtime_error("kv_rows requires one KV stream (kv_unified or n_seq_max == 1)");
+        }
+        if (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+            throw std::runtime_error("kv_rows requires a default context type");
+        }
+    }
 
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         cparams.rope_scaling_type = hparams.rope_scaling_type_train;
@@ -1964,6 +1991,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
+        return nullptr;
+    }
+
+    // the host ops of the graph have run once the compute returns: the CPU computes its splits synchronously
+    try {
+        res->after_compute(sched.get());
+    } catch (const std::exception & err) {
+        // e.g. the caller failed to read or write the K/V rows of a sparse attention layer
+        LLAMA_LOG_ERROR("%s: failed to compute graph: %s\n", __func__, err.what());
+        ret = GGML_STATUS_FAILED;
         return nullptr;
     }
 
@@ -4569,6 +4606,8 @@ llama_context_params llama_context_default_params() {
         /*.moe_slot_sets               =*/ 1,
         /*.lookup_rows                 =*/ nullptr,
         /*.lookup_rows_user_data       =*/ nullptr,
+        /*.kv_rows                     =*/ nullptr,
+        /*.kv_rows_user_data           =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

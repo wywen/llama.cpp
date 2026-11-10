@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -40,6 +41,28 @@ public:
 
 private:
     llama_kv_cache_rot_params outer;
+};
+
+// which layers of every untagged llama_kv_cache (the attention cache, not the indexer's) constructed on this thread while in
+// scope have K/V rows that the caller stores and serves (see llama_context_params.kv_rows): such a layer keeps its cell
+// metadata and rotation matrices but has no K/V tensors; scopes nest, the innermost applies
+struct llama_kv_cache_rows_params {
+    std::function<bool(uint32_t il)> caller_rows; // empty: every layer has its tensors
+};
+
+class llama_kv_cache_rows_scope {
+public:
+    explicit llama_kv_cache_rows_scope(const llama_kv_cache_rows_params & params);
+    ~llama_kv_cache_rows_scope();
+
+    llama_kv_cache_rows_scope(const llama_kv_cache_rows_scope &) = delete;
+    llama_kv_cache_rows_scope & operator=(const llama_kv_cache_rows_scope &) = delete;
+
+    // the params of the innermost scope on this thread, the defaults outside any scope
+    static const llama_kv_cache_rows_params & current();
+
+private:
+    llama_kv_cache_rows_params outer;
 };
 
 // saved cell metadata of one or more KV caches: one entry per cache, in snapshot order
@@ -217,6 +240,9 @@ public:
     ggml_tensor * get_k_storage(int32_t il) const;
     ggml_tensor * get_v_storage(int32_t il) const; // nullptr for layers without a V cache
 
+    // the layers whose K/V rows the caller stores have no K/V tensors, see llama_kv_cache_rows_scope
+    bool has_caller_rows() const;
+
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
     // The stream holding seq_id's cells.
@@ -326,7 +352,15 @@ private:
 
         ggml_tensor * k_rot = nullptr;
         ggml_tensor * v_rot = nullptr;
+
+        // the buffer type of the layer's tensors; a layer whose K/V rows the caller stores has none, only rotations
+        ggml_backend_buffer_type_t buft = nullptr;
     };
+
+    ggml_type cache_type_k;
+    ggml_type cache_type_v;
+
+    bool caller_rows = false; // some layers have no K/V tensors, see llama_kv_cache_rows_scope
 
     bool v_trans = true;  // the value tensor is transposed
 

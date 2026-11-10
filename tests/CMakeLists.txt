@@ -266,6 +266,11 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
         ARGS --models "${PER_EXPERT_MODEL_DIR}")
     set_tests_properties(test-lookup-pages PROPERTIES FIXTURES_REQUIRED per-expert-models)
 
+    llama_build(test-qsa-staging.cpp)
+    llama_test(test-qsa-staging LABEL "main behavior backend"
+        ARGS --models "${PER_EXPERT_MODEL_DIR}")
+    set_tests_properties(test-qsa-staging PROPERTIES FIXTURES_REQUIRED per-expert-models)
+
     llama_build(test-kpool-views.cpp)
     llama_test(test-kpool-views LABEL "main behavior backend"
         ARGS --models "${PER_EXPERT_MODEL_DIR}")
