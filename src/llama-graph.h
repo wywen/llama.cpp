@@ -12,6 +12,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <string>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -129,12 +130,53 @@ public:
         GGML_UNUSED(params);
         return false;
     }
+
+    // after a compute: throws if the host ops that the graph ran for this input failed
+    virtual void check_computed() const {}
 protected:
     // env: LLAMA_GRAPH_INPUT_DEBUG
     int debug = 0;
 };
 
 using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
+
+// the K/V rows of one sparse attention layer that the caller serves at the layer's cut, see build_attn_kv_rows
+struct llm_graph_kv_rows {
+    llama_kv_rows_callback read      = nullptr;
+    void *                 user_data = nullptr;
+
+    int32_t il   = -1;
+    int64_t n_kv = 0; // the cells that the selection addresses
+
+    std::vector<int32_t> cells; // the union of the ubatch's selections in ascending order, set at the cut
+    std::vector<int32_t> slot;  // [n_kv] the staging row of each cell, -1 for the cells not selected
+
+    std::string error; // the first failure of the layer's host ops in the last compute
+};
+
+// the K/V rows that the sparse attention layers of one graph read from the caller
+// the rows are known only at the cuts, so set_input only clears the errors of the previous compute; the inputs that
+//     the selections read decide reuse
+class llm_graph_input_kv_rows : public llm_graph_input_i {
+public:
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override {
+        GGML_UNUSED(params);
+        return true;
+    }
+
+    void check_computed() const override;
+
+    std::vector<std::unique_ptr<llm_graph_kv_rows>> layers;
+};
+
+// the staging that a sparse attention layer reads in place of its K/V cache views, see build_attn_kv_rows
+struct llm_graph_kv_staging {
+    ggml_tensor * k    = nullptr; // [n_embd_head_k, n_head_kv, n_stage, 1] the selected K rows, in the cache type
+    ggml_tensor * v    = nullptr; // [n_embd_head_v, n_head_kv, n_stage, 1] the selected V rows, in the cache type
+    ggml_tensor * mask = nullptr; // F16 [n_stage, n_tokens, 1, 1] 0 where a token selects a row, -inf elsewhere
+};
 
 // the rows of a lookup table served by the caller that one graph gathers, see llm_graph_context::build_lookup_rows
 // the input of the graph that knows the row ids owns it and calls set from its set_input
@@ -975,6 +1017,9 @@ public:
     void set_inputs(const llama_ubatch * ubatch);
     void set_outputs(const llm_graph_params & params);
 
+    // after a compute: throws if a host op of the graph failed, see llm_graph_input_i::check_computed
+    void check_computed() const;
+
     // try to update the existing graph result using the new graph parameters in order to reuse it
     // this can only be done if we determine that the resulting graph using the new graph parameters
     //   would be identical to the existing graph. in that case, we simply have to update the memory
@@ -1314,6 +1359,27 @@ struct llm_graph_context {
     // n_ids rows of the served lookup table, gathered on the CPU from the rows that the caller writes into `rows`, as
     //     the loaded table would be gathered; throws if the context has no row reader
     ggml_tensor * build_lookup_rows(llm_graph_lookup_rows & rows, const llama_lookup_table & table, int64_t n_ids) const;
+
+    // the K/V rows that sparse attention layer il reads from the caller (cparams.kv_rows) in place of the cache views
+    //     k_view and v_view, which the graph does not read; the stores of the ubatch's new rows must come before
+    // a token's selection is that of ggml_top_k_mask: the member cells (blocks [n_blk, n_pick]) of its live picks
+    //     (top_k [n_top, n_tokens], live when top_score [n_top, n_tokens] is above -inf) and its extra cells
+    //     (extra [n_extra, n_tokens]), within the n_kv cells of the views; n_sel bounds the cells of one token
+    // host ops on the CPU: "qsa_cut-<il>" takes the union of the selections and writes the mask, then
+    //     "qsa_k_sel-<il>" and "qsa_v_sel-<il>" ask the caller for the rows of the union
+    llm_graph_kv_staging build_attn_kv_rows(
+            llm_graph_input_kv_rows * inp,
+                    ggml_tensor * top_k,
+                    ggml_tensor * top_score,
+                    ggml_tensor * blocks,
+                    ggml_tensor * extra,
+                    ggml_tensor * k_view,
+                    ggml_tensor * v_view,
+                        int64_t   n_sel,
+                            int   il) const;
+
+    // the K/V rows input of a graph whose sparse attention layers read their rows from the caller
+    llm_graph_input_kv_rows * build_inp_kv_rows() const;
 
     // applies the RoPE of layer il, cur is returned as is if the layer has none
     ggml_tensor * build_rope(ggml_tensor * cur, ggml_tensor * pos, int il) const;
