@@ -2488,7 +2488,8 @@ static bool ggml_backend_sched_normalize_graph(struct ggml_cgraph * graph) {
                 continue;
             }
             ggml_tensor * src = node->src[next_src++];
-            if (src == nullptr || ggml_hash_contains(&emitted, src)) {
+            // ggml_cast names its own result as src[1]: a node that reads itself is not a cycle
+            if (src == nullptr || src == node || ggml_hash_contains(&emitted, src)) {
                 continue;
             }
             if (!ggml_hash_contains(&in_graph, src)) {
