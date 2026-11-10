@@ -14,6 +14,25 @@
 // llama_memory_hybrid plus a third cache with one indexer key per token, for block-sparse attention (qwen4exp QSA)
 // the indexer is a side buffer over the attention cells: same size, padding, streams and slots, so cell j is one token in both
 
+class llama_memory_hybrid_idx;
+
+// saved cell metadata of a hybrid memory with an indexer cache: the hybrid's two caches, the indexer's cells, and what
+// the indexer keeps beside them to place pooled keys; only llama_memory_hybrid_idx reads the parts past the base
+struct llama_memory_hybrid_idx_cells : llama_memory_hybrid_cells {
+    llama_memory_hybrid_idx_cells();
+    ~llama_memory_hybrid_idx_cells();
+
+    llama_kv_cache_cells idx;
+
+private:
+    friend class llama_memory_hybrid_idx;
+
+    struct indexer;
+
+    // unique_ptr because the pool layout is incomplete here
+    std::unique_ptr<indexer> pools;
+};
+
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
     llama_memory_hybrid_idx(
@@ -65,9 +84,9 @@ public:
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
-    // not supported: the snapshot of the base class would leave the indexer cells out of step with the attention cells
-    llama_memory_cells_t cells_snapshot(llama_seq_id /*seq_id*/) const override { return nullptr; }
-    void cells_restore(llama_seq_id /*seq_id*/, const llama_memory_cells_i * /*snap*/) override {}
+    // all three caches' cells, plus the pool layout and the stale positions that decide what the next ubatch re-pools
+    llama_memory_cells_t cells_snapshot(llama_seq_id seq_id) const override;
+    void cells_restore(llama_seq_id seq_id, const llama_memory_cells_i * snap) override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 

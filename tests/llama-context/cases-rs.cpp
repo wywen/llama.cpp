@@ -587,14 +587,14 @@ struct case_rollback_stale : ctx_test {
 // A restored cells snapshot must place the next ubatches exactly as the memory would have placed them at snapshot time.
 // Cell data is not restored, so each comparison reads only state the detour between snapshot and restore left untouched,
 // against a context that never took the detour. Memories that keep no cells snapshot (DeepSeek V4, and the hybrid
-// memories with sliding window attention or a sparse-attention indexer) must return none.
+// memories with sliding window attention) must return none.
 struct case_cells_snapshot : ctx_test {
     test_group group() const override { return TEST_GROUP_RS; }
 
     const char * name() const override { return "cells_snapshot"; }
 
     const char * description() const override {
-        return "a restored recurrent cells snapshot places the next ubatches like a context that never took the detour";
+        return "a restored recurrent cells snapshot places the next ubatches like a context that never took the detour, and replays them alike";
     }
 
     case_result run(model_run & mr) const override {
@@ -605,8 +605,7 @@ struct case_cells_snapshot : ctx_test {
         char arch_name[64] = {};
         llama_model_meta_val_str(mr.model, "general.architecture", arch_name, sizeof(arch_name));
         const llm_arch arch = llama_arch_from_string(arch_name);
-        const bool no_snapshot = arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_QWEN4EXP ||
-                                 arch == LLM_ARCH_KIMI_K31 || arch == LLM_ARCH_GLM5_NEXT || llama_model_n_swa(mr.model) > 0;
+        const bool no_snapshot = arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || llama_model_n_swa(mr.model) > 0;
 
         const auto make_ctx = [&](uint32_t n_seq_max, uint32_t n_rs_seq) {
             ctx_opts opts;
@@ -688,6 +687,31 @@ struct case_cells_snapshot : ctx_test {
                             decode_stream(ctx_ref.get(), 2, 0, 2*n_ubatch, &logits_ref), tag + "the fresh decode failed");
                 const float diff = max_diff(logits, logits_ref);
                 CTX_REQUIRE(diff == 0.0f, tag + "fresh sequence logits differ from the reference, max diff " + std::to_string(diff));
+            }
+
+            // a replayed prompt: the same ubatches submitted again after a restore are placed, and with an indexer cache
+            // re-pooled, as the first submission was, so every pass computes the same logits
+            {
+                llama_context_ptr ctx = make_ctx(1, n_rs_seq);
+                if (!ctx) {
+                    return case_result::fail();
+                }
+
+                llama_memory_cells_t snap = llama_memory_cells_snapshot(llama_get_memory(ctx.get()), 0);
+                CTX_REQUIRE(snap != nullptr, tag + "no cells snapshot to replay from");
+
+                std::vector<float> logits_first;
+                std::vector<float> logits_replay;
+                bool ok = decode_stream(ctx.get(), 2, 0, 3*n_ubatch, &logits_first);
+                for (int pass = 0; ok && pass < 2; ++pass) {
+                    llama_memory_cells_restore(llama_get_memory(ctx.get()), 0, snap);
+                    logits_replay.clear();
+                    ok = pos_max(ctx.get()) == -1 && decode_stream(ctx.get(), 2, 0, 3*n_ubatch, &logits_replay);
+                }
+                llama_memory_cells_free(snap);
+                CTX_REQUIRE(ok, tag + "the replayed decode failed");
+                const float diff = max_diff(logits_first, logits_replay);
+                CTX_REQUIRE(diff == 0.0f, tag + "replayed prompt logits differ from the first pass, max diff " + std::to_string(diff));
             }
 
             // a pending partial removal: the restore must make it pending again though the detour consumed it; the detour
