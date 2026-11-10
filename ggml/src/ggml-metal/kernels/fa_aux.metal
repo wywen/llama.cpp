@@ -360,6 +360,7 @@ kernel void kernel_flash_attn_ext_vec_idx(
 
 constant int32_t FC_flash_attn_ext_vec_reduce_DV  [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 0)]];
 constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 1)]];
+constant bool    FC_flash_attn_ext_vec_reduce_partial [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 2)]];
 
 kernel void kernel_flash_attn_ext_vec_reduce(
         constant ggml_metal_kargs_flash_attn_ext_vec_reduce & args,
@@ -384,9 +385,34 @@ kernel void kernel_flash_attn_ext_vec_reduce(
     const float ms = exp(M - m);
 
     S = simd_sum(S*ms);
-    S = S == 0.0f ? 0.0f : 1.0f/S;
 
     const short DV4 = DV/4;
+
+    if (FC_flash_attn_ext_vec_reduce_partial) {
+        // one partial row of [O[DV], S, M], O unnormalized - a row without finite scores stores M = -inf
+        device const float4 * htmp4 = (device const float4 *) htmp + rid*DV4*NWG;
+        device       float  * dst1  = (device       float  *) dst  + rid*(DV + 2);
+
+        for (short i = sgitg; i < DV4; i += NWG) {
+            const float4 v = simd_sum(htmp4[i*NWG + iwg]*ms);
+
+            if (iwg == 0) {
+                dst1[4*i + 0] = v[0];
+                dst1[4*i + 1] = v[1];
+                dst1[4*i + 2] = v[2];
+                dst1[4*i + 3] = v[3];
+            }
+        }
+
+        if (sgitg == 0 && iwg == 0) {
+            dst1[DV + 0] = S;
+            dst1[DV + 1] = S == 0.0f ? -INFINITY : m;
+        }
+
+        return;
+    }
+
+    S = S == 0.0f ? 0.0f : 1.0f/S;
 
     device const float4 * htmp4 = (device const float4 *) htmp + rid*DV4*NWG;
     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
@@ -401,6 +427,85 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 
 #undef NWG
 #undef DV
+}
+
+// merge two flash attention partials of disjoint KV ranges, rows of [O[DV], S, M]
+// a partial without finite scores has S = 0 and M = -inf: clamping M keeps the exponents finite
+// under fast math, its weight underflows to 0 against any finite max
+kernel void kernel_flash_attn_ext_merge(
+        constant ggml_metal_kargs_flash_attn_ext_merge & args,
+        device const char * a,
+        device const char * b,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort3  ntg[[threads_per_threadgroup]]) {
+    const int32_t i1 = tgpig.x;
+    const int32_t i2 = tgpig.y;
+    const int32_t i3 = tgpig.z;
+
+    const int32_t DV = args.dv;
+
+    device const float * pa = (device const float *) (a   + i1*args.nb01 + i2*args.nb02 + i3*args.nb03);
+    device const float * pb = (device const float *) (b   + i1*args.nb11 + i2*args.nb12 + i3*args.nb13);
+    device       float * pd = (device       float *) (dst + i1*args.nb1  + i2*args.nb2  + i3*args.nb3);
+
+    const float Ma = max(pa[DV + 1], -FLT_MAX/2);
+    const float Mb = max(pb[DV + 1], -FLT_MAX/2);
+    const float M  = max(Ma, Mb);
+
+    const float sa = exp(Ma - M);
+    const float sb = exp(Mb - M);
+
+    for (int32_t i = tiitg; i < DV; i += ntg.x) {
+        pd[i] = pa[i]*sa + pb[i]*sb;
+    }
+
+    if (tiitg == 0) {
+        const float S = pa[DV + 0]*sa + pb[DV + 0]*sb;
+
+        pd[DV + 0] = S;
+        pd[DV + 1] = S == 0.0f ? -INFINITY : M;
+    }
+}
+
+// normalize a flash attention partial, rows of [O[DV], S, M] -> [DV]
+// the sink only adds to the denominator, as in kernel_flash_attn_ext
+kernel void kernel_flash_attn_ext_finalize(
+        constant ggml_metal_kargs_flash_attn_ext_finalize & args,
+        device const char * a,
+        device const char * sinks,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort3  ntg[[threads_per_threadgroup]]) {
+    const int32_t i1 = tgpig.x;
+    const int32_t i2 = tgpig.y;
+    const int32_t i3 = tgpig.z;
+
+    const int32_t DV = args.dv;
+
+    device const float * pa = (device const float *) (a   + i1*args.nb01 + i2*args.nb02 + i3*args.nb03);
+    device       float * pd = (device       float *) (dst + i1*args.nb1  + i2*args.nb2  + i3*args.nb3);
+
+    float S  = pa[DV + 0];
+    float ms = 1.0f;
+
+    if (args.has_sinks) {
+        // dim 1 is the head
+        const float s = ((device const float *) sinks)[i1];
+        const float M = max(pa[DV + 1], -FLT_MAX/2);
+        const float m = max(M, s);
+
+        ms = exp(M - m);
+        S  = S*ms + exp(s - m);
+    }
+
+    const float scale = S == 0.0f ? 0.0f : ms/S;
+
+    for (int32_t i = tiitg; i < DV; i += ntg.x) {
+        pd[i] = pa[i]*scale;
+    }
 }
 
 constant short FC_lightning_indexer_nh [[function_constant(FC_LIGHTNING_INDEXER + 0)]];

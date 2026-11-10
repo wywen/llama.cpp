@@ -1287,6 +1287,12 @@ struct test_case {
         return nmse(a, b, n);
     }
 
+    // the error of one graph node, t is the node of the first backend
+    virtual double err_node(const ggml_tensor * t, const float * a, const float * b, size_t n) {
+        GGML_UNUSED(t);
+        return err(a, b, n);
+    }
+
     virtual float grad_eps() {
         return 1e-1f;
     }
@@ -1589,7 +1595,7 @@ struct test_case {
                 }
             }
 
-            double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+            double err = ud->tc->err_node(t1, f1.data(), f2.data(), f1.size());
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
                 //for (int i = 0; i < (int) f1.size(); i++) {
@@ -9058,6 +9064,423 @@ struct test_flash_attn_ext_kv_rows : public test_case {
     }
 };
 
+// NMSE over the pairs that are not the same infinity: a partial without finite scores stores M = -inf
+static double nmse_skip_equal_inf(const float * a, const float * b, size_t n) {
+    double mse_a_b = 0.0;
+    double mse_a_0 = 0.0;
+
+    for (size_t i = 0; i < n; i++) {
+        if (std::isinf(a[i]) && a[i] == b[i]) {
+            continue;
+        }
+        mse_a_b += ((double) a[i] - b[i]) * ((double) a[i] - b[i]);
+        mse_a_0 += (double) a[i] * a[i];
+    }
+
+    return mse_a_0 == 0.0 ? mse_a_b : mse_a_b / mse_a_0;
+}
+
+// mask contents for the chunked flash attention tests
+enum fa_partial_mask {
+    FA_PARTIAL_MASK_NONE,   // no mask
+    FA_PARTIAL_MASK_RANDOM, // random values with -inf and zero blocks
+    FA_PARTIAL_MASK_EMPTY,  // every entry -inf: a chunk without valid cells
+    FA_PARTIAL_MASK_ROWS,   // every other query row -inf: rows with and without valid cells
+};
+
+static const char * fa_partial_mask_name(fa_partial_mask m) {
+    switch (m) {
+        case FA_PARTIAL_MASK_NONE:   return "none";
+        case FA_PARTIAL_MASK_RANDOM: return "random";
+        case FA_PARTIAL_MASK_EMPTY:  return "empty";
+        case FA_PARTIAL_MASK_ROWS:   return "rows";
+    }
+    return "?";
+}
+
+static std::string var_to_str(fa_partial_mask m) {
+    return fa_partial_mask_name(m);
+}
+
+static void init_fa_partial_mask(ggml_tensor * t, fa_partial_mask mode) {
+    if (mode == FA_PARTIAL_MASK_RANDOM) {
+        init_tensor_kq_mask(t);
+        return;
+    }
+
+    const int64_t n = ggml_nelements(t);
+    std::vector<float> f(n);
+
+    std::mt19937 gen(0x4641);
+    std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t row = i / t->ne[0];
+        const bool masked = mode == FA_PARTIAL_MASK_EMPTY || (mode == FA_PARTIAL_MASK_ROWS && (row % t->ne[1]) % 2 == 0);
+        f[i] = masked ? -INFINITY : dis(gen);
+    }
+
+    std::vector<ggml_fp16_t> h(n);
+    ggml_fp32_to_fp16_row(f.data(), h.data(), n);
+    ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+}
+
+// GGML_OP_FLASH_ATTN_EXT_PARTIAL
+struct test_flash_attn_ext_partial : public test_case {
+    const int64_t hsk; // K head size
+    const int64_t hsv; // V head size
+    const int64_t nh;  // K/V heads
+    const std::array<int64_t, 2> nr23; // repeat in dim 2 and 3, tests for grouped-query attention
+    const int64_t kv;  // KV cells in the range
+    const int64_t nb;  // batch size
+
+    const fa_partial_mask mask;
+    const bool mask_view; // the mask is a column view of a wider mask
+
+    const float max_bias;
+    const float logit_softcap;
+
+    const ggml_type type_KV;
+
+    std::string vars() override {
+        return VARS_TO_STR11(hsk, hsv, nh, nr23, kv, nb, mask, mask_view, max_bias, logit_softcap, type_KV);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        return nmse_skip_equal_inf(a, b, n);
+    }
+
+    test_flash_attn_ext_partial(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 4, std::array<int64_t, 2> nr23 = {1, 1},
+                                int64_t kv = 256, int64_t nb = 8, fa_partial_mask mask = FA_PARTIAL_MASK_RANDOM, bool mask_view = false,
+                                float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_type type_KV = GGML_TYPE_F16)
+        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), mask_view(mask_view),
+          max_bias(max_bias), logit_softcap(logit_softcap), type_KV(type_KV) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nb, nh*nr23[0], nr23[1]);
+        ggml_set_name(q, "q");
+
+        // K/V are views of a larger buffer, like a KV cache
+        ggml_tensor * k0 = ggml_new_tensor_4d(ctx, type_KV, hsk, 2*kv, nh, nr23[1]);
+        ggml_tensor * v0 = ggml_new_tensor_4d(ctx, type_KV, hsv, 2*kv, nh, nr23[1]);
+        ggml_set_name(k0, "k0");
+        ggml_set_name(v0, "v0");
+
+        ggml_tensor * k = ggml_view_4d(ctx, k0, hsk, kv, nh, nr23[1], k0->nb[1], k0->nb[2], k0->nb[3], 0);
+        ggml_tensor * v = ggml_view_4d(ctx, v0, hsv, kv, nh, nr23[1], v0->nb[1], v0->nb[2], v0->nb[3], 0);
+
+        ggml_tensor * m = nullptr;
+        if (mask != FA_PARTIAL_MASK_NONE) {
+            // the column view starts past the first 64 columns, like a later range of the full mask
+            const int64_t off = mask_view ? 64 : 0;
+
+            ggml_tensor * m0 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv + 2*off, nb, 1, nr23[1]);
+            ggml_set_name(m0, "m");
+
+            m = mask_view ? ggml_view_4d(ctx, m0, kv, nb, 1, nr23[1], m0->nb[1], m0->nb[2], m0->nb[3], off*m0->nb[0]) : m0;
+        }
+
+        ggml_tensor * out = ggml_flash_attn_ext_partial(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue;
+            }
+            if (strcmp(t->name, "m") == 0) {
+                init_fa_partial_mask(t, mask);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// fill a partial [dv + 2, ...] with a valid online-softmax state: O, S > 0 and M finite
+// rows with (row % empty_mod) == empty_rem hold the empty state O = 0, S = 0, M = -inf
+static void init_fa_partial_state(ggml_tensor * t, uint32_t seed, int empty_mod, int empty_rem) {
+    const int64_t dv    = t->ne[0] - 2;
+    const int64_t nrows = ggml_nrows(t);
+
+    std::vector<float> f(ggml_nelements(t));
+
+    std::mt19937 gen(seed);
+    std::uniform_real_distribution<float> dis_o(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> dis_s(0.5f, 8.0f);
+    std::uniform_real_distribution<float> dis_m(-10.0f, 10.0f);
+
+    for (int64_t r = 0; r < nrows; ++r) {
+        float * row = f.data() + r*(dv + 2);
+
+        if (empty_mod > 0 && r % empty_mod == empty_rem) {
+            for (int64_t i = 0; i < dv; ++i) {
+                row[i] = 0.0f;
+            }
+            row[dv + 0] = 0.0f;
+            row[dv + 1] = -INFINITY;
+            continue;
+        }
+
+        const float S = dis_s(gen);
+        for (int64_t i = 0; i < dv; ++i) {
+            row[i] = S*dis_o(gen); // |O| <= S*max|v|
+        }
+        row[dv + 0] = S;
+        row[dv + 1] = dis_m(gen);
+    }
+
+    ggml_backend_tensor_set(t, f.data(), 0, f.size()*sizeof(float));
+}
+
+// GGML_OP_FLASH_ATTN_EXT_MERGE
+struct test_flash_attn_ext_merge : public test_case {
+    const int64_t dv;
+    const int64_t nh;
+    const int64_t nb;
+    const int64_t ne3;
+    const bool empty_a; // every other row of a has no valid cells
+    const bool empty_b; // every third row of b has no valid cells
+
+    std::string vars() override {
+        return VARS_TO_STR6(dv, nh, nb, ne3, empty_a, empty_b);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        return nmse_skip_equal_inf(a, b, n);
+    }
+
+    test_flash_attn_ext_merge(int64_t dv = 128, int64_t nh = 8, int64_t nb = 4, int64_t ne3 = 1, bool empty_a = false, bool empty_b = false)
+        : dv(dv), nh(nh), nb(nb), ne3(ne3), empty_a(empty_a), empty_b(empty_b) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv + 2, nh, nb, ne3);
+        ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv + 2, nh, nb, ne3);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_flash_attn_ext_merge(ctx, a, b);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "a") == 0) {
+                init_fa_partial_state(t, 1, empty_a ? 2 : 0, 0);
+            } else if (strcmp(t->name, "b") == 0) {
+                init_fa_partial_state(t, 2, empty_b ? 3 : 0, 0);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_FLASH_ATTN_EXT_FINALIZE
+struct test_flash_attn_ext_finalize : public test_case {
+    const int64_t dv;
+    const int64_t nh;
+    const int64_t nb;
+    const int64_t ne3;
+    const bool sinks;
+    const bool empty; // every other row has no valid cells
+
+    std::string vars() override {
+        return VARS_TO_STR6(dv, nh, nb, ne3, sinks, empty);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_flash_attn_ext_finalize(int64_t dv = 128, int64_t nh = 8, int64_t nb = 4, int64_t ne3 = 1, bool sinks = false, bool empty = false)
+        : dv(dv), nh(nh), nb(nb), ne3(ne3), sinks(sinks), empty(empty) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv + 2, nh, nb, ne3);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * s = nullptr;
+        if (sinks) {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
+            ggml_set_name(s, "s");
+        }
+
+        ggml_tensor * out = ggml_flash_attn_ext_finalize(ctx, a, s);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "a") == 0) {
+                init_fa_partial_state(t, 3, empty ? 2 : 0, 1);
+            } else if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -10.0f, 10.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// flash attention over n_kv split into chunks of disjoint KV cells: one partial per chunk, merged and
+// finalized, compared with the unchunked ggml_flash_attn_ext of the same inputs
+// the output stacks [chunked, unchunked] along dim 3, the error covers both the comparison between the
+// two halves on each backend and the comparison between the backends
+struct test_flash_attn_ext_chunked : public test_case {
+    const int64_t hsk;
+    const int64_t hsv;
+    const int64_t nh;
+    const std::array<int64_t, 2> nr23;
+    const int64_t kv;
+    const int64_t nb;
+    const int64_t n_chunks;
+    const int64_t align;       // chunk boundaries are multiples of align
+    const fa_partial_mask mask;
+    const int64_t empty_chunk; // index of a chunk whose mask columns are all -inf, or -1
+    const bool sinks;
+    const float max_bias;
+    const float logit_softcap;
+    const ggml_type type_KV;
+
+    std::vector<int64_t> bounds;
+
+    std::string vars() override {
+        return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, n_chunks, align, mask, empty_chunk, sinks, max_bias, logit_softcap, type_KV);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FLASH_ATTN_EXT_FINALIZE";
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    double err_node(const ggml_tensor * t, const float * a, const float * b, size_t n) override {
+        double e = nmse_skip_equal_inf(a, b, n);
+        if (strcmp(t->name, "out") == 0) {
+            // the stacked output: chunked vs unchunked on each backend
+            GGML_ASSERT(n % 2 == 0);
+            e = std::max(e, nmse(a, a + n/2, n/2));
+            e = std::max(e, nmse(b, b + n/2, n/2));
+        }
+        return e;
+    }
+
+    test_flash_attn_ext_chunked(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 4, std::array<int64_t, 2> nr23 = {1, 1},
+                                int64_t kv = 1024, int64_t nb = 8, int64_t n_chunks = 3, int64_t align = 64,
+                                fa_partial_mask mask = FA_PARTIAL_MASK_RANDOM, int64_t empty_chunk = -1, bool sinks = false,
+                                float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_type type_KV = GGML_TYPE_F16)
+        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), n_chunks(n_chunks), align(align), mask(mask),
+          empty_chunk(empty_chunk), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), type_KV(type_KV) {
+        GGML_ASSERT(empty_chunk < 0 || mask != FA_PARTIAL_MASK_NONE);
+
+        bounds.push_back(0);
+        for (int64_t i = 1; i < n_chunks; ++i) {
+            const int64_t c = (i*kv/n_chunks)/align*align;
+            GGML_ASSERT(c > bounds.back() && c < kv);
+            bounds.push_back(c);
+        }
+        bounds.push_back(kv);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nb, nh*nr23[0], nr23[1]);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hsk, kv, nh, nr23[1]);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hsv, kv, nh, nr23[1]);
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+
+        ggml_tensor * m = nullptr;
+        if (mask != FA_PARTIAL_MASK_NONE) {
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+            ggml_set_name(m, "m");
+        }
+
+        ggml_tensor * s = nullptr;
+        if (sinks) {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, q->ne[2]);
+            ggml_set_name(s, "s");
+        }
+
+        const float scale = 1.0f/sqrtf(hsk);
+
+        ggml_tensor * acc = nullptr;
+        for (int64_t i = 0; i < n_chunks; ++i) {
+            const int64_t c0 = bounds[i];
+            const int64_t nc = bounds[i + 1] - c0;
+
+            ggml_tensor * kc = ggml_view_4d(ctx, k, hsk, nc, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], c0*k->nb[1]);
+            ggml_tensor * vc = ggml_view_4d(ctx, v, hsv, nc, nh, nr23[1], v->nb[1], v->nb[2], v->nb[3], c0*v->nb[1]);
+            ggml_tensor * mc = m ? ggml_view_4d(ctx, m, nc, nb, 1, nr23[1], m->nb[1], m->nb[2], m->nb[3], c0*m->nb[0]) : nullptr;
+
+            ggml_tensor * p = ggml_flash_attn_ext_partial(ctx, q, kc, vc, mc, scale, max_bias, logit_softcap);
+            ggml_prec_set_acc(p, GGML_PREC_F32);
+
+            acc = acc ? ggml_flash_attn_ext_merge(ctx, acc, p) : p;
+        }
+
+        ggml_tensor * chunked = ggml_flash_attn_ext_finalize(ctx, acc, s);
+
+        ggml_tensor * ref = ggml_flash_attn_ext(ctx, q, k, v, m, scale, max_bias, logit_softcap);
+        ggml_flash_attn_ext_add_sinks(ref, s);
+        ggml_prec_set_acc(ref, GGML_PREC_F32);
+
+        ggml_tensor * out = ggml_concat(ctx, chunked, ref, 3);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue;
+            }
+            if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -10.0f, 10.0f);
+            } else if (strcmp(t->name, "m") == 0) {
+                init_fa_partial_mask(t, mask);
+
+                if (empty_chunk >= 0) {
+                    // mask out every cell of one chunk
+                    std::vector<ggml_fp16_t> h(ggml_nelements(t));
+                    ggml_backend_tensor_get(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+                    const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+                    for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                        for (int64_t c = bounds[empty_chunk]; c < bounds[empty_chunk + 1]; ++c) {
+                            h[r*kv + c] = ninf;
+                        }
+                    }
+                    ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12766,6 +13189,83 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 10.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
+
+    // FLASH_ATTN_EXT_PARTIAL: flash attention over one KV range, unnormalized with its softmax statistics
+    for (auto [hsk, hsv] : std::vector<std::pair<int64_t, int64_t>>{{64, 64}, {128, 128}, {256, 256}, {576, 512}}) {
+        for (int64_t nr2 : {1, 4}) {
+            for (int64_t nb : {1, 3, 32}) {
+                for (fa_partial_mask mask : {FA_PARTIAL_MASK_RANDOM, FA_PARTIAL_MASK_EMPTY, FA_PARTIAL_MASK_ROWS}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_partial(hsk, hsv, 4, {nr2, 1}, 256, nb, mask));
+                }
+            }
+        }
+    }
+    for (int64_t nb : {1, 32}) {
+        // a KV range that is not a multiple of the kernel cache tile
+        test_cases.emplace_back(new test_flash_attn_ext_partial(128, 128, 4, {2, 1}, 113, nb, FA_PARTIAL_MASK_RANDOM));
+        // the mask is a column view of a wider mask
+        test_cases.emplace_back(new test_flash_attn_ext_partial(128, 128, 4, {2, 1}, 256, nb, FA_PARTIAL_MASK_RANDOM, true));
+        test_cases.emplace_back(new test_flash_attn_ext_partial(128, 128, 4, {2, 1}, 256, nb, FA_PARTIAL_MASK_NONE));
+        test_cases.emplace_back(new test_flash_attn_ext_partial(128, 128, 4, {2, 2}, 256, nb, FA_PARTIAL_MASK_RANDOM));
+        test_cases.emplace_back(new test_flash_attn_ext_partial(128, 128, 4, {2, 1}, 256, nb, FA_PARTIAL_MASK_RANDOM, false, 8.0f));
+        test_cases.emplace_back(new test_flash_attn_ext_partial(128, 128, 4, {2, 1}, 256, nb, FA_PARTIAL_MASK_RANDOM, false, 0.0f, 30.0f));
+        test_cases.emplace_back(new test_flash_attn_ext_partial( 96,  64, 4, {2, 1}, 256, nb, FA_PARTIAL_MASK_RANDOM));
+        test_cases.emplace_back(new test_flash_attn_ext_partial(128, 128, 4, {2, 1}, 256, nb, FA_PARTIAL_MASK_RANDOM, false, 0.0f, 0.0f, GGML_TYPE_F32));
+        test_cases.emplace_back(new test_flash_attn_ext_partial(128, 128, 4, {2, 1}, 256, nb, FA_PARTIAL_MASK_RANDOM, false, 0.0f, 0.0f, GGML_TYPE_Q8_0));
+    }
+
+    // FLASH_ATTN_EXT_MERGE
+    for (int64_t dv : {64, 128, 512}) {
+        for (int64_t nb : {1, 7}) {
+            for (bool empty_a : {false, true}) {
+                for (bool empty_b : {false, true}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_merge(dv, 8, nb, 1, empty_a, empty_b));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_merge(128, 4, 5, 3, true, true));
+
+    // FLASH_ATTN_EXT_FINALIZE
+    for (int64_t dv : {64, 128, 512}) {
+        for (int64_t nb : {1, 7}) {
+            for (bool sinks : {false, true}) {
+                for (bool empty : {false, true}) {
+                    test_cases.emplace_back(new test_flash_attn_ext_finalize(dv, 8, nb, 1, sinks, empty));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_finalize(128, 4, 5, 3, true, true));
+
+    // chunked flash attention: partials over disjoint KV ranges, merged and finalized, against the unchunked op
+    for (int64_t nr2 : {1, 4}) {
+        for (int64_t nb : {1, 8, 32}) {
+            for (int64_t n_chunks : {2, 3, 4}) {
+                test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {nr2, 1}, 1024, nb, n_chunks));
+            }
+        }
+    }
+    for (int64_t nb : {1, 32}) {
+        for (auto [hsk, hsv] : std::vector<std::pair<int64_t, int64_t>>{{64, 64}, {256, 256}, {576, 512}}) {
+            test_cases.emplace_back(new test_flash_attn_ext_chunked(hsk, hsv, 2, {4, 1}, 1024, nb, 3));
+        }
+        // a chunk without valid cells merges as the identity
+        test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1024, nb, 4, 64, FA_PARTIAL_MASK_RANDOM, 1));
+        test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1024, nb, 4, 64, FA_PARTIAL_MASK_RANDOM, 0));
+        // rows without valid cells in any chunk
+        test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1024, nb, 3, 64, FA_PARTIAL_MASK_ROWS));
+        // chunk boundaries off the kernel cache tiles
+        test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1000, nb, 3, 2));
+        test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1024, nb, 3, 64, FA_PARTIAL_MASK_NONE));
+        test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 2}, 1024, nb, 3));
+        // sinks go to the finalize, once
+        test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1024, nb, 3, 64, FA_PARTIAL_MASK_RANDOM, -1, true));
+        test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1024, nb, 3, 64, FA_PARTIAL_MASK_RANDOM, -1, false, 8.0f));
+        test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1024, nb, 3, 64, FA_PARTIAL_MASK_RANDOM, -1, false, 0.0f, 30.0f));
+        test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1024, nb, 3, 64, FA_PARTIAL_MASK_RANDOM, -1, false, 0.0f, 0.0f, GGML_TYPE_F32));
+        test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1024, nb, 3, 64, FA_PARTIAL_MASK_RANDOM, -1, false, 0.0f, 0.0f, GGML_TYPE_Q8_0));
+    }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));

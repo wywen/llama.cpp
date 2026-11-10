@@ -1079,8 +1079,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_FILL: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
-            case GGML_OP_FLASH_ATTN_EXT: {
+            case GGML_OP_FLASH_ATTN_EXT:
+            case GGML_OP_FLASH_ATTN_EXT_PARTIAL: {
                 split_state = handle_flash_attn_ext(src_ss);
+            } break;
+            case GGML_OP_FLASH_ATTN_EXT_MERGE: {
+                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+            } break;
+            case GGML_OP_FLASH_ATTN_EXT_FINALIZE: {
+                // the rows are (head, query) pairs, a head split carries the sinks split along dim 0
+                split_state = handle_per_row(src_ss);
             } break;
             case GGML_OP_FLASH_ATTN_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);

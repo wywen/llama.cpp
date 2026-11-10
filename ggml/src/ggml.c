@@ -1100,6 +1100,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "FLASH_ATTN_EXT_PARTIAL",
+    "FLASH_ATTN_EXT_MERGE",
+    "FLASH_ATTN_EXT_FINALIZE",
 
     "UNARY",
 
@@ -1117,7 +1120,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1216,6 +1219,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "flash_attn_ext_partial(x)",
+    "flash_attn_ext_merge(a, b)",
+    "flash_attn_ext_finalize(x)",
 
     "unary(x)",
 
@@ -1233,7 +1239,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3326,6 +3332,7 @@ bool ggml_prec_set_acc(
             }
             break;
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_EXT_PARTIAL:
             {
                 const int32_t prec_i32 = (int32_t) prec;
                 ggml_set_op_params_i32(a, 3, prec_i32);
@@ -3370,6 +3377,7 @@ enum ggml_prec ggml_prec_get_acc(
         case GGML_OP_MUL_MAT_ID:
             return (enum ggml_prec) ggml_get_op_params_i32(a, 0);
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_EXT_PARTIAL:
             return (enum ggml_prec) ggml_get_op_params_i32(a, 3);
         default:
             return GGML_PREC_UNDEFINED;
@@ -5583,8 +5591,10 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
         struct ggml_tensor  * kv_rows,
         float                 scale,
         float                 max_bias,
-        float                 logit_softcap) {
+        float                 logit_softcap,
+        bool                  partial) {
     GGML_ASSERT(ggml_can_mul_mat(k, q));
+    GGML_ASSERT(!partial || !kv_rows);
     // TODO: check if vT can be multiplied by (k*qT)
 
     if (kv_rows) {
@@ -5601,7 +5611,8 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
 
     if (mask) {
         GGML_ASSERT(mask->type == GGML_TYPE_F16);
-        GGML_ASSERT(ggml_is_contiguous(mask));
+        // a partial attends over a KV range, its mask may be a column view of the full mask
+        GGML_ASSERT(partial ? mask->nb[0] == ggml_type_size(GGML_TYPE_F16) : ggml_is_contiguous(mask));
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
 
         GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
@@ -5613,13 +5624,14 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
     }
 
     // permute(0, 2, 1, 3)
-    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    // a partial row holds the unnormalized output followed by the softmax sum S and max M
+    int64_t ne[4] = { v->ne[0] + (partial ? 2 : 0), q->ne[2], q->ne[1], q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     float params[] = { scale, max_bias, logit_softcap };
     ggml_set_op_params(result, params, sizeof(params));
 
-    result->op     = GGML_OP_FLASH_ATTN_EXT;
+    result->op     = partial ? GGML_OP_FLASH_ATTN_EXT_PARTIAL : GGML_OP_FLASH_ATTN_EXT;
     result->src[0] = q;
     result->src[1] = k;
     result->src[2] = v;
@@ -5638,7 +5650,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
         float                 scale,
         float                 max_bias,
         float                 logit_softcap) {
-    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, NULL, scale, max_bias, logit_softcap);
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, NULL, scale, max_bias, logit_softcap, false);
 }
 
 struct ggml_tensor * ggml_flash_attn_ext_rows(
@@ -5651,7 +5663,61 @@ struct ggml_tensor * ggml_flash_attn_ext_rows(
         float                 scale,
         float                 max_bias,
         float                 logit_softcap) {
-    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, kv_rows, scale, max_bias, logit_softcap);
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, kv_rows, scale, max_bias, logit_softcap, false);
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_partial(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap) {
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, NULL, scale, max_bias, logit_softcap, true);
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_merge(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(a, b));
+    GGML_ASSERT(a->ne[0] > 2);
+    GGML_ASSERT(ggml_is_contiguous_rows(a) && ggml_is_contiguous_rows(b));
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, a->ne);
+
+    result->op     = GGML_OP_FLASH_ATTN_EXT_MERGE;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_finalize(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * sinks) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[0] > 2);
+    GGML_ASSERT(ggml_is_contiguous_rows(a));
+
+    if (sinks) {
+        GGML_ASSERT(sinks->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(sinks));
+        GGML_ASSERT(sinks->ne[0] == a->ne[1]); // one sink per head
+    }
+
+    int64_t ne[4] = { a->ne[0] - 2, a->ne[1], a->ne[2], a->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_FLASH_ATTN_EXT_FINALIZE;
+    result->src[0] = a;
+    result->src[1] = sinks;
+
+    return result;
 }
 
 
