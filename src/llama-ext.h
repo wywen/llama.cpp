@@ -46,6 +46,17 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
 // The result is valid as llama_graph_reserve's.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve_widest(struct llama_context * ctx);
 
+// As llama_graph_reserve and llama_graph_reserve_widest, over memory whose sequences span at most n_cells cells (n_cells > 0):
+// each attention cache's graph views min(n_cells, cache size) cells instead of every cell.
+// Returns nullptr when the context's memory cannot simulate a shorter extent.
+LLAMA_API struct ggml_cgraph * llama_graph_reserve_extent(
+        struct llama_context * ctx,
+        uint32_t n_tokens,
+        uint32_t n_seqs,
+        uint32_t n_outputs,
+        uint32_t n_cells);
+LLAMA_API struct ggml_cgraph * llama_graph_reserve_widest_extent(struct llama_context * ctx, uint32_t n_cells);
+
 // Whether the next decode reserves the scheduler again because a setting changed (a backend sampler,
 // an adapter, the attention type, ...); that reserve may reallocate the compute buffers.
 LLAMA_API bool llama_sched_reserve_pending(const struct llama_context * ctx);

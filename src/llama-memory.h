@@ -135,6 +135,14 @@ struct llama_memory_i {
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
 
+    // simulate a full cache whose sequences span at most n_cells cells: each attention cache views min(n_cells, its size)
+    // cells, used for allocating the compute buffers of the graphs over a shorter extent
+    // returns nullptr if the memory cannot simulate a shorter extent
+    virtual llama_memory_context_ptr init_full_extent(uint32_t n_cells) {
+        GGML_UNUSED(n_cells);
+        return nullptr;
+    }
+
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update
     virtual llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) = 0;

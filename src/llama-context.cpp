@@ -4969,6 +4969,30 @@ struct ggml_cgraph * llama_graph_reserve(
     return ctx->graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
 }
 
+// the full-memory context a reserve over n_cells cells builds on: false when the memory cannot simulate that extent
+static bool init_memory_at_extent(struct llama_context * ctx, uint32_t n_cells, llama_memory_context_ptr & mctx) {
+    GGML_ASSERT(n_cells > 0);
+    auto memory = ctx->get_memory();
+    if (!memory) {
+        return true;
+    }
+    mctx = memory->init_full_extent(n_cells);
+    return mctx != nullptr && mctx->get_status() == LLAMA_MEMORY_STATUS_SUCCESS;
+}
+
+struct ggml_cgraph * llama_graph_reserve_extent(
+        struct llama_context * ctx,
+        uint32_t n_tokens,
+        uint32_t n_seqs,
+        uint32_t n_outputs,
+        uint32_t n_cells) {
+    llama_memory_context_ptr mctx;
+    if (!init_memory_at_extent(ctx, n_cells, mctx)) {
+        return nullptr;
+    }
+    return ctx->graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
+}
+
 // llama adapter API
 
 int32_t llama_set_adapters_lora(
@@ -5381,6 +5405,14 @@ struct ggml_cgraph * llama_graph_reserve_widest(struct llama_context * ctx) {
     llama_memory_context_ptr mctx;
     if (memory) {
         mctx = memory->init_full();
+    }
+    return ctx->graph_reserve_widest(mctx.get());
+}
+
+struct ggml_cgraph * llama_graph_reserve_widest_extent(struct llama_context * ctx, uint32_t n_cells) {
+    llama_memory_context_ptr mctx;
+    if (!init_memory_at_extent(ctx, n_cells, mctx)) {
+        return nullptr;
     }
     return ctx->graph_reserve_widest(mctx.get());
 }

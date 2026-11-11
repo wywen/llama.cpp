@@ -532,6 +532,11 @@ llama_memory_context_ptr llama_memory_recurrent::init_full() {
     return std::make_unique<llama_memory_recurrent_context>(this);
 }
 
+llama_memory_context_ptr llama_memory_recurrent::init_full_extent(uint32_t n_cells) {
+    GGML_UNUSED(n_cells);
+    return init_full();
+}
+
 llama_memory_context_ptr llama_memory_recurrent::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(lctx);
     GGML_UNUSED(optimize);

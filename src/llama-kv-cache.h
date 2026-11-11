@@ -191,6 +191,8 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_full_extent(uint32_t n_cells) override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
@@ -481,6 +483,11 @@ public:
     // used to create a full-cache context
     llama_kv_cache_context(
             llama_kv_cache * kv);
+
+    // used to create a full-cache context that views min(n_cells, kv size) cells
+    llama_kv_cache_context(
+            llama_kv_cache * kv,
+            uint32_t n_cells);
 
     // used to create an update context
     llama_kv_cache_context(
