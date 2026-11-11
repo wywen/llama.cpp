@@ -18,7 +18,8 @@ extern "C" {
 
     // as ggml_gallocr_reserve_n, for a graph the buffers must hold from now on: its plan becomes the covering plan of its
     // topology, which a later re-plan of that topology falls back on rather than grow a chunk, unless a covering plan
-    // already holds the graph or the covering plan of its topology gives some tensor more room
+    // already holds the graph or the covering plan of its topology gives some tensor more room. a reserve that
+    // reallocates keeps every chunk at least as large as before, so the covering plans of every topology keep holding
     GGML_API bool ggml_gallocr_reserve_n_covering(
         ggml_gallocr_t galloc,
         struct ggml_cgraph * graph,
