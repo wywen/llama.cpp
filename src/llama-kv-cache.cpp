@@ -955,6 +955,10 @@ llama_memory_context_ptr llama_kv_cache::init_full() {
     return std::make_unique<llama_kv_cache_context>(this);
 }
 
+llama_memory_context_ptr llama_kv_cache::init_full_extent(uint32_t n_cells) {
+    return std::make_unique<llama_kv_cache_context>(this, n_cells);
+}
+
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);
 
@@ -3291,8 +3295,14 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
 llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
 
 llama_kv_cache_context::llama_kv_cache_context(
-        llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = kv->get_size();
+        llama_kv_cache * kv) : llama_kv_cache_context(kv, kv->get_size()) {
+}
+
+llama_kv_cache_context::llama_kv_cache_context(
+        llama_kv_cache * kv,
+        uint32_t n_cells) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+    GGML_ASSERT(n_cells > 0);
+    n_kv = std::min(kv->get_size(), n_cells);
 
     // worst case for graph reservation, only a unified cache splits into per-sequence lists
     n_kv_rows = kv->get_n_stream() == 1 ? n_kv : 0;

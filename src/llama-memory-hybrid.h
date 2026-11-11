@@ -60,6 +60,8 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_full_extent(uint32_t n_cells) override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
@@ -110,6 +112,9 @@ public:
 
     // init full
     explicit llama_memory_hybrid_context(llama_memory_hybrid * mem);
+
+    // init full, the attention cache viewing min(n_cells, its size) cells
+    llama_memory_hybrid_context(llama_memory_hybrid * mem, uint32_t n_cells);
 
     // init update
     explicit llama_memory_hybrid_context(
