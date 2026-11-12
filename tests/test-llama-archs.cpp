@@ -1716,6 +1716,11 @@ static bool nextn_test(const llm_arch arch) {
     return arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP;
 }
 
+// archs whose layers read their compress ratio from the file, so a NextN layer may be QSA or dense
+static bool nextn_dense_test(const llm_arch arch) {
+    return arch == LLM_ARCH_QWEN4EXP;
+}
+
 // archs whose saved test models include one with a NextN layer, <arch>-moe-nextn.gguf, beside those without
 static bool nextn_save(const llm_arch arch) {
     return arch == LLM_ARCH_QWEN4EXP;
@@ -1970,6 +1975,83 @@ static bool check_nextn_borrowed_head(const llm_arch arch, const size_t seed, co
     }
 
     result = format("%d trunk layers, %u NextN layer", n_layer, n_layer_nextn);
+    return true;
+}
+
+// a file may give the NextN layer a compress ratio of 0 while the trunk layers keep theirs: the NextN layer then attends
+//     densely, yet the trunk still sets the k-pool size, so the MTP graph must not leave inputs it fills unallocated
+static bool check_nextn_dense_decode(const llm_arch arch, const size_t seed, const float stdev, std::string & result) {
+    const uint32_t n_layer_nextn = 1;
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe_mandatory(arch), LLAMA_POOLING_TYPE_UNSPECIFIED, /*iswa_only =*/ false,
+        /*n_layer_min =*/ 0, n_layer_nextn);
+
+    const std::string key_ratios = llama_arch_kv_name(arch, LLM_KV_ATTENTION_COMPRESS_RATIOS);
+    const int64_t     id_ratios  = gguf_find_key(gguf_ctx.get(), key_ratios.c_str());
+    if (id_ratios < 0) {
+        result = "the model has no compress ratios";
+        return false;
+    }
+    const size_t n_ratios = gguf_get_arr_n(gguf_ctx.get(), id_ratios);
+    std::vector<uint32_t> ratios((const uint32_t *) gguf_get_arr_data(gguf_ctx.get(), id_ratios),
+                                 (const uint32_t *) gguf_get_arr_data(gguf_ctx.get(), id_ratios) + n_ratios);
+    ratios.back() = 0;
+    gguf_set_arr_data(gguf_ctx.get(), key_ratios.c_str(), GGUF_TYPE_UINT32, ratios.data(), ratios.size());
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    ggml_backend_dev_t cpu_only[] = { nullptr };
+    model_params.devices  = cpu_only;
+    model_params.load_mtp = true;
+    tensor_data_params tensor_params = { seed, stdev, /*sensitive =*/ false, arch };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
+    if (!model) {
+        result = "failed to create the model";
+        return false;
+    }
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx           = 0;
+    ctx_params.n_ubatch        = 64;
+    ctx_params.n_threads       = 4;
+    ctx_params.n_threads_batch = 4;
+    llama_context_ptr ctx_trunk(llama_init_from_model(model.get(), ctx_params));
+    if (!ctx_trunk) {
+        result = "failed to create the trunk context";
+        return false;
+    }
+    ctx_params.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+    ctx_params.ctx_other = ctx_trunk.get();
+    llama_context_ptr ctx_mtp(llama_init_from_model(model.get(), ctx_params));
+    if (!ctx_mtp) {
+        result = "failed to create the MTP context";
+        return false;
+    }
+
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const uint32_t n_tokens = 8;
+    const std::vector<llama_token> tokens = get_tokens(n_tokens, n_vocab, seed);
+    const std::vector<float> h(llama_model_n_embd_out(model.get()), 0.0f);
+
+    // a catch-up decode, then one draft step after it
+    llama_pos pos = 0;
+    for (const uint32_t n : { n_tokens - 1, 1u }) {
+        common_batch batch(ctx_mtp.get());
+        for (uint32_t i = 0; i < n; ++i, ++pos) {
+            const int32_t idx = batch.add(tokens[pos], pos, 0, i + 1 == n);
+            batch.set_embd_state(idx, { h.data(), 1, h.size() });
+        }
+        if (llama_process(ctx_mtp.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            result = format("the MTP context fails to decode %u tokens at position %d", n, pos - (llama_pos) n);
+            return false;
+        }
+        const float * logits = llama_get_logits_ith(ctx_mtp.get(), -1);
+        if (!std::all_of(logits, logits + n_vocab, [](float x) { return std::isfinite(x); })) {
+            result = format("the MTP context gives non-finite logits for %u tokens", n);
+            return false;
+        }
+    }
+
+    result = format("NextN layer %d attends densely", llama_model_n_layer(model.get()));
     return true;
 }
 
@@ -2392,6 +2474,23 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 all_ok = false;
             }
             LOG("%s: %s NextN layers borrowing the target's head: %s (%s)\n", __func__, llama_arch_name(arch),
+                ok ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m", result.c_str());
+        }
+
+        if (nextn_dense_test(arch) && arch_supported(arch)) {
+            std::string result;
+            bool ok = false;
+            try {
+                ok = check_nextn_dense_decode(arch, seed, stdev, result);
+            } catch (const std::exception & e) {
+                result = e.what();
+            }
+            n_tests++;
+            if (!ok) {
+                n_failed++;
+                all_ok = false;
+            }
+            LOG("%s: %s NextN layer without QSA decodes: %s (%s)\n", __func__, llama_arch_name(arch),
                 ok ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m", result.c_str());
         }
     }
