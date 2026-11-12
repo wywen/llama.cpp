@@ -1643,7 +1643,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        is_mem_shared = llama_get_memory_other(ctx_dft) == llama_get_memory(ctx_tgt);
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ is_mem_shared);

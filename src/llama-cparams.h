@@ -26,7 +26,11 @@ struct llama_memory_cparams {
     bool kv_unified;
 
     enum llama_context_type ctx_type;
+
+    // the context whose model weights or results this context reads, if any
     llama_context * ctx_other;
+    // the memory is a view of ctx_other's memory (its cells, and its layers where shared), not one of its own
+    bool mem_shares_other;
 };
 
 struct llama_cparams : llama_memory_cparams {

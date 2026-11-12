@@ -182,7 +182,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int trunk_flags = nf.trunk;
     const int mtp_flags   = nf.mtp;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    // a file of NextN layers alone may leave these to the target model, whose own the MTP graph then reads
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
 
     // there is no output_norm: the final hyper-connection mixer carries it
     // the gammas load as [n_embd, hc] so the grouped norm multiplies them without a graph reshape
@@ -192,7 +193,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
     if (output == NULL) {
-        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
+        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED | trunk_flags);
     }
 
     // flat [ple_head_dim, n_rows] gather target
@@ -213,8 +214,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             ple_rows = ple_w->tensor->ne[1];
         }
 
+        // only trunk layers read it
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY | TENSOR_PAGEABLE);
+                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY | TENSOR_PAGEABLE | trunk_flags);
     }
 
     auto load_block = [&](int il, int flags) {
@@ -605,9 +607,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
 
+    const llama_model & head = model_head();
+
     ggml_tensor * tok_embd;
     if (ubatch.token) {
-        tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+        tok_embd = ggml_get_rows(ctx0, head.tok_embd, inp->tokens);
     } else {
         tok_embd = inp->embd;
     }
@@ -668,7 +672,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(head.output, cur, head.output_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }

@@ -274,7 +274,12 @@ LLAMA_API bool llama_supports_embd_row(const struct llama_context * ctx);
 // Returns the batch index (>= 0), or the llama_batch_ext_add() error codes.
 LLAMA_API int32_t llama_batch_ext_add_embd_row(struct llama_batch_ext * batch, llama_seq_id seq_id, int32_t row);
 
+// The context whose model weights or results this context reads (an assistant's or a draft's target), or NULL.
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
+
+// The memory of ctx_other that this context's memory is a view of, or NULL when its memory is its own.
+// A context can read the weights of ctx_other and still keep its own memory.
+LLAMA_API llama_memory_t llama_get_memory_other(const struct llama_context * ctx);
 
 //
 // model/context data extraction

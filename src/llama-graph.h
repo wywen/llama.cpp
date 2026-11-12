@@ -1202,6 +1202,10 @@ struct llm_graph_context {
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
 
+    // the model whose token embedding, output norm and LM head the graph reads: this one, or the model of ctx_other
+    //     when this one has no token embedding or LM head of its own (a file of NextN layers alone)
+    const llama_model & model_head() const;
+
     // true when the last layer must be narrowed to the output rows before the nextn hidden state is captured
     bool crop_before_nextn(const ggml_tensor * inp_out_ids) const {
         return inp_out_ids != nullptr && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
