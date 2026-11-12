@@ -1721,9 +1721,10 @@ static bool nextn_dense_test(const llm_arch arch) {
     return arch == LLM_ARCH_QWEN4EXP;
 }
 
-// archs whose saved test models include one with a NextN layer, <arch>-moe-nextn.gguf, beside those without
+// archs whose saved test models include one with a NextN layer, <arch>-moe-nextn.gguf, beside those without, and
+//     <arch>-moe-nextn-only.gguf, the NextN layer of that model alone
 static bool nextn_save(const llm_arch arch) {
-    return arch == LLM_ARCH_QWEN4EXP;
+    return arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP;
 }
 
 // the layer of a node named exactly <prefix><il>, or -1; a view of the node extends the name and is not one
@@ -2106,6 +2107,11 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
             llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
             const std::uintmax_t size = std::filesystem::file_size(path);
             LOG_CNT(" (%.2f MB)\n", (double) size / (1024.0 * 1024.0));
+            if (cfg.n_layer_nextn > 0) {
+                const std::string path_only = dir + "/" + llama_arch_name(arch) + "-" + cfg.file_suffix + "-only.gguf";
+                LOG_INF("%s: '%s %s' NextN layer alone -> %s\n", __func__, llama_arch_name(arch), cfg.name.c_str(), path_only.c_str());
+                save_nextn_only(path, path_only, llama_model_n_layer(model_and_ctx.first.get()));
+            }
             std::string sensitivity;
             if (check_sensitivity(model_and_ctx.first.get(), seed, sensitivity)) {
                 LOG_INF("%s: %s model (%s) sensitivity: %s\n", __func__, llama_arch_name(arch), cfg.name.c_str(), sensitivity.c_str());

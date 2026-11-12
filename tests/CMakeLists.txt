@@ -245,7 +245,7 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     set(PER_EXPERT_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-per-expert")
     file(MAKE_DIRECTORY "${PER_EXPERT_MODEL_DIR}")
     llama_test(test-llama-archs NAME test-generate-per-expert-models LABEL "main behavior backend"
-        ARGS -a "^(qwen3moe|qwen35moe|gemma4|qwen4exp)$" -o "${PER_EXPERT_MODEL_DIR}")
+        ARGS -a "^(qwen3moe|qwen35moe|gemma4|qwen4exp|deepseek2)$" -o "${PER_EXPERT_MODEL_DIR}")
     set_tests_properties(test-generate-per-expert-models PROPERTIES FIXTURES_SETUP per-expert-models)
     llama_test(test-per-expert-tensors LABEL "main behavior backend"
         ARGS --models "${PER_EXPERT_MODEL_DIR}")
