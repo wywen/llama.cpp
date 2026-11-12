@@ -308,7 +308,8 @@ llama_memory_cparams llama_cparams_memory_shape(const llama_model & model, const
     cparams.ctx_type    = params.ctx_type;
     cparams.n_ctx       = params.n_ctx == 0 ? hparams.n_ctx_train : params.n_ctx;
 
-    cparams.ctx_other = nullptr;
+    cparams.ctx_other        = nullptr;
+    cparams.mem_shares_other = false;
 
     // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -317,7 +318,8 @@ llama_memory_cparams llama_cparams_memory_shape(const llama_model & model, const
             throw std::runtime_error("Gemma4Assistant requires ctx_other to be set (this warning is normal during memory fitting)");
         }
 
-        cparams.ctx_other = params.ctx_other;
+        cparams.ctx_other        = params.ctx_other;
+        cparams.mem_shares_other = true;
     }
 
     if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
@@ -391,7 +393,7 @@ llama_memory_i * llama_context_create_memory(
         /*.type_v    =*/ params.type_v,
         /*.swa_full  =*/ params.swa_full,
         /*.ctx_type  =*/ cparams.ctx_type,
-        /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+        /*.mem_other =*/ cparams.mem_shares_other ? llama_get_memory(cparams.ctx_other) : nullptr,
         /*.no_alloc  =*/ model.no_alloc(),
     };
 
@@ -5394,6 +5396,11 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+llama_memory_t llama_get_memory_other(const struct llama_context * ctx) {
+    const auto & cparams = ctx->get_cparams();
+    return cparams.mem_shares_other ? llama_get_memory(cparams.ctx_other) : nullptr;
 }
 
 bool llama_output_reserve(struct llama_context * ctx, uint32_t n_outputs) {

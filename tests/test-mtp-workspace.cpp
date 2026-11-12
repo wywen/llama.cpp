@@ -129,7 +129,7 @@ int run(const char * target_path, const char * draft_path) {
     request.prompt   = &prompt;
     request.result   = &drafted;
 
-    const bool      independent_draft = llama_get_ctx_other(ctx_dft) != ctx_tgt;
+    const bool      independent_draft = llama_get_memory_other(ctx_dft) != llama_get_memory(ctx_tgt);
     const llama_pos draft_end_before  = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), 0);
     common_speculative_draft(spec.get());
     if (drafted.size() != 3) {
