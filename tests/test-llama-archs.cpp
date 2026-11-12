@@ -1088,10 +1088,12 @@ static llama_model_ptr get_model(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const bool sensitive_weights = false) {
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const bool sensitive_weights = false,
+        const bool load_mtp = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = load_mtp;
     std::vector<ggml_backend_dev_t> devs_copy = devs;
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
@@ -1117,8 +1119,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
         const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
         const enum llama_pooling_type pooling = LLAMA_POOLING_TYPE_UNSPECIFIED,
-        const enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO, const bool sensitive_weights = false) {
-    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides, sensitive_weights);
+        const enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO, const bool sensitive_weights = false,
+        const bool load_mtp = false) {
+    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides, sensitive_weights, load_mtp);
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.flash_attn_type = flash_attn_type;
@@ -1636,6 +1639,7 @@ struct model_config {
     bool                    moe;
     enum llama_pooling_type pooling;           // unspecified for models that return logits
     bool                    iswa_only = false; // see get_gguf_ctx
+    uint32_t                n_layer_nextn = 0; // see get_gguf_ctx
 };
 
 // encoder-only archs are generated as an embedding model and as a reranker
@@ -1710,6 +1714,11 @@ static bool arch_supported(const llm_arch arch) {
 // archs whose generated model also gets a NextN layer, to check how its trunk and MTP graphs name their layer outputs
 static bool nextn_test(const llm_arch arch) {
     return arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP;
+}
+
+// archs whose saved test models include one with a NextN layer, <arch>-moe-nextn.gguf, beside those without
+static bool nextn_save(const llm_arch arch) {
+    return arch == LLM_ARCH_QWEN4EXP;
 }
 
 // the layer of a node named exactly <prefix><il>, or -1; a view of the node extends the name and is not one
@@ -1998,14 +2007,18 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue;
         }
-        for (const model_config & cfg : get_model_configs(arch)) {
+        std::vector<model_config> configs = get_model_configs(arch);
+        if (nextn_save(arch)) {
+            configs.push_back({"MoE NextN", "moe-nextn", true, LLAMA_POOLING_TYPE_UNSPECIFIED, false, /*n_layer_nextn =*/ 1});
+        }
+        for (const model_config & cfg : configs) {
             if (!llama_arch_supports_save(arch) || !arch_supported(arch)) {
                 LOG_INF("%s: %s model (%s) is unsupported, skipping\n", __func__, llama_arch_name(arch), cfg.name.c_str());
                 continue;
             }
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, cfg.moe, cfg.pooling, cfg.iswa_only);
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, cfg.moe, cfg.pooling, cfg.iswa_only, /*n_layer_min =*/ 0, cfg.n_layer_nextn);
             auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, false, nullptr, 0, cfg.pooling,
-                LLAMA_FLASH_ATTN_TYPE_AUTO, /*sensitive_weights =*/ true);
+                LLAMA_FLASH_ATTN_TYPE_AUTO, /*sensitive_weights =*/ true, /*load_mtp =*/ cfg.n_layer_nextn > 0);
             const std::string path = dir + "/" + llama_arch_name(arch) + "-" + cfg.file_suffix + ".gguf";
             LOG_INF("%s: '%s %s' -> %s ...", __func__, llama_arch_name(arch), cfg.name.c_str(), path.c_str());
             llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
