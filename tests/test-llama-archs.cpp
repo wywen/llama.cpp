@@ -23,12 +23,14 @@
 #include "../src/llama-model.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -303,8 +305,9 @@ struct kv_writer {
 
 // iswa_only: gemma4 with interleaved sliding window attention but without per-layer embeddings or shared KV layers
 // n_layer_min: the fewest layers the model gets
+// n_layer_nextn: the NextN (MTP) layers appended after the trunk layers
 static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const enum llama_pooling_type pooling, const bool iswa_only = false,
-        const uint32_t n_layer_min = 0) {
+        const uint32_t n_layer_min = 0, const uint32_t n_layer_nextn = 0) {
     gguf_context_ptr ret(gguf_init_empty());
     kv_writer ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -411,8 +414,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     ms.add_kv(LLM_KV_CONTEXT_LENGTH,            n_ctx);
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
-    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
+    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer + n_layer_nextn);
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
+    if (n_layer_nextn > 0) {
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, n_layer_nextn);
+    }
 
     if (arch == LLM_ARCH_K2_HORIZON) {
         ms.add_kv(LLM_KV_ROPE_SCALING_YARN_BETA_FAST, 128.0f);
@@ -606,7 +612,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,  1.0e-6f);
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
         // without this the QSA layers fall back to dense and go uncovered
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer + n_layer_nextn, 4));
 
         // has_cell_ext() needs ple_n_heads here: the indexer cache serializes no ext without it
         const uint32_t ple_ngram_size      = 3;
@@ -1701,6 +1707,128 @@ static bool arch_supported(const llm_arch arch) {
     return true;
 }
 
+// archs whose generated model also gets a NextN layer, to check how its trunk and MTP graphs name their layer outputs
+static bool nextn_test(const llm_arch arch) {
+    return arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP;
+}
+
+// the layer of a node named exactly <prefix><il>, or -1; a view of the node extends the name and is not one
+static int named_layer(const ggml_tensor * t, const char * prefix) {
+    const char * name = ggml_get_name(t);
+    const size_t n = strlen(prefix);
+    if (strncmp(name, prefix, n) != 0 || !isdigit((unsigned char) name[n])) {
+        return -1;
+    }
+    char * end = nullptr;
+    const long il = strtol(name + n, &end, 10);
+    return *end == '\0' ? (int) il : -1;
+}
+
+// each layer in [il_begin, il_end) has exactly one output named <prefix><il> for one of the prefixes, a node that computes it and not
+//     a view, and no other layer has one; returns why not, empty if so
+static std::string check_layer_outputs(ggml_cgraph * gf, const std::vector<const char *> & prefixes, const int il_begin, const int il_end) {
+    if (gf == nullptr) {
+        return "the graph does not build";
+    }
+    std::map<int, std::vector<const ggml_tensor *>> outputs;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * t = ggml_graph_node(gf, i);
+        for (const char * prefix : prefixes) {
+            const int il = named_layer(t, prefix);
+            if (il >= 0) {
+                outputs[il].push_back(t);
+            }
+        }
+    }
+    for (int il = il_begin; il < il_end; ++il) {
+        const auto it = outputs.find(il);
+        if (it == outputs.end() || it->second.size() != 1) {
+            return format("layer %d has %zu outputs, expected 1", il, it == outputs.end() ? (size_t) 0 : it->second.size());
+        }
+        if (it->second[0]->view_src != nullptr) {
+            return format("the output of layer %d (%s) is a view", il, ggml_get_name(it->second[0]));
+        }
+    }
+    for (const auto & [il, nodes] : outputs) {
+        if (il < il_begin || il >= il_end) {
+            return format("%s is the output of a layer outside [%d, %d)", ggml_get_name(nodes[0]), il_begin, il_end);
+        }
+    }
+    return "";
+}
+
+// a model with NextN layers splits into a trunk graph whose layers end at l_out-<il> or l_last-<il> and an MTP graph whose layers
+//     end at mtp_post_ffn-<il>, il from n_layer on: each graph names each of its own layer outputs once and none of the other's
+static bool check_nextn_outputs(const llm_arch arch, const size_t seed, const float stdev, std::string & result) {
+    const uint32_t n_layer_nextn = 1;
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe_mandatory(arch), LLAMA_POOLING_TYPE_UNSPECIFIED, /*iswa_only =*/ false,
+        /*n_layer_min =*/ 0, n_layer_nextn);
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    ggml_backend_dev_t cpu_only[] = { nullptr };
+    model_params.devices  = cpu_only;
+    model_params.load_mtp = true;
+    tensor_data_params tensor_params = { seed, stdev, /*sensitive =*/ false, arch };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
+    if (!model) {
+        result = "failed to create the model";
+        return false;
+    }
+    const int n_layer = llama_model_n_layer(model.get());
+    if (llama_model_n_layer_nextn(model.get()) != (int32_t) n_layer_nextn) {
+        result = "the model has no NextN layer";
+        return false;
+    }
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx           = 0;
+    ctx_params.n_ubatch        = 64;
+    ctx_params.n_threads       = 4;
+    ctx_params.n_threads_batch = 4;
+    llama_context_ptr ctx_trunk(llama_init_from_model(model.get(), ctx_params));
+    if (!ctx_trunk) {
+        result = "failed to create the trunk context";
+        return false;
+    }
+    ctx_params.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+    ctx_params.ctx_other = ctx_trunk.get();
+    llama_context_ptr ctx_mtp(llama_init_from_model(model.get(), ctx_params));
+    if (!ctx_mtp) {
+        result = "failed to create the MTP context";
+        return false;
+    }
+
+    const std::vector<const char *> trunk_prefixes = { "l_out-", "l_last-" };
+    const std::vector<const char *> mtp_prefixes   = { "mtp_post_ffn-" };
+    const struct { uint32_t n_tokens; uint32_t n_outputs; } shapes[] = { { 1, 1 }, { 8, 1 }, { 8, 8 } };
+    for (const auto & shape : shapes) {
+        const std::string what = format("%u tokens, %u outputs", shape.n_tokens, shape.n_outputs);
+
+        ggml_cgraph * gf_trunk = llama_graph_reserve(ctx_trunk.get(), shape.n_tokens, 1, shape.n_outputs);
+        std::string err = check_layer_outputs(gf_trunk, trunk_prefixes, 0, n_layer);
+        if (err.empty()) {
+            err = check_layer_outputs(gf_trunk, mtp_prefixes, 0, 0);
+        }
+        if (!err.empty()) {
+            result = "trunk graph, " + what + ": " + err;
+            return false;
+        }
+
+        ggml_cgraph * gf_mtp = llama_graph_reserve(ctx_mtp.get(), shape.n_tokens, 1, shape.n_outputs);
+        err = check_layer_outputs(gf_mtp, mtp_prefixes, n_layer, n_layer + n_layer_nextn);
+        if (err.empty()) {
+            err = check_layer_outputs(gf_mtp, trunk_prefixes, 0, 0);
+        }
+        if (!err.empty()) {
+            result = "MTP graph, " + what + ": " + err;
+            return false;
+        }
+    }
+    result = format("%d trunk layers, %u NextN layer", n_layer, n_layer_nextn);
+    return true;
+}
+
 static int save_models(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const std::string & dir) {
     struct user_data_t {
         struct {
@@ -2088,6 +2216,18 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                     LOG_INF("%s: %s %s %s: %s\n", __func__, llama_arch_name(arch), dc.label.c_str(), config_name.c_str(), mixed_note.c_str());
                 }
             }
+        }
+
+        if (nextn_test(arch) && arch_supported(arch)) {
+            std::string result;
+            const bool ok = check_nextn_outputs(arch, seed, stdev, result);
+            n_tests++;
+            if (!ok) {
+                n_failed++;
+                all_ok = false;
+            }
+            LOG("%s: %s NextN layer outputs: %s (%s)\n", __func__, llama_arch_name(arch),
+                ok ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m", result.c_str());
         }
     }
 

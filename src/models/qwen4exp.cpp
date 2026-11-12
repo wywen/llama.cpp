@@ -652,6 +652,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
     cur    = ffn_mix.cur;
     cur    = build_layer_ffn(cur, il);
     res_hc = build_hc_combine(res_hc, cur, ffn_mix.inject, il);
+    cb(res_hc, "mtp_post_ffn", il);
 
     // the next draft step reads this residual as its h
     ggml_tensor * flat     = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, n_tokens);
