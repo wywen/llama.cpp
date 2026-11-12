@@ -691,6 +691,7 @@ llama_context::llama_context(
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
             }
             backends.emplace_back(backend);
+            backend_init_devs.push_back(dev.dev);
         }
 
         // tensors of ctx_other (e.g. a shared KV cache) can be on devices that this model does not use
@@ -706,6 +707,7 @@ llama_context::llama_context(
                     throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev_other.dev)));
                 }
                 backends.emplace_back(backend);
+                backend_init_devs.push_back(dev_other.dev);
             }
         }
 
@@ -718,6 +720,7 @@ llama_context::llama_context(
                     throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
                 }
                 backends.emplace_back(backend);
+                backend_init_devs.push_back(dev);
             }
         }
 
@@ -727,6 +730,7 @@ llama_context::llama_context(
             throw std::runtime_error("failed to initialize CPU backend");
         }
         backends.emplace_back(backend_cpu);
+        backend_init_devs.push_back(ggml_backend_get_device(backend_cpu));
 
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
@@ -922,16 +926,19 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
             ggml_backend_dev_t device_fused = backend_fused ? ggml_backend_get_device(backend_fused) : nullptr;
 
-            // TODO: make this descriptor-specific; model.dev_layer() preserves the current behavior,
-            // but is still wrong for cases like --no-kv-offload.
-            ggml_backend_dev_t device_layer = model.dev_layer(node.il);
+            // TODO: make this descriptor-specific; the layer's device is still a stand-in for the
+            // descriptor-specific placement, which differs for cases like --no-kv-offload.
+            ggml_backend_dev_t device_layer  = model.dev_layer(node.il);
+            ggml_backend_t     backend_layer = backend_initialized_from(device_layer);
 
-            if (device_fused != device_layer) {
-                LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
-                        "is assigned to device %s (usually due to missing support)\n",
+            if (backend_fused != backend_layer) {
+                LLAMA_LOG_WARN("%s: layer %d runs on backend %s (device %s) but %s "
+                        "is assigned to backend %s (device %s) (usually due to missing support)\n",
                         func, node.il,
+                        backend_layer ? ggml_backend_name(backend_layer) : "none",
                         device_layer ? ggml_backend_dev_name(device_layer) : "none",
                         probe.name,
+                        backend_fused ? ggml_backend_name(backend_fused) : "none",
                         device_fused ? ggml_backend_dev_name(device_fused) : "none");
                 device_mismatch = true;
                 break;
@@ -1738,6 +1745,15 @@ ggml_backend_t llama_context::backend_from_dev(ggml_backend_dev_t dev) const {
     for (const auto & backend : backends) {
         if (ggml_backend_get_device(backend.get()) == dev) {
             return backend.get();
+        }
+    }
+    return nullptr;
+}
+
+ggml_backend_t llama_context::backend_initialized_from(ggml_backend_dev_t dev) const {
+    for (size_t i = 0; i < backend_init_devs.size(); ++i) {
+        if (backend_init_devs[i] == dev) {
+            return backends[i].get();
         }
     }
     return nullptr;

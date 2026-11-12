@@ -286,6 +286,10 @@ private:
 
     ggml_backend_t backend_from_dev(ggml_backend_dev_t dev) const;
 
+    // unlike backend_from_dev(), matches the device a backend was created from, which can differ
+    // from the device the backend reports when a device delegates execution to another device's backend
+    ggml_backend_t backend_initialized_from(ggml_backend_dev_t dev) const;
+
     //
     // graph
     //
@@ -330,8 +334,8 @@ private:
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
-    // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
-    // that differs from the layer it belongs to (usually due to missing backend support)
+    // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a backend
+    // other than the one that executes its layer (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
 
     // TODO: read/write lora adapters and cvec
@@ -452,6 +456,10 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // the device each entry of backends was initialized from; differs from ggml_backend_get_device()
+    // when a device delegates execution to another device's backend
+    std::vector<ggml_backend_dev_t> backend_init_devs;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
