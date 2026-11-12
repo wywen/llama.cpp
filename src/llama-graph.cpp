@@ -1609,6 +1609,13 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
         res->set_params(params);
     }
 
+const llama_model & llm_graph_context::model_head() const {
+    if ((model.tok_embd != nullptr && model.output != nullptr) || cparams.ctx_other == nullptr) {
+        return model;
+    }
+    return *llama_get_model(cparams.ctx_other);
+}
+
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     if (cb_func) {
         cb_func(ubatch, cur, name, il);

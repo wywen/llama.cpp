@@ -1829,6 +1829,141 @@ static bool check_nextn_outputs(const llm_arch arch, const size_t seed, const fl
     return true;
 }
 
+// writes the tensors of the NextN layers of the model in src_path, and none of its other tensors, to dst_path: a file of
+//     NextN layers alone, which has no token embedding, output norm or LM head of its own, nor the optional ones of a NextN layer
+static void save_nextn_only(const std::string & src_path, const std::string & dst_path, const int n_layer) {
+    ggml_context * ctx_data = nullptr;
+    gguf_init_params params = { /*no_alloc =*/ false, &ctx_data };
+    gguf_context_ptr src(gguf_init_from_file(src_path.c_str(), params));
+    ggml_context_ptr ctx_data_ptr(ctx_data);
+    if (!src) {
+        throw std::runtime_error("failed to read " + src_path);
+    }
+    gguf_context_ptr dst(gguf_init_empty());
+    gguf_set_kv(dst.get(), src.get());
+    const std::string prefix = format("blk.%d.", n_layer);
+    const std::string own_head[] = { prefix + "nextn.embed_tokens.", prefix + "nextn.shared_head_head.", prefix + "nextn.shared_head_norm." };
+    for (int64_t i = 0; i < gguf_get_n_tensors(src.get()); ++i) {
+        const char * name = gguf_get_tensor_name(src.get(), i);
+        const bool head = std::any_of(std::begin(own_head), std::end(own_head),
+            [name](const std::string & p) { return strncmp(name, p.c_str(), p.size()) == 0; });
+        if (strncmp(name, prefix.c_str(), prefix.size()) == 0 && !head) {
+            gguf_add_tensor(dst.get(), ggml_get_tensor(ctx_data, name));
+        }
+    }
+    if (!gguf_write_to_file(dst.get(), dst_path.c_str(), /*only_meta =*/ false)) {
+        throw std::runtime_error("failed to write " + dst_path);
+    }
+}
+
+// whether a node of the graph reads tensor t
+static bool graph_reads(ggml_cgraph * gf, const ggml_tensor * t) {
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (node->src[j] == t) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// a file of NextN layers alone has no token embedding or LM head and reads those of the model of the context it drafts for,
+//     ctx_other, without sharing that context's memory: an MTP context over it needs ctx_other, its graph reads the very
+//     tensors of the target model, and its memory is its own
+static bool check_nextn_borrowed_head(const llm_arch arch, const size_t seed, const float stdev, std::string & result) {
+    const uint32_t n_layer_nextn = 1;
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe_mandatory(arch), LLAMA_POOLING_TYPE_UNSPECIFIED, /*iswa_only =*/ false,
+        /*n_layer_min =*/ 0, n_layer_nextn);
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    ggml_backend_dev_t cpu_only[] = { nullptr };
+    model_params.devices  = cpu_only;
+    model_params.load_mtp = true;
+    tensor_data_params tensor_params = { seed, stdev, /*sensitive =*/ false, arch };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
+    if (!model) {
+        result = "failed to create the model";
+        return false;
+    }
+    const int n_layer = llama_model_n_layer(model.get());
+
+    const std::string path_full  = get_tmp_gguf_path();
+    const std::string path_nextn = get_tmp_gguf_path();
+    llama_model_save_to_file(model.get(), path_full.c_str());
+    save_nextn_only(path_full, path_nextn, n_layer);
+    std::filesystem::remove(path_full);
+    llama_model_ptr model_nextn(llama_model_load_from_file(path_nextn.c_str(), model_params));
+    std::filesystem::remove(path_nextn);
+    if (!model_nextn) {
+        result = "failed to load the file of NextN layers";
+        return false;
+    }
+    if (model_nextn->tok_embd != nullptr || model_nextn->output != nullptr || model_nextn->output_norm != nullptr) {
+        result = "the file of NextN layers has a token embedding, an output norm or an LM head";
+        return false;
+    }
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx           = 0;
+    ctx_params.n_ubatch        = 64;
+    ctx_params.n_threads       = 4;
+    ctx_params.n_threads_batch = 4;
+    llama_context_ptr ctx_trunk(llama_init_from_model(model.get(), ctx_params));
+    if (!ctx_trunk) {
+        result = "failed to create the trunk context";
+        return false;
+    }
+
+    ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    if (llama_context_ptr ctx_alone(llama_init_from_model(model_nextn.get(), ctx_params)); ctx_alone) {
+        result = "an MTP context without ctx_other was created";
+        return false;
+    }
+    ctx_params.ctx_other = ctx_trunk.get();
+    llama_context_ptr ctx_mtp(llama_init_from_model(model_nextn.get(), ctx_params));
+    if (!ctx_mtp) {
+        result = "failed to create the MTP context";
+        return false;
+    }
+    if (llama_get_ctx_other(ctx_mtp.get()) != ctx_trunk.get()) {
+        result = "the MTP context does not read ctx_other";
+        return false;
+    }
+
+    const struct { uint32_t n_tokens; uint32_t n_outputs; } shapes[] = { { 1, 1 }, { 8, 1 }, { 8, 8 } };
+    for (const auto & shape : shapes) {
+        ggml_cgraph * gf = llama_graph_reserve(ctx_mtp.get(), shape.n_tokens, 1, shape.n_outputs);
+        if (gf == nullptr) {
+            result = format("the MTP graph does not build for %u tokens, %u outputs", shape.n_tokens, shape.n_outputs);
+            return false;
+        }
+        if (!graph_reads(gf, model->tok_embd) || !graph_reads(gf, model->output) ||
+                (model->output_norm != nullptr && !graph_reads(gf, model->output_norm))) {
+            result = format("the MTP graph for %u tokens, %u outputs does not read the token embedding, output norm and LM head of the target",
+                shape.n_tokens, shape.n_outputs);
+            return false;
+        }
+    }
+
+    // memory that mirrored the target's would hold the cells the target decodes
+    if (llama_get_memory_other(ctx_mtp.get()) != nullptr || llama_get_memory(ctx_mtp.get()) == llama_get_memory(ctx_trunk.get())) {
+        result = "the MTP context shares the memory of ctx_other";
+        return false;
+    }
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    decode_last(ctx_trunk.get(), get_tokens(8, n_vocab, seed), 0);
+    if (llama_memory_seq_pos_max(llama_get_memory(ctx_mtp.get()), 0) != -1) {
+        result = "the memory of the MTP context holds the cells the target decoded";
+        return false;
+    }
+
+    result = format("%d trunk layers, %u NextN layer", n_layer, n_layer_nextn);
+    return true;
+}
+
 static int save_models(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const std::string & dir) {
     struct user_data_t {
         struct {
@@ -2227,6 +2362,23 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 all_ok = false;
             }
             LOG("%s: %s NextN layer outputs: %s (%s)\n", __func__, llama_arch_name(arch),
+                ok ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m", result.c_str());
+        }
+
+        if (nextn_test(arch) && arch_supported(arch)) {
+            std::string result;
+            bool ok = false;
+            try {
+                ok = check_nextn_borrowed_head(arch, seed, stdev, result);
+            } catch (const std::exception & e) {
+                result = e.what();
+            }
+            n_tests++;
+            if (!ok) {
+                n_failed++;
+                all_ok = false;
+            }
+            LOG("%s: %s NextN layers borrowing the target's head: %s (%s)\n", __func__, llama_arch_name(arch),
                 ok ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m", result.c_str());
         }
     }

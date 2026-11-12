@@ -37,10 +37,11 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     const int trunk_flags = nf.trunk;
     const int mtp_flags   = nf.mtp;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    // a file of NextN layers alone may leave these to the target model, whose own the MTP graph then reads
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
 
     // output
-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
+    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, trunk_flags);
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
 
     // optional projection of the embeddings output
@@ -49,7 +50,7 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
 
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
-        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
+        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED | trunk_flags);
     }
 
     auto load_block_trunk = [&](int il, int flags) {
@@ -505,12 +506,14 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
     ggml_set_input(inp->embd);
 
+    const llama_model & head = model_head();
+
     // TODO: make static using `ggml_build_forward_select()`
     //       see llm_graph_context::build_inp_embd() for reference
     ggml_tensor * tok_embd;
     ASSERT_EMBD_OR_TOKEN(ubatch);
     if (ubatch.token) {
-        ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+        ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : head.tok_embd;
 
         tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
 
@@ -623,7 +626,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
 
     ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
             ? layer.nextn.shared_head_norm
-            : model.output_norm;
+            : head.output_norm;
     GGML_ASSERT(head_norm_w && "QWEN35 MTP: missing both nextn.shared_head_norm and output_norm");
     cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
 
@@ -633,8 +636,8 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
     cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     cb(cur, "mtp_shared_head_norm", -1);
 
-    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
-    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : head.output;
+    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : head.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
     cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
