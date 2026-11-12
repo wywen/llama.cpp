@@ -433,6 +433,21 @@ extern "C" {
         struct llama_sampler * sampler;
     };
 
+    // where an extra router lookahead reads its input, see "MoE router lookahead" [EXPERIMENTAL]
+    enum llama_moe_router_ahead_input {
+        LLAMA_MOE_ROUTER_AHEAD_INPUT_ROUTER = 0, // the MoE layer's own router input
+        LLAMA_MOE_ROUTER_AHEAD_INPUT_EMBD   = 1, // the graph's input token embeddings
+    };
+
+    // an extra router lookahead: the graph of MoE layer il also computes the router logits ("ffn_moe_logits", before bias and gating)
+    // that MoE layer il_router of model would compute on input
+    struct llama_moe_router_ahead_extra {
+        int32_t                           il;
+        const struct llama_model        * model;     // NULL: the context's own model
+        int32_t                           il_router; // any layer of model with a router, NextN layers included
+        enum llama_moe_router_ahead_input input;
+    };
+
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggml-org/llama.cpp/pull/7544
     struct llama_context_params {
@@ -545,6 +560,8 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool moe_router_ahead; // add the router lookahead outputs of the MoE layers to the graph, see "MoE router lookahead" [EXPERIMENTAL]
+        const struct llama_moe_router_ahead_extra * moe_router_ahead_extra; // extra router lookaheads, independent of moe_router_ahead [EXPERIMENTAL]
+        size_t                                      n_moe_router_ahead_extra;
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -1013,6 +1030,21 @@ extern "C" {
     //
     // Supported for the architectures that use the shared MoE FFN router and for gemma4; architectures that build
     // their own router have no lookahead tensors.
+    //
+    // llama_context_params.moe_router_ahead_extra asks for more lookaheads, on or off with moe_router_ahead
+    // independently of it, so that a caller that drafts with a second context can predict the routing across contexts:
+    // extra k of the list makes the graph of MoE layer il also compute "ffn_moe_logits_ahead_extra-<il>-<k>", F32
+    // [n_expert, n_tokens], a graph output like the lookahead above, from the router of layer il_router of model (a
+    // layer of a NextN head included, in the same model or in another one that stays loaded as long as the context),
+    // applied to the layer's router input or to the graph's input token embeddings (the token embedding rows of an MTP
+    // graph). Several extras may name one layer; they are built in list order, ahead of the layer's own router. The
+    // list is read by llama_init_from_model only.
+    //
+    // The context refuses to be created when il is not a MoE layer of the context's model, when layer il_router of
+    // model has no router, or when the width of the input differs from that of the router (for the router input, the
+    // n_embd of the context's model); an input that a built graph does not have, or that has another width, also fails
+    // the creation. The extras add outputs only: the logits are unchanged. Only the architectures with the shared MoE
+    // FFN router build them.
     //
 
     // the MoE layer that follows MoE layer il, whose router the lookahead of layer il predicts, or -1 if il is not a MoE

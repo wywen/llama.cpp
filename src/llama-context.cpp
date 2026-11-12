@@ -778,6 +778,36 @@ llama_context::llama_context(
         }
     }
 
+    if (params.n_moe_router_ahead_extra > 0 && !hparams.vocab_only) {
+        if (params.moe_router_ahead_extra == nullptr) {
+            throw std::runtime_error("n_moe_router_ahead_extra is set without moe_router_ahead_extra");
+        }
+        for (size_t k = 0; k < params.n_moe_router_ahead_extra; ++k) {
+            const llama_moe_router_ahead_extra & e = params.moe_router_ahead_extra[k];
+            const llama_model & m = e.model ? *e.model : model;
+
+            if (e.il < 0 || (uint32_t) e.il >= hparams.n_layer_all || (size_t) e.il >= model.layers.size() ||
+                model.layers[e.il].ffn_gate_inp == nullptr) {
+                throw std::runtime_error(format("moe_router_ahead_extra[%zu]: layer %d is not a MoE layer of the model", k, e.il));
+            }
+            if (e.il_router < 0 || (uint32_t) e.il_router >= m.hparams.n_layer_all || (size_t) e.il_router >= m.layers.size() ||
+                m.layers[e.il_router].ffn_gate_inp == nullptr) {
+                throw std::runtime_error(format("moe_router_ahead_extra[%zu]: layer %d of the model has no router", k, e.il_router));
+            }
+            if (e.input != LLAMA_MOE_ROUTER_AHEAD_INPUT_ROUTER && e.input != LLAMA_MOE_ROUTER_AHEAD_INPUT_EMBD) {
+                throw std::runtime_error(format("moe_router_ahead_extra[%zu]: unknown input %d", k, (int) e.input));
+            }
+
+            ggml_tensor * router = m.layers[e.il_router].ffn_gate_inp;
+            if (e.input == LLAMA_MOE_ROUTER_AHEAD_INPUT_ROUTER && router->ne[0] != (int64_t) hparams.n_embd) {
+                throw std::runtime_error(format("moe_router_ahead_extra[%zu]: the router of layer %d takes %" PRId64 " values, the router input has %u",
+                        k, e.il_router, router->ne[0], hparams.n_embd));
+            }
+
+            moe_routers_extra.push_back({ (int) e.il, router, e.input, (int) k });
+        }
+    }
+
     // init backends
     if (!hparams.vocab_only) {
         LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__);
@@ -3264,6 +3294,7 @@ llm_graph_params llama_context::graph_params(
         /*.moe_slots   =*/ moe_slots.get(),
         /*.lookup_rows =*/ lookup_rows.get(),
         /*.moe_routers =*/ moe_routers.empty() ? nullptr : &moe_routers,
+        /*.moe_routers_extra =*/ moe_routers_extra.empty() ? nullptr : &moe_routers_extra,
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.layer_inp_dev =*/ layer_inp_dev,
@@ -4674,6 +4705,8 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.moe_router_ahead            =*/ false,
+        /*.moe_router_ahead_extra      =*/ nullptr,
+        /*.n_moe_router_ahead_extra    =*/ 0,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

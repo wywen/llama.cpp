@@ -42,6 +42,14 @@ class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
 
+// an extra router lookahead of a context, see llama_context_params.moe_router_ahead_extra
+struct llm_moe_router_ahead_extra {
+    int                               il;
+    ggml_tensor                     * router;
+    enum llama_moe_router_ahead_input input;
+    int                               k;      // index in the caller's list
+};
+
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
@@ -884,6 +892,9 @@ struct llm_graph_params {
     // [n_layer] the router weight of each MoE layer, nullptr for the other layers; nullptr = no router lookahead
     const std::vector<ggml_tensor *> * moe_routers = nullptr;
 
+    // the extra router lookaheads of the context, nullptr = none
+    const std::vector<llm_moe_router_ahead_extra> * moe_routers_extra = nullptr;
+
     const llama_prec_policy * prec_policy = nullptr;
 
     const llama_hadamard * hdmd = nullptr;
@@ -1180,6 +1191,7 @@ struct llm_graph_context {
     const llama_lookup_row_reader * lookup_rows;
 
     const std::vector<ggml_tensor *> * moe_routers; // see llm_graph_params::moe_routers
+    const std::vector<llm_moe_router_ahead_extra> * moe_routers_extra; // see llm_graph_params::moe_routers_extra
 
     const llama_prec_policy * prec_policy;
 
@@ -1357,6 +1369,10 @@ struct llm_graph_context {
     //     the first MoE layer after il, or -1 if the lookahead is off, `router` is not layer il's router or il is the
     //     last MoE layer
     int moe_router_ahead_layer(int il, const ggml_tensor * router) const;
+
+    // the extra router lookaheads (llama_context_params.moe_router_ahead_extra) of MoE layer il, built on `cur`, the
+    //     router input of the layer; fails the graph build for an input that the graph does not have
+    void build_moe_router_ahead_extra(ggml_tensor * cur, llama_expert_gating_func_type gating_op, int il) const;
 
     // names the router lookahead logits of layer il, marks them as an output and adds them to the graph, which must
     //     happen before the router of layer il is built so that the router nodes stay adjacent

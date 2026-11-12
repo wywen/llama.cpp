@@ -569,6 +569,7 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
         tok_embd = inp->embd;
     }
     cb(tok_embd, "mtp_tok_embd", il);
+    res->t_inp_embd = tok_embd; // the input token embeddings of an extra router lookahead
 
     inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
     ggml_set_input(inp->h);
