@@ -239,7 +239,8 @@ static ggml_mem_range ggml_mem_range_from_tensor(const ggml_tensor * tensor, ggm
 
     ggml_mem_range mr;
 
-    if (tensor->buffer) {
+    // a tensor in a buffer without storage (e.g. a placeholder of memory that is not allocated) has no address yet
+    if (tensor->buffer && tensor->data) {
         // when the tensor is allocated, use the actual memory address range in the buffer
         //
         // take the actual allocated size with ggml_backend_buft_get_alloc_size()
