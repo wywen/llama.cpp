@@ -258,7 +258,7 @@ struct llama_graph_plan;
 // (flash attention, fused ops) resolve as context creation resolves them. The memory and MoE slot placeholders take the
 // buffer types their devices report while the plan is built, which a device that rebinds its tensors at allocation may
 // set to those its tensors run from. The callbacks of params that run while a
-// graph computes or a scheduler reserves its buffers (cb_eval, cb_reserve, cb_graph_prepare, cb_outputs_enqueued,
+// graph computes or a scheduler reserves its buffers (cb_eval, cb_reserve, cb_graph_prepare, cb_outputs_enqueued, sched_caller_alloc,
 // abort_callback) are not installed.
 // The graphs, the planned contexts and the tensors they read stay valid until llama_graph_plan_free.
 // Throws std::runtime_error for a null model, an invalid `other`, parameters context creation refuses, a shape the

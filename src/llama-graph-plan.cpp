@@ -88,6 +88,7 @@ llama_graph_plan * llama_graph_plan_build(const std::vector<llama_graph_plan_mem
         params.cb_graph_prepare             = nullptr;
         params.cb_graph_prepare_user_data   = nullptr;
         params.cb_outputs_enqueued          = nullptr;
+        params.sched_caller_alloc           = nullptr;
         params.cb_outputs_enqueued_user_data = nullptr;
         params.abort_callback               = nullptr;
         params.abort_callback_data          = nullptr;
