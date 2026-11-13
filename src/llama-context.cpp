@@ -8,6 +8,7 @@
 #include "llama-io.h"
 #include "llama-kv-cache.h"
 #include "llama-memory.h"
+#include "llama-memory-alloc.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -448,6 +449,7 @@ llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
     model(model),
+    no_alloc(model.no_alloc() || llama_memory_alloc_planning()),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     // MTP uses the embd input for the hidden state
@@ -746,8 +748,8 @@ llama_context::llama_context(
 
         llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);
 
-        // graph outputs buffer
-        {
+        // graph outputs buffer, which a graph plan never reads
+        if (!llama_memory_alloc_planning()) {
             if (output_reserve(params.n_seq_max) < params.n_seq_max) {
                 throw std::runtime_error("failed to reserve initial output buffer");
             }
@@ -765,7 +767,7 @@ llama_context::llama_context(
 
     // the slots of the MoE layers that read their expert weights from slots, as the KV cache: per context, not state
     if (!model.moe_slots.empty()) {
-        moe_slots = std::make_unique<llama_moe_slot_pool>(model.moe_slots, cparams.moe_slot_sets, params.moe_slots, params.moe_slots_user_data, model.no_alloc());
+        moe_slots = std::make_unique<llama_moe_slot_pool>(model.moe_slots, cparams.moe_slot_sets, params.moe_slots, params.moe_slots_user_data, no_alloc);
     }
 
     // the caller's reader of the rows of the lookup tables that it serves
@@ -884,7 +886,7 @@ llama_context::llama_context(
             if (!model.moe_slots.empty()) {
                 throw std::runtime_error("the MoE cache cannot be used with a model that reads expert weights from MoE slots");
             }
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
+            moe_cache = std::make_unique<llama_moe_cache>(model, no_alloc, backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
         }
 
         sched_reserve();
@@ -912,7 +914,7 @@ llama_context::~llama_context() {
     synchronize();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
-    if (!model.no_alloc() && !opt_ctx) {
+    if (!no_alloc && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
             ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -1133,7 +1135,7 @@ void llama_context::sched_reserve() {
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
-                model.no_alloc(), model.no_alloc() ? backend_buf_exp_size.data() : nullptr);
+                no_alloc, no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
@@ -1160,7 +1162,7 @@ void llama_context::sched_reserve() {
         n_splits_tg = n_splits_pp;
         n_nodes_tg  = n_nodes_pp;
     } else {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.no_alloc());
+        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -1173,7 +1175,7 @@ void llama_context::sched_reserve() {
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
-        ggml_cgraph * gf = graph_reserve_widest(mctx.get(), model.no_alloc());
+        ggml_cgraph * gf = graph_reserve_widest(mctx.get(), no_alloc);
 
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
@@ -1183,7 +1185,7 @@ void llama_context::sched_reserve() {
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
-        if (!model.no_alloc()) {
+        if (!no_alloc) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
         if (backend_buf_exp_size[i] > 1) {
@@ -1220,7 +1222,7 @@ bool llama_context::sched_reserve_pending() const {
     return sched_need_reserve;
 }
 
-ggml_cgraph * llama_context::graph_reserve_widest(const llama_memory_context_i * mctx, bool split_only) {
+std::array<uint32_t, 3> llama_context::graph_shape_widest() const {
     const uint32_t n_tokens  = std::min(cparams.n_ctx, cparams.n_ubatch);
     const uint32_t n_outputs = std::min(n_tokens, cparams.n_outputs_max);
 
@@ -1232,10 +1234,15 @@ ggml_cgraph * llama_context::graph_reserve_widest(const llama_memory_context_i *
             // [TAG_RESERVE_DIAG_DECAY]
             // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
             // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
-            return graph_reserve(n_tokens, 1, n_outputs, mctx, split_only);
+            return { n_tokens, 1, n_outputs };
         default:
-            return graph_reserve(n_tokens, cparams.n_seq_max, n_outputs, mctx, split_only);
+            return { n_tokens, cparams.n_seq_max, n_outputs };
     }
+}
+
+ggml_cgraph * llama_context::graph_reserve_widest(const llama_memory_context_i * mctx, bool split_only) {
+    const auto [n_tokens, n_seqs, n_outputs] = graph_shape_widest();
+    return graph_reserve(n_tokens, n_seqs, n_outputs, mctx, split_only);
 }
 
 void llama_context::synchronize() {
@@ -3289,6 +3296,42 @@ ggml_cgraph * llama_context::graph_reserve(
     return gf;
 }
 
+llm_graph_result_ptr llama_context::graph_plan(
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, int32_t moe_slot_set) {
+    GGML_ASSERT(n_outputs >= 1);
+    GGML_ASSERT(n_seqs >= 1);
+
+    // as graph_reserve shapes its dummy ubatch
+    if (n_tokens % n_seqs != 0) {
+        n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs;
+    }
+
+    const auto save_n_outputs = this->n_outputs;
+    this->n_outputs = n_outputs;
+
+    llama_batch_allocr balloc_plan(model.hparams.n_pos_per_embd());
+    llama_ubatch ubatch = balloc_plan.ubatch_reserve(n_tokens/n_seqs, n_seqs);
+
+    ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
+
+    // at least the capacity of the context's own graph results, which sched_reserve sizes for its widest graph
+    const uint32_t max_nodes = std::max(graph_max_nodes(n_tokens), graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch)));
+    llm_graph_result_ptr res(new llm_graph_result(max_nodes));
+
+    auto gparams = graph_params(res.get(), ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    gparams.cparams.moe_slot_set = moe_slot_set;
+
+    ggml_cgraph * gf = model.build_graph(gparams);
+
+    this->n_outputs = save_n_outputs;
+
+    if (gf == nullptr || !ggml_backend_sched_rewrite_graph(sched.get(), gf)) {
+        return nullptr;
+    }
+
+    return res;
+}
+
 llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -4394,7 +4437,7 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
-    if (model.no_alloc()) {
+    if (no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);

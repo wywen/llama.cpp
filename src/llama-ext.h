@@ -220,6 +220,60 @@ struct llama_memory_plan {
 // context creation (backends, samplers, output and compute buffers) are not checked.
 LLAMA_API llama_memory_plan llama_model_memory_plan(const struct llama_model * model, const llama_context_params & params);
 
+//
+// graph planning
+//
+
+// how a planned graph's ubatch is shaped
+enum llama_graph_plan_width {
+    LLAMA_GRAPH_PLAN_WIDTH_UBATCH, // n_tokens, n_seqs and n_outputs as given, as llama_graph_reserve takes them
+    LLAMA_GRAPH_PLAN_WIDTH_WIDEST, // the widest prompt graph, as llama_graph_reserve_widest reserves it
+};
+
+// one graph a member of a plan builds
+struct llama_graph_plan_shape {
+    llama_graph_plan_width width;
+    uint32_t n_tokens;           // for LLAMA_GRAPH_PLAN_WIDTH_UBATCH
+    uint32_t n_seqs;
+    uint32_t n_outputs;
+    uint32_t n_cells;            // 0: over the whole memory, as llama_graph_reserve; else as llama_graph_reserve_extent
+    int32_t  nextn_layer_offset; // the appended NextN block the graph runs, see llama_set_nextn_layer_offset
+    int32_t  moe_slot_set;       // the MoE slot set the graph reads, see llama_set_moe_slot_set; -1 = the widest, as a reserve
+};
+
+// one context of a plan, and the graphs it builds
+struct llama_graph_plan_member {
+    const llama_model *  model;
+    llama_context_params params; // as llama_init_from_model takes them, ctx_other aside
+    int32_t              other;  // the earlier member whose context is this member's ctx_other; -1 for none
+    std::vector<llama_graph_plan_shape> shapes;
+};
+
+struct llama_graph_plan;
+
+// Builds each member's context as llama_init_from_model would, over memory that allocates nothing (as
+// llama_model_memory_plan builds it) and without compute or output buffers: a member that reads or shares the memory
+// of its ctx_other reads that member's planned context. Then builds each of the member's graphs as the matching
+// reserve would and runs the member's cb_graph_rewrite on it; no graph is split, placed or allocated. Device probes
+// (flash attention, fused ops) resolve as context creation resolves them. The memory and MoE slot placeholders take the
+// buffer types their devices report while the plan is built, which a device that rebinds its tensors at allocation may
+// set to those its tensors run from. The callbacks of params that run while a
+// graph computes or a scheduler reserves its buffers (cb_eval, cb_reserve, cb_graph_prepare, cb_outputs_enqueued,
+// abort_callback) are not installed.
+// The graphs, the planned contexts and the tensors they read stay valid until llama_graph_plan_free.
+// Throws std::runtime_error for a null model, an invalid `other`, parameters context creation refuses, a shape the
+// memory cannot build, or a graph that fails to build or rewrite.
+LLAMA_API llama_graph_plan * llama_graph_plan_build(const std::vector<llama_graph_plan_member> & members);
+
+// the graph of members[member].shapes[shape]
+LLAMA_API struct ggml_cgraph * llama_graph_plan_graph(const llama_graph_plan * plan, size_t member, size_t shape);
+
+// the planned context of members[member], to query: it never decodes
+LLAMA_API const struct llama_context * llama_graph_plan_context(const llama_graph_plan * plan, size_t member);
+
+// frees the graphs, the contexts and the memory of a plan
+LLAMA_API void llama_graph_plan_free(llama_graph_plan * plan);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

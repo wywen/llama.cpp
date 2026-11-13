@@ -433,6 +433,11 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_graph_prepare_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_prepare_callback callback, void * user_data);
     GGML_API void                 ggml_backend_sched_set_graph_rewrite_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_rewrite_callback callback, void * user_data);
 
+    // Runs the graph-rewrite callback, if one is set, on a graph and restores its invariants, as a reserve or an allocation
+    // does before it splits the graph; the graph is not split, placed or allocated
+    // returns false if the callback fails or the rewritten graph reads a tensor that is neither a node nor a leaf of it
+    GGML_API bool                 ggml_backend_sched_rewrite_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+
     // Plan the allocation again when the tensors of a graph shrink, not only when they grow (default: false)
     // the new plan starts at offset 0 of the first chunk; compute buffers that fit the plan are not reallocated,
     // but the reserve callback still fires with their current sizes

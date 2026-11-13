@@ -30,6 +30,7 @@ set(LLAMA_CORE_SOURCES
     llama-memory.cpp
     llama-memory-alloc.cpp
     llama-memory-plan.cpp
+    llama-graph-plan.cpp
     llama-moe-cache.cpp
     llama-lookup-tables.cpp
     llama-moe-slots.cpp

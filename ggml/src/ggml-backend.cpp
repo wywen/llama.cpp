@@ -2548,8 +2548,9 @@ static bool ggml_backend_sched_normalize_graph(struct ggml_cgraph * graph) {
     return true;
 }
 
-// runs the rewrite callback, if one is set, on a graph that is about to be split
-static bool ggml_backend_sched_rewrite_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+bool ggml_backend_sched_rewrite_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    GGML_ASSERT(sched);
+
     if (sched->callback_graph_rewrite == NULL) {
         return true;
     }

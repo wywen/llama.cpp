@@ -1,4 +1,5 @@
 #include "llama-moe-slots.h"
+#include "llama-memory-alloc.h"
 
 #include "llama-impl.h"
 
@@ -140,8 +141,15 @@ void llama_moe_slot_pool::add_region(int32_t set, const llama_moe_slot_layer * l
         throw std::runtime_error("failed to create ggml context");
     }
 
-    // without allocation, a placeholder of the layer's buffer type, which the scheduler places as the real buffer
-    ggml_backend_buffer_t buf = no_alloc ? ggml_backend_buft_alloc_buffer(layer->buft, 0) : ggml_backend_buft_alloc_buffer(buft, size);
+    // without allocation, a placeholder of the layer's buffer type, which the scheduler places as the real buffer; a
+    // planned context's placeholder takes the buffer type the device places memory in now, as its memory's do
+    ggml_backend_buffer_type_t placeholder = layer->buft;
+    if (no_alloc && llama_memory_alloc_planning()) {
+        if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
+            placeholder = ggml_backend_dev_buffer_type(dev);
+        }
+    }
+    ggml_backend_buffer_t buf = no_alloc ? ggml_backend_buft_alloc_buffer(placeholder, 0) : ggml_backend_buft_alloc_buffer(buft, size);
     if (buf == nullptr) {
         throw std::runtime_error(format("unable to allocate %s buffer of %zu bytes for the MoE slots of layer %d, set %d",
             ggml_backend_buft_name(buft), size, il, set));
