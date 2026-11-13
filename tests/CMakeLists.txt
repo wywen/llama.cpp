@@ -508,6 +508,8 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     # rewrites graphs in the backend scheduler on the CPU and, when the machine has one, on a Metal device
     # reads the use counts of the rewritten graph from the non-public ggml-impl.h
     llama_build_and_test(test-sched-graph-rewrite.cpp  LABEL "main behavior backend"  LINK ggml)
+    # computes a graph allocated by a caller on the CPU and, when the machine has one, on a Metal device
+    llama_build_and_test(test-sched-caller-alloc.cpp  LABEL "main behavior backend"  LINK ggml)
 endif()
 
 llama_build(test-export-graph-ops.cpp)

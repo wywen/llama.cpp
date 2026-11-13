@@ -508,6 +508,8 @@ llama_context::llama_context(
     cparams.cb_graph_prepare_user_data = params.cb_graph_prepare_user_data;
     cparams.cb_graph_rewrite           = params.cb_graph_rewrite;
     cparams.cb_graph_rewrite_user_data = params.cb_graph_rewrite_user_data;
+    cparams.has_sched_caller_alloc     = params.sched_caller_alloc != nullptr;
+    cparams.sched_caller_alloc         = params.sched_caller_alloc ? *params.sched_caller_alloc : ggml_backend_sched_caller_alloc{};
     cparams.n_graph_nodes_extra        = params.n_graph_nodes_extra;
     cparams.cb_outputs_enqueued           = params.cb_outputs_enqueued;
     cparams.cb_outputs_enqueued_user_data = params.cb_outputs_enqueued_user_data;
@@ -1067,6 +1069,9 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_reserve_callback(sched.get(), cparams.cb_reserve, cparams.cb_reserve_user_data);
     ggml_backend_sched_set_graph_prepare_callback(sched.get(), cparams.cb_graph_prepare, cparams.cb_graph_prepare_user_data);
     ggml_backend_sched_set_graph_rewrite_callback(sched.get(), cparams.cb_graph_rewrite, cparams.cb_graph_rewrite_user_data);
+    if (cparams.has_sched_caller_alloc && !ggml_backend_sched_set_caller_alloc(sched.get(), &cparams.sched_caller_alloc)) {
+        throw std::runtime_error("the scheduler refuses a caller allocator");
+    }
     // a caller that tracks per-graph extents wants each graph placed tightly
     ggml_backend_sched_set_replan_on_shrink(sched.get(), cparams.cb_graph_prepare != nullptr);
 }
@@ -4739,6 +4744,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_graph_rewrite            =*/ nullptr,
         /*.cb_graph_rewrite_user_data  =*/ nullptr,
         /*.n_graph_nodes_extra         =*/ 0,
+        /*.sched_caller_alloc          =*/ nullptr,
         /*.cb_outputs_enqueued         =*/ nullptr,
         /*.cb_outputs_enqueued_user_data =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,

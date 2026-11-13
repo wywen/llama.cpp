@@ -503,6 +503,9 @@ extern "C" {
         // cb_graph_rewrite adds; 0 = no capacity is reserved for a rewrite
         uint32_t n_graph_nodes_extra;
 
+        // see ggml_backend_sched_set_caller_alloc; NULL = the scheduler allocates its graphs; the struct is copied
+        const struct ggml_backend_sched_caller_alloc * sched_caller_alloc;
+
         // called once per graph computed on the context's scheduler (each ubatch of encode and decode, each K-shift),
         // after the asynchronous copies of its outputs have been enqueued and before the inputs of a later graph are
         // written, so that a caller can record backend events that complete with those copies
