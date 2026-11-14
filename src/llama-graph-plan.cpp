@@ -54,7 +54,8 @@ static llm_graph_result_ptr llama_graph_plan_shape_build(llama_context & ctx, co
     }
 
     ctx.set_nextn_layer_offset(shape.nextn_layer_offset);
-    llm_graph_result_ptr res = ctx.graph_plan(n_tokens, n_seqs, n_outputs, mctx.get(), shape.moe_slot_set);
+    ctx.set_embeddings_nextn(shape.embeddings_nextn, shape.embeddings_nextn_masked);
+    llm_graph_result_ptr res = ctx.graph_plan(n_tokens, n_seqs, n_outputs, mctx.get(), shape.moe_slot_set, shape.backend_sampling);
     if (!res) {
         throw std::runtime_error(format("failed to build or rewrite the graph of %u tokens, %u sequences, %u outputs", n_tokens, n_seqs, n_outputs));
     }
@@ -106,6 +107,7 @@ llama_graph_plan * llama_graph_plan_build(const std::vector<llama_graph_plan_mem
             graphs.push_back(llama_graph_plan_shape_build(ctx, shape));
         }
         ctx.set_nextn_layer_offset(0);
+        ctx.set_embeddings_nextn(false, false);
     }
 
     return plan.release();

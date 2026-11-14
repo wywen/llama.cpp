@@ -3302,7 +3302,8 @@ ggml_cgraph * llama_context::graph_reserve(
 }
 
 llm_graph_result_ptr llama_context::graph_plan(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, int32_t moe_slot_set) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, int32_t moe_slot_set,
+        bool backend_sampling) {
     GGML_ASSERT(n_outputs >= 1);
     GGML_ASSERT(n_seqs >= 1);
 
@@ -3313,6 +3314,12 @@ llm_graph_result_ptr llama_context::graph_plan(
 
     const auto save_n_outputs = this->n_outputs;
     this->n_outputs = n_outputs;
+
+    // the graph of a context its samplers have not attached to yet; restored below
+    std::map<llama_seq_id, llama_sampler *> save_samplers;
+    if (!backend_sampling) {
+        save_samplers.swap(sampling.samplers);
+    }
 
     llama_batch_allocr balloc_plan(model.hparams.n_pos_per_embd());
     llama_ubatch ubatch = balloc_plan.ubatch_reserve(n_tokens/n_seqs, n_seqs);
@@ -3329,6 +3336,9 @@ llm_graph_result_ptr llama_context::graph_plan(
     ggml_cgraph * gf = model.build_graph(gparams);
 
     this->n_outputs = save_n_outputs;
+    if (!backend_sampling) {
+        sampling.samplers.swap(save_samplers);
+    }
 
     if (gf == nullptr || !ggml_backend_sched_rewrite_graph(sched.get(), gf)) {
         return nullptr;

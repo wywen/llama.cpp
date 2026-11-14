@@ -3,10 +3,14 @@
 // For every generated model of the architectures below, on one backend, the plan of a context (and of an MTP
 // context reading it, where the model has a NextN layer) must build, node by node, the graph the real context
 // reserves for the same shape: the same ops, shapes, strides, names and parameters, reading the same nodes, model
-// weights, memory tensors and inputs. A graph rewrite callback runs on both. The plan must allocate nothing.
+// weights, memory tensors and inputs. A graph rewrite callback runs on both. The plan must allocate nothing. So must
+// the plan of a context sampling on the backend, and of the contexts of a speculative session, which output nextn
+// embeddings and sample the draft on the backend: each context reserves its graphs before these attach and again
+// after, and the plan builds each shape in the state its context reserved it in.
 
 #include "llama.h"
 #include "llama-cpp.h"
+#include "speculative.h"
 
 #include "../src/llama-context.h"
 #include "../src/llama-ext.h"
@@ -285,22 +289,94 @@ llama_context_params make_params(const context_case & c, rewrite_state & rewrite
 }
 
 llama_graph_plan_shape ubatch_shape(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, uint32_t n_cells = 0) {
-    return { LLAMA_GRAPH_PLAN_WIDTH_UBATCH, n_tokens, n_seqs, n_outputs, n_cells, 0, -1 };
+    return { LLAMA_GRAPH_PLAN_WIDTH_UBATCH, n_tokens, n_seqs, n_outputs, n_cells, 0, -1, false, false, false };
 }
 
 llama_graph_plan_shape widest_shape(uint32_t n_cells = 0) {
-    return { LLAMA_GRAPH_PLAN_WIDTH_WIDEST, 0, 0, 0, n_cells, 0, -1 };
+    return { LLAMA_GRAPH_PLAN_WIDTH_WIDEST, 0, 0, 0, n_cells, 0, -1, false, false, false };
 }
 
-// the graph a real context reserves for a planned shape
+// the graph a real context reserves for a planned shape, in the nextn state the shape names
 ggml_cgraph * reserve(llama_context * ctx, const llama_graph_plan_shape & shape) {
     llama_set_nextn_layer_offset(ctx, shape.nextn_layer_offset);
+    llama_set_embeddings_nextn(ctx, shape.embeddings_nextn, shape.embeddings_nextn_masked);
     if (shape.width == LLAMA_GRAPH_PLAN_WIDTH_WIDEST) {
         return shape.n_cells == 0 ? llama_graph_reserve_widest(ctx) : llama_graph_reserve_widest_extent(ctx, shape.n_cells);
     }
     return shape.n_cells == 0
         ? llama_graph_reserve(ctx, shape.n_tokens, shape.n_seqs, shape.n_outputs)
         : llama_graph_reserve_extent(ctx, shape.n_tokens, shape.n_seqs, shape.n_outputs, shape.n_cells);
+}
+
+// what a context does past its creation parameters, which changes the graphs it builds
+enum class feature_set {
+    none,
+    backend_sampler, // the target samples every sequence on the backend
+    mtp_session,     // as a speculative session sets them: the target outputs nextn embeddings for every row, the
+                     // draft for its output rows, and the draft samples on the backend
+    mtp_masked,      // the same, with the target's nextn embeddings for its output rows only, as over shared memory
+};
+
+const char * feature_name(feature_set f) {
+    switch (f) {
+        case feature_set::none:            return "plain";
+        case feature_set::backend_sampler: return "backend-sampler";
+        case feature_set::mtp_session:     return "mtp-session";
+        case feature_set::mtp_masked:      return "mtp-masked";
+    }
+    return "?";
+}
+
+struct member_features {
+    bool nextn        = false;
+    bool nextn_masked = false;
+    bool sampler      = false; // a backend sampler on each sequence
+};
+
+member_features features_of(feature_set f, size_t member) {
+    switch (f) {
+        case feature_set::none:
+            return {};
+        case feature_set::backend_sampler:
+            return { false, false, member == 0 };
+        case feature_set::mtp_session:
+            return member == 0 ? member_features{ true, false, false } : member_features{ true, true, true };
+        case feature_set::mtp_masked:
+            return member == 0 ? member_features{ true, true, false } : member_features{ true, true, true };
+    }
+    return {};
+}
+
+// the backend sampler chains of one context, one per sequence, freed after the context
+struct sampler_chains {
+    std::vector<llama_sampler *>          chains;
+    std::vector<llama_sampler_seq_config> configs;
+
+    sampler_chains() = default;
+    sampler_chains(const sampler_chains &) = delete;
+    sampler_chains & operator=(const sampler_chains &) = delete;
+    ~sampler_chains() {
+        for (llama_sampler * chain : chains) {
+            llama_sampler_free(chain);
+        }
+    }
+
+    void make(uint32_t n_seqs) {
+        for (uint32_t seq = 0; seq < n_seqs; ++seq) {
+            chains.push_back(common_speculative_draft_backend_chain());
+            configs.push_back({ (llama_seq_id) seq, chains.back() });
+        }
+    }
+};
+
+// whether a graph samples on the backend: it gathers the rows of the top-k sampler, which names them
+bool samples_on_backend(ggml_cgraph * gf) {
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        if (strcmp(ggml_get_name(ggml_graph_node(gf, i)), "top_k_rows") == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 struct plan_case {
@@ -322,12 +398,16 @@ void fail(outcome & out, const std::string & what) {
     out.failures++;
 }
 
-void check_case(const plan_case & pc, outcome & out) {
+void check_case(const plan_case & pc, feature_set features, outcome & out) {
     for (const context_case & cc : context_cases) {
         if (pc.draft != nullptr && !cc.drafts) {
             continue;
         }
-        const std::string label = pc.label + " [" + cc.name + "]";
+        const bool session = features == feature_set::mtp_session || features == feature_set::mtp_masked;
+        if (session && pc.draft == nullptr) {
+            continue;
+        }
+        const std::string label = pc.label + " [" + cc.name + ", " + feature_name(features) + "]";
         rewrite_state rewrite_real;
         rewrite_state rewrite_plan;
 
@@ -356,6 +436,31 @@ void check_case(const plan_case & pc, outcome & out) {
             }
         }
 
+        // a member with features reserves its shapes before they attach and again after; the plan's chains and the real
+        // contexts' chains are their own: a chain initializes its backend once
+        std::vector<sampler_chains> plan_chains(members.size());
+        std::vector<sampler_chains> real_chains(members.size());
+        for (size_t m = 0; m < members.size(); ++m) {
+            const member_features f = features_of(features, m);
+            if (!f.nextn && !f.sampler) {
+                continue;
+            }
+            const size_t n_before = members[m].shapes.size();
+            for (size_t s = 0; s < n_before; ++s) {
+                llama_graph_plan_shape after = members[m].shapes[s];
+                after.embeddings_nextn        = f.nextn;
+                after.embeddings_nextn_masked = f.nextn_masked;
+                after.backend_sampling        = f.sampler;
+                members[m].shapes.push_back(after);
+            }
+            if (f.sampler) {
+                plan_chains[m].make(members[m].params.n_seq_max);
+                real_chains[m].make(members[m].params.n_seq_max);
+                members[m].params.samplers   = plan_chains[m].configs.data();
+                members[m].params.n_samplers = plan_chains[m].configs.size();
+            }
+        }
+
         llama_graph_plan * plan = nullptr;
         try {
             plan = llama_graph_plan_build(members);
@@ -375,6 +480,17 @@ void check_case(const plan_case & pc, outcome & out) {
                 break;
             }
         }
+        // as a session attaches them to contexts it did not create: after creation, before the first shape sampling on
+        // the backend
+        std::vector<bool> attached(members.size(), false);
+        const auto attach = [&](size_t m) {
+            for (const llama_sampler_seq_config & config : real_chains[m].configs) {
+                if (!llama_set_sampler(real[m].get(), config.seq_id, config.sampler)) {
+                    fail(out, label + ": member " + std::to_string(m) + " does not sample on the backend");
+                }
+            }
+            attached[m] = true;
+        };
         if (real.size() != members.size() || !real.back()) {
             llama_graph_plan_free(plan);
             continue;
@@ -393,6 +509,13 @@ void check_case(const plan_case & pc, outcome & out) {
                 rewrite_real.other  = other;
                 rewrite_real.record = true;
                 rewrite_real.rewritten.clear();
+                if (members[m].shapes[s].backend_sampling && !attached[m]) {
+                    attach(m);
+                }
+                if (!members[m].shapes[s].backend_sampling && attached[m]) {
+                    fail(out, what + ": a shape without backend sampling follows one with it");
+                    continue;
+                }
                 ggml_cgraph * reserved = reserve(real[m].get(), members[m].shapes[s]);
                 rewrite_real.record = false;
                 out.graphs++;
@@ -413,14 +536,47 @@ void check_case(const plan_case & pc, outcome & out) {
                 if (!rewritten) {
                     fail(out, what + ": the planned graph was not rewritten");
                 }
+                // a sampler the plan dropped would leave both graphs without it alike
+                if (members[m].shapes[s].backend_sampling != samples_on_backend(planned)) {
+                    fail(out, what + (members[m].shapes[s].backend_sampling ? ": the planned graph samples nothing on the backend"
+                                                                            : ": the planned graph samples before its samplers attach"));
+                }
             }
             llama_set_nextn_layer_offset(real[m].get(), 0);
+            llama_set_embeddings_nextn(real[m].get(), false, false);
         }
         // the draft's context reads the target's, so it goes first
         while (!real.empty()) {
             real.pop_back();
         }
         llama_graph_plan_free(plan);
+    }
+}
+
+// a context outputting nextn embeddings for every row builds a graph of its own: the plan is not equal to the built
+// graph only because the flag changes nothing
+void check_nextn_changes_graph(const plan_case & pc, outcome & out) {
+    const context_case & cc = context_cases[0];
+    rewrite_state rewrite;
+    // a verify graph, whose outputs are fewer than its tokens
+    std::vector<std::vector<std::string>> graphs;
+    for (const bool nextn : { false, true }) {
+        llama_graph_plan_shape verify = ubatch_shape(cc.n_ubatch, 1, 3);
+        verify.embeddings_nextn = nextn;
+        std::vector<llama_graph_plan_member> members;
+        members.push_back({ pc.target, make_params(cc, rewrite), -1, { verify } });
+        llama_graph_plan * plan = nullptr;
+        try {
+            plan = llama_graph_plan_build(members);
+        } catch (const std::exception & e) {
+            fail(out, pc.label + ": the plan failed: " + e.what());
+            return;
+        }
+        graphs.push_back(describe_graph(llama_graph_plan_graph(plan, 0, 0), pc.target, nullptr));
+        llama_graph_plan_free(plan);
+    }
+    if (graphs[0] == graphs[1]) {
+        fail(out, pc.label + ": the nextn embeddings of every row change no planned graph");
     }
 }
 
@@ -549,7 +705,12 @@ int main(int argc, char ** argv) {
         check_bad_member_throws(cases.front().target, out);
     }
     for (const plan_case & pc : cases) {
-        check_case(pc, out);
+        for (const feature_set f : { feature_set::none, feature_set::backend_sampler, feature_set::mtp_session, feature_set::mtp_masked }) {
+            check_case(pc, f, out);
+        }
+        if (pc.draft != nullptr) {
+            check_nextn_changes_graph(pc, out);
+        }
     }
 
     printf("%s: %zu cases, %zu graphs compared, %zu failures\n", argv[0], cases.size(), out.graphs, out.failures);
