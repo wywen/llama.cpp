@@ -239,6 +239,12 @@ struct llama_graph_plan_shape {
     uint32_t n_cells;            // 0: over the whole memory, as llama_graph_reserve; else as llama_graph_reserve_extent
     int32_t  nextn_layer_offset; // the appended NextN block the graph runs, see llama_set_nextn_layer_offset
     int32_t  moe_slot_set;       // the MoE slot set the graph reads, see llama_set_moe_slot_set; -1 = the widest, as a reserve
+    // the context's state when it builds the graph: whether it outputs nextn embeddings, and only for the output rows,
+    // as llama_set_embeddings_nextn sets them; and whether its sequences sample on the backend with the samplers of the
+    // member's params, as once they attach
+    bool     embeddings_nextn;
+    bool     embeddings_nextn_masked;
+    bool     backend_sampling;
 };
 
 // one context of a plan, and the graphs it builds
@@ -259,7 +265,10 @@ struct llama_graph_plan;
 // buffer types their devices report while the plan is built, which a device that rebinds its tensors at allocation may
 // set to those its tensors run from. The callbacks of params that run while a
 // graph computes or a scheduler reserves its buffers (cb_eval, cb_reserve, cb_graph_prepare, cb_outputs_enqueued, sched_caller_alloc,
-// abort_callback) are not installed.
+// abort_callback) are not installed. The backend samplers of params attach as context creation attaches them, and a
+// shape that samples on the backend builds its graph with them, as the built context's graph once they attach; a
+// sampler chain initializes its backend once, so the chains a plan reads are its own, and the caller keeps them alive
+// until llama_graph_plan_free.
 // The graphs, the planned contexts and the tensors they read stay valid until llama_graph_plan_free.
 // Throws std::runtime_error for a null model, an invalid `other`, parameters context creation refuses, a shape the
 // memory cannot build, or a graph that fails to build or rewrite.

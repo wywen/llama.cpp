@@ -51,6 +51,10 @@ common_speculative_output_limits common_speculative_get_output_limits(
 // return true if the target and draft models have compatible vocabs
 bool common_speculative_are_compatible(const llama_model * model_tgt, const llama_model * model_dft);
 
+// a new chain of the samplers a draft context samples each sequence with on the backend, when the draft parameters
+// ask for backend sampling: what common_speculative_init attaches with llama_set_sampler. The caller frees it.
+llama_sampler * common_speculative_draft_backend_chain();
+
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
 void common_speculative_free(common_speculative * spec);
