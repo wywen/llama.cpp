@@ -1242,6 +1242,10 @@ struct ggml_backend_sched {
     ggml_backend_sched_graph_submit_callback callback_graph_submit;
     void * callback_graph_submit_user_data;
 
+    // computes each graph handed to a backend while computing splits, in place of ggml_backend_graph_compute_async
+    ggml_backend_sched_split_compute_callback callback_split_compute;
+    void * callback_split_compute_user_data;
+
     ggml_backend_sched_graph_prepare_callback callback_graph_prepare;
     void * callback_graph_prepare_user_data;
 
@@ -2325,6 +2329,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     };
 
+    auto compute_graph = [&](int split_id, int first, ggml_backend_t backend, struct ggml_cgraph * graph) {
+        if (sched->callback_split_compute) {
+            return sched->callback_split_compute(sched, split_id, first, backend, graph, sched->callback_split_compute_user_data);
+        }
+        return ggml_backend_graph_compute_async(backend, graph);
+    };
+
     struct ggml_backend_sched_split * splits = sched->splits;
 
     int prev_backend_id = -1;
@@ -2361,7 +2372,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            enum ggml_status ec = compute_graph(split_id, 0, split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 if (!split_submitted) {
                     graph_submitted(ec);
@@ -2390,7 +2401,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
-                enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                enum ggml_status ec = compute_graph(split_id, j0, split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
                     if (!split_submitted) {
                         graph_submitted(ec);
@@ -2976,6 +2987,12 @@ void ggml_backend_sched_set_graph_submit_callback(ggml_backend_sched_t sched, gg
     GGML_ASSERT(sched);
     sched->callback_graph_submit = callback;
     sched->callback_graph_submit_user_data = user_data;
+}
+
+void ggml_backend_sched_set_split_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_split_compute_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_split_compute = callback;
+    sched->callback_split_compute_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

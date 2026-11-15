@@ -368,6 +368,15 @@ extern "C" {
     // Callback once per graph compute, after the first split is submitted or when the submission fails before that
     typedef void (*ggml_backend_sched_graph_submit_callback)(ggml_backend_sched_t sched, enum ggml_status status, void * user_data);
 
+    // Callback that computes `graph` on `backend` in place of ggml_backend_graph_compute_async. The scheduler calls it
+    // for every graph it would hand a backend while computing splits: each split's graph, or, with an eval callback, each
+    // view of a split between the nodes the eval callback asks for. `split_id` is the split's index and `first` the index
+    // in the split's graph of `graph`'s first node. A status other than GGML_STATUS_SUCCESS fails the compute as a
+    // failing backend compute does. The callback may compute the graph itself or call ggml_backend_graph_compute_async.
+    typedef enum ggml_status (*ggml_backend_sched_split_compute_callback)(
+            ggml_backend_sched_t sched, int split_id, int first,
+            ggml_backend_t backend, struct ggml_cgraph * graph, void * user_data);
+
     // Callback once per allocated graph, after every tensor has its address and before the inputs are set
     // returning false fails ggml_backend_sched_alloc_graph
     // a graph that is computed again without ggml_backend_sched_alloc_graph needs ggml_backend_sched_prepare_graph
@@ -449,6 +458,8 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_reserve_callback(ggml_backend_sched_t sched, ggml_backend_sched_reserve_callback callback, void * user_data);
     GGML_API void                 ggml_backend_sched_set_graph_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_compute_callback callback, void * user_data);
     GGML_API void                 ggml_backend_sched_set_graph_submit_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_submit_callback callback, void * user_data);
+    // NULL computes each split with ggml_backend_graph_compute_async (the default)
+    GGML_API void                 ggml_backend_sched_set_split_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_split_compute_callback callback, void * user_data);
     GGML_API void                 ggml_backend_sched_set_graph_prepare_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_prepare_callback callback, void * user_data);
     GGML_API void                 ggml_backend_sched_set_graph_rewrite_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_rewrite_callback callback, void * user_data);
 

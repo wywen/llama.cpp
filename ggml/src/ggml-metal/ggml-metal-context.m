@@ -471,6 +471,34 @@ static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_te
     return ggml_metal_buffer_get_id(ggml_metal_tensor_buffer(t), t);
 }
 
+// encode nodes [i0, i1) of gf into cmd_buf with the context's fusion, concurrency and debug settings
+// every path that computes graph nodes encodes them through this function, so a range encodes the same kernels,
+// fusions and barriers whichever path encodes it
+static void ggml_metal_encode_range(ggml_metal_t ctx, ggml_metal_cmd_buf_t cmd_buf, struct ggml_cgraph * gf,
+        int i0, int i1, bool use_capture) {
+    ggml_metal_op_t op = ggml_metal_op_init(
+        ctx->dev,
+        cmd_buf,
+        gf,
+        ctx->finfo,
+        i0,
+        i1,
+        ctx->use_concurrency,
+        use_capture,
+        ctx->debug_graph);
+
+    for (int idx = 0; idx < ggml_metal_op_n_nodes(op); ++idx) {
+        const int res = ggml_metal_op_encode(op, idx);
+        if (res == 0) {
+            break;
+        }
+
+        idx += res - 1;
+    }
+
+    ggml_metal_op_free(op);
+}
+
 void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     @autoreleasepool {
         // wrap the source data into a Metal buffer
@@ -1341,27 +1369,8 @@ static enum ggml_status ggml_metal_graph_compute_paged(ggml_metal_t ctx, struct 
                 }
             }
 
-            // encode nodes [seg_start, seg_end) as the stock encode_async does over its slice
-            ggml_metal_op_t op = ggml_metal_op_init(
-                ctx->dev,
-                (ggml_metal_cmd_buf_t) cmd_buf,
-                gf,
-                ctx->finfo,
-                seg_start,
-                seg_end,
-                ctx->use_concurrency,
-                false, // capture is not supported on the boundary-scheduled path
-                ctx->debug_graph);
-
-            for (int idx = 0; idx < ggml_metal_op_n_nodes(op); ++idx) {
-                const int r = ggml_metal_op_encode(op, idx);
-                if (r == 0) {
-                    break;
-                }
-                idx += r - 1;
-            }
-
-            ggml_metal_op_free(op);
+            // capture is not supported on the boundary-scheduled path
+            ggml_metal_encode_range(ctx, (ggml_metal_cmd_buf_t) cmd_buf, gf, seg_start, seg_end, false);
 
             // window exit: copy out after the last encoded segment produced it
             if (window_last && blit_out_here) {
@@ -1674,6 +1683,30 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     //printf("%s: graph optimize took %.3f ms\n", __func__, (ggml_time_us() - t_start) / 1000.0);
 }
 
+void ggml_metal_encode_nodes(ggml_metal_t ctx, struct ggml_cgraph * gf, int i0, int i1, ggml_metal_cmd_buf_t cmd_buf) {
+    // keep the memory wired, as a graph compute does
+    ggml_metal_device_rsets_keep_alive(ctx->dev);
+
+    // the encoders are autoreleased; the caller's thread may have no pool
+    @autoreleasepool {
+        ggml_metal_encode_range(ctx, cmd_buf, gf, i0, i1, false);
+    }
+}
+
+void ggml_metal_commit_fence(ggml_metal_t ctx) {
+    @autoreleasepool {
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+
+        [cmd_buf commit];
+
+        [ctx->cmd_bufs_ext addObject:cmd_buf];
+        ctx->cmd_buf_last = cmd_buf;
+
+        [cmd_buf retain];
+    }
+}
+
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
     @autoreleasepool {
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
@@ -1760,27 +1793,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
 
         id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
 
-        ggml_metal_op_t ctx_op = ggml_metal_op_init(
-            ctx->dev,
-            cmd_buf,
-            ctx->gf,
-            ctx->finfo,
-            idx_start,
-            idx_end,
-            ctx->use_concurrency,
-            ctx->capture_compute == 0,
-            ctx->debug_graph);
-
-        for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
-            const int res = ggml_metal_op_encode(ctx_op, idx);
-            if (res == 0) {
-                break;
-            }
-
-            idx += res - 1;
-        }
-
-        ggml_metal_op_free(ctx_op);
+        ggml_metal_encode_range(ctx, (ggml_metal_cmd_buf_t) cmd_buf, ctx->gf, idx_start, idx_end, ctx->capture_compute == 0);
 
         if (cb_idx < 2 || ctx->abort_callback == NULL) {
             [cmd_buf commit];
