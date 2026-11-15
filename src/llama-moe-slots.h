@@ -16,7 +16,7 @@
 #define LLAMA_MOE_SLOT_ALIGNMENT_DEFAULT 16384
 
 // a MoE layer whose expert weights are read from caller-filled slots, see llama_model_params.moe_slots
-// the model holds the geometry of a slot and the file runs that fill it; each context allocates its own slots
+// the model holds the geometry of a slot and the file runs that fill it; the caller allocates the slots
 struct llama_moe_slot_layer {
     struct member {
         std::string   name;
@@ -76,68 +76,4 @@ private:
     std::unordered_map<const ggml_tensor *, const llama_moe_slot_layer *> by_stock;
 
     std::vector<ggml_context_ptr> ctxs; // stock metadata
-};
-
-// the slots of one slot layer in a context: one buffer that holds the slot map, zero padded to the alignment, then
-// n_slots slots of slot_size bytes
-struct llama_moe_slot_region {
-    const llama_moe_slot_layer * layer = nullptr;
-
-    int32_t n_slots  = 0;
-    size_t  map_size = 0; // round_up(n_expert*4, alignment), the offset of the first slot
-
-    ggml_backend_buffer_t buf      = nullptr; // owned by llama_moe_slot_pool
-    ggml_tensor *         region   = nullptr; // I8 [map_size + n_slots*slot_size], the whole buffer
-    ggml_tensor *         slot_map = nullptr; // I32 [1, n_expert] at offset 0
-
-    std::vector<ggml_tensor *> members; // as layer->members: [ne0, ne1, n_slots] at map_size + offset, nb[2] = slot_size
-
-    // the slot ranges: range r holds the slots [bounds[r], bounds[r + 1]); one range [0, n_slots) if not split
-    std::vector<int32_t> bounds;
-
-    int32_t n_ranges() const {
-        return (int32_t) bounds.size() - 1;
-    }
-
-    // the member tensor that stands in for the stock expert weight w, nullptr if w is not a member
-    ggml_tensor * get(const ggml_tensor * w) const;
-};
-
-// the slot sets of a context, each with the slots of each slot layer of its model, see llama_context_params.moe_slots
-class llama_moe_slot_pool {
-public:
-    // asks `get_params` for the slots of each slot layer in each of the n_sets sets of context lctx; NULL = no slots
-    llama_moe_slot_pool(const llama_context * lctx, const llama_moe_slots & slots, uint32_t n_sets, llama_moe_slot_pool_callback get_params, void * user_data, bool no_alloc);
-
-    uint32_t n_sets() const {
-        return (uint32_t) regions.size();
-    }
-
-    // the slots of layer il in set `set`, nullptr if the layer is not a slot layer or this set has no slots for it
-    const llama_moe_slot_region * region(int32_t set, int32_t il) const;
-
-    // the slots of layer il in the set with the most slots for it, nullptr if no set has slots for it
-    const llama_moe_slot_region * widest(int32_t il) const;
-
-    const llama_moe_slots & model_slots() const {
-        return slots;
-    }
-
-    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
-
-private:
-    // asks `get_params` for the slots of `layer` in set `set` and allocates them
-    void add_region(const llama_context * lctx, int32_t set, const llama_moe_slot_layer * layer, llama_moe_slot_pool_callback get_params, void * user_data, bool no_alloc);
-
-    const llama_moe_slots & slots;
-
-    std::vector<std::map<int32_t, llama_moe_slot_region>> regions; // [n_sets], by layer
-
-    std::vector<ggml_context_ptr> ctxs; // region, slot map and member tensors
-    struct buffer {
-        ggml_backend_buffer_ptr    buf;
-        ggml_backend_buffer_type_t buft;
-        size_t                     size; // without allocation, the size it would have
-    };
-    std::vector<buffer> bufs;
 };

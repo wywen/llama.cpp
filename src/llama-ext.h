@@ -238,7 +238,6 @@ struct llama_graph_plan_shape {
     uint32_t n_outputs;
     uint32_t n_cells;            // 0: over the whole memory, as llama_graph_reserve; else as llama_graph_reserve_extent
     int32_t  nextn_layer_offset; // the appended NextN block the graph runs, see llama_set_nextn_layer_offset
-    int32_t  moe_slot_set;       // the MoE slot set the graph reads, see llama_set_moe_slot_set; -1 = the widest, as a reserve
     // the context's state when it builds the graph: whether it outputs nextn embeddings, and only for the output rows,
     // as llama_set_embeddings_nextn sets them; and whether its sequences sample on the backend with the samplers of the
     // member's params, as once they attach
@@ -261,7 +260,7 @@ struct llama_graph_plan;
 // llama_model_memory_plan builds it) and without compute or output buffers: a member that reads or shares the memory
 // of its ctx_other reads that member's planned context. Then builds each of the member's graphs as the matching
 // reserve would and runs the member's cb_graph_rewrite on it for GGML_BACKEND_SCHED_REWRITE_PLAN; no graph is split,
-// placed or allocated. Device probes (flash attention, fused ops) resolve as context creation resolves them. The memory and MoE slot placeholders take the
+// placed or allocated. Device probes (flash attention, fused ops) resolve as context creation resolves them. The memory placeholders take the
 // buffer types their devices report while the plan is built, which a device that rebinds its tensors at allocation may
 // set to those its tensors run from. The callbacks of params that run while a
 // graph computes or a scheduler reserves its buffers (cb_eval, cb_reserve, cb_graph_prepare, cb_outputs_enqueued, sched_caller_alloc,

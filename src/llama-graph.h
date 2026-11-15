@@ -973,8 +973,8 @@ struct llm_graph_params {
             return false;
         }
 
-        // the slot sets have the same topology, but a graph rewrite reads the slot tensors of the graph's set
-        if (cparams.moe_slot_set != other.cparams.moe_slot_set) {
+        // the variants have the same topology, but the caller's graph rewrite keys on the graph's variant
+        if (cparams.graph_variant != other.cparams.graph_variant) {
             return false;
         }
 
