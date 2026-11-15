@@ -370,26 +370,14 @@ typedef struct ggml_metal_buffer * ggml_metal_buffer_t;
 
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared);
 ggml_metal_buffer_t ggml_metal_buffer_map (ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size);
-// see ggml_backend_metal_buffer_from_host_ptr_split
-ggml_metal_buffer_t ggml_metal_buffer_map_split(ggml_metal_device_t dev, void * ptr, size_t size, const size_t * split_offsets, int n_splits);
+// see ggml_backend_metal_buffer_from_ranges: range i has sizes[i] bytes and the Metal buffer metals[i]
+ggml_metal_buffer_t ggml_metal_buffer_map_ranges(ggml_metal_device_t dev, void * base, size_t size, const size_t * sizes, void * const * metals, int n_ranges);
+// see ggml_backend_metal_buffer_set_range
+bool ggml_metal_buffer_set_range(ggml_metal_buffer_t buf, int i, void * metal);
 
 void   ggml_metal_buffer_free     (ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_base (ggml_metal_buffer_t buf);
 bool   ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf);
-
-// a buffer over host memory (from ggml_metal_buffer_map): see ggml_backend_metal_buffer_unwrap
-bool ggml_metal_buffer_unwrap            (ggml_metal_buffer_t buf);
-bool ggml_metal_buffer_rewrap            (ggml_metal_buffer_t buf);
-bool ggml_metal_buffer_request_residency (ggml_metal_buffer_t buf);
-bool ggml_metal_buffer_end_residency     (ggml_metal_buffer_t buf);
-// sub-range i of a buffer from ggml_metal_buffer_map_split: see ggml_backend_metal_buffer_unwrap_range
-bool ggml_metal_buffer_unwrap_range            (ggml_metal_buffer_t buf, int i);
-bool ggml_metal_buffer_rewrap_range            (ggml_metal_buffer_t buf, int i);
-bool ggml_metal_buffer_request_residency_range (ggml_metal_buffer_t buf, int i);
-bool ggml_metal_buffer_end_residency_range     (ggml_metal_buffer_t buf, int i);
-// the Metal buffers residency set s holds, as a mask of their indices (bit i for buffers[i]); 0 when there is no such
-// set, it is not made yet, or the OS has no residency sets. A split buffer has one set per sub-range, any other one set
-uint64_t ggml_metal_buffer_rset_members(ggml_metal_buffer_t buf, int s);
 
 void   ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size);
 void   ggml_metal_buffer_set_tensor   (ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
@@ -405,8 +393,6 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 // Metal buffer based on the host memory pointer
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
-// the Metal buffer that fully contains t and t's offset in it, or false when none does; never logs or aborts
-bool ggml_metal_buffer_find_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t, struct ggml_metal_buffer_id * res);
 
 #ifdef __cplusplus
 }

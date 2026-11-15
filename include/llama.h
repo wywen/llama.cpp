@@ -860,7 +860,7 @@ extern "C" {
     //
     // Slot ranges (llama_moe_slot_pool_params.n_range_splits) split the slots of a layer in a set into ranges of
     // consecutive slots, for a buffer that a device binds in disjoint parts, such as one from
-    // ggml_backend_metal_buffer_from_host_ptr_split. With more than one range, every op of the graph that reads a
+    // ggml_backend_metal_buffer_from_ranges. With more than one range, every op of the graph that reads a
     // member tensor reads a view of it limited to the slots of one range (named <member>.r<range>, e.g.
     // blk.0.ffn_up_exps.slots.r1): each expert weight is read by one mul_mat_id per range (named as the unranged node
     // with a suffix _r<range>, e.g. ffn_moe_up_r1-<il>), whose ids are the slots of the selected experts made local to
@@ -875,8 +875,8 @@ extern "C" {
     //
     // Every range is read by every graph that computes the layer, whichever experts the router selects: the op of a
     // range none of whose slots are selected still binds the range (on Metal, wiring its pages), and the range must be
-    // readable, e.g. a sub-range of a split Metal buffer must be wrapped. Skipping the ranges that no selected expert
-    // reads is not supported yet.
+    // readable, e.g. a range of a buffer from ggml_backend_metal_buffer_from_ranges must have a Metal buffer. Skipping
+    // the ranges that no selected expert reads is not supported yet.
     //
 
 #define LLAMA_MOE_SLOT_MAX_MEMBERS 3

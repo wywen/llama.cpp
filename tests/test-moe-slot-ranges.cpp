@@ -6,13 +6,13 @@
 // and that every op of the graph that reads a member tensor reads a view of it inside one range, each expert weight
 //     read by one mul_mat_id per range named with the range; that the context reports its ranges, refuses bad splits
 //     and slot sets of a layer with different numbers of ranges, and that two sets split differently compute alike
-// on a Metal device, also with the slot buffer split at its ranges (ggml_backend_metal_buffer_from_host_ptr_split,
-//     one sub-range for the slot map and one per slot range):
-//   - ranged slots on the split buffer compute the logits of unsplit slots in a device buffer, also with each
-//     sub-range's residency requested on its own and after a range is unwrapped and rewrapped between graphs
-//   - unranged slots on the split buffer abort at encode, since a member tensor crosses the split points
-//   - with the sub-range of one slot range unwrapped, a graph aborts with the message that names the range's view and
-//     sub-range (every graph reads every range, whichever experts it selects)
+// on a Metal device, also with the slot buffer in ranges of their own Metal buffers (ggml_backend_metal_buffer_from_ranges,
+//     one range for the slot map and one per slot range):
+//   - ranged slots on the ranged buffer compute the logits of unsplit slots in a device buffer, also after a range's
+//     Metal buffer is replaced between graphs
+//   - unranged slots on the ranged buffer abort at encode, since a member tensor crosses the range boundaries
+//   - with one slot range's Metal buffer removed, a graph aborts with the message that names the range's view and
+//     range (every graph reads every range, whichever experts it selects)
 //
 // the models are the MoE models written by test-llama-archs (-o <dir>)
 
@@ -27,6 +27,7 @@
 
 #ifdef TEST_MOE_SLOT_RANGES_METAL
 #include "ggml-metal.h"
+#include "metal-nocopy-buffer.h"
 
 #include <mach-o/dyld.h>
 #include <spawn.h>
@@ -614,18 +615,49 @@ static void test_refusals(const std::string & path, const std::string & stem, ch
 #ifdef TEST_MOE_SLOT_RANGES_METAL
 
 //
-// slots in a Metal buffer split at the slot ranges
+// slots in a Metal buffer of one range per slot range
 //
 
-// a caller's buffer type that allocates page-aligned host memory and wraps it with
-// ggml_backend_metal_buffer_from_host_ptr_split at the offsets given for each allocation, in allocation order
+// a buffer from ggml_backend_metal_buffer_from_ranges over caller memory, and the Metal buffers of its ranges
+struct ranged_buffer {
+    ggml_backend_buffer_t buf = nullptr;
+    void * mem = nullptr;
+    std::vector<size_t> begs;    // each range's offset in mem
+    std::vector<size_t> lengths; // the page-rounded length each range's Metal buffer wraps
+    std::vector<void *> metals;
+
+    // replaces range i's Metal buffer with a new one over the same pages, or with none
+    bool rewrap(ggml_backend_dev_t dev, int i) {
+        void * m = test_metal_nocopy_buffer_new(dev, (uint8_t *) mem + begs[i], lengths[i]);
+        if (m == nullptr || !ggml_backend_metal_buffer_set_range(buf, i, m)) {
+            if (m != nullptr) {
+                test_metal_buffer_release(m);
+            }
+            return false;
+        }
+        test_metal_buffer_release(metals[i]);
+        metals[i] = m;
+        return true;
+    }
+
+    bool unwrap(int i) {
+        if (!ggml_backend_metal_buffer_set_range(buf, i, nullptr)) {
+            return false;
+        }
+        test_metal_buffer_release(metals[i]);
+        metals[i] = nullptr;
+        return true;
+    }
+};
+
+// a caller's buffer type that allocates page-aligned host memory, splits it at the offsets given for each allocation,
+// in allocation order, and wraps each range in a Metal buffer of its own
 struct split_buft {
     ggml_backend_buffer_type wrapper;
     ggml_backend_dev_t dev;
     std::vector<std::vector<size_t>> offsets; // per allocation
     size_t next = 0;
-    std::vector<void *> mems;
-    std::vector<ggml_backend_buffer_t> bufs;
+    std::vector<ranged_buffer> bufs;
 
     explicit split_buft(ggml_backend_dev_t dev) : dev(dev) {
         wrapper.iface = {
@@ -641,11 +673,21 @@ struct split_buft {
                     return nullptr;
                 }
                 memset(mem, 0, GGML_PAD(size, page));
-                w->mems.push_back(mem);
                 const std::vector<size_t> & offs = w->offsets[w->next++];
-                ggml_backend_buffer_t buf = ggml_backend_metal_buffer_from_host_ptr_split(w->dev, mem, size, offs.data(), (int) offs.size());
-                w->bufs.push_back(buf);
-                return buf;
+                ranged_buffer rb;
+                rb.mem = mem;
+                std::vector<ggml_backend_metal_range> ranges;
+                for (size_t i = 0; i <= offs.size(); ++i) {
+                    const size_t beg = i == 0 ? 0 : offs[i - 1];
+                    const size_t end = i == offs.size() ? size : offs[i];
+                    rb.begs.push_back(beg);
+                    rb.lengths.push_back(GGML_PAD(end - beg, page));
+                    rb.metals.push_back(test_metal_nocopy_buffer_new(w->dev, (uint8_t *) mem + beg, rb.lengths.back()));
+                    ranges.push_back({ end - beg, rb.metals.back() });
+                }
+                rb.buf = ggml_backend_metal_buffer_from_ranges(w->dev, mem, size, ranges.data(), (int) ranges.size());
+                w->bufs.push_back(rb);
+                return rb.buf;
             },
             /*.alloc_buffer_n   =*/ nullptr,
             /*.get_alignment    =*/ [](ggml_backend_buffer_type_t) { return (size_t) 32; },
@@ -658,9 +700,15 @@ struct split_buft {
         wrapper.context = this;
     }
 
+    // after the buffers are freed
     ~split_buft() {
-        for (void * m : mems) {
-            free(m);
+        for (ranged_buffer & rb : bufs) {
+            for (void * m : rb.metals) {
+                if (m != nullptr) {
+                    test_metal_buffer_release(m);
+                }
+            }
+            free(rb.mem);
         }
     }
 
@@ -672,8 +720,8 @@ struct split_buft {
     }
 };
 
-// the split offsets of each layer's slot buffer, in layer order: the slot map, then one sub-range per slot range
-// (sub-range r + 1 holds slot range r)
+// the split offsets of each layer's slot buffer, in layer order: the slot map, then one range per slot range
+// (range r + 1 holds slot range r)
 static std::vector<std::vector<size_t>> split_offsets(const llama_model * model, const slot_layers & layers, const std::vector<int32_t> & splits) {
     std::vector<std::vector<size_t>> res;
     for (const auto & [il, _] : layers) {
@@ -702,12 +750,12 @@ static ggml_backend_dev_t metal_device() {
     return nullptr;
 }
 
-// the ranges of the slots in a split buffer: 3, or 2 for a bank of 2 experts
+// the ranges of the slots in a ranged buffer: 3, or 2 for a bank of 2 experts
 static int32_t n_ranges_of(const assignment & a) {
     return std::min(3, min_slots(a));
 }
 
-// a context whose slots, a shuffled bank in n_ranges_of ranges, are in split buffers; ranged = false reads them unranged
+// a context whose slots, a shuffled bank in n_ranges_of ranges, are in ranged buffers; ranged = false reads them unranged
 struct split_context {
     slot_layers layers;
     llama_model_ptr model;
@@ -782,12 +830,12 @@ static bool aborted(int status) {
     return WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
 }
 
-// child modes, which must abort: unranged slots on the split buffer, or ranged slots with the sub-range of slot range
-// `range` unwrapped after a graph computed
+// child modes, which must abort: unranged slots on the ranged buffer, or ranged slots with the Metal buffer of slot
+// range `range` removed after a graph computed
 static int child_unranged(const std::string & path, ggml_backend_dev_t dev) {
     split_context sc(path, dev, false);
     get_logits(sc.lctx.get(), PROMPT_LONG.n_tokens, PROMPT_LONG.n_batch);
-    printf("unranged slots on a split buffer computed\n");
+    printf("unranged slots on a ranged buffer computed\n");
     return 0;
 }
 
@@ -795,9 +843,9 @@ static int child_unwrapped(const std::string & path, ggml_backend_dev_t dev, int
     split_context sc(path, dev, true);
     get_logits(sc.lctx.get(), PROMPT_LONG.n_tokens, PROMPT_LONG.n_batch);
     fprintf(stderr, "the wrapped ranges compute\n");
-    for (ggml_backend_buffer_t buf : sc.buft->bufs) {
-        if (!ggml_backend_metal_buffer_end_residency_range(buf, range + 1) || !ggml_backend_metal_buffer_unwrap_range(buf, range + 1)) {
-            fprintf(stderr, "sub-range %d was not unwrapped\n", range + 1);
+    for (ranged_buffer & rb : sc.buft->bufs) {
+        if (!rb.unwrap(range + 1)) {
+            fprintf(stderr, "range %d kept its Metal buffer\n", range + 1);
             return 1;
         }
     }
@@ -807,7 +855,7 @@ static int child_unwrapped(const std::string & path, ggml_backend_dev_t dev, int
 }
 
 static void test_metal_split(const std::string & path, const std::string & stem, ggml_backend_dev_t dev, checker & check) {
-    const std::string label = stem + ", split Metal buffer";
+    const std::string label = stem + ", ranged Metal buffer";
     const std::vector<prompt> prompts = { PROMPT_LONG, PROMPT_WIDE };
 
     // the reference: the same slots unranged in a device buffer
@@ -827,8 +875,8 @@ static void test_metal_split(const std::string & path, const std::string & stem,
     {
         split_context sc(path, dev, true);
         bool split_ok = !sc.buft->bufs.empty() && sc.buft->next == sc.layers.size();
-        for (ggml_backend_buffer_t buf : sc.buft->bufs) {
-            split_ok = split_ok && buf != nullptr;
+        for (const ranged_buffer & rb : sc.buft->bufs) {
+            split_ok = split_ok && rb.buf != nullptr;
         }
         const int32_t n_ranges = n_ranges_of(sc.assign);
         check(split_ok, label + ": each slot layer's buffer is split at the slot map and its " + std::to_string(n_ranges) + " ranges (" +
@@ -838,32 +886,21 @@ static void test_metal_split(const std::string & path, const std::string & stem,
         const double e = nmse(logits, ref);
         check(e <= NMSE_MAX, label + ": " + std::to_string(n_ranges) + " ranges, NMSE vs unranged in a device buffer " + fmt_nmse(e) + (same_bits(logits, ref) ? " (bitwise)" : ""));
 
-        // the caller holds the residency of each sub-range on its own
-        bool residency_ok = true;
-        for (ggml_backend_buffer_t buf : sc.buft->bufs) {
-            for (int i = 0; i <= n_ranges; ++i) {
-                residency_ok = residency_ok && ggml_backend_metal_buffer_request_residency_range(buf, i);
-            }
-        }
-        const double e_res = nmse(logits_of(sc.lctx.get(), prompts), ref);
-        check(residency_ok && e_res <= NMSE_MAX, label + ": with each sub-range's residency requested on its own, NMSE " + fmt_nmse(e_res));
-
-        // a range unwrapped and rewrapped between graphs computes the same
+        // a range whose Metal buffer is replaced between graphs computes the same
         bool cycle_ok = true;
-        for (ggml_backend_buffer_t buf : sc.buft->bufs) {
-            cycle_ok = cycle_ok && ggml_backend_metal_buffer_end_residency_range(buf, 2) && ggml_backend_metal_buffer_unwrap_range(buf, 2) &&
-                ggml_backend_metal_buffer_rewrap_range(buf, 2) && ggml_backend_metal_buffer_request_residency_range(buf, 2);
+        for (ranged_buffer & rb : sc.buft->bufs) {
+            cycle_ok = cycle_ok && rb.rewrap(dev, 2);
         }
         const std::vector<float> after = logits_of(sc.lctx.get(), prompts);
-        check(cycle_ok && same_bits(after, logits), label + ": after slot range 1 is unwrapped and rewrapped, the logits are bitwise unchanged");
+        check(cycle_ok && same_bits(after, logits), label + ": after slot range 1's Metal buffer is replaced, the logits are bitwise unchanged");
     }
 
     {
         int status = 0;
         std::string err;
         const bool waited = run_child({ "--child-unranged", path }, &status, &err);
-        check(waited && aborted(status) && err.find("crosses a split point") != std::string::npos,
-            label + ": unranged slots on the split buffer abort at encode, a member crosses a split point");
+        check(waited && aborted(status) && err.find("crosses a range boundary") != std::string::npos,
+            label + ": unranged slots on the ranged buffer abort at encode, a member crosses a range boundary");
     }
 
     slot_layers layers;
@@ -873,9 +910,9 @@ static void test_metal_split(const std::string & path, const std::string & stem,
         std::string err;
         const bool waited = run_child({ "--child-unwrapped", path, std::to_string(range) }, &status, &err);
         // the abort names the view of the range
-        const std::string sub = ".slots.r" + std::to_string(range) + "' is in sub-range " + std::to_string(range + 1) + " of a split buffer";
+        const std::string sub = ".slots.r" + std::to_string(range) + "' is in range " + std::to_string(range + 1) + " of a buffer";
         check(err.find("the wrapped ranges compute") != std::string::npos && waited && aborted(status) && err.find(sub) != std::string::npos,
-            label + ": with slot range " + std::to_string(range) + " unwrapped, a graph aborts naming its view and sub-range " + std::to_string(range + 1));
+            label + ": with slot range " + std::to_string(range) + "'s Metal buffer removed, a graph aborts naming its view and range " + std::to_string(range + 1));
     }
 }
 
