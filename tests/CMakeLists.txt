@@ -510,6 +510,9 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-sched-graph-rewrite.cpp  LABEL "main behavior backend"  LINK ggml)
     # computes a graph allocated by a caller on the CPU and, when the machine has one, on a Metal device
     llama_build_and_test(test-sched-caller-alloc.cpp  LABEL "main behavior backend"  LINK ggml)
+    # computes the splits of a graph through the scheduler's split-compute callback, on a GPU and the CPU when the
+    # machine has a GPU
+    llama_build_and_test(test-sched-split-compute.cpp  LABEL "main behavior backend"  LINK ggml)
 endif()
 
 llama_build(test-export-graph-ops.cpp)
