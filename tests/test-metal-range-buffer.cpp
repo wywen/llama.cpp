@@ -320,6 +320,24 @@ static void test_shared_metal(fixture & f) {
     test_metal_buffer_release(whole);
 }
 
+// an empty tensor on the boundary between two ranges ends in the first, which has a Metal buffer, though the second has none
+static void test_empty_on_boundary(fixture & f) {
+    const char * sc = "empty-boundary";
+
+    const std::array<ggml_backend_metal_range, 2> ranges = {{ { f.sub, f.metal[0] }, { f.sub, nullptr } }};
+    ggml_backend_buffer_t b = ggml_backend_metal_buffer_from_ranges(f.dev, f.mem, 2*f.sub, ranges.data(), 2);
+    check(b != nullptr, sc, "a buffer whose second range has no Metal buffer is created");
+    if (b == nullptr) {
+        return;
+    }
+    ggml_tensor * t = ggml_new_tensor_1d(f.ctx, GGML_TYPE_F32, 0);
+    ggml_set_name(t, "empty");
+    check(ggml_backend_tensor_alloc(b, t, f.range_base(1)) == GGML_STATUS_SUCCESS, sc, "an empty tensor is placed on the boundary");
+    const ggml_metal_buffer_id id = id_of(t);
+    check(id.metal == f.metal[0] && id.offs == f.sub, sc, "it resolves to the end of the range before the boundary");
+    ggml_backend_buffer_free(b);
+}
+
 static void test_validation(fixture & f) {
     const char * sc = "validation";
     const size_t page = f.page;
@@ -508,6 +526,7 @@ int main(int argc, char ** argv) {
     test_replace(f);
     test_resolve(f, "resolve-after-replace");
     test_shared_metal(f);
+    test_empty_on_boundary(f);
     test_validation(f);
     test_caller_buft(f);
     test_encode_across();

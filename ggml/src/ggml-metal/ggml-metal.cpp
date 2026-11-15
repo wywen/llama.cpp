@@ -1306,6 +1306,16 @@ ggml_backend_buffer_t ggml_backend_metal_buffer_from_ranges(
     return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_mapped(props_dev->device), ggml_backend_metal_buffer_shared_i, res, size);
 }
 
+ggml_metal_buffer_t ggml_metal_tensor_buffer(const struct ggml_tensor * t) {
+    ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;
+
+    if (buffer == NULL || !ggml_backend_buffer_is_metal(buffer)) {
+        GGML_ABORT("%s: tensor '%s' is not in a Metal buffer", __func__, t->name);
+    }
+
+    return (ggml_metal_buffer_t) buffer->context;
+}
+
 bool ggml_backend_metal_buffer_set_range(ggml_backend_buffer_t buffer, int i, void * metal) {
     if (buffer == NULL || !ggml_backend_buffer_is_metal(buffer)) {
         GGML_LOG_ERROR("%s: not a Metal buffer\n", __func__);

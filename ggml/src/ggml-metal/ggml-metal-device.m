@@ -1264,8 +1264,8 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     }
                 }
 
-                // ggml's residency sets are disconnected whatever GGML_METAL_NO_RESIDENCY says: the
-                // caller keeps device memory resident (see ggml_backend_metal_buffer_request_residency)
+                // ggml's residency sets are disconnected whatever GGML_METAL_NO_RESIDENCY says: a buffer built
+                // over caller-supplied Metal buffers leaves keeping them resident to the caller
                 dev->props.use_residency_sets = false;
 
                 dev->props.use_shared_buffers = dev->props.has_unified_memory;
@@ -2716,8 +2716,7 @@ void ggml_metal_buffer_set_tensor_n(ggml_metal_buffer_t buf, struct ggml_tensor 
                     continue;
                 }
 
-                ggml_backend_buffer_t tensor_buf_ggml = tensors[i]->view_src ? tensors[i]->view_src->buffer : tensors[i]->buffer;
-                ggml_metal_buffer_t tensor_buf = (ggml_metal_buffer_t) tensor_buf_ggml->context;
+                ggml_metal_buffer_t tensor_buf = ggml_metal_tensor_buffer(tensors[i]);
                 struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(tensor_buf, tensors[i]);
                 bid_dst.offs += offsets[i];
 
@@ -2773,8 +2772,7 @@ void ggml_metal_buffer_get_tensor_n(ggml_metal_buffer_t buf, const struct ggml_t
                     continue;
                 }
 
-                ggml_backend_buffer_t tensor_buf_ggml = tensors[i]->view_src ? tensors[i]->view_src->buffer : tensors[i]->buffer;
-                ggml_metal_buffer_t tensor_buf = (ggml_metal_buffer_t) tensor_buf_ggml->context;
+                ggml_metal_buffer_t tensor_buf = ggml_metal_tensor_buffer(tensors[i]);
                 struct ggml_metal_buffer_id bid_src = ggml_metal_buffer_get_id(tensor_buf, tensors[i]);
                 bid_src.offs += offsets[i];
 
@@ -2796,7 +2794,7 @@ void ggml_metal_buffer_get_tensor_n(ggml_metal_buffer_t buf, const struct ggml_t
 }
 
 bool ggml_metal_buffer_cpy_tensor(ggml_metal_buffer_t buf_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
-    ggml_metal_buffer_t buf_src = (ggml_metal_buffer_t)src->buffer->context;
+    ggml_metal_buffer_t buf_src = ggml_metal_tensor_buffer(src);
 
     const size_t size = ggml_nbytes(src);
 
@@ -2843,8 +2841,7 @@ bool ggml_metal_buffer_cpy_tensor_n(ggml_metal_buffer_t buf_dst, const struct gg
 
     bool all_shared = true;
     for (size_t i = 0; i < n_tensors; ++i) {
-        ggml_backend_buffer_t src_buf = srcs[i]->view_src ? srcs[i]->view_src->buffer : srcs[i]->buffer;
-        ggml_metal_buffer_t buf_src = (ggml_metal_buffer_t) src_buf->context;
+        ggml_metal_buffer_t buf_src = ggml_metal_tensor_buffer(srcs[i]);
         if (!buf_dst->is_shared || !buf_src->is_shared) {
             all_shared = false;
             break;
@@ -2864,10 +2861,8 @@ bool ggml_metal_buffer_cpy_tensor_n(ggml_metal_buffer_t buf_dst, const struct gg
         struct ggml_metal_buffer_id * bid_dsts = malloc(n_tensors * sizeof(struct ggml_metal_buffer_id));
 
         for (size_t i = 0; i < n_tensors; ++i) {
-            ggml_backend_buffer_t src_buf = srcs[i]->view_src ? srcs[i]->view_src->buffer : srcs[i]->buffer;
-            ggml_backend_buffer_t dst_buf = dsts[i]->view_src ? dsts[i]->view_src->buffer : dsts[i]->buffer;
-            ggml_metal_buffer_t buf_src = (ggml_metal_buffer_t) src_buf->context;
-            ggml_metal_buffer_t buf_dst_i = (ggml_metal_buffer_t) dst_buf->context;
+            ggml_metal_buffer_t buf_src = ggml_metal_tensor_buffer(srcs[i]);
+            ggml_metal_buffer_t buf_dst_i = ggml_metal_tensor_buffer(dsts[i]);
             bid_srcs[i] = ggml_metal_buffer_get_id(buf_src, srcs[i]);
             bid_dsts[i] = ggml_metal_buffer_get_id(buf_dst_i, dsts[i]);
 
@@ -2934,7 +2929,7 @@ static struct ggml_metal_buffer_id ggml_metal_buffer_get_range_id(ggml_metal_buf
     const uintptr_t beg = (uintptr_t) t->data;
     const uintptr_t end = beg + ggml_nbytes(t);
 
-    // the last range that starts at or before t
+    // the last range that starts at or before t; an empty tensor on a boundary ends in the range before it
     int lo = 0;
     int hi = buf->n_ranges;
     while (hi - lo > 1) {
@@ -2944,6 +2939,11 @@ static struct ggml_metal_buffer_id ggml_metal_buffer_get_range_id(ggml_metal_buf
         } else {
             hi = mid;
         }
+    }
+
+    if (beg == end && lo > 0 && beg == (uintptr_t) buf->ranges[lo].data &&
+            atomic_load_explicit(&buf->ranges[lo - 1].metal, memory_order_acquire) != NULL) {
+        lo--;
     }
 
     const struct ggml_metal_buffer_range * range = &buf->ranges[lo];

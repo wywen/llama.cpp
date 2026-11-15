@@ -394,6 +394,10 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
 
+// the Metal buffer that holds t (or the tensor it views); aborts, naming t, when t has no buffer or its buffer is not a
+// Metal buffer, whose context would otherwise be read as one
+ggml_metal_buffer_t ggml_metal_tensor_buffer(const struct ggml_tensor * t);
+
 #ifdef __cplusplus
 }
 #endif

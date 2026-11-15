@@ -78,22 +78,16 @@ static bool ggml_metal_fusion_same_buffer(const ggml_tensor * a, const ggml_tens
         return false;
     }
 
-    ggml_backend_buffer_t ba = a->view_src ? a->view_src->buffer : a->buffer;
-    ggml_backend_buffer_t bb = b->view_src ? b->view_src->buffer : b->buffer;
-
-    ggml_metal_buffer_t ca = (ggml_metal_buffer_t) ba->context;
-    ggml_metal_buffer_t cb = (ggml_metal_buffer_t) bb->context;
+    ggml_metal_buffer_t ca = ggml_metal_tensor_buffer(a);
+    ggml_metal_buffer_t cb = ggml_metal_tensor_buffer(b);
 
     return ggml_metal_buffer_get_id(ca, a).metal == ggml_metal_buffer_get_id(cb, b).metal;
 }
 
 // true if the memory of two tensors overlaps in the same Metal buffer
 static bool ggml_metal_fusion_overlap(const ggml_tensor * a, const ggml_tensor * b) {
-    ggml_backend_buffer_t ba = a->view_src ? a->view_src->buffer : a->buffer;
-    ggml_backend_buffer_t bb = b->view_src ? b->view_src->buffer : b->buffer;
-
-    const ggml_metal_buffer_id bid_a = ggml_metal_buffer_get_id((ggml_metal_buffer_t) ba->context, a);
-    const ggml_metal_buffer_id bid_b = ggml_metal_buffer_get_id((ggml_metal_buffer_t) bb->context, b);
+    const ggml_metal_buffer_id bid_a = ggml_metal_buffer_get_id(ggml_metal_tensor_buffer(a), a);
+    const ggml_metal_buffer_id bid_b = ggml_metal_buffer_get_id(ggml_metal_tensor_buffer(b), b);
 
     if (bid_a.metal == nullptr || bid_a.metal != bid_b.metal) {
         return false;
