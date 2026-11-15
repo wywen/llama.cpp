@@ -603,7 +603,6 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.moe_cache_size      = params.moe_cache_size;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
-    cparams.moe_router_ahead    = params.moe_router_ahead;
     cparams.moe_slot_sets       = params.moe_slot_sets;
     cparams.moe_slot_set        = 0;
 
@@ -747,43 +746,6 @@ llama_context::llama_context(
         lookup_rows = std::make_unique<llama_lookup_row_reader>();
         lookup_rows->read      = params.lookup_rows;
         lookup_rows->user_data = params.lookup_rows_user_data;
-    }
-
-    if (cparams.moe_router_ahead && !hparams.vocab_only) {
-        const int32_t n_layer = hparams.n_layer();
-        for (int32_t il = 0; il < n_layer; ++il) {
-            moe_routers.push_back(model.layers[il].ffn_gate_inp);
-        }
-    }
-
-    if (params.n_moe_router_ahead_extra > 0 && !hparams.vocab_only) {
-        if (params.moe_router_ahead_extra == nullptr) {
-            throw std::runtime_error("n_moe_router_ahead_extra is set without moe_router_ahead_extra");
-        }
-        for (size_t k = 0; k < params.n_moe_router_ahead_extra; ++k) {
-            const llama_moe_router_ahead_extra & e = params.moe_router_ahead_extra[k];
-            const llama_model & m = e.model ? *e.model : model;
-
-            if (e.il < 0 || (uint32_t) e.il >= hparams.n_layer_all || (size_t) e.il >= model.layers.size() ||
-                model.layers[e.il].ffn_gate_inp == nullptr) {
-                throw std::runtime_error(format("moe_router_ahead_extra[%zu]: layer %d is not a MoE layer of the model", k, e.il));
-            }
-            if (e.il_router < 0 || (uint32_t) e.il_router >= m.hparams.n_layer_all || (size_t) e.il_router >= m.layers.size() ||
-                m.layers[e.il_router].ffn_gate_inp == nullptr) {
-                throw std::runtime_error(format("moe_router_ahead_extra[%zu]: layer %d of the model has no router", k, e.il_router));
-            }
-            if (e.input != LLAMA_MOE_ROUTER_AHEAD_INPUT_ROUTER && e.input != LLAMA_MOE_ROUTER_AHEAD_INPUT_EMBD) {
-                throw std::runtime_error(format("moe_router_ahead_extra[%zu]: unknown input %d", k, (int) e.input));
-            }
-
-            ggml_tensor * router = m.layers[e.il_router].ffn_gate_inp;
-            if (e.input == LLAMA_MOE_ROUTER_AHEAD_INPUT_ROUTER && router->ne[0] != (int64_t) hparams.n_embd) {
-                throw std::runtime_error(format("moe_router_ahead_extra[%zu]: the router of layer %d takes %" PRId64 " values, the router input has %u",
-                        k, e.il_router, router->ne[0], hparams.n_embd));
-            }
-
-            moe_routers_extra.push_back({ (int) e.il, router, e.input, (int) k });
-        }
     }
 
     // init backends
@@ -3332,8 +3294,6 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
         /*.lookup_rows =*/ lookup_rows.get(),
-        /*.moe_routers =*/ moe_routers.empty() ? nullptr : &moe_routers,
-        /*.moe_routers_extra =*/ moe_routers_extra.empty() ? nullptr : &moe_routers_extra,
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.layer_inp_dev =*/ layer_inp_dev,
@@ -4744,9 +4704,6 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
-        /*.moe_router_ahead            =*/ false,
-        /*.moe_router_ahead_extra      =*/ nullptr,
-        /*.n_moe_router_ahead_extra    =*/ 0,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

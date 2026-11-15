@@ -4209,6 +4209,10 @@ int32_t llama_model_moe_router_ahead_layer(const struct llama_model * model, int
     return -1;
 }
 
+struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name) {
+    return const_cast<ggml_tensor *>(model->get_tensor(name));
+}
+
 int32_t llama_model_moe_expert_runs(const struct llama_model * model, int32_t il, int32_t expert, struct llama_moe_expert_run * runs, int32_t n_max) {
     const llama_moe_slot_layer * layer = model->moe_slots.layer(il);
     if (layer == nullptr || expert < 0 || expert >= layer->n_expert) {

@@ -1594,8 +1594,6 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     moe_cache        (params.moe_cache),
     lookup_rows      (params.lookup_rows),
-    moe_routers      (params.moe_routers),
-    moe_routers_extra(params.moe_routers_extra),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
@@ -2295,17 +2293,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
-        const int il_ahead = moe_router_ahead_layer(il, gate_inp);
-        if (il_ahead >= 0) {
-            ggml_tensor * logits_ahead = build_lora_mm((*moe_routers)[il_ahead], cur); // [n_expert, n_tokens]
-            if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
-                ggml_prec_set_acc(logits_ahead, GGML_PREC_F32);
-            }
-            build_moe_router_ahead(logits_ahead, il);
-        }
-
-        build_moe_router_ahead_extra(cur, gating_op, il);
-
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
         if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
             ggml_prec_set_acc(logits, GGML_PREC_F32);
@@ -2685,60 +2672,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
-}
-
-int llm_graph_context::moe_router_ahead_layer(int il, const ggml_tensor * router) const {
-    if (moe_routers == nullptr || router == nullptr || il < 0 || il >= (int) moe_routers->size() ||
-        (*moe_routers)[il] != router) {
-        return -1;
-    }
-
-    for (int il_next = il + 1; il_next < (int) moe_routers->size(); ++il_next) {
-        if ((*moe_routers)[il_next] != nullptr) {
-            return il_next;
-        }
-    }
-
-    return -1;
-}
-
-void llm_graph_context::build_moe_router_ahead(ggml_tensor * logits_ahead, int il) const {
-    cb(logits_ahead, "ffn_moe_logits_ahead", il);
-    ggml_set_output(logits_ahead);
-    ggml_build_forward_expand(gf, logits_ahead);
-}
-
-void llm_graph_context::build_moe_router_ahead_extra(ggml_tensor * cur, llama_expert_gating_func_type gating_op, int il) const {
-    if (moe_routers_extra == nullptr) {
-        return;
-    }
-
-    for (const llm_moe_router_ahead_extra & e : *moe_routers_extra) {
-        if (e.il != il) {
-            continue;
-        }
-
-        ggml_tensor * input = e.input == LLAMA_MOE_ROUTER_AHEAD_INPUT_EMBD ? res->t_inp_embd : cur;
-        if (input == nullptr) {
-            const std::string msg = format("moe_router_ahead_extra[%d]: the graph of layer %d has no input token embeddings to read", e.k, il);
-            LLAMA_LOG_ERROR("%s: %s\n", __func__, msg.c_str());
-            throw std::runtime_error(msg);
-        }
-        if (input->ne[0] != e.router->ne[0]) {
-            const std::string msg = format("moe_router_ahead_extra[%d]: the router takes %" PRId64 " values, the input of layer %d has %" PRId64,
-                    e.k, e.router->ne[0], il, input->ne[0]);
-            LLAMA_LOG_ERROR("%s: %s\n", __func__, msg.c_str());
-            throw std::runtime_error(msg);
-        }
-
-        ggml_tensor * logits_extra = build_lora_mm(e.router, input); // [n_expert, n_tokens]
-        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
-            ggml_prec_set_acc(logits_extra, GGML_PREC_F32);
-        }
-        cb(logits_extra, format("ffn_moe_logits_ahead_extra-%d-%d", il, e.k).c_str(), -1);
-        ggml_set_output(logits_extra);
-        ggml_build_forward_expand(gf, logits_extra);
-    }
 }
 
 llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(

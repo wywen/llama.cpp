@@ -382,12 +382,6 @@ private:
     // see llama_context_params.lookup_rows
     std::unique_ptr<llama_lookup_row_reader> lookup_rows;
 
-    // [n_layer] the router weight of each MoE layer, empty unless llama_context_params.moe_router_ahead
-    std::vector<ggml_tensor *> moe_routers;
-
-    // the extra router lookaheads, see llama_context_params.moe_router_ahead_extra
-    std::vector<llm_moe_router_ahead_extra> moe_routers_extra;
-
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 
