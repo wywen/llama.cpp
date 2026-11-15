@@ -192,77 +192,48 @@ GGML_BACKEND_API void ggml_backend_metal_set_reorder_barrier_prefixes(
         ggml_backend_t backend, int n, const char * const * prefixes);
 
 //
-// buffers over host memory, released and recreated
+// buffers over caller host memory, resolved through a caller range table
 //
-// The Metal buffers of a buffer from buffer_from_host_ptr capture the physical pages of the caller's memory: pages
-// the caller replaces under them (with mmap MAP_FIXED, say) are not seen by the GPU. These calls release the Metal
-// buffers so that the pages can be replaced, and recreate them over the same memory. The backend buffer, its base
-// and its tensors are unchanged.
+// A buffer from ggml_backend_metal_buffer_from_ranges spans the caller's host memory [base, base + size), tiled by
+// n_ranges consecutive ranges: range 0 starts at base, each next one where the previous ends, and the last ends at
+// base + size. Each range has a Metal buffer that the caller supplies, or none. A kernel that uses a tensor binds the
+// Metal buffer of the range that holds the tensor, at the tensor's offset in the range. Encoding a kernel that uses a
+// tensor in a range with no Metal buffer, or a tensor that crosses a range boundary, aborts, naming the tensor. Host
+// access to the tensors (set, get, memset, clear) reads and writes the host memory and needs no Metal buffer.
 //
-// The first of these calls on a buffer hands its residency set to the caller: from then on the set is requested
-// only by ggml_backend_metal_buffer_request_residency. Calls on one buffer are serialized and may run on any thread.
+// Ownership: the backend makes no Metal buffer and no residency set for such a buffer, and never retains, releases or
+// requests residency for the caller's objects. A range's Metal buffer is an id<MTLBuffer> of the device, passed as
+// void *, whose contents hold the whole range, e.g. a no-copy buffer over the range's pages. The backend reads it when it encodes or blits work that uses a tensor in the range, from the call that
+// installs it until the call that replaces it. The caller keeps it alive over that span, and after it until every
+// command buffer that binds it has completed: the backend encodes with unretained references. Freeing the backend
+// buffer releases nothing of the caller's.
+//
+// A buffer type that a caller makes with a Metal device as its device is supported by that device, like the device's
+// own types; its buffers must place every tensor in Metal buffers, e.g. in buffers from
+// ggml_backend_metal_buffer_from_ranges.
 //
 
-// release the Metal buffers; the caller ends the residency first and ensures no command buffer in flight binds the
-// buffer. Encoding a kernel that uses the buffer aborts until rewrap; host access keeps working
-GGML_BACKEND_API bool ggml_backend_metal_buffer_unwrap            (ggml_backend_buffer_t buffer);
-// recreate the Metal buffers over the same ranges; pages never written read as zeros
-GGML_BACKEND_API bool ggml_backend_metal_buffer_rewrap            (ggml_backend_buffer_t buffer);
-// ask Metal to keep the buffer resident (may be repeated), or end that request
-// false when the buffer is not over host memory or the OS has no residency sets; request_residency also when unwrapped
-GGML_BACKEND_API bool ggml_backend_metal_buffer_request_residency (ggml_backend_buffer_t buffer);
-GGML_BACKEND_API bool ggml_backend_metal_buffer_end_residency     (ggml_backend_buffer_t buffer);
+// a range of a buffer from ggml_backend_metal_buffer_from_ranges
+struct ggml_backend_metal_range {
+    size_t size;  // bytes, > 0
+    void * metal; // id<MTLBuffer> over the range, or NULL for none
+};
 
-// a buffer over host memory like one from ggml_backend_dev_buffer_from_host_ptr, but wrapped in disjoint Metal buffers
-// split at split_offsets, for a caller that binds sub-ranges of one host allocation independently: a kernel that uses a
-// tensor inside one sub-range wires only that sub-range's pages. A tensor or view that crosses a split point is in no
-// Metal buffer, and encoding a kernel that uses it aborts. Unwrap, rewrap and the residency set calls work as above on
-// every sub-range at once, and per sub-range as below. ptr must be page aligned; the offsets must be strictly
-// increasing, page aligned and inside (0, size); there are at most 63 of them and no sub-range may be larger than the
-// device's max buffer size. NULL on bad input
-GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_metal_buffer_from_host_ptr_split(
-        ggml_backend_dev_t dev, void * ptr, size_t size, const size_t * split_offsets, int n_splits);
+// NULL, with a log line, when dev is not a Metal device, the ranges do not tile [base, base + size), or a Metal buffer
+// is not of the device or does not hold its range; the range table is copied
+GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_metal_buffer_from_ranges(
+        ggml_backend_dev_t dev, void * base, size_t size, const struct ggml_backend_metal_range * ranges, int n_ranges);
 
-//
-// sub-ranges of a split buffer, released and recreated one at a time
-//
-// For a caller that holds and replaces sub-ranges of one host allocation independently. A buffer from
-// ggml_backend_metal_buffer_from_host_ptr_split has one residency set per sub-range, holding that sub-range's Metal
-// buffer alone, and each sub-range is wrapped or unwrapped on its own. Sub-range i, 0 <= i <= n_splits, starts at
-// split_offsets[i - 1] (0 for i == 0). The calls below act on sub-range i as the whole-buffer calls above act on a
-// buffer. On a split buffer the whole-buffer calls act on every sub-range; they change nothing and return false when
-// one sub-range refuses: unwrap when a sub-range is already unwrapped, rewrap when one is wrapped, request_residency
-// when one is unwrapped.
-//
-// Handoff: the first call, per sub-range or whole-buffer, that names a sub-range hands that sub-range's residency set
-// to the caller; a whole-buffer call names every sub-range. From then on the backend neither requests nor keeps alive
-// that set, so the sub-range is resident only while the caller requests it. The sets of sub-ranges no call has named
-// yet stay with the backend. A refused call hands nothing over.
-//
-// Calls on one buffer, per sub-range or whole-buffer, are serialized and may run on any thread; a call on one
-// sub-range never changes another. Before unwrapping sub-range i the caller ends its residency and ensures no command
-// buffer in flight binds sub-range i; work that binds other sub-ranges may be in flight, and may be encoded while
-// sub-range i is unwrapped. Encoding a kernel that uses a tensor in an unwrapped sub-range aborts, naming the tensor.
-//
-// Each returns false, with a log line, when the buffer is not from ggml_backend_metal_buffer_from_host_ptr_split or i
-// is not one of its sub-ranges, and otherwise when its whole-buffer counterpart would for that sub-range
-//
-GGML_BACKEND_API bool ggml_backend_metal_buffer_unwrap_range            (ggml_backend_buffer_t buffer, int i);
-GGML_BACKEND_API bool ggml_backend_metal_buffer_rewrap_range            (ggml_backend_buffer_t buffer, int i);
-GGML_BACKEND_API bool ggml_backend_metal_buffer_request_residency_range (ggml_backend_buffer_t buffer, int i);
-GGML_BACKEND_API bool ggml_backend_metal_buffer_end_residency_range     (ggml_backend_buffer_t buffer, int i);
+// replace range i's Metal buffer with `metal` (NULL: none), checked as above; false, with a log line and nothing
+// changed, when the buffer is not from ggml_backend_metal_buffer_from_ranges, i is not one of its ranges or `metal` is
+// refused. Work that binds other ranges may be encoded or in flight meanwhile. Before replacing a range's Metal buffer
+// the caller ensures that no encode that uses the range is running; command buffers in flight that bind the previous
+// one still use it, so the caller releases it only once they have completed.
+GGML_BACKEND_API bool ggml_backend_metal_buffer_set_range(ggml_backend_buffer_t buffer, int i, void * metal);
 
-// buffer type for compute buffers that the caller places in memory it manages, for ggml_backend_sched_new
-// alloc_buffer must return a buffer whose tensors resolve to Metal buffers, e.g. one from
-// ggml_backend_dev_buffer_from_host_ptr on the Metal device; max_size bounds each buffer the scheduler requests
-// alignment and allocation sizes follow the mapped Metal buffer type; the buffer type must outlive its buffers
-GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_metal_compute_buft_new(
-        ggml_backend_dev_t dev,
-        const char * name,
-        ggml_backend_buffer_t (*alloc_buffer)(ggml_backend_buffer_type_t buft, size_t size, void * user_data),
-        size_t max_size,
-        void * user_data);
-GGML_BACKEND_API void   ggml_backend_metal_compute_buft_free(ggml_backend_buffer_type_t buft);
+// the id<MTLDevice> of a Metal device, as void *, not retained: valid while the device is; NULL, with a log line, for
+// a device that is not a Metal device
+GGML_BACKEND_API void * ggml_backend_metal_device_get_mtl_device(ggml_backend_dev_t dev);
 
 #ifdef __cplusplus
 }

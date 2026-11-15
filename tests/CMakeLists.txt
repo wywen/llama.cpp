@@ -258,8 +258,9 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
 
     llama_build(test-moe-slot-ranges.cpp)
     if (GGML_METAL AND NOT GGML_BACKEND_DL)
-        # also checks the slots in a split host-pointer Metal buffer; skips that without a device
-        target_link_libraries(test-moe-slot-ranges PRIVATE ggml-metal)
+        # also checks the slots in a Metal buffer of one range per slot range; skips that without a device
+        target_sources(test-moe-slot-ranges PRIVATE metal-nocopy-buffer.mm)
+        target_link_libraries(test-moe-slot-ranges PRIVATE ggml-metal "-framework Foundation" "-framework Metal")
         target_compile_definitions(test-moe-slot-ranges PRIVATE TEST_MOE_SLOT_RANGES_METAL)
     endif()
     llama_test(test-moe-slot-ranges LABEL "main behavior backend"
@@ -451,9 +452,11 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-metal-encode-window.cpp  LABEL "main behavior backend"  LINK ggml ggml-metal)
     # drives host cuts through the public Metal API on a real device and prints the cost of a cut; skips without one
     llama_build_and_test(test-metal-host-cuts.cpp  LABEL "main behavior backend"  LINK ggml ggml-metal)
-    # resolves views of a split host-pointer buffer through the Metal buffer lookup and computes on them; skips without a device
-    llama_build_and_test(test-metal-split-host-buffer.cpp  LABEL "main behavior backend"  LINK ggml ggml-metal)
-    target_include_directories(test-metal-split-host-buffer PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
+    # resolves tensors of a buffer over caller-made Metal buffers through its range table and computes on them; skips
+    # without a device
+    llama_build_and_test(test-metal-range-buffer.cpp metal-nocopy-buffer.mm  LABEL "main behavior backend"  LINK ggml ggml-metal)
+    target_include_directories(test-metal-range-buffer PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
+    target_link_libraries(test-metal-range-buffer PRIVATE "-framework Foundation" "-framework Metal")
 endif()
 
 if (NOT GGML_BACKEND_DL AND GGML_CPU)

@@ -468,9 +468,7 @@ static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_te
         return (struct ggml_metal_buffer_id) { nil, 0 };
     }
 
-    ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;
-
-    return ggml_metal_buffer_get_id(buffer->context, t);
+    return ggml_metal_buffer_get_id(ggml_metal_tensor_buffer(t), t);
 }
 
 void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
