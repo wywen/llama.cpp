@@ -1602,7 +1602,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     // the buffer type of a slot layer's expert weight must support the member's slot tensor, strided by the slot size
-    // (the number of slots is chosen by each context, the check takes one slot per expert)
+    // (the number of slots is chosen by the caller, the check takes one slot per expert)
     ggml_tensor t_slots = t_meta;
     if (slot_plan) {
         t_slots.nb[2] = slot_plan->slot_size;

@@ -8,7 +8,6 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
-#include "llama-moe-slots.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -97,9 +96,6 @@ struct llama_context {
 
     llama_memory_t get_memory() const;
 
-    // the slots of the MoE layers that read their expert weights from slots, nullptr if the model has none
-    const llama_moe_slot_pool * get_moe_slots() const;
-
     // the caller's reader of the rows of the served lookup tables, nullptr if none
     const llama_lookup_row_reader * get_lookup_rows() const;
 
@@ -155,8 +151,8 @@ struct llama_context {
     bool supports_embd_row() const;
     void set_nextn_layer_offset(int32_t offset);
 
-    // the MoE slot set that the following graphs read; false, keeping the current set, if `set` is out of range
-    bool set_moe_slot_set(int32_t set);
+    // the caller's value that the following graphs are built for, see llama_set_graph_variant
+    void set_graph_variant(uint32_t variant);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -320,8 +316,7 @@ public:
     // results are left as they are. The graph reads `mctx` while it is built, and the memory tensors after. Its
     // sequences sample with the context's backend samplers where `backend_sampling`, as before none attached elsewhere.
     llm_graph_result_ptr graph_plan(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, int32_t moe_slot_set,
-        bool backend_sampling);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool backend_sampling);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -375,9 +370,6 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
-
-    // the slots of this context, see llama_context_params.moe_slots
-    std::unique_ptr<llama_moe_slot_pool> moe_slots;
 
     // see llama_context_params.lookup_rows
     std::unique_ptr<llama_lookup_row_reader> lookup_rows;

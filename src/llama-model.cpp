@@ -2227,7 +2227,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 // the slot geometry of the layers that read their expert weights from slots, and the file runs that fill each slot
-// the contexts allocate the slots
+// the caller allocates the slots
 void llama_model_base::load_tensors_moe_slots(llama_model_loader & ml) {
     for (auto & [il, plan] : ml.moe_slot_plans) {
         if (!plan.slots) {

@@ -603,8 +603,6 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.moe_cache_size      = params.moe_cache_size;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
-    cparams.moe_slot_sets       = params.moe_slot_sets;
-    cparams.moe_slot_set        = 0;
 
     // resolved after flash attention, see resolve_fused_ops()
     {
@@ -734,11 +732,6 @@ llama_context::llama_context(
     // init the memory module
     if (!hparams.vocab_only) {
         memory.reset(llama_context_create_memory(model, params, cparams));
-    }
-
-    // the slots of the MoE layers that read their expert weights from slots, as the KV cache: per context, not state
-    if (!model.moe_slots.empty()) {
-        moe_slots = std::make_unique<llama_moe_slot_pool>(this, model.moe_slots, cparams.moe_slot_sets, params.moe_slots, params.moe_slots_user_data, no_alloc);
     }
 
     // the caller's reader of the rows of the lookup tables that it serves
@@ -1258,10 +1251,6 @@ uint32_t llama_context::n_threads_batch() const {
 
 llama_memory_t llama_context::get_memory() const {
     return memory.get();
-}
-
-const llama_moe_slot_pool * llama_context::get_moe_slots() const {
-    return moe_slots.get();
 }
 
 const llama_lookup_row_reader * llama_context::get_lookup_rows() const {
@@ -1793,16 +1782,8 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
-bool llama_context::set_moe_slot_set(int32_t set) {
-    if (set < 0 || (uint32_t) set >= cparams.moe_slot_sets) {
-        LLAMA_LOG_ERROR("%s: MoE slot set %d is out of range, the context has %u sets; keeping set %d\n",
-                __func__, set, cparams.moe_slot_sets, cparams.moe_slot_set);
-        return false;
-    }
-
-    // the sets differ only in the slot tensors that the graph reads: the graph is rebuilt, the scheduler is not reserved again
-    cparams.moe_slot_set = set;
-    return true;
+void llama_context::set_graph_variant(uint32_t variant) {
+    cparams.graph_variant = variant;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -1985,7 +1966,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         try {
             gf = model.build_graph(gparams);
         } catch (const std::exception & err) {
-            // e.g. the graph reads a MoE layer that this context has no slots for
             LLAMA_LOG_ERROR("%s: failed to build the graph: %s\n", __func__, err.what());
             gf = nullptr;
         }
@@ -3193,9 +3173,6 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
 
-    // the compute buffers cover every MoE slot set: some backends size an expert matmul's scratch by its slot count
-    gparams.cparams.moe_slot_set = LLAMA_MOE_SLOT_SET_WIDEST;
-
     res->reset();
 
     auto * gf = model.build_graph(gparams);
@@ -3230,8 +3207,7 @@ ggml_cgraph * llama_context::graph_reserve(
 }
 
 llm_graph_result_ptr llama_context::graph_plan(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, int32_t moe_slot_set,
-        bool backend_sampling) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool backend_sampling) {
     GGML_ASSERT(n_outputs >= 1);
     GGML_ASSERT(n_seqs >= 1);
 
@@ -3259,7 +3235,6 @@ llm_graph_result_ptr llama_context::graph_plan(
     llm_graph_result_ptr res(new llm_graph_result(max_nodes));
 
     auto gparams = graph_params(res.get(), ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
-    gparams.cparams.moe_slot_set = moe_slot_set;
 
     ggml_cgraph * gf = model.build_graph(gparams);
 
@@ -3386,7 +3361,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     }
 
     // the experts can lie further apart than their size, as in MoE slots, which interleave the members of an expert
-    // (llama_moe_slot_layout); a run of experts [a, b) spans from the start of a to the end of b - 1, which for the
+    // (see "MoE expert slots"); a run of experts [a, b) spans from the start of a to the end of b - 1, which for the
     // last expert is the end of the tensor
     const int64_t n_expert      = src->ne[2];
     const size_t  expert_stride = src->nb[2];
@@ -4372,11 +4347,6 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
-    if (moe_slots) {
-        for (const auto & [buft, size] : moe_slots->memory_breakdown()) {
-            ret[buft].context += size;
-        }
-    }
     if (no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
@@ -4689,9 +4659,6 @@ llama_context_params llama_context_default_params() {
         /*.cb_kv_rot_set_user_data     =*/ nullptr,
         /*.moe_cache_size              =*/ 0,
         /*.moe_cache_cpu_share         =*/ 0.0f,
-        /*.moe_slots                   =*/ nullptr,
-        /*.moe_slots_user_data         =*/ nullptr,
-        /*.moe_slot_sets               =*/ 1,
         /*.lookup_rows                 =*/ nullptr,
         /*.lookup_rows_user_data       =*/ nullptr,
         /*.kv_rows                     =*/ nullptr,
@@ -4915,8 +4882,8 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
 }
 
-bool llama_set_moe_slot_set(llama_context * ctx, int32_t set) {
-    return ctx->set_moe_slot_set(set);
+void llama_set_graph_variant(llama_context * ctx, uint32_t variant) {
+    ctx->set_graph_variant(variant);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
@@ -4925,37 +4892,6 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     }
 
     return ctx->get_memory();
-}
-
-bool llama_context_moe_slot_layout(const struct llama_context * ctx, int32_t il, int32_t set, struct llama_moe_slot_layout * layout) {
-    const llama_moe_slot_pool * pool = ctx->get_moe_slots();
-    const llama_moe_slot_region * region = pool ? pool->region(set, il) : nullptr;
-    if (region == nullptr) {
-        return false;
-    }
-
-    const llama_moe_slot_layer & layer = *region->layer;
-
-    llama_moe_slot_layout res = {};
-    res.n_expert  = layer.n_expert;
-    res.n_slots   = region->n_slots;
-    res.alignment = layer.alignment;
-    res.map_size  = region->map_size;
-    res.slot_size = layer.slot_size;
-    res.buffer    = region->buf;
-    res.region    = region->region;
-    res.slot_map  = region->slot_map;
-    res.n_members = (int32_t) layer.members.size();
-    for (size_t i = 0; i < layer.members.size(); ++i) {
-        const auto & m = layer.members[i];
-        res.members[i] = { m.name.c_str(), region->members[i], m.offset, m.size };
-    }
-    res.n_range_splits = region->n_ranges() - 1;
-    for (int32_t r = 0; r < res.n_range_splits; ++r) {
-        res.range_splits[r] = region->bounds[r + 1];
-    }
-    *layout = res;
-    return true;
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {

@@ -293,11 +293,11 @@ llama_context_params make_params(const context_case & c, rewrite_state & rewrite
 }
 
 llama_graph_plan_shape ubatch_shape(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, uint32_t n_cells = 0) {
-    return { LLAMA_GRAPH_PLAN_WIDTH_UBATCH, n_tokens, n_seqs, n_outputs, n_cells, 0, -1, false, false, false };
+    return { LLAMA_GRAPH_PLAN_WIDTH_UBATCH, n_tokens, n_seqs, n_outputs, n_cells, 0, false, false, false };
 }
 
 llama_graph_plan_shape widest_shape(uint32_t n_cells = 0) {
-    return { LLAMA_GRAPH_PLAN_WIDTH_WIDEST, 0, 0, 0, n_cells, 0, -1, false, false, false };
+    return { LLAMA_GRAPH_PLAN_WIDTH_WIDEST, 0, 0, 0, n_cells, 0, false, false, false };
 }
 
 // the graph a real context reserves for a planned shape, in the nextn state the shape names
