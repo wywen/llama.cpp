@@ -280,8 +280,10 @@ extern "C" {
 
     // called during context initialization once for each MoE layer il that reads its expert weights from slots and
     // each slot set `set` in [0, llama_context_params.moe_slot_sets)
+    // ctx is the context the slots belong to, still initializing: llama_context_moe_slot_layout reports its slots once
+    // the callback has returned for every layer and set, before the context builds or reserves any graph
     // returns the slots of the layer in that set, see llama_context_params.moe_slots
-    typedef struct llama_moe_slot_pool_params (*llama_moe_slot_pool_callback)(int32_t il, int32_t n_expert, int32_t set, void * user_data);
+    typedef struct llama_moe_slot_pool_params (*llama_moe_slot_pool_callback)(const struct llama_context * ctx, int32_t il, int32_t n_expert, int32_t set, void * user_data);
 
     // called during loading once for each lookup table whose rows the caller can serve, with its tensor name, number of
     // rows and the bytes of one row
@@ -843,40 +845,36 @@ extern "C" {
     //   offset 0          map_size          map_size + slot_size
     //   | slot map | pad | slot 0          | slot 1          | ... n_slots slots
     //
-    // The slot map is an I32 [1, n_expert] tensor holding the slot of each expert. The graph remaps the router's
-    // expert ids through it and reads each expert weight from its member tensor; per-expert scales and biases are
-    // still indexed by the expert ids. Slots are not shared between contexts and are not part of the context state.
+    // The slot map is an I32 [1, n_expert] tensor holding the slot of each expert. Slots are not shared between contexts
+    // and are not part of the context state.
+    //
+    // The graphs llama builds read the stock expert weights, which hold no data: a caller rewrites each graph
+    // (llama_context_params.cb_graph_rewrite) to remap the router's expert ids through the slot map and read each
+    // expert weight from its member tensor, with per-expert scales and biases still indexed by the expert ids. A graph
+    // that still reads a stock expert weight after the rewrite must not be computed.
     //
     // llama never accesses the slots or the slot map after allocation: the caller writes them (e.g. from the runs of
     // llama_model_moe_expert_runs), outside the graph computations that read them. The slot map starts zeroed, the
     // slots uninitialized. Every expert the router can select must map to a slot that holds it.
     //
-    // Each graph reads the slot set chosen with llama_set_moe_slot_set (initially 0), e.g. a small set for decode and
-    // a full one for prompt processing. A change of set rebuilds the graph with the same nodes and splits and does not
-    // reserve the scheduler again: the compute buffers are reserved for the largest slot count of each layer.
+    // Each graph is built for the slot set chosen with llama_set_moe_slot_set (initially 0), e.g. a small set for decode
+    // and a full one for prompt processing, and a graph rewrite reads that set's slots. A change of set rebuilds the
+    // graph and does not reserve the scheduler again, so a rewrite of a graph llama reserves
+    // (GGML_BACKEND_SCHED_REWRITE_RESERVE) reads the set with the most slots of each layer: the compute buffers then
+    // cover the largest slot count.
     //
     // A member tensor strides its experts by slot_size, which need not be a whole number of blocks: a device that
     // cannot read such a tensor does not support it, and the layer falls back to the next buffer type.
     //
     // Slot ranges (llama_moe_slot_pool_params.n_range_splits) split the slots of a layer in a set into ranges of
     // consecutive slots, for a buffer that a device binds in disjoint parts, such as one from
-    // ggml_backend_metal_buffer_from_ranges. With more than one range, every op of the graph that reads a
-    // member tensor reads a view of it limited to the slots of one range (named <member>.r<range>, e.g.
-    // blk.0.ffn_up_exps.slots.r1): each expert weight is read by one mul_mat_id per range (named as the unranged node
-    // with a suffix _r<range>, e.g. ffn_moe_up_r1-<il>), whose ids are the slots of the selected experts made local to
-    // the range (ffn_moe_slots_r<range>-<il>), -1 for slots outside it, and the per-range results are summed. Each
-    // selected expert is read in exactly one range, the others give it zero rows, so the router weights and the
-    // expert selection are those of the unranged graph.
+    // ggml_backend_metal_buffer_from_ranges; a rewrite that reads each range through its own view of a member
+    // tensor binds only that range's part.
     //
     // A range [s0, s1) spans the bytes [map_size + s0*slot_size, map_size + s1*slot_size) of the region, and the slot
     // map the bytes [0, n_expert*4). A buffer split at map_size and at the start of each range keeps the slot map and
     // each range in its own part; the offsets are multiples of llama_model_params.moe_slot_alignment, so an alignment
     // that is a multiple of the page size makes them page aligned.
-    //
-    // Every range is read by every graph that computes the layer, whichever experts the router selects: the op of a
-    // range none of whose slots are selected still binds the range (on Metal, wiring its pages), and the range must be
-    // readable, e.g. a range of a buffer from ggml_backend_metal_buffer_from_ranges must have a Metal buffer. Skipping
-    // the ranges that no selected expert reads is not supported yet.
     //
 
 #define LLAMA_MOE_SLOT_MAX_MEMBERS 3

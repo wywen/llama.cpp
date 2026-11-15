@@ -25,7 +25,6 @@ struct llama_prec_policy;
 struct llama_hadamard;
 
 class llama_moe_cache;
-class llama_moe_slot_pool;
 struct llama_lookup_row_reader;
 struct llama_lookup_table;
 
@@ -886,7 +885,6 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
-    const llama_moe_slot_pool    * moe_slots;
     const llama_lookup_row_reader * lookup_rows; // nullptr if the caller serves no lookup table rows
 
     // [n_layer] the router weight of each MoE layer, nullptr for the other layers; nullptr = no router lookahead
@@ -989,7 +987,7 @@ struct llm_graph_params {
             return false;
         }
 
-        // the slot sets have the same topology, but the graph reads the slot tensors of its set
+        // the slot sets have the same topology, but a graph rewrite reads the slot tensors of the graph's set
         if (cparams.moe_slot_set != other.cparams.moe_slot_set) {
             return false;
         }
@@ -1120,25 +1118,9 @@ struct llm_graph_amax_src1 {
     ggml_tensor * scale_s; // scale to undo on the matmul result, or nullptr
 };
 
-// the experts of a MoE layer read at slots: from caller-filled slots, or from the MoE cache
-struct llm_graph_moe_slots {
-    ggml_tensor * slots = nullptr; // [n_expert_used, n_tokens] the slot of each selected expert, nullptr: read the expert weights
-
-    // [n_expert_used, n_tokens] the MoE cache misses computed from the host experts, -1 for the other experts, or nullptr
-    ggml_tensor * cpu_ids = nullptr;
-
-    // the tensor that stands in for each expert weight
-    std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> weights;
-
-    // the slot ranges of a region split into more than one, else empty (see llama_moe_slot_pool_params)
-    struct range {
-        int32_t       start = 0;       // the first slot
-        int32_t       n     = 0;       // the number of slots
-        ggml_tensor * ids   = nullptr; // [n_expert_used, n_tokens] the slots made local to the range, -1 outside it
-    };
-    std::vector<range> ranges;
-
-    ggml_tensor * get(const ggml_tensor * w) const;
+struct llm_graph_moe_cache_slots {
+    ggml_tensor * slots;   // [n_expert_used, n_tokens] slots of the selected experts in the MoE cache, or nullptr
+    ggml_tensor * cpu_ids; // [n_expert_used, n_tokens] misses computed from the host experts, -1 for the other experts, or nullptr
 };
 
 struct llm_graph_context {
@@ -1187,7 +1169,6 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
-    const llama_moe_slot_pool    * moe_slots;
     const llama_lookup_row_reader * lookup_rows;
 
     const std::vector<ggml_tensor *> * moe_routers; // see llm_graph_params::moe_routers
@@ -1248,18 +1229,14 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
-    // if slots is set, the experts are read from the tensor that stands in for w at these slots (see build_moe_slots),
-    //     the scale and the LoRA still at ids
-    // with slot ranges, one mul_mat_id per range reads a view of the stand-in limited to the range's slots, at the
-    //     range's local ids, and the results are summed; each is named <name>_r<range> for layer il if name is set
+    // if slots is set, the experts are selected by slots instead of ids, from the MoE cache if cached (see build_moe_cache_slots)
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s   = nullptr,
-        const llm_graph_moe_slots * slots = nullptr,
-               const char * name  = nullptr,
-                       int   il    = -1) const;
+              ggml_tensor * w_s    = nullptr,
+              ggml_tensor * slots  = nullptr,
+                     bool   cached = true) const;
 
     // rescale `cur` (the src1 of a matmul) by a power of two, computed from its maximum absolute
     // keep both individual values and Q8 activation block sums within F16 range
@@ -1378,11 +1355,9 @@ struct llm_graph_context {
     //     happen before the router of layer il is built so that the router nodes stay adjacent
     void build_moe_router_ahead(ggml_tensor * logits_ahead, int il) const;
 
-    // the slots of the selected experts and the tensors that stand in for the expert weights, from the caller-filled
-    //     slots of the layer in the context or from the MoE cache; no slots if the layer reads its expert weights
-    // with cpu_part, also the MoE cache misses computed from the host experts, if the cache leaves any to the CPU
-    // throws if the layer reads its expert weights from slots and the context has none for it
-    llm_graph_moe_slots build_moe_slots(
+    // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
+    // with cpu_part, also the misses computed from the host experts, if the cache leaves any to the CPU
+    llm_graph_moe_cache_slots build_moe_cache_slots(
              ggml_tensor * selected_experts,
              ggml_tensor * up_exps,
              ggml_tensor * gate_exps,

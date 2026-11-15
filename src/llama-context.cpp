@@ -21,7 +21,6 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -36,24 +35,12 @@ static void llama_verify_hadamard_graph(
         ggml_cgraph * gf,
         const llama_hadamard_rotations & rotations,
         const llama_hadamard_rotations & inverses,
-        const llama_moe_cache * moe_cache,
-        const llama_moe_slot_pool * moe_slots) {
+        const llama_moe_cache * moe_cache) {
     // the MoE cache gives the matmul a copy of the expert weights, so the copy also needs the transform of its source
     llama_hadamard_rotations forward = rotations;
     for (const auto & [w, t] : rotations) {
         if (const ggml_tensor * cached = moe_cache ? moe_cache->get_experts(w) : nullptr) {
             forward.emplace(cached, t);
-        }
-    }
-    // so do the slot tensors read in place of the expert weights, which the ops of slot ranges read through views
-    std::set<const ggml_tensor *> slot_tensors;
-    if (moe_slots) {
-        for (const auto & [w, slots] : moe_slots->substitutes()) {
-            slot_tensors.insert(slots);
-            const auto it = rotations.find(w);
-            if (it != rotations.end()) {
-                forward.emplace(slots, it->second);
-            }
         }
     }
 
@@ -86,11 +73,7 @@ static void llama_verify_hadamard_graph(
             continue;
         }
 
-        const ggml_tensor * as = node->src[0];
-        if (as->view_src != nullptr && slot_tensors.count(as->view_src) > 0) {
-            as = as->view_src;
-        }
-        const auto it = forward.find(as);
+        const auto it = forward.find(node->src[0]);
         if (it == forward.end()) {
             if (inverses.count(node->src[0])) {
                 throw std::runtime_error(format(
@@ -125,19 +108,6 @@ static void llama_verify_hadamard_graph(
             throw std::runtime_error(format(
                 "Hadamard-latent table '%s' is read without the inverse transform",
                 node->src[0]->name));
-        }
-    }
-}
-
-// check that no op reads an expert weight that is read from slots: it has no data
-static void llama_verify_moe_slots_graph(ggml_cgraph * gf, const llama_moe_slots & moe_slots) {
-    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-        const ggml_tensor * node = ggml_graph_node(gf, i);
-        for (int s = 0; s < GGML_MAX_SRC; ++s) {
-            if (node->src[s] != nullptr && moe_slots.of(node->src[s]) != nullptr) {
-                throw std::runtime_error(format("expert weight '%s' is read from MoE slots, but op '%s' (%s) reads the weight itself",
-                    node->src[s]->name, node->name, ggml_op_name(node->op)));
-            }
         }
     }
 }
@@ -769,7 +739,7 @@ llama_context::llama_context(
 
     // the slots of the MoE layers that read their expert weights from slots, as the KV cache: per context, not state
     if (!model.moe_slots.empty()) {
-        moe_slots = std::make_unique<llama_moe_slot_pool>(model.moe_slots, cparams.moe_slot_sets, params.moe_slots, params.moe_slots_user_data, no_alloc);
+        moe_slots = std::make_unique<llama_moe_slot_pool>(this, model.moe_slots, cparams.moe_slot_sets, params.moe_slots, params.moe_slots_user_data, no_alloc);
     }
 
     // the caller's reader of the rows of the lookup tables that it serves
@@ -3270,12 +3240,8 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
-        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get(), moe_slots.get());
+        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get());
         hadamard_verified = true;
-    }
-    if (!moe_slots_verified && gf && !model.moe_slots.empty()) {
-        llama_verify_moe_slots_graph(gf, model.moe_slots);
-        moe_slots_verified = true;
     }
     if (!lookup_tables_verified && gf && !model.lookup_tables.empty()) {
         llama_verify_lookup_tables_graph(gf, model.lookup_tables);
@@ -3365,7 +3331,6 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
-        /*.moe_slots   =*/ moe_slots.get(),
         /*.lookup_rows =*/ lookup_rows.get(),
         /*.moe_routers =*/ moe_routers.empty() ? nullptr : &moe_routers,
         /*.moe_routers_extra =*/ moe_routers_extra.empty() ? nullptr : &moe_routers_extra,

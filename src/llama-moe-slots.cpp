@@ -55,7 +55,7 @@ static void place(ggml_backend_buffer_t buf, ggml_tensor * t, size_t offset, boo
     }
 }
 
-llama_moe_slot_pool::llama_moe_slot_pool(const llama_moe_slots & slots, uint32_t n_sets, llama_moe_slot_pool_callback get_params, void * user_data, bool no_alloc) :
+llama_moe_slot_pool::llama_moe_slot_pool(const llama_context * lctx, const llama_moe_slots & slots, uint32_t n_sets, llama_moe_slot_pool_callback get_params, void * user_data, bool no_alloc) :
     slots(slots) {
     if (n_sets == 0) {
         throw std::runtime_error("the number of MoE slot sets must be at least 1");
@@ -63,15 +63,15 @@ llama_moe_slot_pool::llama_moe_slot_pool(const llama_moe_slots & slots, uint32_t
     regions.resize(n_sets);
     for (uint32_t set = 0; set < n_sets; ++set) {
         for (const auto & [_, layer] : slots.all()) {
-            add_region((int32_t) set, layer.get(), get_params, user_data, no_alloc);
+            add_region(lctx, (int32_t) set, layer.get(), get_params, user_data, no_alloc);
         }
     }
 }
 
-void llama_moe_slot_pool::add_region(int32_t set, const llama_moe_slot_layer * layer, llama_moe_slot_pool_callback get_params, void * user_data, bool no_alloc) {
+void llama_moe_slot_pool::add_region(const llama_context * lctx, int32_t set, const llama_moe_slot_layer * layer, llama_moe_slot_pool_callback get_params, void * user_data, bool no_alloc) {
     const int32_t il = layer->il;
 
-    const llama_moe_slot_pool_params pp = get_params ? get_params(il, layer->n_expert, set, user_data) : llama_moe_slot_pool_params{};
+    const llama_moe_slot_pool_params pp = get_params ? get_params(lctx, il, layer->n_expert, set, user_data) : llama_moe_slot_pool_params{};
     const int32_t n = pp.n_slots;
     if (n < 0) {
         throw std::runtime_error(format("layer %d, set %d: invalid number of MoE slots %d", il, set, n));
@@ -229,18 +229,6 @@ const llama_moe_slot_region * llama_moe_slot_pool::widest(int32_t il) const {
         const auto it = set.find(il);
         if (it != set.end() && (res == nullptr || it->second.n_slots > res->n_slots)) {
             res = &it->second;
-        }
-    }
-    return res;
-}
-
-std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> llama_moe_slot_pool::substitutes() const {
-    std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> res;
-    for (const auto & set : regions) {
-        for (const auto & [_, region] : set) {
-            for (size_t i = 0; i < region.members.size(); ++i) {
-                res.emplace_back(region.layer->members[i].stock, region.members[i]);
-            }
         }
     }
     return res;
