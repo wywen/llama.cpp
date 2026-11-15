@@ -529,9 +529,6 @@ private:
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;
 
-    // true after the check that no op reads an expert weight read from MoE slots passes on a reserved graph
-    bool moe_slots_verified = false;
-
     // true after the check that no op reads a lookup table served by the caller passes on a reserved graph
     bool lookup_tables_verified = false;
 

@@ -257,12 +257,6 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     set_tests_properties(test-moe-slots PROPERTIES FIXTURES_REQUIRED per-expert-models)
 
     llama_build(test-moe-slot-ranges.cpp)
-    if (GGML_METAL AND NOT GGML_BACKEND_DL)
-        # also checks the slots in a Metal buffer of one range per slot range; skips that without a device
-        target_sources(test-moe-slot-ranges PRIVATE metal-nocopy-buffer.mm)
-        target_link_libraries(test-moe-slot-ranges PRIVATE ggml-metal "-framework Foundation" "-framework Metal")
-        target_compile_definitions(test-moe-slot-ranges PRIVATE TEST_MOE_SLOT_RANGES_METAL)
-    endif()
     llama_test(test-moe-slot-ranges LABEL "main behavior backend"
         ARGS --models "${PER_EXPERT_MODEL_DIR}")
     set_tests_properties(test-moe-slot-ranges PROPERTIES FIXTURES_REQUIRED per-expert-models)

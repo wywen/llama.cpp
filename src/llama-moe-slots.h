@@ -106,8 +106,8 @@ struct llama_moe_slot_region {
 // the slot sets of a context, each with the slots of each slot layer of its model, see llama_context_params.moe_slots
 class llama_moe_slot_pool {
 public:
-    // asks `get_params` for the slots of each slot layer in each of the n_sets sets; NULL = no slots
-    llama_moe_slot_pool(const llama_moe_slots & slots, uint32_t n_sets, llama_moe_slot_pool_callback get_params, void * user_data, bool no_alloc);
+    // asks `get_params` for the slots of each slot layer in each of the n_sets sets of context lctx; NULL = no slots
+    llama_moe_slot_pool(const llama_context * lctx, const llama_moe_slots & slots, uint32_t n_sets, llama_moe_slot_pool_callback get_params, void * user_data, bool no_alloc);
 
     uint32_t n_sets() const {
         return (uint32_t) regions.size();
@@ -123,14 +123,11 @@ public:
         return slots;
     }
 
-    // every stock expert weight read from the slots of this context, with the tensor that stands in for it in each set
-    std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> substitutes() const;
-
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
 private:
     // asks `get_params` for the slots of `layer` in set `set` and allocates them
-    void add_region(int32_t set, const llama_moe_slot_layer * layer, llama_moe_slot_pool_callback get_params, void * user_data, bool no_alloc);
+    void add_region(const llama_context * lctx, int32_t set, const llama_moe_slot_layer * layer, llama_moe_slot_pool_callback get_params, void * user_data, bool no_alloc);
 
     const llama_moe_slots & slots;
 
