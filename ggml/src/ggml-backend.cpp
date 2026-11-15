@@ -2718,7 +2718,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
         if (!ggml_backend_sched_caller_alloc_graph(sched, /*reserve =*/ true)) {
             return false;
         }
-    } else if (!ggml_gallocr_reserve_n_covering(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+    } else if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
     }
 
@@ -2838,11 +2838,6 @@ void ggml_backend_sched_set_graph_rewrite_callback(ggml_backend_sched_t sched, g
     GGML_ASSERT(sched);
     sched->callback_graph_rewrite = callback;
     sched->callback_graph_rewrite_user_data = user_data;
-}
-
-void ggml_backend_sched_set_replan_on_shrink(ggml_backend_sched_t sched, bool replan) {
-    GGML_ASSERT(sched);
-    ggml_gallocr_set_replan_on_shrink(sched->galloc, replan);
 }
 
 size_t ggml_backend_sched_get_compute_extent(ggml_backend_sched_t sched, int backend_index, int chunk, ggml_backend_buffer_t * chunk_buffer) {

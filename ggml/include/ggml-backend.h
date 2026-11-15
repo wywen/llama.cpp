@@ -457,11 +457,6 @@ extern "C" {
     // returns false if the callback fails or the rewritten graph reads a tensor that is neither a node nor a leaf of it
     GGML_API bool                 ggml_backend_sched_rewrite_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph, enum ggml_backend_sched_rewrite_purpose purpose);
 
-    // Plan the allocation again when the tensors of a graph shrink, not only when they grow (default: false)
-    // the new plan starts at offset 0 of the first chunk; compute buffers that fit the plan are not reallocated,
-    // but the reserve callback still fires with their current sizes
-    GGML_API void                 ggml_backend_sched_set_replan_on_shrink(ggml_backend_sched_t sched, bool replan);
-
     // Bytes of chunk `chunk` of the compute buffer of a backend that the last allocated or reserved graph uses
     // the chunk's buffer is returned in *chunk_buffer; returns 0 and NULL past the last chunk, and for a backend
     // that shares its allocator with an earlier backend

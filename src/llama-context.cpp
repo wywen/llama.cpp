@@ -997,8 +997,6 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     if (cparams.has_sched_caller_alloc && !ggml_backend_sched_set_caller_alloc(sched.get(), &cparams.sched_caller_alloc)) {
         throw std::runtime_error("the scheduler refuses a caller allocator");
     }
-    // a caller that tracks per-graph extents wants each graph placed tightly
-    ggml_backend_sched_set_replan_on_shrink(sched.get(), cparams.cb_graph_prepare != nullptr);
 }
 
 void llama_context::sched_reserve() {
