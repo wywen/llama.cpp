@@ -373,6 +373,18 @@ extern "C" {
     // a graph that is computed again without ggml_backend_sched_alloc_graph needs ggml_backend_sched_prepare_graph
     typedef bool (*ggml_backend_sched_graph_prepare_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * user_data);
 
+    // What the scheduler rewrites a graph for
+    enum ggml_backend_sched_rewrite_purpose {
+        // ggml_backend_sched_reserve, ggml_backend_sched_reserve_size and ggml_backend_sched_split_graph: the graph
+        // measures or reserves the compute buffers, and is not computed
+        GGML_BACKEND_SCHED_REWRITE_RESERVE,
+        // ggml_backend_sched_alloc_graph: the graph is allocated to be computed
+        GGML_BACKEND_SCHED_REWRITE_ALLOC,
+        // a caller's ggml_backend_sched_rewrite_graph: the graph is inspected as rewritten, and is not split, placed or
+        // allocated
+        GGML_BACKEND_SCHED_REWRITE_PLAN,
+    };
+
     // Callback that rewrites a graph in place before the scheduler splits it
     // it runs at the start of ggml_backend_sched_alloc_graph, ggml_backend_sched_reserve, ggml_backend_sched_reserve_size
     // and ggml_backend_sched_split_graph, so a reserved compute buffer is planned for the rewritten graph;
@@ -386,7 +398,9 @@ extern "C" {
     // the callback sees a graph each time it is allocated or reserved: a graph that is passed again keeps the
     // nodes of an earlier rewrite, so the callback must recognize a graph that it has already rewritten
     // a graph that is computed again without ggml_backend_sched_alloc_graph is not rewritten again
-    typedef bool (*ggml_backend_sched_graph_rewrite_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * user_data);
+    // `purpose` says what the rewritten graph is for, so a callback can rewrite a graph whose compute buffers are
+    // reserved differently from one that is about to be computed
+    typedef bool (*ggml_backend_sched_graph_rewrite_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, enum ggml_backend_sched_rewrite_purpose purpose, void * user_data);
 
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
@@ -438,10 +452,10 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_graph_prepare_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_prepare_callback callback, void * user_data);
     GGML_API void                 ggml_backend_sched_set_graph_rewrite_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_rewrite_callback callback, void * user_data);
 
-    // Runs the graph-rewrite callback, if one is set, on a graph and restores its invariants, as a reserve or an allocation
-    // does before it splits the graph; the graph is not split, placed or allocated
+    // Runs the graph-rewrite callback, if one is set, on a graph for `purpose` and restores its invariants, as a reserve
+    // or an allocation does before it splits the graph; the graph is not split, placed or allocated
     // returns false if the callback fails or the rewritten graph reads a tensor that is neither a node nor a leaf of it
-    GGML_API bool                 ggml_backend_sched_rewrite_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    GGML_API bool                 ggml_backend_sched_rewrite_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph, enum ggml_backend_sched_rewrite_purpose purpose);
 
     // Plan the allocation again when the tensors of a graph shrink, not only when they grow (default: false)
     // the new plan starts at offset 0 of the first chunk; compute buffers that fit the plan are not reallocated,

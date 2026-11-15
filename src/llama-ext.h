@@ -260,8 +260,8 @@ struct llama_graph_plan;
 // Builds each member's context as llama_init_from_model would, over memory that allocates nothing (as
 // llama_model_memory_plan builds it) and without compute or output buffers: a member that reads or shares the memory
 // of its ctx_other reads that member's planned context. Then builds each of the member's graphs as the matching
-// reserve would and runs the member's cb_graph_rewrite on it; no graph is split, placed or allocated. Device probes
-// (flash attention, fused ops) resolve as context creation resolves them. The memory and MoE slot placeholders take the
+// reserve would and runs the member's cb_graph_rewrite on it for GGML_BACKEND_SCHED_REWRITE_PLAN; no graph is split,
+// placed or allocated. Device probes (flash attention, fused ops) resolve as context creation resolves them. The memory and MoE slot placeholders take the
 // buffer types their devices report while the plan is built, which a device that rebinds its tensors at allocation may
 // set to those its tensors run from. The callbacks of params that run while a
 // graph computes or a scheduler reserves its buffers (cb_eval, cb_reserve, cb_graph_prepare, cb_outputs_enqueued, sched_caller_alloc,

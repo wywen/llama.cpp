@@ -3340,7 +3340,7 @@ llm_graph_result_ptr llama_context::graph_plan(
         sampling.samplers.swap(save_samplers);
     }
 
-    if (gf == nullptr || !ggml_backend_sched_rewrite_graph(sched.get(), gf)) {
+    if (gf == nullptr || !ggml_backend_sched_rewrite_graph(sched.get(), gf, GGML_BACKEND_SCHED_REWRITE_PLAN)) {
         return nullptr;
     }
 

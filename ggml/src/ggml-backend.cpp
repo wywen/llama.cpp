@@ -2642,13 +2642,13 @@ static bool ggml_backend_sched_normalize_graph(struct ggml_cgraph * graph) {
     return true;
 }
 
-bool ggml_backend_sched_rewrite_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+bool ggml_backend_sched_rewrite_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph, enum ggml_backend_sched_rewrite_purpose purpose) {
     GGML_ASSERT(sched);
 
     if (sched->callback_graph_rewrite == NULL) {
         return true;
     }
-    if (!sched->callback_graph_rewrite(sched, graph, sched->callback_graph_rewrite_user_data)) {
+    if (!sched->callback_graph_rewrite(sched, graph, purpose, sched->callback_graph_rewrite_user_data)) {
         return false;
     }
     return ggml_backend_sched_normalize_graph(graph);
@@ -2657,7 +2657,7 @@ bool ggml_backend_sched_rewrite_graph(ggml_backend_sched_t sched, struct ggml_cg
 bool ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
 
-    if (!ggml_backend_sched_rewrite_graph(sched, graph)) {
+    if (!ggml_backend_sched_rewrite_graph(sched, graph, GGML_BACKEND_SCHED_REWRITE_RESERVE)) {
         return false;
     }
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
@@ -2669,7 +2669,7 @@ bool ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     GGML_ASSERT(sched);
     GGML_ASSERT(sizes);
 
-    if (!ggml_backend_sched_rewrite_graph(sched, measure_graph)) {
+    if (!ggml_backend_sched_rewrite_graph(sched, measure_graph, GGML_BACKEND_SCHED_REWRITE_RESERVE)) {
         return false;
     }
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
@@ -2703,7 +2703,7 @@ bool ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
     GGML_ASSERT(sched);
 
-    if (!ggml_backend_sched_rewrite_graph(sched, measure_graph)) {
+    if (!ggml_backend_sched_rewrite_graph(sched, measure_graph, GGML_BACKEND_SCHED_REWRITE_RESERVE)) {
         return false;
     }
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
@@ -2731,7 +2731,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     GGML_ASSERT(sched);
     GGML_ASSERT(!sched->is_alloc);
 
-    if (!ggml_backend_sched_rewrite_graph(sched, graph)) {
+    if (!ggml_backend_sched_rewrite_graph(sched, graph, GGML_BACKEND_SCHED_REWRITE_ALLOC)) {
         return false;
     }
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
