@@ -1,5 +1,5 @@
 // the scheduler's graph-rewrite callback: a caller substitutes an op in a graph with an equivalent chain of ops
-// after the graph is built and before the scheduler splits and allocates it
+// after the graph is built and before the scheduler splits and allocates it, told what each rewrite is for
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -22,11 +22,13 @@ struct rewrite_state {
     bool           dangling  = false;   // rewire a reader to a tensor that is not in the graph
     int            n_calls   = 0;
     int            n_rewrites = 0;
+    std::vector<ggml_backend_sched_rewrite_purpose> purposes; // of each call, in order
 };
 
-static bool rewrite_scale(ggml_backend_sched_t /*sched*/, ggml_cgraph * graph, void * user_data) {
+static bool rewrite_scale(ggml_backend_sched_t /*sched*/, ggml_cgraph * graph, ggml_backend_sched_rewrite_purpose purpose, void * user_data) {
     auto * state = static_cast<rewrite_state *>(user_data);
     state->n_calls++;
+    state->purposes.push_back(purpose);
     if (!state->accept) {
         return false;
     }
@@ -198,6 +200,7 @@ static void test_backend(ggml_backend_t backend) {
         CHECK(ggml_backend_sched_reserve(sched, g.graph));
         CHECK(state.n_calls == 1);
         CHECK(state.n_rewrites == 1);
+        CHECK(state.purposes.back() == GGML_BACKEND_SCHED_REWRITE_RESERVE);
         ggml_free(g.ctx);
     }
     const size_t reserved = ggml_backend_sched_get_buffer_size(sched, backend);
@@ -208,6 +211,7 @@ static void test_backend(ggml_backend_t backend) {
         compute(g, y, z);
         CHECK(state.n_calls == 2);
         CHECK(state.n_rewrites == 2);
+        CHECK(state.purposes.back() == GGML_BACKEND_SCHED_REWRITE_ALLOC);
         CHECK(reallocs.n_realloc == 0);
         CHECK(ggml_backend_sched_get_buffer_size(sched, backend) == reserved);
 
@@ -253,14 +257,28 @@ static void test_backend(ggml_backend_t backend) {
         std::vector<size_t> sizes(backends.size());
         CHECK(ggml_backend_sched_reserve_size(sched, g.graph, sizes.data()));
         CHECK(state.n_calls == 4);
+        CHECK(state.purposes.back() == GGML_BACKEND_SCHED_REWRITE_RESERVE);
         CHECK(ggml_graph_n_nodes(g.graph) == 4);
         ggml_free(g.ctx);
 
         g = build_graph(x);
         CHECK(ggml_backend_sched_split_graph(sched, g.graph));
         CHECK(state.n_calls == 5);
+        CHECK(state.purposes.back() == GGML_BACKEND_SCHED_REWRITE_RESERVE);
         CHECK(ggml_graph_n_nodes(g.graph) == 4);
         ggml_backend_sched_reset(sched);
+        ggml_free(g.ctx);
+    }
+
+    // a caller rewrites a graph to inspect it, for the purpose it names: the chain sits before the readers it rewired
+    {
+        test_graph g = build_graph(x);
+        CHECK(ggml_backend_sched_rewrite_graph(sched, g.graph, GGML_BACKEND_SCHED_REWRITE_PLAN));
+        CHECK(state.n_calls == 6);
+        CHECK(state.purposes.back() == GGML_BACKEND_SCHED_REWRITE_PLAN);
+        CHECK(ggml_graph_n_nodes(g.graph) == 4);
+        CHECK(find_node_named(g.graph, "rewrite.s.0") == 0);
+        CHECK(find_node_named(g.graph, "rewrite.s.1") == 1);
         ggml_free(g.ctx);
     }
 
@@ -274,7 +292,8 @@ static void test_backend(ggml_backend_t backend) {
         CHECK(!ggml_backend_sched_reserve(sched, g.graph));
         CHECK(!ggml_backend_sched_reserve_size(sched, g.graph, sizes.data()));
         CHECK(!ggml_backend_sched_split_graph(sched, g.graph));
-        CHECK(state.n_calls == 10);
+        CHECK(!ggml_backend_sched_rewrite_graph(sched, g.graph, GGML_BACKEND_SCHED_REWRITE_PLAN));
+        CHECK(state.n_calls == 12);
         ggml_backend_sched_reset(sched);
         ggml_free(g.ctx);
     }

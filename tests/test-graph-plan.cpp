@@ -142,13 +142,16 @@ struct rewrite_state {
     const llama_model * other = nullptr;
     bool record = false;
     std::vector<std::string> rewritten;
+    ggml_backend_sched_rewrite_purpose recorded = GGML_BACKEND_SCHED_REWRITE_ALLOC; // of the call that recorded
+    size_t n_plan = 0;                                                              // calls for a plan
     std::vector<ggml_context_ptr> ctxs;
 };
 
 constexpr const char * rewrite_node_name = "plan_test_rewrite";
 
-bool rewrite_graph(ggml_backend_sched_t /*sched*/, ggml_cgraph * gf, void * user_data) {
+bool rewrite_graph(ggml_backend_sched_t /*sched*/, ggml_cgraph * gf, ggml_backend_sched_rewrite_purpose purpose, void * user_data) {
     auto * state = static_cast<rewrite_state *>(user_data);
+    state->n_plan += purpose == GGML_BACKEND_SCHED_REWRITE_PLAN;
     const int n_nodes = ggml_graph_n_nodes(gf);
     int first_norm = -1;
     bool done = false;
@@ -180,6 +183,7 @@ bool rewrite_graph(ggml_backend_sched_t /*sched*/, ggml_cgraph * gf, void * user
     }
     if (state->record) {
         state->rewritten = describe_graph(gf, state->model, state->other);
+        state->recorded  = purpose;
     }
     return true;
 }
@@ -468,6 +472,14 @@ void check_case(const plan_case & pc, feature_set features, outcome & out) {
             fail(out, label + ": the plan failed: " + e.what());
             continue;
         }
+        // the reserves that probe a device while the planned contexts are built rewrite for a reserve
+        size_t n_shapes = 0;
+        for (const llama_graph_plan_member & member : members) {
+            n_shapes += member.shapes.size();
+        }
+        if (rewrite_plan.n_plan != n_shapes) {
+            fail(out, label + ": the plan rewrote " + std::to_string(rewrite_plan.n_plan) + " graphs for a plan, not one per shape");
+        }
 
         std::vector<llama_context_ptr> real;
         for (size_t m = 0; m < members.size(); ++m) {
@@ -522,6 +534,9 @@ void check_case(const plan_case & pc, feature_set features, outcome & out) {
                 if (reserved == nullptr || rewrite_real.rewritten.empty()) {
                     fail(out, what + ": the real reserve failed, or ran no rewrite");
                     continue;
+                }
+                if (rewrite_real.recorded != GGML_BACKEND_SCHED_REWRITE_RESERVE) {
+                    fail(out, what + ": the real reserve rewrote its graph for a purpose other than a reserve");
                 }
                 if (const std::string diff = graph_difference(planned, rewrite_real.rewritten, members[m].model, other); !diff.empty()) {
                     fail(out, what + ": " + diff);

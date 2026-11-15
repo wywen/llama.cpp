@@ -494,6 +494,9 @@ extern "C" {
         // see ggml_backend_sched_graph_rewrite_callback; runs on every graph that the context's scheduler reserves,
         // measures or allocates, each time after llama builds it; a graph that llama reuses without building it
         // again keeps its rewritten nodes and is not passed to the callback again
+        // its purpose is GGML_BACKEND_SCHED_REWRITE_RESERVE for a graph llama reserves or measures,
+        // GGML_BACKEND_SCHED_REWRITE_ALLOC for a graph llama computes, and GGML_BACKEND_SCHED_REWRITE_PLAN for a graph
+        // that llama_graph_plan_build plans
         // the callback must not replace the input tensors or the output tensors (logits, embeddings, sampled tokens)
         // that llama reads and writes: it may rewire their readers, or change such a tensor's op and srcs in place
         ggml_backend_sched_graph_rewrite_callback cb_graph_rewrite;
