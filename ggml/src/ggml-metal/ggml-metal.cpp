@@ -761,6 +761,33 @@ const char * ggml_backend_metal_last_error(ggml_backend_t backend) {
     return ggml_metal_last_error((ggml_metal_t)backend->context);
 }
 
+enum ggml_status ggml_backend_metal_encode_nodes(
+        ggml_backend_t backend, struct ggml_cgraph * graph, int i0, int i1, void * cmd_buf) {
+    if (!ggml_backend_is_metal(backend)) {
+        GGML_LOG_ERROR("%s: not a Metal backend\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+    if (graph == NULL || i0 < 0 || i1 < i0 || i1 > graph->n_nodes) {
+        GGML_LOG_ERROR("%s: nodes [%d, %d) are not a range of a graph of %d nodes\n", __func__,
+                i0, i1, graph != NULL ? graph->n_nodes : 0);
+        return GGML_STATUS_FAILED;
+    }
+    if (cmd_buf == NULL) {
+        GGML_LOG_ERROR("%s: no command buffer\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+
+    ggml_metal_encode_nodes((ggml_metal_t)backend->context, graph, i0, i1, cmd_buf);
+
+    return GGML_STATUS_SUCCESS;
+}
+
+void ggml_backend_metal_commit_fence(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_commit_fence((ggml_metal_t)backend->context);
+}
+
 void ggml_backend_metal_set_boundary_schedule(
         ggml_backend_t backend,
         int n_cuts,  struct ggml_tensor * const * cut_nodes,  ggml_metal_event_t * sig_ev,  const uint64_t * sig_val,
@@ -1275,6 +1302,15 @@ void * ggml_backend_metal_device_get_mtl_device(ggml_backend_dev_t dev) {
     return ggml_metal_device_get_obj((ggml_metal_device_t)dev->context);
 }
 
+void * ggml_backend_metal_device_get_mtl_queue(ggml_backend_dev_t dev) {
+    if (!ggml_backend_dev_is_metal(dev)) {
+        GGML_LOG_ERROR("%s: not a Metal device\n", __func__);
+        return NULL;
+    }
+
+    return ggml_metal_device_get_queue((ggml_metal_device_t)dev->context);
+}
+
 ggml_backend_buffer_t ggml_backend_metal_buffer_from_ranges(
         ggml_backend_dev_t dev, void * base, size_t size, const struct ggml_backend_metal_range * ranges, int n_ranges) {
     if (!ggml_backend_dev_is_metal(dev)) {
@@ -1314,6 +1350,17 @@ ggml_metal_buffer_t ggml_metal_tensor_buffer(const struct ggml_tensor * t) {
     }
 
     return (ggml_metal_buffer_t) buffer->context;
+}
+
+void * ggml_backend_metal_tensor_mtl_buffer(const struct ggml_tensor * t, size_t * offs) {
+    const ggml_metal_buffer_id id = ggml_metal_buffer_get_id(ggml_metal_tensor_buffer(t), t);
+    if (id.metal == NULL) {
+        GGML_ABORT("%s: tensor '%s' is in no Metal buffer of its buffer", __func__, t->name);
+    }
+
+    *offs = id.offs;
+
+    return id.metal;
 }
 
 bool ggml_backend_metal_buffer_set_range(ggml_backend_buffer_t buffer, int i, void * metal) {

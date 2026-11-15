@@ -1683,6 +1683,30 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     //printf("%s: graph optimize took %.3f ms\n", __func__, (ggml_time_us() - t_start) / 1000.0);
 }
 
+void ggml_metal_encode_nodes(ggml_metal_t ctx, struct ggml_cgraph * gf, int i0, int i1, ggml_metal_cmd_buf_t cmd_buf) {
+    // keep the memory wired, as a graph compute does
+    ggml_metal_device_rsets_keep_alive(ctx->dev);
+
+    // the encoders are autoreleased; the caller's thread may have no pool
+    @autoreleasepool {
+        ggml_metal_encode_range(ctx, cmd_buf, gf, i0, i1, false);
+    }
+}
+
+void ggml_metal_commit_fence(ggml_metal_t ctx) {
+    @autoreleasepool {
+        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+
+        [cmd_buf commit];
+
+        [ctx->cmd_bufs_ext addObject:cmd_buf];
+        ctx->cmd_buf_last = cmd_buf;
+
+        [cmd_buf retain];
+    }
+}
+
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
     @autoreleasepool {
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);

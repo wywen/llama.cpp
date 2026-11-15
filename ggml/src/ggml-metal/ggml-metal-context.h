@@ -32,6 +32,12 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 enum ggml_status ggml_metal_graph_compute (ggml_metal_t ctx, struct ggml_cgraph * gf);
 void             ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf);
 
+// See ggml_backend_metal_encode_nodes; the range is valid and cmd_buf is not NULL.
+void ggml_metal_encode_nodes(ggml_metal_t ctx, struct ggml_cgraph * gf, int i0, int i1, ggml_metal_cmd_buf_t cmd_buf);
+
+// See ggml_backend_metal_commit_fence.
+void ggml_metal_commit_fence(ggml_metal_t ctx);
+
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev);
 void ggml_metal_event_wait  (ggml_metal_t ctx, ggml_metal_event_t ev);
 void ggml_metal_event_signal(ggml_metal_t ctx, ggml_metal_event_t ev, uint64_t value);

@@ -235,6 +235,37 @@ GGML_BACKEND_API bool ggml_backend_metal_buffer_set_range(ggml_backend_buffer_t 
 // a device that is not a Metal device
 GGML_BACKEND_API void * ggml_backend_metal_device_get_mtl_device(ggml_backend_dev_t dev);
 
+//
+// encoding into caller command buffers
+//
+// A caller that schedules a graph itself encodes ranges of its nodes into command buffers it makes from the device's
+// queue, commits them in the order it chooses, and owns them throughout. The backend holds nothing of the caller's.
+//
+
+// Encode nodes [i0, i1) of `graph` into `cmd_buf`, an id<MTLCommandBuffer> of the backend's device passed as void *,
+// as a graph compute encodes the same nodes into one of its command buffers: the same pipelines, the same fusion (a
+// fused run never crosses i0 or i1), the same concurrency, with memory barriers between dependent nodes of the range.
+// Every tensor the range uses must be in a Metal buffer of the device.
+// The call makes and ends its own encoders on cmd_buf and neither enqueues, commits, retains nor waits for it; it
+// holds nothing once it returns. The caller keeps cmd_buf and every buffer the range binds alive until cmd_buf has
+// completed: the backend encodes with unretained references.
+// GGML_STATUS_FAILED, logging why, for a range outside the graph, a NULL command buffer or a backend that is not Metal.
+GGML_BACKEND_API enum ggml_status ggml_backend_metal_encode_nodes(
+        ggml_backend_t backend, struct ggml_cgraph * graph, int i0, int i1, void * cmd_buf);
+
+// the id<MTLCommandQueue> the device's backends commit to, as void *, not retained: valid while the device is;
+// NULL, with a log line, for a device that is not a Metal device
+GGML_BACKEND_API void * ggml_backend_metal_device_get_mtl_queue(ggml_backend_dev_t dev);
+
+// the id<MTLBuffer> that holds t's data, as void *, not retained, and in *offs the offset of the data in it; valid
+// until the range holding t is replaced (ggml_backend_metal_buffer_set_range) or its buffer is freed; aborts, naming
+// t, when t is not in a Metal buffer or its range has no Metal buffer
+GGML_BACKEND_API void * ggml_backend_metal_tensor_mtl_buffer(const struct ggml_tensor * t, size_t * offs);
+
+// commit an empty command buffer to the backend's queue and make it the one ggml_backend_synchronize waits for, so a
+// synchronize also waits for every command buffer the caller committed to the queue before the call
+GGML_BACKEND_API void ggml_backend_metal_commit_fence(ggml_backend_t backend);
+
 #ifdef __cplusplus
 }
 #endif

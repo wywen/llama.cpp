@@ -450,6 +450,10 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-metal-range-buffer.cpp metal-nocopy-buffer.mm  LABEL "main behavior backend"  LINK ggml ggml-metal)
     target_include_directories(test-metal-range-buffer PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
     target_link_libraries(test-metal-range-buffer PRIVATE "-framework Foundation" "-framework Metal")
+    # encodes ranges of a graph into command buffers the test makes and compares them with a graph compute; skips
+    # without a device
+    llama_build_and_test(test-metal-encode-nodes.cpp metal-command-buffer.mm metal-nocopy-buffer.mm  LABEL "main behavior backend"  LINK ggml ggml-metal)
+    target_link_libraries(test-metal-encode-nodes PRIVATE "-framework Foundation" "-framework Metal")
 endif()
 
 if (NOT GGML_BACKEND_DL AND GGML_CPU)
