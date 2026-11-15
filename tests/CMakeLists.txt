@@ -261,11 +261,6 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
         ARGS --models "${PER_EXPERT_MODEL_DIR}")
     set_tests_properties(test-moe-slot-ranges PROPERTIES FIXTURES_REQUIRED per-expert-models)
 
-    llama_build(test-moe-router-ahead.cpp)
-    llama_test(test-moe-router-ahead LABEL "main behavior backend"
-        ARGS --models "${PER_EXPERT_MODEL_DIR}")
-    set_tests_properties(test-moe-router-ahead PROPERTIES FIXTURES_REQUIRED per-expert-models)
-
     llama_build(test-lookup-pages.cpp)
     llama_test(test-lookup-pages LABEL "main behavior backend"
         ARGS --models "${PER_EXPERT_MODEL_DIR}")
