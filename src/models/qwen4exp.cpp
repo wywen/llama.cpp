@@ -766,9 +766,6 @@ public:
     ggml_tensor * new_pool_rep  = nullptr; // I64 [n_new]          cell to write each new pooled key into
     ggml_tensor * new_pool_pos  = nullptr; // I32 [4*n_new]        M-RoPE position of each new block's first member
 
-    // the K/V rows that the QSA layers read from the caller, nullptr if they read their cache
-    llm_graph_input_kv_rows * kv_rows = nullptr;
-
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t kpool;
     uint32_t n_new = 0; // padded to a stable bound, never below 1
@@ -815,10 +812,6 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     ggml_set_input(inp->new_pool_rep);
     inp->new_pool_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*inp->n_new);
     ggml_set_input(inp->new_pool_pos);
-
-    if (cparams.kv_rows != nullptr) {
-        inp->kv_rows = build_inp_kv_rows();
-    }
 
     return (llm_graph_input_kpool *) res->add_input(std::move(inp));
 }
@@ -894,15 +887,6 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], unordered
     cb(top_k, "indexer_top_k", il);
 
-    // the caller serves the selected rows: the cut reads the picks and whether each is live, see build_attn_kv_rows
-    if (inp_kpool->kv_rows != nullptr) {
-        ggml_tensor * top_score = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, score, 1, n_pool, n_tokens), top_k); // [1, n_top_pool, n_tokens]
-        top_score = ggml_reshape_2d(ctx0, top_score, n_top_pool, n_tokens);
-        cb(top_score, "indexer_top_score", il);
-
-        return { nullptr, top_k, top_score };
-    }
-
     // flash attention requires an f16 mask
     const ggml_type type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
@@ -916,7 +900,7 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
         res->add_fused_node({LLM_FUSED_OP_TOP_K_MASK, sel, il});
         cb(sel, "indexer_sel", il);
 
-        return { sel, top_k, nullptr };
+        return { sel, top_k };
     }
 
     // the top blocks, then the incomplete tail with n_kv for missing cells
@@ -969,10 +953,10 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     sel = ggml_cont(ctx0, sel);
     cb(sel, "indexer_sel", il);
 
-    return { sel, top_k, nullptr };
+    return { sel, top_k };
 }
 
-// Dense GQA self-attention over the cells that the QSA mask keeps, or over their rows served by the caller.
+// Dense GQA self-attention over the cells that the QSA mask keeps.
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         llm_graph_input_attn_kv * inp,
         llm_graph_input_kpool *   inp_kpool,
@@ -1004,45 +988,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     const auto * mctx_cur = inp->mctx;
 
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k = nullptr;
-    ggml_tensor * v = nullptr;
+    // store to KV cache
+    {
+        const auto & k_idxs = inp->get_k_idxs();
+        const auto & v_idxs = inp->get_v_idxs();
 
-    ggml_tensor * sel = qsel.mask;
-    if (sel == nullptr) {
-        // the caller stores the layer's K/V rows: no cache tensors, the graph outputs the new rows and attends over the
-        // staging of the cut
-        if (!cparams.flash_attn) {
-            throw std::runtime_error(format("layer %d reads its K/V rows from the caller, which requires flash attention", il));
-        }
-        GGML_ASSERT(mctx_cur->get_n_kv() == inp_kpool->n_kv);
-        // the input sets the V store indices, which no op reads here, so keep them allocated
-        ggml_build_forward_expand(gf, inp->get_v_idxs());
-
-        const llm_graph_kv_staging st = build_attn_kv_rows(inp_kpool->kv_rows, qsel.top_k, qsel.top_score,
-                inp_kpool->pool_idxs, inp_kpool->tail_idxs, inp->get_k_idxs(), k_cur, v_cur,
-                mctx_cur->type_k(), mctx_cur->type_v(), inp_kpool->n_kv, n_sel, il);
-        k   = st.k;
-        v   = st.v;
-        sel = st.mask;
-    } else {
-        // store to KV cache
-        {
-            const auto & k_idxs = inp->get_k_idxs();
-            const auto & v_idxs = inp->get_v_idxs();
-
-            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
-        }
-
-        k = mctx_cur->get_k(ctx0, il);
-        v = mctx_cur->get_v(ctx0, il);
-
-        // the selection replaces the kq_mask: split it into the streams of the K view
-        const int64_t n_stream = k->ne[3];
-        GGML_ASSERT(sel->ne[0] == k->ne[2] && sel->ne[1] % n_stream == 0);
-        sel = ggml_reshape_4d(ctx0, sel, sel->ne[0], sel->ne[1]/n_stream, 1, n_stream);
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
+
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    // the selection replaces the kq_mask: split it into the streams of the K view
+    ggml_tensor * sel = qsel.mask;
+    const int64_t n_stream = k->ne[3];
+    GGML_ASSERT(sel->ne[0] == k->ne[2] && sel->ne[1] % n_stream == 0);
+    sel = ggml_reshape_4d(ctx0, sel, sel->ne[0], sel->ne[1]/n_stream, 1, n_stream);
     cb(sel, "kq_mask_qsa", il);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, nullptr, n_sel, kq_scale, il);

@@ -272,10 +272,25 @@ llama_kv_cache::llama_kv_cache(
         if (caller_rows_of(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: the caller stores the K/V rows\n", __func__, il);
 
+            if (!ctx_caller_rows) {
+                ggml_init_params params = { 2*n_layer*ggml_tensor_overhead(), nullptr, true };
+                ctx_caller_rows.reset(ggml_init(params));
+                if (!ctx_caller_rows) {
+                    throw std::runtime_error("failed to create ggml context for the caller's kv rows");
+                }
+            }
+
+            ggml_tensor * k = ggml_new_tensor_3d(ctx_caller_rows.get(), type_k, n_embd_k_gqa, kv_size, n_stream);
+            ggml_tensor * v = is_mla ? nullptr : ggml_new_tensor_3d(ctx_caller_rows.get(), type_v, n_embd_v_gqa, kv_size, n_stream);
+
+            ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
+            v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
+
             caller_rows = true;
             map_layer_ids[il] = layers.size();
-            layers.push_back({ il, nullptr, nullptr, std::vector<ggml_tensor *>(n_stream, nullptr), std::vector<ggml_tensor *>(n_stream, nullptr), });
-            layers.back().buft = buft;
+            layers.push_back({ il, k, v, std::vector<ggml_tensor *>(n_stream, nullptr), std::vector<ggml_tensor *>(n_stream, nullptr), });
+            layers.back().buft        = buft;
+            layers.back().caller_rows = true;
             continue;
         }
 
@@ -460,13 +475,12 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
         for (bool is_k : { true, false }) {
             const uint32_t n_rot = is_k ? n_rot_k : n_rot_v;
             auto * cache = is_k ? layer.k : layer.v;
-            // a layer whose rows the caller stores still rotates them as its cache would
-            const bool rotates = cache != nullptr || (layer.buft != nullptr && layer.k == nullptr && layer.v == nullptr && (is_k || !hparams.is_mla()));
-            if (!n_rot || !rotates) {
+            if (!n_rot || cache == nullptr) {
                 continue;
             }
 
-            const auto buft = rot_buft ? rot_buft : cache ? ggml_backend_buffer_get_type(cache->buffer) : layer.buft;
+            // a layer whose rows the caller stores still rotates them as its cache would
+            const auto buft = rot_buft ? rot_buft : layer.caller_rows ? layer.buft : ggml_backend_buffer_get_type(cache->buffer);
             auto & ctx = ctx_map[buft];
             if (!ctx) {
                 ggml_init_params params = { 2*layers.size()*ggml_tensor_overhead(), nullptr, true };
@@ -2316,7 +2330,7 @@ size_t llama_kv_cache::size_k_bytes() const {
     size_t size_k_bytes = 0;
 
     for (const auto & layer : layers) {
-        size_k_bytes += layer.k ? ggml_nbytes(layer.k) : 0;
+        size_k_bytes += layer.k && !layer.caller_rows ? ggml_nbytes(layer.k) : 0;
     }
 
     return size_k_bytes;
@@ -2326,7 +2340,7 @@ size_t llama_kv_cache::size_v_bytes() const {
     size_t size_v_bytes = 0;
 
     for (const auto & layer : layers) {
-        size_v_bytes += layer.v ? ggml_nbytes(layer.v) : 0;
+        size_v_bytes += layer.v && !layer.caller_rows ? ggml_nbytes(layer.v) : 0;
     }
 
     return size_v_bytes;
@@ -2462,7 +2476,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     }
 
     if (caller_rows) {
-        throw std::runtime_error("the caller stores the K/V rows of some layers (kv_rows), so the state cannot hold them");
+        throw std::runtime_error("the caller stores the K/V rows of some layers (kv_rows_caller), so the state cannot hold them");
     }
 
     io.write(&n_stream, sizeof(n_stream));
@@ -2548,7 +2562,7 @@ const slot_info_vec_t *   sinfos_in) {
     }
 
     if (caller_rows) {
-        throw std::runtime_error("the caller stores the K/V rows of some layers (kv_rows), so the state cannot hold them");
+        throw std::runtime_error("the caller stores the K/V rows of some layers (kv_rows_caller), so the state cannot hold them");
     }
 
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]

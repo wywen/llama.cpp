@@ -403,9 +403,9 @@ llama_memory_i * llama_context_create_memory(
         /*.set_user_data =*/ params.cb_kv_rot_set_user_data,
     });
 
-    // the sparse attention layers whose K/V rows the caller stores get no K/V tensors
+    // the sparse attention layers whose K/V rows the caller stores get metadata-only K/V tensors
     llama_kv_cache_rows_params rows_params;
-    if (params.kv_rows != nullptr) {
+    if (params.kv_rows_caller) {
         rows_params.caller_rows = [&model](uint32_t il) {
             return llama_model_kv_rows_layer(model, il);
         };
@@ -483,24 +483,6 @@ llama_context::llama_context(
     cparams.n_graph_nodes_extra        = params.n_graph_nodes_extra;
     cparams.cb_outputs_enqueued           = params.cb_outputs_enqueued;
     cparams.cb_outputs_enqueued_user_data = params.cb_outputs_enqueued_user_data;
-    cparams.kv_rows                       = params.kv_rows;
-    cparams.kv_rows_user_data             = params.kv_rows_user_data;
-
-    if (cparams.kv_rows != nullptr) {
-        if (!llm_arch_supports_kv_rows(model.arch)) {
-            throw std::runtime_error(format("kv_rows is set, but %s has no sparse attention layers that read K/V rows from the caller",
-                llm_arch_name(model.arch)));
-        }
-        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-            throw std::runtime_error("kv_rows requires flash attention");
-        }
-        if (!params.kv_unified && params.n_seq_max > 1) {
-            throw std::runtime_error("kv_rows requires one KV stream (kv_unified or n_seq_max == 1)");
-        }
-        if (params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
-            throw std::runtime_error("kv_rows requires a default context type");
-        }
-    }
 
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         cparams.rope_scaling_type = hparams.rope_scaling_type_train;
@@ -867,9 +849,19 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             throw std::runtime_error(std::string("failed to reserve graph for ") + probe.name + " check");
         }
 
+        // a fused node that the caller's graph rewrite removed computes nothing, so its placement proves nothing
+        const auto in_graph = [gf](const ggml_tensor * t) {
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                if (ggml_graph_node(gf, i) == t) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
         bool device_mismatch = false;
         for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
-            if (node.op != probe.op) {
+            if (node.op != probe.op || !in_graph(node.tensor)) {
                 continue;
             }
 
@@ -1994,16 +1986,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
-        return nullptr;
-    }
-
-    // the host ops of the graph have run once the compute returns: the CPU computes its splits synchronously
-    try {
-        res->after_compute(sched.get());
-    } catch (const std::exception & err) {
-        // e.g. the caller failed to read or write the K/V rows of a sparse attention layer
-        LLAMA_LOG_ERROR("%s: failed to compute graph: %s\n", __func__, err.what());
-        ret = GGML_STATUS_FAILED;
         return nullptr;
     }
 
@@ -4639,8 +4621,6 @@ llama_context_params llama_context_default_params() {
         /*.cb_kv_rot_set_user_data     =*/ nullptr,
         /*.moe_cache_size              =*/ 0,
         /*.moe_cache_cpu_share         =*/ 0.0f,
-        /*.kv_rows                     =*/ nullptr,
-        /*.kv_rows_user_data           =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -4649,6 +4629,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.kv_rows_caller              =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

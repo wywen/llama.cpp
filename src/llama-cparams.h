@@ -97,8 +97,4 @@ struct llama_cparams : llama_memory_cparams {
     ggml_backend_sched_caller_alloc sched_caller_alloc;
     void (*cb_outputs_enqueued)(ggml_backend_sched_t sched, void * user_data);
     void * cb_outputs_enqueued_user_data;
-
-    // the caller that stores the K/V rows of the sparse attention layers, nullptr = the layers have K/V caches
-    llama_kv_rows_callback kv_rows;
-    void *                 kv_rows_user_data;
 };
