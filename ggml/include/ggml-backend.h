@@ -399,7 +399,8 @@ extern "C" {
     // and ggml_backend_sched_split_graph, so a reserved compute buffer is planned for the rewritten graph;
     // returning false fails the call
     // the callback may add nodes with ggml_build_forward_expand, change the srcs and op params of nodes, and remove a
-    // node by setting its entry in ggml_graph_nodes(graph) to NULL; the tensors it adds come from a ggml_context that the caller owns and keeps alive while the
+    // node by setting its entry in ggml_graph_nodes(graph) to NULL, and assign a node's backend with
+    // ggml_backend_sched_set_tensor_backend, which the split keeps unless a caller allocator places the node; the tensors it adds come from a ggml_context that the caller owns and keeps alive while the
     // graph is in use; the graph's node capacity bounds the nodes it can add
     // after the callback returns, the scheduler moves each node that is out of order to just before its first reader,
     // keeping the relative order of the other nodes, and recounts the uses of each tensor; the call fails if a node
@@ -416,6 +417,8 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
     // Initialize backend buffers from a measure graph
+    // both split the graph with the backends assigned to its nodes before the call (reset the scheduler before building
+    // the graph) and by the graph-rewrite callback, and leave the scheduler reset
     // both return false if the graph-rewrite callback fails; under a caller allocator that measures, neither allocates
     // (see ggml_backend_sched_caller_alloc.measure)
     GGML_API bool                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
