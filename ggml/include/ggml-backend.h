@@ -416,7 +416,8 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
     // Initialize backend buffers from a measure graph
-    // both return false if the graph-rewrite callback fails
+    // both return false if the graph-rewrite callback fails; under a caller allocator that measures, neither allocates
+    // (see ggml_backend_sched_caller_alloc.measure)
     GGML_API bool                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
 
@@ -495,6 +496,12 @@ extern "C" {
         // memory given to them
         bool (*alloc)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool reserve, void * user_data);
         void * user_data;
+        // optional; NULL reserves through alloc. When set, ggml_backend_sched_reserve and ggml_backend_sched_reserve_size
+        // allocate nothing: after the graph is split, and after the reserve callback, they hand the graph the backends
+        // compute (ggml_backend_sched_get_graph) to measure in place of alloc, and leave every tensor without memory and
+        // every compute extent at 0. ggml_backend_sched_split_graph and ggml_backend_sched_alloc_graph are unaffected.
+        // Returning false fails the call
+        bool (*measure)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * user_data);
     };
 
     // Sets the caller allocator, or with NULL hands allocation back to the graph allocator; resets the scheduler and

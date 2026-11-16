@@ -2107,6 +2107,14 @@ static bool ggml_backend_sched_caller_alloc_graph(ggml_backend_sched_t sched, bo
     }
 
     struct ggml_cgraph * graph = &sched->graph;
+    if (reserve && sched->caller_alloc.measure != NULL) {
+        if (!sched->caller_alloc.measure(sched, graph, sched->caller_alloc.user_data)) {
+            GGML_LOG_ERROR("%s: the caller allocator failed to measure the graph\n", __func__);
+            return false;
+        }
+        return true;
+    }
+
     sched->caller_allocating = true;
     const bool ok = sched->caller_alloc.alloc(sched, graph, reserve, sched->caller_alloc.user_data);
     sched->caller_allocating = false;

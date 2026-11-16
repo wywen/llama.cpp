@@ -76,7 +76,7 @@ struct llama_context {
     bool sched_reserve_pending() const;
 
     // reserve the widest graph sched_reserve sizes the compute buffers for, on the current scheduler
-    ggml_cgraph * graph_reserve_widest(const llama_memory_context_i * mctx, bool split_only = false);
+    ggml_cgraph * graph_reserve_widest(const llama_memory_context_i * mctx);
 
     void synchronize();
 
@@ -302,6 +302,9 @@ public:
     void notify_outputs_enqueued();
 
     // reserve a graph with a dummy ubatch of the specified size
+    // `split_only` splits and places the graph without reserving it, to inspect its placement
+    // a no_alloc context allocates nothing: it sizes the compute buffers into `sizes`, if given, or hands the graph to the
+    // caller allocator's measure (see llama_context_params.sched_caller_alloc); `sizes` is for a no_alloc context only
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
@@ -355,7 +358,7 @@ private:
     const llama_model & model;
 
     // the context backs its memory with placeholders and reserves its graphs without allocating compute buffers: its
-    // model was loaded without allocation, or it is built for a graph plan (llama_graph_plan_build)
+    // model was loaded without allocation, or it is built for a plan (llama_graph_plan_build, llama_init_plan_from_model)
     const bool no_alloc;
 
     llama_cparams cparams{};
