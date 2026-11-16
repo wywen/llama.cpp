@@ -72,6 +72,12 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    // whether a setting changed since the last scheduler reserve
+    bool sched_reserve_pending() const;
+
+    // reserve the widest graph sched_reserve sizes the compute buffers for, on the current scheduler
+    ggml_cgraph * graph_reserve_widest(const llama_memory_context_i * mctx, bool split_only = false);
+
     void synchronize();
 
     const llama_model   & get_model()   const;
@@ -151,6 +157,9 @@ struct llama_context {
     bool set_ctx_state_src(llama_context * ctx_src);
     bool supports_state_row() const;
     void set_nextn_layer_offset(int32_t offset);
+
+    // the caller's value that the following graphs are built for, see llama_set_graph_variant
+    void set_graph_variant(uint32_t variant);
     void set_causal_attn(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -226,6 +235,8 @@ struct llama_context {
     void perf_reset();
 
     llama_memory_breakdown memory_breakdown() const;
+    bool reserve_outputs(uint32_t n_outputs);
+    ggml_backend_buffer_t get_output_buffer() const { return buf_output.get(); }
 
     //
     // training
@@ -280,6 +291,10 @@ private:
 
     ggml_backend_t backend_from_dev(ggml_backend_dev_t dev) const;
 
+    // unlike backend_from_dev(), matches the device a backend was created from, which can differ
+    // from the device the backend reports when a device delegates execution to another device's backend
+    ggml_backend_t backend_initialized_from(ggml_backend_dev_t dev) const;
+
     //
     // graph
     //
@@ -289,13 +304,21 @@ public:
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
+    // the result of the most recently built graph, or nullptr if none is current
+    const llm_graph_result * get_gf_res_last() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
+    // invokes cparams.cb_outputs_enqueued, if set, once a computed graph's output copies are enqueued
+    void notify_outputs_enqueued();
+
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+
+    // the ubatch shape graph_reserve_widest reserves: n_tokens, n_seqs, n_outputs
+    std::array<uint32_t, 3> graph_shape_widest() const;
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -333,8 +356,8 @@ private:
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
-    // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
-    // that differs from the layer it belongs to (usually due to missing backend support)
+    // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a backend
+    // other than the one that executes its layer (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
 
     // TODO: read/write lora adapters and cvec
@@ -451,6 +474,10 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // the device each entry of backends was initialized from; differs from ggml_backend_get_device()
+    // when a device delegates execution to another device's backend
+    std::vector<ggml_backend_dev_t> backend_init_devs;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

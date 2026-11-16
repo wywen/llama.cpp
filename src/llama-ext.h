@@ -42,6 +42,49 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// Reserves the widest prompt graph, the one a scheduler reserve sizes the compute buffers for last.
+// The result is valid as llama_graph_reserve's.
+LLAMA_API struct ggml_cgraph * llama_graph_reserve_widest(struct llama_context * ctx);
+
+// As llama_graph_reserve and llama_graph_reserve_widest, over memory whose sequences span at most n_cells cells (n_cells > 0):
+// each attention cache's graph views min(n_cells, cache size) cells instead of every cell.
+// Returns nullptr when the context's memory cannot simulate a shorter extent.
+LLAMA_API struct ggml_cgraph * llama_graph_reserve_extent(
+        struct llama_context * ctx,
+        uint32_t n_tokens,
+        uint32_t n_seqs,
+        uint32_t n_outputs,
+        uint32_t n_cells);
+LLAMA_API struct ggml_cgraph * llama_graph_reserve_widest_extent(struct llama_context * ctx, uint32_t n_cells);
+
+// Whether the next decode reserves the scheduler again because a setting changed (a backend sampler,
+// an adapter, the attention type, ...); that reserve may reallocate the compute buffers.
+LLAMA_API bool llama_sched_reserve_pending(const struct llama_context * ctx);
+
+// Runs a pending scheduler reserve now instead of at the next decode; does nothing when none is pending.
+// Returns false when the reserve failed: discard the context.
+LLAMA_API bool llama_sched_reserve_now(struct llama_context * ctx);
+
+// Reserves the output buffer for n_outputs rows, after the embedding and backend sampler setup and before decoding.
+// Rejects 0 or more than n_batch or n_outputs_max rows without changing the context. Returns false for a valid
+// request when the allocation failed: discard the context, its previous output buffer may have been released.
+LLAMA_API bool llama_output_reserve(struct llama_context * ctx, uint32_t n_outputs);
+
+// The output buffer, valid until it grows or the context is freed.
+LLAMA_API ggml_backend_buffer_t llama_get_output_buffer(const struct llama_context * ctx);
+
+struct llama_fused_node_info {
+    const struct ggml_tensor * tensor;
+    int32_t layer;
+};
+
+// Copies the flash-attention nodes of the last decoded graph and their layers, at most `capacity` entries, and
+// returns their total count. The tensors are valid until the next decode or graph reset.
+LLAMA_API size_t llama_get_fused_node_info(
+    const struct llama_context * ctx,
+    struct llama_fused_node_info * out,
+    size_t capacity);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

@@ -291,6 +291,15 @@ set_tests_properties(test-llama-context PROPERTIES
     FIXTURES_REQUIRED generate-models
 )
 
+# Test that the graph variant keys graph reuse, using the generated dummy models
+llama_build(test-graph-variant.cpp)
+llama_test(
+    test-graph-variant
+    LABEL main
+    ARGS --models "${MODEL_DIR}"
+)
+set_tests_properties(test-graph-variant PROPERTIES FIXTURES_REQUIRED generate-models)
+
 # Test memory planning against real context construction, using the generated dummy models
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # uses internal functions not exported with LLAMA_API

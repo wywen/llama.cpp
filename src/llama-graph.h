@@ -901,6 +901,11 @@ struct llm_graph_params {
             return false;
         }
 
+        // the variants have the same topology, but the caller's graph rewrite keys on the graph's variant
+        if (cparams.graph_variant != other.cparams.graph_variant) {
+            return false;
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&

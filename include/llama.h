@@ -406,6 +406,41 @@ extern "C" {
 
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
+        ggml_backend_sched_reserve_callback cb_reserve;
+        void * cb_reserve_user_data;
+
+        // returns the compute buffer type to use for a backend in place of buft (return buft to keep it)
+        // called once per backend when the context creates its scheduler
+        ggml_backend_buffer_type_t (*cb_compute_buft)(ggml_backend_t backend, ggml_backend_buffer_type_t buft, void * user_data);
+        void * cb_compute_buft_user_data;
+
+        // see ggml_backend_sched_set_graph_prepare_callback
+        ggml_backend_sched_graph_prepare_callback cb_graph_prepare;
+        void * cb_graph_prepare_user_data;
+
+        // see ggml_backend_sched_graph_rewrite_callback; runs on every graph that the context's scheduler reserves,
+        // measures or allocates, each time after llama builds it; a graph that llama reuses without building it
+        // again keeps its rewritten nodes and is not passed to the callback again
+        // its purpose is GGML_BACKEND_SCHED_REWRITE_RESERVE for a graph llama reserves or measures,
+        // GGML_BACKEND_SCHED_REWRITE_ALLOC for a graph llama computes, and GGML_BACKEND_SCHED_REWRITE_PLAN for a graph
+        // that llama_graph_plan_build plans
+        // the callback must not replace the input tensors or the output tensors (logits, embeddings, sampled tokens)
+        // that llama reads and writes: it may rewire their readers, or change such a tensor's op and srcs in place
+        ggml_backend_sched_graph_rewrite_callback cb_graph_rewrite;
+        void * cb_graph_rewrite_user_data;
+
+        // node capacity that each graph and the scheduler reserve beyond the nodes llama builds, for the nodes that
+        // cb_graph_rewrite adds; 0 = no capacity is reserved for a rewrite
+        uint32_t n_graph_nodes_extra;
+
+        // see ggml_backend_sched_set_caller_alloc; NULL = the scheduler allocates its graphs; the struct is copied
+        const struct ggml_backend_sched_caller_alloc * sched_caller_alloc;
+
+        // called once per graph computed on the context's scheduler (each ubatch of encode and decode, each K-shift),
+        // after the asynchronous copies of its outputs have been enqueued and before the inputs of a later graph are
+        // written, so that a caller can record backend events that complete with those copies
+        void (*cb_outputs_enqueued)(ggml_backend_sched_t sched, void * user_data);
+        void * cb_outputs_enqueued_user_data;
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
@@ -595,6 +630,8 @@ extern "C" {
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
+
+    LLAMA_API ggml_backend_sched_t       llama_get_sched   (struct llama_context * ctx);
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
@@ -1169,6 +1206,14 @@ extern "C" {
 
     // Returns whether the context is currently using causal attention
     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
+
+    // Set the variant of the graphs the context builds from now on: an opaque value of the caller, initially 0, that
+    // its graph rewrite (llama_context_params.cb_graph_rewrite) keys on, e.g. to read other tensors in a graph of the
+    // same shape. llama does not reuse a graph built for another variant: the next graph is built again and passed to
+    // the rewrite. A change of variant does not reserve the scheduler again, so a rewrite of a graph llama reserves
+    // (GGML_BACKEND_SCHED_REWRITE_RESERVE) must cover every variant the caller uses; the graphs that
+    // llama_graph_plan_build plans are built for variant 0.
+    LLAMA_API void llama_set_graph_variant(struct llama_context * ctx, uint32_t variant);
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);

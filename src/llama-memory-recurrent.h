@@ -42,6 +42,9 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    // the recurrent state of a sequence does not depend on its extent
+    llama_memory_context_ptr init_full_extent(uint32_t n_cells) override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     void clear(bool data) override;
