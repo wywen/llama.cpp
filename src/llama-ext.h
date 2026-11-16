@@ -73,18 +73,6 @@ LLAMA_API bool llama_output_reserve(struct llama_context * ctx, uint32_t n_outpu
 // The output buffer, valid until it grows or the context is freed.
 LLAMA_API ggml_backend_buffer_t llama_get_output_buffer(const struct llama_context * ctx);
 
-struct llama_fused_node_info {
-    const struct ggml_tensor * tensor;
-    int32_t layer;
-};
-
-// Copies the flash-attention nodes of the last decoded graph and their layers, at most `capacity` entries, and
-// returns their total count. The tensors are valid until the next decode or graph reset.
-LLAMA_API size_t llama_get_fused_node_info(
-    const struct llama_context * ctx,
-    struct llama_fused_node_info * out,
-    size_t capacity);
-
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 
