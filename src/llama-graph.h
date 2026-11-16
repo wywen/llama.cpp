@@ -25,8 +25,6 @@ struct llama_prec_policy;
 struct llama_hadamard;
 
 class llama_moe_cache;
-struct llama_lookup_row_reader;
-struct llama_lookup_table;
 
 struct llama_memory_context_i;
 
@@ -186,23 +184,6 @@ struct llm_graph_kv_staging {
     ggml_tensor * k    = nullptr; // [n_embd_head_k, n_head_kv, n_stage, 1] in the cache type
     ggml_tensor * v    = nullptr; // [n_embd_head_v, n_head_kv, n_stage, 1] in the cache type
     ggml_tensor * mask = nullptr; // F16 [n_stage, n_tokens, 1, 1] 0 where a token selects a row, -inf elsewhere
-};
-
-// the rows of a lookup table served by the caller that one graph gathers, see llm_graph_context::build_lookup_rows
-// the input of the graph that knows the row ids owns it and calls set from its set_input
-struct llm_graph_lookup_rows {
-    const llama_lookup_row_reader * reader = nullptr;
-    const llama_lookup_table *      table  = nullptr;
-
-    ggml_tensor * staging = nullptr; // [n_cols, n_ids] the rows that the caller writes, in id order
-    ggml_tensor * iota    = nullptr; // I32 [n_ids] the identity index that gathers them
-
-    std::vector<uint8_t> scratch; // the rows, when staging is not in host memory
-
-    int64_t n_ids() const;
-
-    // asks the caller for the rows ids[0, n_ids()); throws if a row is out of range or the caller fails
-    void set(const int32_t * ids);
 };
 
 class llm_graph_input_embd : public llm_graph_input_i {
@@ -877,7 +858,6 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
-    const llama_lookup_row_reader * lookup_rows; // nullptr if the caller serves no lookup table rows
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -1155,7 +1135,6 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
-    const llama_lookup_row_reader * lookup_rows;
 
     const llama_prec_policy * prec_policy;
 
@@ -1343,10 +1322,6 @@ struct llm_graph_context {
     // tok_scale: applied to token rows only
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
     ggml_tensor * build_inp_pos() const;
-
-    // n_ids rows of the served lookup table, gathered on the CPU from the rows that the caller writes into `rows`, as
-    //     the loaded table would be gathered; throws if the context has no row reader
-    ggml_tensor * build_lookup_rows(llm_graph_lookup_rows & rows, const llama_lookup_table & table, int64_t n_ids) const;
 
     // sparse attention layer il over K/V rows that the caller stores (cparams.kv_rows), with no K/V cache tensors
     // - the ubatch's new rows, k_cur and v_cur ([n_embd_head, n_head_kv, n_tokens], rotated as the cache would store

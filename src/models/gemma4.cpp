@@ -490,13 +490,6 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         ggml_tensor * ple = model.per_layer_tok_embd;
 
-        if (served.table) {
-            // the rows that the loaded table would be read at: the token ids, or the padding row
-            const int32_t padding = 0;
-            served.set(ubatch->token ? ubatch->token : &padding);
-            return;
-        }
-
         const bool prefetch = model.can_prefetch.count(ple);
 
         if (ubatch->token) {
@@ -515,18 +508,11 @@ public:
     }
 
     bool can_reuse(const llm_graph_params & params) override {
-        if (served.table) {
-            return params.ubatch.token ? by_token && served.n_ids() == params.ubatch.n_tokens : !by_token;
-        }
         return params.ubatch.token ? tokens && tokens->ne[0] == params.ubatch.n_tokens : tokens == nullptr;
     }
 
     ggml_tensor * tokens = nullptr;
     ggml_tensor * token0 = nullptr;
-
-    // with the table served by the caller: its rows for the tokens, or the padding row
-    llm_graph_lookup_rows served;
-    bool                  by_token = false;
 
     const llama_model & model;
 };
@@ -535,19 +521,6 @@ public:
 // output shape: [n_embd_per_layer, n_layer, n_tokens]
 ggml_tensor * llama_model_gemma4::graph::build_inp_per_layer() {
     auto inp = std::make_unique<llm_graph_input_gemma4_ple>(model);
-
-    // a table whose rows the caller serves is gathered from the rows that the caller writes, in order: the same
-    //     gather on the same backend as from the loaded table
-    if (const llama_lookup_table * table = model.lookup_tables.of(model.per_layer_tok_embd)) {
-        // mixed ubatch: embd rows read the padding row, as below
-        inp->by_token = ubatch.token != nullptr;
-
-        ggml_tensor * inp_per_layer = build_lookup_rows(inp->served, *table, inp->by_token ? ubatch.n_tokens : 1);
-        cb(inp_per_layer, inp->by_token ? "inp_per_layer_selected" : "inp_per_layer_multimodal", -1);
-
-        res->add_input(std::move(inp));
-        return inp_per_layer;
-    }
 
     ggml_tensor * inp_per_layer;
     // mixed ubatch: embd rows have token id 0, same padding row as below

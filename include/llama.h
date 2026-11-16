@@ -260,11 +260,6 @@ extern "C" {
     // returns true if the caller serves the table's rows, see llama_model_params.lookup_tables
     typedef bool (*llama_lookup_table_callback)(const char * name, int64_t n_rows, size_t row_size, void * user_data);
 
-    // called when a computation reads rows of served lookup table `table`, see "Lookup tables served by the caller"
-    // writes the bytes of row rows[i], as the model file stores them, at dst + i*row_size for each i in [0, n_rows)
-    // returns false to fail the computation
-    typedef bool (*llama_lookup_rows_callback)(int32_t table, const int32_t * rows, int32_t n_rows, void * dst, size_t row_size, void * user_data);
-
     // reads or writes the K/V rows of sparse attention layer il, which the caller stores, see "Sparse attention K/V rows
     // stored by the caller"; the rows of K (v == false) or V (v == true) of cells[i], as the cache would store them, are
     // at rows + i*row_size for each i in [0, n_cells)
@@ -385,8 +380,8 @@ extern "C" {
         // a power of two, at least the alignment of the layer's buffer type; 0 = 16384
         size_t moe_slot_alignment;
 
-        // if set, the lookup tables for which it returns true are not loaded: the caller serves their rows to each
-        // context, see "Lookup tables served by the caller"; NULL = every table is loaded
+        // if set, the lookup tables for which it returns true are not loaded: the caller serves their rows to the
+        // graphs that read them, see "Lookup tables served by the caller"; NULL = every table is loaded
         llama_lookup_table_callback lookup_tables;
         void * lookup_tables_user_data;
 
@@ -485,11 +480,6 @@ extern "C" {
 
         size_t moe_cache_size;      // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
         float  moe_cache_cpu_share; // share of the MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]
-
-        // reads the rows of the served lookup tables, see "Lookup tables served by the caller"; NULL = none, and a graph
-        // that reads a served table then fails to build
-        llama_lookup_rows_callback lookup_rows;
-        void *                     lookup_rows_user_data;
 
         // stores the K/V rows of the sparse attention layers in place of the context, see "Sparse attention K/V rows
         // stored by the caller"; NULL = the layers have K/V caches [EXPERIMENTAL]
@@ -835,18 +825,19 @@ extern "C" {
     //
     // Lookup tables served by the caller
     //
-    // A lookup table whose rows the caller serves (see llama_model_params.lookup_tables) is not loaded. Only tables
-    // that the graph reads by row with ids known on the host can be served, e.g. per-layer token embeddings; a graph
-    // that reads a served table otherwise fails to build.
+    // A lookup table whose rows the caller serves (see llama_model_params.lookup_tables) is not loaded: it is created
+    // as metadata only, with no buffer. Only tables that the graph reads by row with ids known on the host can be
+    // served, e.g. per-layer token embeddings.
     //
-    // When the context sets the inputs of a ubatch, it asks the caller (llama_context_params.lookup_rows) for the rows
-    // that the ubatch reads, in token order, rows_per_token per token, repeats included: the same rows that the loaded
-    // table would be read at. A token's rows can depend on the tokens before it in its sequence (e.g. the n-gram hashes
-    // of qwen4exp); llama_model_lookup_table_rows names them ahead of a decode. A ubatch of input embeddings reads the
-    // rows that the architecture uses in place of a token's (row 0 once for gemma4, the rows of the image token for
-    // qwen4exp). The caller writes the bytes of each row as the model file stores them, e.g. read from the file at
-    // offset + row*row_size (see llama_model_lookup_table_info), into a host input of the graph; the graph then reads
-    // them as it would read the table.
+    // The graphs read a served table as they read the loaded table: a GGML_OP_GET_ROWS of the table's tensor at an
+    // I32 graph input, which the context sets to the rows that the ubatch reads, in token order, rows_per_token per
+    // token, repeats included. A token's rows can depend on the tokens before it in its sequence (e.g. the n-gram
+    // hashes of qwen4exp); llama_model_lookup_table_rows names them ahead of a decode. A ubatch of input embeddings
+    // reads the rows that the architecture uses in place of a token's (row 0 once for gemma4, the rows of the image
+    // token for qwen4exp). The table holds no data, so the caller rewrites each such gather before the graph is
+    // allocated (llama_context_params.cb_graph_rewrite), e.g. to gather the bytes of the rows as the model file
+    // stores them, read from the file at offset + row*row_size (see llama_model_lookup_table_info) once the inputs
+    // are set; a graph that still reads the table computes over memory that holds nothing.
     //
 
     // a lookup table whose rows the caller serves
@@ -869,8 +860,8 @@ extern "C" {
     LLAMA_API bool llama_model_lookup_table_info(const struct llama_model * model, int32_t table, struct llama_lookup_table_info * info);
 
     // the rows of served lookup table `table` that tokens[n_context, n_tokens) of one sequence read, with
-    //     tokens[0, n_context) as their predecessors: rows_per_token rows per token, in the order in which
-    //     llama_context_params.lookup_rows is asked for them, e.g. to name the rows of draft tokens ahead of a decode
+    //     tokens[0, n_context) as their predecessors: rows_per_token rows per token, in the order in which the graph's
+    //     row input holds them, e.g. to name the rows of draft tokens ahead of a decode
     // a predecessor before tokens[0] reads as missing, as at the start of the sequence
     // rows holds (n_tokens - n_context)*rows_per_token entries; returns false, leaving `rows` unspecified, if `table` is
     //     out of range, the arguments are invalid or a row is out of range

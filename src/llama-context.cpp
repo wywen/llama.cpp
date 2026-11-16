@@ -734,13 +734,6 @@ llama_context::llama_context(
         memory.reset(llama_context_create_memory(model, params, cparams));
     }
 
-    // the caller's reader of the rows of the lookup tables that it serves
-    if (!model.lookup_tables.empty() && params.lookup_rows != nullptr) {
-        lookup_rows = std::make_unique<llama_lookup_row_reader>();
-        lookup_rows->read      = params.lookup_rows;
-        lookup_rows->user_data = params.lookup_rows_user_data;
-    }
-
     // init backends
     if (!hparams.vocab_only) {
         LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__);
@@ -1249,10 +1242,6 @@ uint32_t llama_context::n_threads_batch() const {
 
 llama_memory_t llama_context::get_memory() const {
     return memory.get();
-}
-
-const llama_lookup_row_reader * llama_context::get_lookup_rows() const {
-    return lookup_rows.get();
 }
 
 bool llama_context::memory_update(bool optimize) {
@@ -1993,7 +1982,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         try {
             res->set_inputs(&ubatch);
         } catch (const std::exception & err) {
-            // e.g. the caller failed to read the lookup table rows that the ubatch reads
             LLAMA_LOG_ERROR("%s: failed to set the graph inputs: %s\n", __func__, err.what());
             ret = GGML_STATUS_FAILED;
             return nullptr;
@@ -3180,10 +3168,6 @@ ggml_cgraph * llama_context::graph_reserve(
         llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get());
         hadamard_verified = true;
     }
-    if (!lookup_tables_verified && gf && !model.lookup_tables.empty()) {
-        llama_verify_lookup_tables_graph(gf, model.lookup_tables);
-        lookup_tables_verified = true;
-    }
 
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;
@@ -3266,7 +3250,6 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
-        /*.lookup_rows =*/ lookup_rows.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.layer_inp_dev =*/ layer_inp_dev,
@@ -4533,7 +4516,6 @@ void llama_context::opt_epoch_iter(
             try {
                 res->set_inputs(&ubatch);
             } catch (const std::exception & err) {
-                // e.g. the caller failed to read the lookup table rows that the ubatch reads
                 LLAMA_LOG_ERROR("%s: failed to set the graph inputs: %s\n", __func__, err.what());
                 return;
             }
@@ -4657,8 +4639,6 @@ llama_context_params llama_context_default_params() {
         /*.cb_kv_rot_set_user_data     =*/ nullptr,
         /*.moe_cache_size              =*/ 0,
         /*.moe_cache_cpu_share         =*/ 0.0f,
-        /*.lookup_rows                 =*/ nullptr,
-        /*.lookup_rows_user_data       =*/ nullptr,
         /*.kv_rows                     =*/ nullptr,
         /*.kv_rows_user_data           =*/ nullptr,
         /*.abort_callback              =*/ nullptr,

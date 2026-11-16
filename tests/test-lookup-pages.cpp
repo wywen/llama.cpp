@@ -1,16 +1,17 @@
-// checks that a model whose per-layer token embedding table is served by the caller (llama_model_params.lookup_tables,
-//     llama_context_params.lookup_rows) computes bitwise identical logits to the same model loaded with the table, when
-//     the test serves the rows itself by reading the model file through a small cache of 16 KiB-aligned file pages:
+// checks that a model whose per-layer token embedding table is served by the caller (llama_model_params.lookup_tables)
+//     computes bitwise identical logits to the same model loaded with the table, when the test serves the rows itself:
+//     its graph rewrite gathers each read of the table from a staging input, which it fills once the inputs are set
+//     with the rows that the graph's row ids name, read from the model file through a small cache of 16 KiB-aligned
+//     file pages:
 //   - a prompt in one ubatch and in several ubatches, then single-token decode steps
 //   - sequences with an EOS in the middle and as the first token, which cut the n-gram context of qwen4exp
 //   - two sequences in one context
 //   - a prompt where only the last token requests output, which prunes rows before the layers that share KV (gemma4)
 //   - a batch of input embeddings
 //   - a model loaded with a locked mapping, and a model split into three files with the table in the last
-// and that only the pageable table is offered, that the served table has no buffer, that each ubatch asks for
+// and that only the pageable table is offered, that the served table has no buffer, that each ubatch reads
 //     rows_per_token rows per token, all inside the table, that llama_model_lookup_table_rows names the rows that were
-//     asked for, that corrupted row bytes change the logits, that a failing caller fails the decode, and that a context
-//     without a row reader is refused
+//     read, and that corrupted row bytes change the logits
 //
 // the models are written by test-llama-archs (-o <dir>)
 
@@ -21,6 +22,9 @@
 #include "gguf.h"
 #include "llama.h"
 #include "llama-cpp.h"
+
+// the caller's graph rewrite replaces the graph's leafs
+#include "../ggml/src/ggml-impl.h"
 
 // the test checks that the stock table has no buffer, the layers that share KV, and the n-gram EOS
 #include "../src/llama-model.h"
@@ -161,7 +165,6 @@ struct row_server {
     int64_t slot_page[N_SLOTS] = { -1, -1, -1 };
     int     next_victim        = 0;
 
-    bool    fail    = false;
     bool    corrupt = false;
     int64_t n_reads = 0; // of file pages
     int64_t n_evicts = 0;
@@ -202,7 +205,7 @@ struct row_server {
 
     bool read(const int32_t * rows, int32_t n_rows, void * dst, size_t row_size) {
         calls.emplace_back(rows, rows + n_rows);
-        if (fail || row_size != info.row_size) {
+        if (row_size != info.row_size) {
             return false;
         }
         for (int32_t i = 0; i < n_rows; ++i) {
@@ -244,8 +247,126 @@ struct row_server {
     }
 };
 
-static bool serve_rows(int32_t table, const int32_t * rows, int32_t n_rows, void * dst, size_t row_size, void * ud) {
-    return table == 0 && ((row_server *) ud)->read(rows, n_rows, dst, row_size);
+// plays the caller's graph rewrite: each gather of the stock table becomes, in place, a gather of a staging input at an
+//     identity index on the CPU, the staging taking the table's place among the graph's leafs; once the context has set
+//     the inputs of the graph that it computes next, the server writes the rows that its row ids name into the staging
+struct row_stager {
+    struct gather {
+        ggml_tensor * node    = nullptr;
+        ggml_tensor * ids     = nullptr;
+        ggml_tensor * staging = nullptr;
+        ggml_tensor * iota    = nullptr;
+    };
+
+    struct graph_gathers {
+        const ggml_cgraph *   gf = nullptr;
+        ggml_context_ptr      ctx;
+        std::vector<gather>   gathers;
+    };
+
+    row_server *        server = nullptr;
+    const ggml_tensor * stock  = nullptr;
+
+    std::vector<graph_gathers> graphs;
+    const ggml_cgraph *        computing = nullptr;
+
+    graph_gathers & of(const ggml_cgraph * gf) {
+        for (auto & g : graphs) {
+            if (g.gf == gf) {
+                return g;
+            }
+        }
+        graphs.emplace_back();
+        graphs.back().gf = gf;
+        return graphs.back();
+    }
+
+    static ggml_backend_t cpu_of(ggml_backend_sched_t sched) {
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+            if (ggml_backend_dev_type(ggml_backend_get_device(b)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                return b;
+            }
+        }
+        return nullptr;
+    }
+
+    bool rewrite(ggml_backend_sched_t sched, ggml_cgraph * gf, ggml_backend_sched_rewrite_purpose purpose) {
+        graph_gathers & rec = of(gf);
+        std::vector<ggml_tensor *> found;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node && node->op == GGML_OP_GET_ROWS && node->src[0] == stock) {
+                found.push_back(node);
+            }
+        }
+        if (!found.empty()) {
+            ggml_init_params params = { 4*found.size()*ggml_tensor_overhead(), nullptr, true };
+            rec.ctx.reset(ggml_init(params));
+            rec.gathers.clear();
+            for (ggml_tensor * node : found) {
+                gather g;
+                g.node    = node;
+                g.ids     = node->src[1];
+                g.staging = ggml_new_tensor_2d(rec.ctx.get(), stock->type, stock->ne[0], g.ids->ne[0]);
+                ggml_set_input(g.staging);
+                g.iota    = ggml_new_tensor_1d(rec.ctx.get(), GGML_TYPE_I32, g.ids->ne[0]);
+                ggml_set_input(g.iota);
+                bool replaced = false;
+                for (int i = 0; i < gf->n_leafs; ++i) {
+                    if (gf->leafs[i] == stock) {
+                        gf->leafs[i] = g.staging;
+                        replaced     = true;
+                    }
+                }
+                if (!replaced || gf->n_leafs >= gf->size) {
+                    return false;
+                }
+                gf->leafs[gf->n_leafs++] = g.iota;
+                ggml_hash_insert(&gf->visited_hash_set, g.staging);
+                ggml_hash_insert(&gf->visited_hash_set, g.iota);
+                node->src[0] = g.staging;
+                node->src[1] = g.iota;
+                if (ggml_backend_t cpu = cpu_of(sched)) {
+                    ggml_backend_sched_set_tensor_backend(sched, node, cpu);
+                }
+                rec.gathers.push_back(g);
+            }
+        }
+        if (purpose == GGML_BACKEND_SCHED_REWRITE_ALLOC) {
+            computing = gf;
+        }
+        return true;
+    }
+
+    void stage() {
+        if (computing == nullptr) {
+            return;
+        }
+        for (const gather & g : of(computing).gathers) {
+            const int64_t n = g.ids->ne[0];
+            std::vector<int32_t> ids(n);
+            ggml_backend_tensor_get(g.ids, ids.data(), 0, n*sizeof(int32_t));
+            std::vector<uint8_t> rows(ggml_nbytes(g.staging));
+            if (!server->read(ids.data(), (int32_t) n, rows.data(), g.staging->nb[1])) {
+                std::fill(rows.begin(), rows.end(), 0);
+            }
+            ggml_backend_tensor_set(g.staging, rows.data(), 0, rows.size());
+            std::vector<int32_t> seq(n);
+            for (int64_t i = 0; i < n; ++i) {
+                seq[i] = (int32_t) i;
+            }
+            ggml_backend_tensor_set(g.iota, seq.data(), 0, n*sizeof(int32_t));
+        }
+    }
+};
+
+static bool rewrite_gathers(ggml_backend_sched_t sched, ggml_cgraph * gf, ggml_backend_sched_rewrite_purpose purpose, void * ud) {
+    return ((row_stager *) ud)->rewrite(sched, gf, purpose);
+}
+
+static void stage_rows(ggml_backend_sched_t, void * ud) {
+    ((row_stager *) ud)->stage();
 }
 
 // the widest row count of a named tensor in the graphs that a context computes
@@ -275,25 +396,30 @@ static constexpr context_shape ONE_UBATCH = { 64, 1 };
 static constexpr context_shape UBATCHES   = { 5, 1 }; // the prompt takes three ubatches
 static constexpr context_shape TWO_SEQS   = { 64, 2 };
 
-static llama_context_params context_params(row_server * server, context_shape shape) {
+static llama_context_params context_params(row_stager * stager, context_shape shape) {
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx           = 0;
     cparams.n_threads       = 4;
     cparams.n_threads_batch = 4;
     cparams.n_ubatch        = shape.n_ubatch;
     cparams.n_seq_max       = shape.n_seq_max;
-    if (server) {
-        cparams.lookup_rows           = serve_rows;
-        cparams.lookup_rows_user_data = server;
+    if (stager) {
+        cparams.cb_graph_rewrite           = rewrite_gathers;
+        cparams.cb_graph_rewrite_user_data = stager;
+        cparams.n_graph_nodes_extra        = 2;
     }
     return cparams;
 }
 
-static llama_context_ptr new_context(llama_model * model, row_server * server, context_shape shape) {
+// a context over model; with a stager, the stager rewrites its graphs and stages their rows
+static llama_context_ptr new_context(llama_model * model, row_stager * stager, context_shape shape) {
     g_log.clear();
-    llama_context_ptr lctx(llama_init_from_model(model, context_params(server, shape)));
+    llama_context_ptr lctx(llama_init_from_model(model, context_params(stager, shape)));
     if (!lctx) {
         throw std::runtime_error("failed to create a context:\n" + g_log);
+    }
+    if (stager) {
+        ggml_backend_sched_set_graph_compute_callback(llama_get_sched(lctx.get()), stage_rows, stager);
     }
     return lctx;
 }
@@ -518,10 +644,13 @@ static void test_served(const std::string & path, const std::string & label, con
         " at " + std::to_string(info.offset) + "), and the stock table has no buffer");
 
     row_server server(model.get());
+    row_stager stager;
+    stager.server = &server;
+    stager.stock  = stock;
 
     for (size_t s = 0; s < ref.seqs.size(); ++s) {
         const sequence & seq = ref.seqs[s];
-        llama_context_ptr lctx = new_context(model.get(), &server, seq.shape);
+        llama_context_ptr lctx = new_context(model.get(), &stager, seq.shape);
         server.calls.clear();
         check(same_bits(get_logits(lctx.get(), seq.tokens, seq.last_only), ref.logits[s]),
             label + ": " + seq.what + ": logits match the stock model bitwise");
@@ -534,7 +663,7 @@ static void test_served(const std::string & path, const std::string & label, con
         std::to_string(server.n_split) + ")");
 
     {
-        llama_context_ptr lctx = new_context(model.get(), &server, TWO_SEQS);
+        llama_context_ptr lctx = new_context(model.get(), &stager, TWO_SEQS);
         server.calls.clear();
         const std::vector<llama_token> & a = ref.seqs[0].tokens;
         const bool same = same_bits(get_logits_2(lctx.get(), a, ref.second), ref.logits_2);
@@ -548,7 +677,7 @@ static void test_served(const std::string & path, const std::string & label, con
             label + ": two sequences: logits match the stock model bitwise, and the row query names their rows");
     }
 
-    llama_context_ptr lctx = new_context(model.get(), &server, ONE_UBATCH);
+    llama_context_ptr lctx = new_context(model.get(), &stager, ONE_UBATCH);
 
     server.calls.clear();
     const std::vector<float> embd = get_embd_logits(lctx.get(), 3);
@@ -564,21 +693,6 @@ static void test_served(const std::string & path, const std::string & label, con
     const std::vector<float> corrupted = get_logits(lctx.get(), ref.seqs[0].tokens);
     check(!corrupted.empty() && !same_bits(corrupted, ref.logits[0]), label + ": corrupted row bytes change the logits");
     server.corrupt = false;
-
-    // a failing caller fails the decode
-    server.fail = true;
-    llama_memory_clear(llama_get_memory(lctx.get()), true);
-    common_batch batch(lctx.get());
-    batch.add(ref.seqs[0].tokens[0], 0, 0, true);
-    g_log.clear();
-    const int32_t rc = llama_process(lctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get());
-    check(rc != 0 && g_log.find("failed to read") != std::string::npos, label + ": a failing row reader fails the decode");
-    server.fail = false;
-
-    // a context without a row reader cannot compute
-    g_log.clear();
-    llama_context_ptr none(llama_init_from_model(model.get(), context_params(nullptr, ONE_UBATCH)));
-    check(!none && g_log.find("no row reader") != std::string::npos, label + ": a context without a row reader fails to initialize");
 }
 
 static void test_model(const std::string & dir, const model_case & mc, const std::vector<ggml_backend_dev_t> & devs, checker & check) {
