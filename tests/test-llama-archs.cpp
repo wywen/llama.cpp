@@ -8,14 +8,32 @@
 #include "llama-cpp.h"
 #include "../src/llama-ext.h"
 
+// the classifier head of a user-defined embedding model is dropped by hand, and the sensitivity check of the
+// generated models corrupts the memory module's caches and states directly
+#include "../src/llama-context.h"
+#include "../src/llama-kv-cache.h"
+#include "../src/llama-kv-cache-dsa.h"
+#include "../src/llama-kv-cache-dsa-iswa.h"
+#include "../src/llama-kv-cache-dsv4.h"
+#include "../src/llama-kv-cache-iswa.h"
+#include "../src/llama-kv-cache-msa.h"
+#include "../src/llama-memory-hybrid-idx.h"
+#include "../src/llama-memory-hybrid-iswa.h"
+#include "../src/llama-memory-recurrent.h"
+#include "../src/llama-model.h"
+
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
+#include <functional>
+#include <map>
 #include <memory>
 #include <random>
 #include <regex>
@@ -32,6 +50,8 @@ static bool arch_matches(const std::string & filter, llm_arch arch) {
 }
 
 // normalized mean squared error = mse(a, b) / mse(a, 0)
+// values masked to the same infinity on both sides (e.g. logits padded with -inf) are skipped, any other non-finite value
+// gives infinity, and all-zero references give NaN
 static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     GGML_ASSERT(a.size() == b.size());
     double mse_a_b = 0.0;
@@ -41,6 +61,13 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
         float a_i = a[i];
         float b_i = b[i];
 
+        if (!std::isfinite(a_i) || !std::isfinite(b_i)) {
+            if (std::isinf(a_i) && a_i == b_i) {
+                continue;
+            }
+            return INFINITY;
+        }
+
         mse_a_b += (a_i - b_i) * (a_i - b_i);
         mse_a_0 += a_i * a_i;
     }
@@ -48,9 +75,15 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     return mse_a_b / mse_a_0;
 }
 
+static bool ends_with(const std::string & str, const std::string & suffix) {
+    return str.size() >= suffix.size() && str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 struct tensor_data_params {
-    size_t seed;
-    float  stdev;
+    size_t   seed;
+    float    stdev;     // of the normal pool
+    bool     sensitive; // see set_tensor_data
+    llm_arch arch;
 };
 
 // fills the values of one tensor, the name carries whatever the property needs
@@ -154,6 +187,30 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     std::vector<float> tmp(ggml_nelements(tensor));
     fill(tmp, tensor->name, params);
 
+    // sensitive: scales and norm weights are near 1 and matrices keep the variance of their input, other tensors keep the pool's
+    // with small values everywhere the product of scales, norms and matrices hides most inputs and cached state from the output
+    // scales and norm weights are 1 + N(0, 0.01) rather than 1, so that dropping an optional one is not the identity
+    if (fill == fill_normal) {
+        const std::string name = tensor->name;
+        // gemma4 multiplies the whole residual stream by each layer's output scale: at the pool's stdev the stream vanishes
+        // with depth and the logits underflow to zero, with either set of weights
+        const bool stream_scale = params.arch == LLM_ARCH_GEMMA4 && name.find(".layer_output_scale.") != std::string::npos;
+        // activation scales (.scales) divide the activation: near 0 a few units dominate the output whatever the context
+        const bool near_one = stream_scale ||
+            (params.sensitive && (ends_with(name, ".scale") || ends_with(name, ".scales") ||
+                (name.find("norm") != std::string::npos && ends_with(name, ".weight"))));
+        if (near_one) {
+            for (float & v : tmp) {
+                v = 1.0f + v * (1.0e-2f / params.stdev);
+            }
+        } else if (params.sensitive && ends_with(name, ".weight") && ggml_n_dims(tensor) >= 2) {
+            const float scale = 1.0f / (std::sqrt((float) tensor->ne[0]) * params.stdev);
+            for (float & v : tmp) {
+                v *= scale;
+            }
+        }
+    }
+
     if (tensor->type == GGML_TYPE_F32) {
         ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
     } else if (tensor->type == GGML_TYPE_F16) {
@@ -206,6 +263,14 @@ static bool host_experts_test(const llm_arch arch) {
     }
 }
 
+// number of experts of an arch's MoE model; gemma4 gets enough for a partial expert cache to matter
+static uint32_t moe_expert_count(const llm_arch arch) {
+    if (host_experts_test(arch)) {
+        return 64;
+    }
+    return arch == LLM_ARCH_GEMMA4 ? 8 : arch == LLM_ARCH_CLOVER_MOE ? 4 : 2;
+}
+
 // writes arch-resolved GGUF keys into the fixture context, the test-side equivalent of llama_model_saver
 struct kv_writer {
     struct gguf_context * gguf_ctx;
@@ -247,7 +312,11 @@ struct kv_writer {
     }
 };
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_layer_min = 0) {
+// iswa_only: gemma4 with interleaved sliding window attention but without per-layer embeddings or shared KV layers
+// n_layer_min: the fewest layers the model gets
+// n_layer_nextn: the NextN (MTP) layers appended after the trunk layers
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const enum llama_pooling_type pooling, const bool iswa_only = false,
+        const uint32_t n_layer_min = 0, const uint32_t n_layer_nextn = 0) {
     gguf_context_ptr ret(gguf_init_empty());
     kv_writer ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -265,7 +334,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     } else if (arch == LLM_ARCH_GEMMA4) {
         // TODO: expand coverage to both GQA and MQA (see https://github.com/ggml-org/llama.cpp/pull/31401#pullrequestreview-5710165130)
         n_head = 4;
-        n_layer = 10; // last 5 layers reuse KV, both SWA and full attention
+        if (iswa_only) {
+            n_layer = 12; // two periods of 5 sliding window layers and 1 full attention layer, as in the Gemma 4 12B layer types
+        } else {
+            n_layer = 10; // last 5 layers reuse KV, both SWA and full attention
+        }
     } else if (arch == LLM_ARCH_GEMMA3N) {
         n_embd = 64;
         n_head = 1;
@@ -273,6 +346,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_layer = 22; // hparams.n_layer_kv_from_start = 20 is hardcoded
     } else if (arch == LLM_ARCH_LFM3) {
         n_layer = 3;
+    } else if (arch == LLM_ARCH_QWEN4EXP) {
+        n_layer = 4; // two linear attention layers and two QSA layers, so the PLE layer can follow another
     } else if (arch == LLM_ARCH_DEEPSEEK4) {
         // head size 64 so that GPU flash attention kernels support the model
         n_embd  = 512;
@@ -353,8 +428,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     ms.add_kv(LLM_KV_CONTEXT_LENGTH,            n_ctx);
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
-    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
+    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer + n_layer_nextn);
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
+    if (n_layer_nextn > 0) {
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, n_layer_nextn);
+    }
 
     if (arch == LLM_ARCH_K2_HORIZON) {
         ms.add_kv(LLM_KV_ROPE_SCALING_YARN_BETA_FAST, 128.0f);
@@ -400,6 +478,16 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
             ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
         }
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_per_layer);
+    } else if (arch == LLM_ARCH_GEMMA4 && iswa_only) {
+        // full attention layers have a single KV head, sliding window layers one per head: with the wider full attention
+        // heads, the full attention KV rows are half as wide as the sliding window ones
+        std::vector<uint32_t> n_head_kv_per_layer;
+        n_head_kv_per_layer.reserve(n_layer);
+        for (uint32_t il = 0; il < n_layer; il++) {
+            n_head_kv_per_layer.push_back(il % 6 < 5 ? n_head : 1);
+        }
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv_per_layer);
     } else if (arch == LLM_ARCH_METIS16) {
         // the layer types repeat in every pass
         std::vector<uint32_t> n_head_kv_per_layer;
@@ -481,16 +569,21 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     if (arch == LLM_ARCH_MAION_CODER) {
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, std::vector<uint32_t>{1, 1, 0, 0});
     } else if (arch == LLM_ARCH_GEMMA4) {
-        ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,      n_embd/2);
-        ms.add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS,      uint32_t(5));
+        ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,      iswa_only ? uint32_t(0) : n_embd/2);
+        ms.add_kv(LLM_KV_ATTENTION_SHARED_KV_LAYERS,      iswa_only ? uint32_t(0) : uint32_t(5));
+        // full attention layers have wider heads than sliding window layers
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,            2*n_embd_head);
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,          2*n_embd_head);
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,        n_embd_head);
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,      n_embd_head);
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT_SWA,        n_embd_head);
         ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,              10000.0f);
-        // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
+        // SWA pattern: every 5th layer is full attention as in Gemma 4 E2B, every 6th with iswa_only as in Gemma 4 12B
+        const uint32_t period = iswa_only ? 6 : 5;
         std::vector<uint32_t> pattern;
         pattern.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
-            pattern.push_back((il + 1) % 5 != 0);
+            pattern.push_back((il + 1) % period != 0);
         }
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
     } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_SPARK2_5 ||
@@ -533,7 +626,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,  1.0e-6f);
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
         // without this the QSA layers fall back to dense and go uncovered
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer + n_layer_nextn, 4));
 
         // has_cell_ext() needs ple_n_heads here: the indexer cache serializes no ext without it
         const uint32_t ple_ngram_size      = 3;
@@ -548,8 +641,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
             ple_head_offsets[h] = uint64_t(h)*n_vocab;
         }
 
-        // the PLE history lives in the recurrent cache, so it must sit on a linear attention layer
-        ms.add_kv(LLM_KV_PLE_LAYERS,                  std::vector<uint32_t>({ 0 }));
+        // the PLE history lives in the recurrent cache, so it must sit on a linear attention layer; qwen4exp's
+        // is the second one, after a layer of each kind, as a real model's PLE layer follows others
+        ms.add_kv(LLM_KV_PLE_LAYERS,                  std::vector<uint32_t>({ arch == LLM_ARCH_QWEN4EXP ? 2u : 0u }));
         ms.add_kv(LLM_KV_PLE_NGRAM_SIZE,              ple_ngram_size);
         ms.add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,         ple_heads_per_ngram);
         ms.add_kv(LLM_KV_PLE_CONV_KERNEL,             uint32_t(4));
@@ -733,6 +827,14 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_TOKENIZER_LIST,   tokenizer_list);
         ms.add_kv(LLM_KV_TOKENIZER_SCORES, tokenizer_scores);
     }
+    if (pooling != LLAMA_POOLING_TYPE_UNSPECIFIED) {
+        ms.add_kv(LLM_KV_POOLING_TYPE,               uint32_t(pooling));
+        ms.add_kv(LLM_KV_ATTENTION_CAUSAL,           false);
+        ms.add_kv(LLM_KV_TOKENIZER_TOKEN_TYPE_COUNT, uint32_t(2));
+        if (pooling == LLAMA_POOLING_TYPE_RANK) {
+            ms.add_kv(LLM_KV_CLASSIFIER_OUTPUT_LABELS, std::vector<std::string>({"LABEL_0"}));
+        }
+    }
 
     // ms.add_kv(LLM_KV_DENSE_2_FEAT_OUT,     n_embd);
     // ms.add_kv(LLM_KV_DENSE_3_FEAT_IN,      n_embd);
@@ -743,7 +845,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_EXPERT_LATENT_LENGTH,       n_ff);
         ms.add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,  uint32_t(2));
         // with more experts than a ubatch uses, the copy of the used experts in host memory skips some of them
-        ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(host_experts_test(arch) ? 64 : arch == LLM_ARCH_CLOVER_MOE ? 4 : 2));
+        ms.add_kv(LLM_KV_EXPERT_COUNT,               moe_expert_count(arch));
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
 
@@ -849,21 +951,203 @@ static std::string get_tmp_gguf_path() {
     return (std::filesystem::temp_directory_path() / ("test-llama-archs-" + std::to_string(++id) + ".gguf")).string();
 }
 
+// the expert selections of a decode, observed through the eval callback: a near-tie in a router's scores can select
+//     other experts when the batch is split differently, which changes everything after that token through the memory
+struct router_observer {
+    struct row {
+        std::vector<int32_t> ids;    // the selected experts or expert groups, sorted
+        float                margin; // between the last selected and the first other score, relative to the largest
+    };
+
+    bool active = false;
+    // by node name (selection and layer), the rows of each graph that computed it, in decode order
+    // a layer can select from two expert sets under one name: every graph computes both, one after the other
+    std::map<std::string, std::vector<std::vector<row>>> routers;
+};
+
+// the rows of each selection named 'name' over the tokens of a decode, from the rows of the graphs in decode order,
+//     or nothing when they do not cover the tokens
+static std::map<std::string, std::vector<router_observer::row>> router_rows(const router_observer & obs, uint32_t n_tokens) {
+    std::map<std::string, std::vector<router_observer::row>> res;
+    for (const auto & [name, chunks] : obs.routers) {
+        size_t n_rows = 0;
+        for (const auto & chunk : chunks) {
+            n_rows += chunk.size();
+        }
+        const size_t n_per_graph = n_rows/n_tokens;
+        if (n_per_graph == 0 || n_rows % n_tokens != 0 || chunks.size() % n_per_graph != 0) {
+            return {};
+        }
+        for (size_t i = 0; i < chunks.size(); i++) {
+            auto & rows = res[name + (n_per_graph > 1 ? "#" + std::to_string(i % n_per_graph) : "")];
+            rows.insert(rows.end(), chunks[i].begin(), chunks[i].end());
+        }
+    }
+    for (const auto & [_, rows] : res) {
+        if (rows.size() != n_tokens) {
+            return {};
+        }
+    }
+    return res;
+}
+
+static router_observer g_router_observer;
+
+// the scores that the top-k selection of 'node', a view of the first k entries of a descending argsort, ranks
+static const ggml_tensor * router_scores(const ggml_tensor * node) {
+    const char * name = ggml_get_name(node);
+    if (strncmp(name, "ffn_moe_topk-", 13) != 0 && strncmp(name, "ffn_moe_group_topk-", 19) != 0) {
+        return nullptr;
+    }
+    if (node->op != GGML_OP_VIEW || node->src[0] == nullptr || node->src[0]->op != GGML_OP_ARGSORT) {
+        return nullptr;
+    }
+    const ggml_tensor * scores = node->src[0]->src[0];
+    if (scores == nullptr || scores->type != GGML_TYPE_F32 || !ggml_is_contiguous(scores) || !ggml_is_contiguous(node->src[0])) {
+        return nullptr;
+    }
+    return scores;
+}
+
+static bool observe_router(ggml_tensor * t, bool ask, void * user_data) {
+    auto * obs = (router_observer *) user_data;
+    const ggml_tensor * scores = obs->active ? router_scores(t) : nullptr;
+    if (ask || scores == nullptr) {
+        // asks for the selections only, and continues the graph after any other tensor
+        return ask ? scores != nullptr : true;
+    }
+
+    const int64_t n = scores->ne[0];
+    const int64_t k = t->ne[0];
+    const int64_t n_rows = ggml_nrows(scores);
+    std::vector<float>   s(ggml_nelements(scores));
+    std::vector<int32_t> order(ggml_nelements(t->src[0]));
+    ggml_backend_tensor_get(scores, s.data(), 0, ggml_nbytes(scores));
+    ggml_backend_tensor_get(t->src[0], order.data(), 0, ggml_nbytes(t->src[0]));
+
+    auto & rows = obs->routers[ggml_get_name(t)].emplace_back();
+    for (int64_t r = 0; r < n_rows; r++) {
+        const float * sr = s.data() + r*n;
+        router_observer::row row;
+        row.ids.assign(order.begin() + r*n, order.begin() + r*n + k);
+        std::sort(row.ids.begin(), row.ids.end());
+
+        // masked scores are -inf, every expert used leaves nothing to tie with
+        row.margin = INFINITY;
+        if (k < n) {
+            std::vector<float> sorted(sr, sr + n);
+            std::sort(sorted.begin(), sorted.end(), std::greater<float>());
+            float scale = 0.0f;
+            for (const float v : sorted) {
+                if (std::isfinite(v)) {
+                    scale = std::max(scale, std::fabs(v));
+                }
+            }
+            if (std::isfinite(sorted[k])) {
+                row.margin = scale > 0.0f ? (sorted[k - 1] - sorted[k])/scale : 0.0f;
+            }
+        }
+        rows.push_back(std::move(row));
+    }
+    return true;
+}
+
+// the selections of a decode may differ from those of a reference decode only where the reference's margin is below
+//     this, relative to the largest score of the row: 10x the largest margin at which they differed over 50 seeds
+static const float max_router_flip_margin = 3.4e-4f;
+
+// how much of a decode is compared with a reference decode of the same tokens, from the routers of both
+struct routed_comparison {
+    bool     routed     = false; // a router selects fewer experts than it ranks
+    bool     consistent = true;  // both decodes ran the same routers over every token
+    uint32_t n_compared = 0;     // the tokens before the first one whose selections differ
+    // the first router of that token whose selections differ, in graph order: the later ones of the token take its output
+    std::string flip_router;
+    float       flip_margin = 0.0f; // the reference's margin there
+};
+
+// the position of a router in the graph of a token: by layer, the expert groups before the experts
+static std::pair<int, int> router_order(const std::string & name) {
+    const size_t dash = name.rfind('-');
+    const int il = dash == std::string::npos ? -1 : std::atoi(name.c_str() + dash + 1);
+    return { il, name.compare(0, 19, "ffn_moe_group_topk-") == 0 ? 0 : 1 };
+}
+
+static routed_comparison compare_routing(const router_observer & ref, const router_observer & cur, uint32_t n_tokens) {
+    routed_comparison res;
+    res.n_compared = n_tokens;
+    const auto rows_ref = router_rows(ref, n_tokens);
+    const auto rows_cur = router_rows(cur, n_tokens);
+    // an observed selection whose rows do not cover the tokens leaves its decode without rows
+    if (rows_ref.size() != rows_cur.size() || rows_ref.empty() != ref.routers.empty() || rows_cur.empty() != cur.routers.empty()) {
+        res.consistent = false;
+    }
+    for (const auto & [name, rows] : rows_ref) {
+        const auto it = rows_cur.find(name);
+        if (it == rows_cur.end()) {
+            res.consistent = false;
+            continue;
+        }
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            res.routed = res.routed || std::isfinite(rows[t].margin);
+            if (rows[t].ids == it->second[t].ids || t > res.n_compared) {
+                continue;
+            }
+            if (t < res.n_compared || router_order(name) < router_order(res.flip_router)) {
+                res.flip_router = name;
+                res.flip_margin = rows[t].margin;
+            }
+            res.n_compared = t;
+        }
+    }
+    return res;
+}
+
+// a decode whose selections first differ from the reference's at a clear margin, or at the first token, is not
+//     explained by a near-tie
+static bool routing_ok(const routed_comparison & r, uint32_t n_tokens) {
+    if (!r.consistent) {
+        return false;
+    }
+    if (r.n_compared == n_tokens) {
+        return true;
+    }
+    return r.n_compared > 0 && r.flip_margin < max_router_flip_margin;
+}
+
+// observes the routers of the decodes made while it lives
+struct router_observation {
+    router_observation()  { g_router_observer = {}; g_router_observer.active = true; }
+    ~router_observation() { g_router_observer = {}; }
+
+    router_observer take() {
+        router_observer res = std::move(g_router_observer);
+        g_router_observer = {};
+        g_router_observer.active = true;
+        return res;
+    }
+};
+
 static llama_model_ptr get_model(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr) {
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const bool sensitive_weights = false,
+        const bool load_mtp = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = load_mtp;
     std::vector<ggml_backend_dev_t> devs_copy = devs;
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
     model_params.tensor_buft_overrides = tensor_buft_overrides;
 
-    tensor_data_params tensor_params = { seed, stdev };
+    tensor_data_params tensor_params = { seed, stdev, sensitive_weights, LLM_ARCH_UNKNOWN };
+    if (gguf_ctx != nullptr) {
+        tensor_params.arch = llama_arch_from_string(gguf_get_val_str(gguf_ctx, gguf_find_key(gguf_ctx, "general.architecture")));
+    }
     llama_model_ptr model(gguf_ctx != nullptr ?
         llama_model_init_from_user(gguf_ctx, set_tensor_data, &tensor_params, model_params) :
         llama_model_load_from_file_ptr(file, model_params));
@@ -877,14 +1161,24 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0) {
-    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides);
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
+        const enum llama_pooling_type pooling = LLAMA_POOLING_TYPE_UNSPECIFIED,
+        const enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO, const bool sensitive_weights = false,
+        const bool load_mtp = false) {
+    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides, sensitive_weights, load_mtp);
 
     llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.flash_attn_type = flash_attn_type;
+    // inactive outside of the mixed batch check, where it asks for no tensor and the graphs compute as without it
+    ctx_params.cb_eval           = observe_router;
+    ctx_params.cb_eval_user_data = &g_router_observer;
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
-    if (!encode) {
+    if (pooling != LLAMA_POOLING_TYPE_UNSPECIFIED) {
+        ctx_params.embeddings = true;
+        ctx_params.n_seq_max  = 4;
+    } else if (!encode) {
         ctx_params.n_ubatch = 64;
     }
     if (moe_cache_size > 0) {
@@ -892,7 +1186,23 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         ctx_params.moe_cache_size = moe_cache_size;
         ctx_params.n_ubatch = 2;
     }
-
+    if (gguf_ctx != nullptr && pooling != LLAMA_POOLING_TYPE_UNSPECIFIED && pooling != LLAMA_POOLING_TYPE_RANK) {
+        // a user-defined model gets every optional tensor, but only a reranker has a classifier head
+        model->cls       = nullptr;
+        model->cls_b     = nullptr;
+        model->cls_out   = nullptr;
+        model->cls_out_b = nullptr;
+    }
+    if (gguf_ctx != nullptr && model->arch == LLM_ARCH_GEMMA4 && model->hparams.n_embd_per_layer == 0) {
+        // without per-layer embeddings (Gemma 4 12B), full attention layers have no V projection and use K as V
+        for (uint32_t il = 0; il < model->hparams.n_layer(); il++) {
+            if (!model->hparams.is_swa(il)) {
+                model->layers[il].wv      = nullptr;
+                model->layers[il].wv_s    = nullptr;
+                model->layers[il].wv_in_s = nullptr;
+            }
+        }
+    }
     llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
     if (!lctx) {
         throw std::runtime_error("failed to create llama context");
@@ -1019,6 +1329,265 @@ static bool check_causal_attn_toggle(
     return ok;
 }
 
+// a corrupted memory cell or a replaced input token must change the output by more than this relative amount
+static const double min_sensitivity = 2.0e-3;
+
+static double relative_change(const std::vector<float> & a, const std::vector<float> & b) {
+    GGML_ASSERT(a.size() == b.size());
+    double diff = 0.0;
+    double norm = 0.0;
+    for (size_t i = 0; i < a.size(); i++) {
+        if (a[i] == b[i]) {
+            if (std::isfinite(a[i])) {
+                norm += (double) a[i] * a[i];
+            }
+            continue; // also skips logits both masked to -inf
+        }
+        if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+            return INFINITY;
+        }
+        diff += ((double) a[i] - b[i]) * ((double) a[i] - b[i]);
+        norm += (double) a[i] * a[i];
+    }
+    return diff == 0.0 ? 0.0 : std::sqrt(diff / norm);
+}
+
+// output of the last token: logits, or the hidden state for models without an output head
+static std::vector<float> decode_last(llama_context * lctx, const std::vector<llama_token> & tokens, const llama_pos pos0) {
+    const llama_model * model = llama_get_model(lctx);
+    common_batch batch(lctx);
+    for (size_t i = 0; i < tokens.size(); i++) {
+        batch.add(tokens[i], pos0 + i, 0, i + 1 == tokens.size());
+    }
+    if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+        throw std::runtime_error("failed to decode batch");
+    }
+    if (model->output == nullptr) {
+        const float * embd = llama_get_embeddings_ith(lctx, -1);
+        return std::vector<float>(embd, embd + llama_model_n_embd_out(model));
+    }
+    const float * logits = llama_get_logits_ith(lctx, -1);
+    return std::vector<float>(logits, logits + llama_vocab_n_tokens(llama_model_get_vocab(model)));
+}
+
+// the attention caches and recurrent states inside a memory module, false if the module type is unknown
+static bool collect_memory(llama_memory_i * mem, std::vector<llama_kv_cache *> & kvs, std::vector<llama_memory_recurrent *> & rss) {
+    const auto add_kv = [&](llama_kv_cache * kv) {
+        if (kv != nullptr) {
+            kvs.push_back(kv);
+        }
+    };
+    if (auto * m = dynamic_cast<llama_kv_cache *>(mem)) {
+        add_kv(m);
+    } else if (auto * m = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        add_kv(m->get_base());
+        add_kv(m->get_swa());
+    } else if (auto * m = dynamic_cast<llama_kv_cache_dsa *>(mem)) {
+        add_kv(m->get_mla());
+        add_kv(m->get_lid());
+    } else if (auto * m = dynamic_cast<llama_kv_cache_dsa_iswa *>(mem)) {
+        add_kv(m->get_dsa()->get_mla());
+        add_kv(m->get_dsa()->get_lid());
+        add_kv(m->get_swa());
+    } else if (auto * m = dynamic_cast<llama_kv_cache_dsv4 *>(mem)) {
+        add_kv(m->get_raw()->get_base());
+        add_kv(m->get_raw()->get_swa());
+        add_kv(m->get_csa());
+        add_kv(m->get_hca());
+        add_kv(m->get_lid());
+    } else if (auto * m = dynamic_cast<llama_kv_cache_msa *>(mem)) {
+        add_kv(m->get_base());
+        add_kv(m->get_idx());
+    } else if (auto * m = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        add_kv(m->get_mem_attn());
+        if (auto * idx = dynamic_cast<llama_memory_hybrid_idx *>(mem)) {
+            add_kv(idx->get_mem_idx());
+        }
+        rss.push_back(m->get_mem_recr());
+    } else if (auto * m = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        add_kv(m->get_mem_attn()->get_base());
+        add_kv(m->get_mem_attn()->get_swa());
+        rss.push_back(m->get_mem_recr());
+    } else if (auto * m = dynamic_cast<llama_memory_recurrent *>(mem)) {
+        rss.push_back(m);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// overwrite every K and V tensor of dst with the one of src, as stale pages holding another sequence would; returns the tensors written
+static size_t copy_kv_storage(const llama_kv_cache * src, const llama_kv_cache * dst) {
+    size_t n_tensors = 0;
+    for (const uint32_t il : dst->get_layer_ids()) {
+        const ggml_tensor * ts[2] = {src->get_k_storage(il), src->get_v_storage(il)};
+        ggml_tensor *       td[2] = {dst->get_k_storage(il), dst->get_v_storage(il)};
+        for (int i = 0; i < 2; i++) {
+            if (td[i] == nullptr) {
+                continue;
+            }
+            GGML_ASSERT(ts[i] != nullptr && ggml_are_same_shape(ts[i], td[i]) && ts[i]->type == td[i]->type);
+            std::vector<uint8_t> data(ggml_nbytes(ts[i]));
+            ggml_backend_tensor_get(ts[i], data.data(), 0, data.size());
+            ggml_backend_tensor_set(td[i], data.data(), 0, data.size());
+            n_tensors++;
+        }
+    }
+    return n_tensors;
+}
+
+// generated weights are random, so check that the paths a memory bug would corrupt actually reach the output
+static bool check_sensitivity(llama_model * model, const size_t seed, std::string & result) {
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx           = 0;
+    ctx_params.n_batch         = 64;
+    ctx_params.n_ubatch        = 64;
+    ctx_params.n_seq_max       = 1;
+    ctx_params.n_threads       = 4;
+    ctx_params.n_threads_batch = 4;
+    if (model->output == nullptr) {
+        ctx_params.embeddings   = true;
+        ctx_params.pooling_type = LLAMA_POOLING_TYPE_NONE;
+    }
+    const auto new_ctx = [&]() {
+        llama_context_ptr lctx(llama_init_from_model(model, ctx_params));
+        if (!lctx) {
+            throw std::runtime_error("failed to create llama context");
+        }
+        return lctx;
+    };
+
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const std::vector<llama_token> prompt = get_tokens(33, n_vocab, seed);
+    const std::vector<llama_token> tokens(prompt.begin(), prompt.end() - 1);
+    const llama_token next = prompt.back();
+
+    bool ok = true;
+    const auto check = [&](const char * name, const double rel) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s%s %.2e", result.empty() ? "" : ", ", name, rel);
+        result += buf;
+        if (!(rel > min_sensitivity)) {
+            ok = false;
+        }
+    };
+
+    std::vector<llama_kv_cache *> kvs;
+    std::vector<llama_memory_recurrent *> rss;
+    {
+        const llama_context_ptr lctx = new_ctx();
+        if (llama_get_memory(lctx.get()) == nullptr) {
+            // without memory only the input can carry a difference
+            const std::vector<float> ref = decode_last(lctx.get(), tokens, 0);
+            std::vector<llama_token> replaced = tokens;
+            replaced[0] = (replaced[0] + 1) % n_vocab;
+            check("token", relative_change(ref, decode_last(new_ctx().get(), replaced, 0)));
+            return ok;
+        }
+        if (!collect_memory(llama_get_memory(lctx.get()), kvs, rss)) {
+            result = "unknown memory module";
+            return false;
+        }
+    }
+
+    const auto corrupted_output = [&](const std::function<void(llama_memory_i *)> & corrupt) {
+        const llama_context_ptr lctx = new_ctx();
+        decode_last(lctx.get(), tokens, 0);
+        corrupt(llama_get_memory(lctx.get()));
+        return decode_last(lctx.get(), {next}, tokens.size());
+    };
+    const std::vector<float> ref = corrupted_output([](llama_memory_i *) {});
+
+    if (!kvs.empty()) {
+        // every cell takes the rows of the same position in another sequence: content-addressed attention reads a
+        // permutation of its cells unchanged, and sparse attention reads only the cells it selects
+        std::vector<llama_token> other = tokens;
+        for (llama_token & t : other) {
+            t = (t + 1) % n_vocab;
+        }
+        const llama_context_ptr lctx_other = new_ctx();
+        decode_last(lctx_other.get(), other, 0);
+        std::vector<llama_kv_cache *> kvs_other;
+        std::vector<llama_memory_recurrent *> rss_other;
+        collect_memory(llama_get_memory(lctx_other.get()), kvs_other, rss_other);
+
+        size_t n_tensors = 0;
+        const std::vector<float> out = corrupted_output([&](llama_memory_i * mem) {
+            std::vector<llama_kv_cache *> kvs_ctx;
+            std::vector<llama_memory_recurrent *> rss_ctx;
+            collect_memory(mem, kvs_ctx, rss_ctx);
+            GGML_ASSERT(kvs_ctx.size() == kvs_other.size());
+            for (size_t i = 0; i < kvs_ctx.size(); i++) {
+                n_tensors += copy_kv_storage(kvs_other[i], kvs_ctx[i]);
+            }
+        });
+        check("stale kv", n_tensors > 0 ? relative_change(ref, out) : 0.0);
+    }
+    if (!rss.empty()) {
+        const std::vector<float> out = corrupted_output([&](llama_memory_i * mem) {
+            std::vector<llama_kv_cache *> kvs_ctx;
+            std::vector<llama_memory_recurrent *> rss_ctx;
+            collect_memory(mem, kvs_ctx, rss_ctx);
+            for (const llama_memory_recurrent * rs : rss_ctx) {
+                for (const std::vector<ggml_tensor *> * states : {&rs->r_l, &rs->s_l}) {
+                    for (ggml_tensor * t : *states) {
+                        if (t != nullptr) {
+                            const std::vector<uint8_t> zeros(ggml_nbytes(t), 0);
+                            ggml_backend_tensor_set(t, zeros.data(), 0, zeros.size());
+                        }
+                    }
+                }
+            }
+        });
+        check("zeroed recurrent state", relative_change(ref, out));
+    }
+    return ok;
+}
+
+// pooled output per sequence: n_embd values, or n_cls_out scores with rank pooling
+static std::vector<float> get_embeddings(llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens) {
+    const uint32_t n_seq     = llama_n_seq_max(lctx);
+    const uint32_t n_seq_tok = tokens.size() / n_seq;
+    const uint32_t n_out     = llama_pooling_type(lctx) == LLAMA_POOLING_TYPE_RANK ? llama_model_n_cls_out(model) : llama_model_n_embd_out(model);
+    common_batch batch(lctx);
+    for (uint32_t s = 0; s < n_seq; s++) {
+        for (uint32_t pos = 0; pos < n_seq_tok; pos++) {
+            batch.add(tokens[s*n_seq_tok + pos], pos, llama_seq_id(s), true);
+        }
+    }
+    if (llama_process(lctx, LLAMA_PROCESS_TYPE_ENCODE, batch.get())) {
+        throw std::runtime_error("failed to encode batch");
+    }
+
+    std::vector<float> ret;
+    ret.reserve(n_seq*n_out);
+    for (uint32_t s = 0; s < n_seq; s++) {
+        const float * embd = llama_get_embeddings_seq(lctx, s);
+        if (embd == nullptr) {
+            throw std::runtime_error("no pooled embeddings for sequence " + std::to_string(s));
+        }
+        ret.insert(ret.end(), embd, embd + n_out);
+    }
+    return ret;
+}
+
+// pooled outputs are dominated by bias terms that do not depend on the input, this keeps only what differs between sequences
+static std::vector<float> seq_deviation(const std::vector<float> & out, const size_t n_seq) {
+    const size_t n_out = out.size() / n_seq;
+    std::vector<float> ret(out.size());
+    for (size_t i = 0; i < n_out; i++) {
+        double mean = 0.0;
+        for (size_t s = 0; s < n_seq; s++) {
+            mean += out[s*n_out + i];
+        }
+        mean /= n_seq;
+        for (size_t s = 0; s < n_seq; s++) {
+            ret[s*n_out + i] = out[s*n_out + i] - mean;
+        }
+    }
+    return ret;
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_FLINT:
@@ -1095,6 +1664,7 @@ static bool moe_implemented(const llm_arch arch) {
         return true;
     }
     switch (arch) {
+        case LLM_ARCH_GEMMA4:
         case LLM_ARCH_LLAMA:
         case LLM_ARCH_REFACT:
         case LLM_ARCH_MINICPM:
@@ -1107,6 +1677,33 @@ static bool moe_implemented(const llm_arch arch) {
         default:
             return false;
     }
+}
+
+struct model_config {
+    std::string             name;
+    std::string             file_suffix;
+    bool                    moe;
+    enum llama_pooling_type pooling;           // unspecified for models that return logits
+    bool                    iswa_only = false; // see get_gguf_ctx
+    uint32_t                n_layer_nextn = 0; // see get_gguf_ctx
+};
+
+// encoder-only archs are generated as an embedding model and as a reranker
+static std::vector<model_config> get_model_configs(const llm_arch arch) {
+    if (arch == LLM_ARCH_BERT) {
+        return {{"Dense", "dense", false, LLAMA_POOLING_TYPE_CLS}, {"Rank", "rank", false, LLAMA_POOLING_TYPE_RANK}};
+    }
+    std::vector<model_config> ret;
+    if (!moe_mandatory(arch)) {
+        ret.push_back({"Dense", "dense", false, LLAMA_POOLING_TYPE_UNSPECIFIED});
+    }
+    if (arch == LLM_ARCH_GEMMA4) {
+        ret.push_back({"ISWA", "dense-iswa-only", false, LLAMA_POOLING_TYPE_UNSPECIFIED, true});
+    }
+    if (moe_implemented(arch)) {
+        ret.push_back({"MoE", "moe", true, LLAMA_POOLING_TYPE_UNSPECIFIED});
+    }
+    return ret;
 }
 
 static bool arch_supported(const llm_arch arch) {
@@ -1128,7 +1725,7 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_RWKV6 || arch == LLM_ARCH_RWKV6QWEN2 || arch == LLM_ARCH_RWKV7 || arch == LLM_ARCH_ARWKV7) {
         return false; // FIXME RWKV models hang indefinitely.
     }
-    if (arch == LLM_ARCH_BERT || arch == LLM_ARCH_MODERN_BERT || arch == LLM_ARCH_NOMIC_BERT || arch == LLM_ARCH_NOMIC_BERT_MOE ||
+    if (arch == LLM_ARCH_MODERN_BERT || arch == LLM_ARCH_NOMIC_BERT || arch == LLM_ARCH_NOMIC_BERT_MOE ||
             arch == LLM_ARCH_NEO_BERT || arch == LLM_ARCH_JINA_BERT_V2 || arch == LLM_ARCH_JINA_BERT_V3 || arch == LLM_ARCH_EUROBERT) {
         return false; // TODO vocab
     }
@@ -1160,6 +1757,351 @@ static bool arch_supported(const llm_arch arch) {
     return true;
 }
 
+// archs whose generated model also gets a NextN layer, to check how its trunk and MTP graphs name their layer outputs
+static bool nextn_test(const llm_arch arch) {
+    return arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP;
+}
+
+// archs whose layers read their compress ratio from the file, so a NextN layer may be QSA or dense
+static bool nextn_dense_test(const llm_arch arch) {
+    return arch == LLM_ARCH_QWEN4EXP;
+}
+
+// archs whose saved test models include one with a NextN layer, <arch>-moe-nextn.gguf, beside those without, and
+//     <arch>-moe-nextn-only.gguf, the NextN layer of that model alone
+static bool nextn_save(const llm_arch arch) {
+    return arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP;
+}
+
+// the layer of a node named exactly <prefix><il>, or -1; a view of the node extends the name and is not one
+static int named_layer(const ggml_tensor * t, const char * prefix) {
+    const char * name = ggml_get_name(t);
+    const size_t n = strlen(prefix);
+    if (strncmp(name, prefix, n) != 0 || !isdigit((unsigned char) name[n])) {
+        return -1;
+    }
+    char * end = nullptr;
+    const long il = strtol(name + n, &end, 10);
+    return *end == '\0' ? (int) il : -1;
+}
+
+// each layer in [il_begin, il_end) has exactly one output named <prefix><il> for one of the prefixes, a node that computes it and not
+//     a view, and no other layer has one; returns why not, empty if so
+static std::string check_layer_outputs(ggml_cgraph * gf, const std::vector<const char *> & prefixes, const int il_begin, const int il_end) {
+    if (gf == nullptr) {
+        return "the graph does not build";
+    }
+    std::map<int, std::vector<const ggml_tensor *>> outputs;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * t = ggml_graph_node(gf, i);
+        for (const char * prefix : prefixes) {
+            const int il = named_layer(t, prefix);
+            if (il >= 0) {
+                outputs[il].push_back(t);
+            }
+        }
+    }
+    for (int il = il_begin; il < il_end; ++il) {
+        const auto it = outputs.find(il);
+        if (it == outputs.end() || it->second.size() != 1) {
+            return format("layer %d has %zu outputs, expected 1", il, it == outputs.end() ? (size_t) 0 : it->second.size());
+        }
+        if (it->second[0]->view_src != nullptr) {
+            return format("the output of layer %d (%s) is a view", il, ggml_get_name(it->second[0]));
+        }
+    }
+    for (const auto & [il, nodes] : outputs) {
+        if (il < il_begin || il >= il_end) {
+            return format("%s is the output of a layer outside [%d, %d)", ggml_get_name(nodes[0]), il_begin, il_end);
+        }
+    }
+    return "";
+}
+
+// a model with NextN layers splits into a trunk graph whose layers end at l_out-<il> or l_last-<il> and an MTP graph whose layers
+//     end at mtp_post_ffn-<il>, il from n_layer on: each graph names each of its own layer outputs once and none of the other's
+static bool check_nextn_outputs(const llm_arch arch, const size_t seed, const float stdev, std::string & result) {
+    const uint32_t n_layer_nextn = 1;
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe_mandatory(arch), LLAMA_POOLING_TYPE_UNSPECIFIED, /*iswa_only =*/ false,
+        /*n_layer_min =*/ 0, n_layer_nextn);
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    ggml_backend_dev_t cpu_only[] = { nullptr };
+    model_params.devices  = cpu_only;
+    model_params.load_mtp = true;
+    tensor_data_params tensor_params = { seed, stdev, /*sensitive =*/ false, arch };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
+    if (!model) {
+        result = "failed to create the model";
+        return false;
+    }
+    const int n_layer = llama_model_n_layer(model.get());
+    if (llama_model_n_layer_nextn(model.get()) != (int32_t) n_layer_nextn) {
+        result = "the model has no NextN layer";
+        return false;
+    }
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx           = 0;
+    ctx_params.n_ubatch        = 64;
+    ctx_params.n_threads       = 4;
+    ctx_params.n_threads_batch = 4;
+    llama_context_ptr ctx_trunk(llama_init_from_model(model.get(), ctx_params));
+    if (!ctx_trunk) {
+        result = "failed to create the trunk context";
+        return false;
+    }
+    ctx_params.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+    ctx_params.ctx_other = ctx_trunk.get();
+    llama_context_ptr ctx_mtp(llama_init_from_model(model.get(), ctx_params));
+    if (!ctx_mtp) {
+        result = "failed to create the MTP context";
+        return false;
+    }
+
+    const std::vector<const char *> trunk_prefixes = { "l_out-", "l_last-" };
+    const std::vector<const char *> mtp_prefixes   = { "mtp_post_ffn-" };
+    const struct { uint32_t n_tokens; uint32_t n_outputs; } shapes[] = { { 1, 1 }, { 8, 1 }, { 8, 8 } };
+    for (const auto & shape : shapes) {
+        const std::string what = format("%u tokens, %u outputs", shape.n_tokens, shape.n_outputs);
+
+        ggml_cgraph * gf_trunk = llama_graph_reserve(ctx_trunk.get(), shape.n_tokens, 1, shape.n_outputs);
+        std::string err = check_layer_outputs(gf_trunk, trunk_prefixes, 0, n_layer);
+        if (err.empty()) {
+            err = check_layer_outputs(gf_trunk, mtp_prefixes, 0, 0);
+        }
+        if (!err.empty()) {
+            result = "trunk graph, " + what + ": " + err;
+            return false;
+        }
+
+        ggml_cgraph * gf_mtp = llama_graph_reserve(ctx_mtp.get(), shape.n_tokens, 1, shape.n_outputs);
+        err = check_layer_outputs(gf_mtp, mtp_prefixes, n_layer, n_layer + n_layer_nextn);
+        if (err.empty()) {
+            err = check_layer_outputs(gf_mtp, trunk_prefixes, 0, 0);
+        }
+        if (!err.empty()) {
+            result = "MTP graph, " + what + ": " + err;
+            return false;
+        }
+    }
+    result = format("%d trunk layers, %u NextN layer", n_layer, n_layer_nextn);
+    return true;
+}
+
+// writes the tensors of the NextN layers of the model in src_path, and none of its other tensors, to dst_path: a file of
+//     NextN layers alone, which has no token embedding, output norm or LM head of its own, nor the optional ones of a NextN layer
+static void save_nextn_only(const std::string & src_path, const std::string & dst_path, const int n_layer) {
+    ggml_context * ctx_data = nullptr;
+    gguf_init_params params = { /*no_alloc =*/ false, &ctx_data };
+    gguf_context_ptr src(gguf_init_from_file(src_path.c_str(), params));
+    ggml_context_ptr ctx_data_ptr(ctx_data);
+    if (!src) {
+        throw std::runtime_error("failed to read " + src_path);
+    }
+    gguf_context_ptr dst(gguf_init_empty());
+    gguf_set_kv(dst.get(), src.get());
+    const std::string prefix = format("blk.%d.", n_layer);
+    const std::string own_head[] = { prefix + "nextn.embed_tokens.", prefix + "nextn.shared_head_head.", prefix + "nextn.shared_head_norm." };
+    for (int64_t i = 0; i < gguf_get_n_tensors(src.get()); ++i) {
+        const char * name = gguf_get_tensor_name(src.get(), i);
+        const bool head = std::any_of(std::begin(own_head), std::end(own_head),
+            [name](const std::string & p) { return strncmp(name, p.c_str(), p.size()) == 0; });
+        if (strncmp(name, prefix.c_str(), prefix.size()) == 0 && !head) {
+            gguf_add_tensor(dst.get(), ggml_get_tensor(ctx_data, name));
+        }
+    }
+    if (!gguf_write_to_file(dst.get(), dst_path.c_str(), /*only_meta =*/ false)) {
+        throw std::runtime_error("failed to write " + dst_path);
+    }
+}
+
+// whether a node of the graph reads tensor t
+static bool graph_reads(ggml_cgraph * gf, const ggml_tensor * t) {
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (node->src[j] == t) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// a file of NextN layers alone has no token embedding or LM head and reads those of the model of the context it drafts for,
+//     ctx_other, without sharing that context's memory: an MTP context over it needs ctx_other, its graph reads the very
+//     tensors of the target model, and its memory is its own
+static bool check_nextn_borrowed_head(const llm_arch arch, const size_t seed, const float stdev, std::string & result) {
+    const uint32_t n_layer_nextn = 1;
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe_mandatory(arch), LLAMA_POOLING_TYPE_UNSPECIFIED, /*iswa_only =*/ false,
+        /*n_layer_min =*/ 0, n_layer_nextn);
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    ggml_backend_dev_t cpu_only[] = { nullptr };
+    model_params.devices  = cpu_only;
+    model_params.load_mtp = true;
+    tensor_data_params tensor_params = { seed, stdev, /*sensitive =*/ false, arch };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
+    if (!model) {
+        result = "failed to create the model";
+        return false;
+    }
+    const int n_layer = llama_model_n_layer(model.get());
+
+    const std::string path_full  = get_tmp_gguf_path();
+    const std::string path_nextn = get_tmp_gguf_path();
+    llama_model_save_to_file(model.get(), path_full.c_str());
+    save_nextn_only(path_full, path_nextn, n_layer);
+    std::filesystem::remove(path_full);
+    llama_model_ptr model_nextn(llama_model_load_from_file(path_nextn.c_str(), model_params));
+    std::filesystem::remove(path_nextn);
+    if (!model_nextn) {
+        result = "failed to load the file of NextN layers";
+        return false;
+    }
+    if (model_nextn->tok_embd != nullptr || model_nextn->output != nullptr || model_nextn->output_norm != nullptr) {
+        result = "the file of NextN layers has a token embedding, an output norm or an LM head";
+        return false;
+    }
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx           = 0;
+    ctx_params.n_ubatch        = 64;
+    ctx_params.n_threads       = 4;
+    ctx_params.n_threads_batch = 4;
+    llama_context_ptr ctx_trunk(llama_init_from_model(model.get(), ctx_params));
+    if (!ctx_trunk) {
+        result = "failed to create the trunk context";
+        return false;
+    }
+
+    ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    if (llama_context_ptr ctx_alone(llama_init_from_model(model_nextn.get(), ctx_params)); ctx_alone) {
+        result = "an MTP context without ctx_other was created";
+        return false;
+    }
+    ctx_params.ctx_other = ctx_trunk.get();
+    llama_context_ptr ctx_mtp(llama_init_from_model(model_nextn.get(), ctx_params));
+    if (!ctx_mtp) {
+        result = "failed to create the MTP context";
+        return false;
+    }
+    if (llama_get_ctx_other(ctx_mtp.get()) != ctx_trunk.get()) {
+        result = "the MTP context does not read ctx_other";
+        return false;
+    }
+
+    const struct { uint32_t n_tokens; uint32_t n_outputs; } shapes[] = { { 1, 1 }, { 8, 1 }, { 8, 8 } };
+    for (const auto & shape : shapes) {
+        ggml_cgraph * gf = llama_graph_reserve(ctx_mtp.get(), shape.n_tokens, 1, shape.n_outputs);
+        if (gf == nullptr) {
+            result = format("the MTP graph does not build for %u tokens, %u outputs", shape.n_tokens, shape.n_outputs);
+            return false;
+        }
+        if (!graph_reads(gf, model->tok_embd) || !graph_reads(gf, model->output) ||
+                (model->output_norm != nullptr && !graph_reads(gf, model->output_norm))) {
+            result = format("the MTP graph for %u tokens, %u outputs does not read the token embedding, output norm and LM head of the target",
+                shape.n_tokens, shape.n_outputs);
+            return false;
+        }
+    }
+
+    // memory that mirrored the target's would hold the cells the target decodes
+    if (llama_get_memory_other(ctx_mtp.get()) != nullptr || llama_get_memory(ctx_mtp.get()) == llama_get_memory(ctx_trunk.get())) {
+        result = "the MTP context shares the memory of ctx_other";
+        return false;
+    }
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    decode_last(ctx_trunk.get(), get_tokens(8, n_vocab, seed), 0);
+    if (llama_memory_seq_pos_max(llama_get_memory(ctx_mtp.get()), 0) != -1) {
+        result = "the memory of the MTP context holds the cells the target decoded";
+        return false;
+    }
+
+    result = format("%d trunk layers, %u NextN layer", n_layer, n_layer_nextn);
+    return true;
+}
+
+// a file may give the NextN layer a compress ratio of 0 while the trunk layers keep theirs: the NextN layer then attends
+//     densely, yet the trunk still sets the k-pool size, so the MTP graph must not leave inputs it fills unallocated
+static bool check_nextn_dense_decode(const llm_arch arch, const size_t seed, const float stdev, std::string & result) {
+    const uint32_t n_layer_nextn = 1;
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe_mandatory(arch), LLAMA_POOLING_TYPE_UNSPECIFIED, /*iswa_only =*/ false,
+        /*n_layer_min =*/ 0, n_layer_nextn);
+
+    const std::string key_ratios = llama_arch_kv_name(arch, LLM_KV_ATTENTION_COMPRESS_RATIOS);
+    const int64_t     id_ratios  = gguf_find_key(gguf_ctx.get(), key_ratios.c_str());
+    if (id_ratios < 0) {
+        result = "the model has no compress ratios";
+        return false;
+    }
+    const size_t n_ratios = gguf_get_arr_n(gguf_ctx.get(), id_ratios);
+    std::vector<uint32_t> ratios((const uint32_t *) gguf_get_arr_data(gguf_ctx.get(), id_ratios),
+                                 (const uint32_t *) gguf_get_arr_data(gguf_ctx.get(), id_ratios) + n_ratios);
+    ratios.back() = 0;
+    gguf_set_arr_data(gguf_ctx.get(), key_ratios.c_str(), GGUF_TYPE_UINT32, ratios.data(), ratios.size());
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    ggml_backend_dev_t cpu_only[] = { nullptr };
+    model_params.devices  = cpu_only;
+    model_params.load_mtp = true;
+    tensor_data_params tensor_params = { seed, stdev, /*sensitive =*/ false, arch };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
+    if (!model) {
+        result = "failed to create the model";
+        return false;
+    }
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx           = 0;
+    ctx_params.n_ubatch        = 64;
+    ctx_params.n_threads       = 4;
+    ctx_params.n_threads_batch = 4;
+    llama_context_ptr ctx_trunk(llama_init_from_model(model.get(), ctx_params));
+    if (!ctx_trunk) {
+        result = "failed to create the trunk context";
+        return false;
+    }
+    ctx_params.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+    ctx_params.ctx_other = ctx_trunk.get();
+    llama_context_ptr ctx_mtp(llama_init_from_model(model.get(), ctx_params));
+    if (!ctx_mtp) {
+        result = "failed to create the MTP context";
+        return false;
+    }
+
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const uint32_t n_tokens = 8;
+    const std::vector<llama_token> tokens = get_tokens(n_tokens, n_vocab, seed);
+    const std::vector<float> h(llama_model_n_embd_out(model.get()), 0.0f);
+
+    // a catch-up decode, then one draft step after it
+    llama_pos pos = 0;
+    for (const uint32_t n : { n_tokens - 1, 1u }) {
+        common_batch batch(ctx_mtp.get());
+        for (uint32_t i = 0; i < n; ++i, ++pos) {
+            const int32_t idx = batch.add(tokens[pos], pos, 0, i + 1 == n);
+            batch.set_embd_state(idx, { h.data(), 1, h.size() });
+        }
+        if (llama_process(ctx_mtp.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            result = format("the MTP context fails to decode %u tokens at position %d", n, pos - (llama_pos) n);
+            return false;
+        }
+        const float * logits = llama_get_logits_ith(ctx_mtp.get(), -1);
+        if (!std::all_of(logits, logits + n_vocab, [](float x) { return std::isfinite(x); })) {
+            result = format("the MTP context gives non-finite logits for %u tokens", n);
+            return false;
+        }
+    }
+
+    result = format("NextN layer %d attends densely", llama_model_n_layer(model.get()));
+    return true;
+}
+
 static int save_models(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const std::string & dir) {
     struct user_data_t {
         struct {
@@ -1183,6 +2125,7 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
         }
     }, &ud);
 
+    bool all_ok = true;
     for (const llm_arch & arch : llama_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
@@ -1193,28 +2136,40 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
             continue;
         }
-        for (bool moe : {false, true}) {
-            if (moe && !moe_implemented(arch)) {
-                continue;
-            }
-            if (!moe && moe_mandatory(arch)) {
-                continue;
-            }
+        std::vector<model_config> configs = get_model_configs(arch);
+        if (nextn_save(arch)) {
+            configs.push_back({"MoE NextN", "moe-nextn", true, LLAMA_POOLING_TYPE_UNSPECIFIED, false, /*n_layer_nextn =*/ 1});
+        }
+        for (const model_config & cfg : configs) {
             if (!llama_arch_supports_save(arch) || !arch_supported(arch)) {
-                LOG_INF("%s: %s model (%s) is unsupported, skipping\n", __func__, llama_arch_name(arch), moe ? "MoE" : "dense");
+                LOG_INF("%s: %s model (%s) is unsupported, skipping\n", __func__, llama_arch_name(arch), cfg.name.c_str());
                 continue;
             }
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
-            llama_model_ptr model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
-            const std::string path = dir + "/" + llama_arch_name(arch) + (moe ? "-moe.gguf" : "-dense.gguf");
-            LOG_INF("%s: '%s %s' -> %s ...", __func__, llama_arch_name(arch), moe ? "MoE" : "dense", path.c_str());
-            llama_model_save_to_file(model.get(), path.c_str());
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, cfg.moe, cfg.pooling, cfg.iswa_only, /*n_layer_min =*/ 0, cfg.n_layer_nextn);
+            auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, false, nullptr, 0, cfg.pooling,
+                LLAMA_FLASH_ATTN_TYPE_AUTO, /*sensitive_weights =*/ true, /*load_mtp =*/ cfg.n_layer_nextn > 0);
+            const std::string path = dir + "/" + llama_arch_name(arch) + "-" + cfg.file_suffix + ".gguf";
+            LOG_INF("%s: '%s %s' -> %s ...", __func__, llama_arch_name(arch), cfg.name.c_str(), path.c_str());
+            llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
             const std::uintmax_t size = std::filesystem::file_size(path);
             LOG_CNT(" (%.2f MB)\n", (double) size / (1024.0 * 1024.0));
+            if (cfg.n_layer_nextn > 0) {
+                const std::string path_only = dir + "/" + llama_arch_name(arch) + "-" + cfg.file_suffix + "-only.gguf";
+                LOG_INF("%s: '%s %s' NextN layer alone -> %s\n", __func__, llama_arch_name(arch), cfg.name.c_str(), path_only.c_str());
+                save_nextn_only(path, path_only, llama_model_n_layer(model_and_ctx.first.get()));
+            }
+            std::string sensitivity;
+            if (check_sensitivity(model_and_ctx.first.get(), seed, sensitivity)) {
+                LOG_INF("%s: %s model (%s) sensitivity: %s\n", __func__, llama_arch_name(arch), cfg.name.c_str(), sensitivity.c_str());
+            } else {
+                LOG_ERR("%s: %s model (%s) is not sensitive enough (minimum %.0e): %s\n",
+                    __func__, llama_arch_name(arch), cfg.name.c_str(), min_sensitivity, sensitivity.c_str());
+                all_ok = false;
+            }
         }
     }
     llama_log_set(ud.log_old.callback, ud.log_old.user_data);
-    return 0;
+    return all_ok ? 0 : 1;
 }
 
 // the CPU and the GPU of an Apple SoC carry the same description, the name tells them apart (CPU, MTL0)
@@ -1322,15 +2277,15 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         max_arch_name_length = std::max(max_arch_name_length, strlen(llama_arch_name(arch)));
     }
 
-    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|%15s|\n";
+    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|%15s|%12s|\n";
     const std::string template_row_cfg = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|";
-    const std::string template_row_res = "%15s %10s|%20s|%15s %10s|\n";
+    const std::string template_row_res = "%15s %10s|%20s|%15s %10s|%12s|\n";
 
     bool all_ok = true;
     size_t n_tests = 0;
     size_t n_failed = 0;
     common_log_flush(common_log_main());
-    LOG(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip", "Mixed batch");
+    LOG(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip", "Mixed batch", "Mixed tokens");
     LOG("|");
     for (size_t i = 0; i < max_arch_name_length; i++) {
         LOG("-");
@@ -1339,7 +2294,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
     for (size_t i = 0; i < max_device_label_length; i++) {
         LOG("-");
     }
-    LOG("|------|---------------|---------|---------------|\n");
+    LOG("|------|---------------|---------|---------------|------------|\n");
     for (const llm_arch & arch : llama_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
@@ -1352,22 +2307,24 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         }
 
         const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
-        for (bool moe : {false, true}) {
-            if (moe && !moe_implemented(arch)) {
-                continue;
-            }
-            if (!moe && moe_mandatory(arch)) {
-                continue;
-            }
-            const std::string config_name = moe ? "MoE" : "Dense";
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+        for (const model_config & cfg : get_model_configs(arch)) {
+            const std::string & config_name = cfg.name;
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, cfg.moe, cfg.pooling, cfg.iswa_only);
             if (arch == LLM_ARCH_BAILINGMOE3) {
                 GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
             }
-            std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
-            std::vector<float> logits_cpu;
+            // models without logits are compared on their pooled embeddings
+            const auto get_output = [&](const std::pair<llama_model_ptr, llama_context_ptr> & model_and_ctx) {
+                if (cfg.pooling != LLAMA_POOLING_TYPE_UNSPECIFIED) {
+                    return get_embeddings(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens);
+                }
+                return get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens, encode);
+            };
+            // CPU references by flash attention
+            std::map<bool, std::pair<llama_model_ptr, llama_context_ptr>> model_and_ctx_cpu;
+            std::map<bool, std::vector<float>> logits_cpu;
             for (device_config & dc : dev_configs) {
-                if (dc.host_experts && (!moe || !host_experts_test(arch))) {
+                if (dc.host_experts && (!cfg.moe || !host_experts_test(arch))) {
                     continue;
                 }
                 const llama_model_tensor_buft_override * overrides = dc.host_experts ? host_experts_overrides : nullptr;
@@ -1383,23 +2340,32 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 std::string status_mixed     = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
                 char mixed_str[12] = {0};
+                std::string mixed_tokens = "all"; // the tokens the mixed batch check compares
+                std::string mixed_note;           // where the selections of a routed model first differ
 
                 bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty());
                 bool test_executed = false;
                 bool test_ok = true;
                 if (!skip) {
-                    if (logits_cpu.empty()) {
-                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, encode);
-                        logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
-                    }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llama_arch_supports_sm_tensor(arch)) {
                         test_executed = true;
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size);
-                        logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
-                        const double nmse_val = nmse(logits_cpu, logits_dev);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, cfg.pooling);
+                        logits_dev = get_output(model_and_ctx_dev);
+                        // a device may turn flash attention off, compare it with the same attention implementation on the CPU
+                        const bool flash_attn = model_and_ctx_dev.second->get_cparams().flash_attn;
+                        if (logits_cpu[flash_attn].empty()) {
+                            model_and_ctx_cpu[flash_attn] = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, encode, nullptr, 0, cfg.pooling,
+                                flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED);
+                            logits_cpu[flash_attn] = get_output(model_and_ctx_cpu[flash_attn]);
+                        }
+                        double nmse_val = nmse(logits_cpu[flash_attn], logits_dev);
+                        if (cfg.pooling != LLAMA_POOLING_TYPE_UNSPECIFIED) {
+                            const size_t n_seq = llama_n_seq_max(model_and_ctx_dev.second.get());
+                            nmse_val = std::max(nmse_val, nmse(seq_deviation(logits_cpu[flash_attn], n_seq), seq_deviation(logits_dev, n_seq)));
+                        }
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                         status_nmse = "\033[1;32mOK\033[0m";
-                        if (nmse_val > 1e-4) {
+                        if (!(nmse_val <= 1e-4)) { // also fails a NaN
                             test_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m";
                         }
@@ -1416,21 +2382,44 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             std::vector<float> logits_mixed;
                             std::vector<float> logits_chunks;
                             if (llama_arch_supports_mixed_batch(arch)) {
-                                if (get_logits_mixed(model_and_ctx_dev.first.get(), lctx_dev, tokens, embd_mixed, false, logits_chunks) != 0 ||
-                                    get_logits_mixed(model_and_ctx_dev.first.get(), lctx_dev, tokens, embd_mixed, true,  logits_mixed)  != 0) {
-                                    throw std::runtime_error("failed to decode mixed batch");
+                                router_observer routers_chunks;
+                                router_observer routers_mixed;
+                                {
+                                    router_observation observation;
+                                    if (get_logits_mixed(model_and_ctx_dev.first.get(), lctx_dev, tokens, embd_mixed, false, logits_chunks) != 0) {
+                                        throw std::runtime_error("failed to decode mixed batch");
+                                    }
+                                    routers_chunks = observation.take();
+                                    if (get_logits_mixed(model_and_ctx_dev.first.get(), lctx_dev, tokens, embd_mixed, true,  logits_mixed)  != 0) {
+                                        throw std::runtime_error("failed to decode mixed batch");
+                                    }
+                                    routers_mixed = observation.take();
                                 }
-                                const double nmse_mixed = nmse(logits_chunks, logits_mixed);
+
+                                // a near-tie of a router can select other experts in the other decode, and the memory carries
+                                //     that difference to every later token: compare the tokens before the first one
+                                const routed_comparison routing = compare_routing(routers_chunks, routers_mixed, tokens.size());
+                                const size_t n_vocab_out = logits_chunks.size()/tokens.size();
+                                logits_chunks.resize(routing.n_compared*n_vocab_out);
+                                logits_mixed.resize(routing.n_compared*n_vocab_out);
+                                const double nmse_mixed = logits_chunks.empty() ? 0.0 : nmse(logits_chunks, logits_mixed);
                                 snprintf(mixed_str, sizeof(mixed_str), "(%.2e)", nmse_mixed);
                                 status_mixed = "\033[1;32mOK\033[0m";
-                                if (nmse_mixed > 1e-4) {
+                                if (nmse_mixed > 1e-4 || !routing_ok(routing, tokens.size())) {
                                     test_ok = false;
                                     status_mixed = "\033[1;31mFAIL\033[0m";
+                                }
+                                if (routing.routed) {
+                                    mixed_tokens = std::to_string(routing.n_compared) + "/" + std::to_string(tokens.size());
+                                }
+                                if (routing.n_compared < tokens.size()) {
+                                    mixed_note = format("experts first differ at token %u in %s, relative margin %.3e",
+                                        routing.n_compared, routing.flip_router.c_str(), routing.flip_margin);
                                 }
                             } else {
                                 // must be rejected as an invalid batch, mute the expected error log
                                 ud.verbosity = LOG_LEVEL_OUTPUT;
-                                const int32_t err = get_logits_mixed(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, embd_mixed, true, logits_mixed);
+                                const int32_t err = get_logits_mixed(model_and_ctx_cpu[flash_attn].first.get(), model_and_ctx_cpu[flash_attn].second.get(), tokens, embd_mixed, true, logits_mixed);
                                 ud.verbosity = verbosity;
                                 if (err != -1) {
                                     test_ok = false;
@@ -1440,7 +2429,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         }
 
                         // runs after the mixed batch check, as it leaves the context with non-causal attention
-                        if (!encode && !check_causal_attn_toggle(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens)) {
+                        if (!encode && cfg.pooling == LLAMA_POOLING_TYPE_UNSPECIFIED && !check_causal_attn_toggle(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens)) {
                             if (test_ok) {
                                 status_nmse = "\033[1;31mFAIL\033[0m (toggle)";
                             }
@@ -1450,26 +2439,43 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
 
                     if (llama_arch_supports_save(arch) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
                         test_executed = true;
-                        GGML_ASSERT(model_and_ctx_dev.first && model_and_ctx_dev.second);
                         // FIXME: when adding a tensor to a gguf_context a copy is made, this changes the pointer which the meta backend
                         //     in turn uses to map the tensors to their simple equivalents - this is fundamentally incompatible
+                        // the roundtrip compares on one device, so it uses the sensitive weights, under which a tensor the saver drops shows
+                        const auto model_and_ctx_saved = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, cfg.pooling,
+                            LLAMA_FLASH_ATTN_TYPE_AUTO, /*sensitive_weights =*/ true);
+                        const std::vector<float> logits_saved = get_output(model_and_ctx_saved);
                         const std::string path = get_tmp_gguf_path();
-                        llama_model_save_to_file(model_and_ctx_dev.first.get(), path.c_str());
+                        llama_model_save_to_file(model_and_ctx_saved.first.get(), path.c_str());
                         FILE * file = fopen(path.c_str(), "rb");
                         GGML_ASSERT(file != nullptr);
 
                         {
-                            auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size);
-                            const std::vector<float> logits_roundtrip = get_logits(
-                                model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
+                            auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, cfg.pooling);
+                            const std::vector<float> logits_roundtrip = get_output(model_and_ctx_roundtrip);
                             status_roundtrip = "\033[1;32mOK\033[0m";
-                            GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
+                            GGML_ASSERT(logits_roundtrip.size() == logits_saved.size());
                             for (size_t i = 0; i < logits_roundtrip.size(); i++) {
-                                if (logits_roundtrip[i] != logits_dev[i]) {
+                                if (logits_roundtrip[i] != logits_saved[i]) {
                                     test_ok = false;
                                     status_roundtrip = "\033[1;31mFAIL\033[0m";
                                     break;
                                 }
+                            }
+                            // the reloaded model must also keep the pooling type and the classifier head
+                            const llama_model * model_dev = model_and_ctx_saved.first.get();
+                            const llama_model * model_rt  = model_and_ctx_roundtrip.first.get();
+                            bool head_ok = llama_pooling_type(model_and_ctx_roundtrip.second.get()) == llama_pooling_type(model_and_ctx_saved.second.get()) &&
+                                (model_rt->cls_out != nullptr) == (model_dev->cls_out != nullptr) &&
+                                llama_model_n_cls_out(model_rt) == llama_model_n_cls_out(model_dev);
+                            for (uint32_t i = 0; head_ok && i < llama_model_n_cls_out(model_dev); i++) {
+                                const char * label_dev = llama_model_cls_label(model_dev, i);
+                                const char * label_rt  = llama_model_cls_label(model_rt, i);
+                                head_ok = (label_dev == nullptr) == (label_rt == nullptr) && (label_dev == nullptr || strcmp(label_dev, label_rt) == 0);
+                            }
+                            if (!head_ok) {
+                                test_ok = false;
+                                status_roundtrip = "\033[1;31mFAIL\033[0m";
                             }
                         }
 
@@ -1487,8 +2493,57 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 }
 
                 // log the results for this test case
-                LOG(template_row_res.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str(), status_mixed.c_str(), mixed_str);
+                LOG(template_row_res.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str(), status_mixed.c_str(), mixed_str, mixed_tokens.c_str());
+                if (!mixed_note.empty()) {
+                    LOG_INF("%s: %s %s %s: %s\n", __func__, llama_arch_name(arch), dc.label.c_str(), config_name.c_str(), mixed_note.c_str());
+                }
             }
+        }
+
+        if (nextn_test(arch) && arch_supported(arch)) {
+            std::string result;
+            const bool ok = check_nextn_outputs(arch, seed, stdev, result);
+            n_tests++;
+            if (!ok) {
+                n_failed++;
+                all_ok = false;
+            }
+            LOG("%s: %s NextN layer outputs: %s (%s)\n", __func__, llama_arch_name(arch),
+                ok ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m", result.c_str());
+        }
+
+        if (nextn_test(arch) && arch_supported(arch)) {
+            std::string result;
+            bool ok = false;
+            try {
+                ok = check_nextn_borrowed_head(arch, seed, stdev, result);
+            } catch (const std::exception & e) {
+                result = e.what();
+            }
+            n_tests++;
+            if (!ok) {
+                n_failed++;
+                all_ok = false;
+            }
+            LOG("%s: %s NextN layers borrowing the target's head: %s (%s)\n", __func__, llama_arch_name(arch),
+                ok ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m", result.c_str());
+        }
+
+        if (nextn_dense_test(arch) && arch_supported(arch)) {
+            std::string result;
+            bool ok = false;
+            try {
+                ok = check_nextn_dense_decode(arch, seed, stdev, result);
+            } catch (const std::exception & e) {
+                result = e.what();
+            }
+            n_tests++;
+            if (!ok) {
+                n_failed++;
+                all_ok = false;
+            }
+            LOG("%s: %s NextN layer without QSA decodes: %s (%s)\n", __func__, llama_arch_name(arch),
+                ok ? "\033[1;32mOK\033[0m" : "\033[1;31mFAIL\033[0m", result.c_str());
         }
     }
 
@@ -1690,6 +2745,10 @@ static int test_kv_shift(const std::string & arch_filter, const size_t seed, con
         if (encode) {
             continue;
         }
+        // generated only as pooled embedding models, which keep no KV cache to shift
+        if (arch == LLM_ARCH_BERT) {
+            continue;
+        }
         for (bool moe : {false, true}) {
             if (moe && !moe_implemented(arch)) {
                 continue;
@@ -1705,7 +2764,7 @@ static int test_kv_shift(const std::string & arch_filter, const size_t seed, con
             // at least 4 layers, so that "every 4th layer" patterns (NoPE, full attention) are covered
             // exaone4 is SWA only with 64 layers, smallthinker always ropes with 4
             const uint32_t n_layer_min = arch == LLM_ARCH_EXAONE4 ? 64 : arch == LLM_ARCH_SMALLTHINKER ? 8 : 4;
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe, n_layer_min);
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe, LLAMA_POOLING_TYPE_UNSPECIFIED, /*iswa_only =*/ false, n_layer_min);
             // different bases, so that a shift using the wrong one is caught
             gguf_set_val_f32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_ROPE_FREQ_BASE).c_str(),     20000.0f);
             gguf_set_val_f32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_ROPE_FREQ_BASE_SWA).c_str(), 10000.0f);

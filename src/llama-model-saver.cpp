@@ -202,7 +202,8 @@ void llama_model_saver::add_kv_from_model() {
     if (hparams.n_embd_out_impl > 0) {
         add_kv(LLM_KV_EMBEDDING_LENGTH_OUT,          hparams.n_embd_out_impl);
     }
-    if (hparams.n_embd_per_layer > 0) {
+    // the gemma4 loader requires the key, where 0 means no per-layer embeddings
+    if (hparams.n_embd_per_layer > 0 || model->arch == LLM_ARCH_GEMMA4) {
         add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,    hparams.n_embd_per_layer);
     }
     add_kv(LLM_KV_BLOCK_COUNT,                       hparams.n_layer_all);
@@ -516,7 +517,7 @@ void llama_model_saver::add_kv_from_model() {
 }
 
 void llama_model_saver::add_tensors_from_model() {
-    if (model->output != nullptr &&
+    if (model->output == nullptr ||
             std::string(model->output->name) != std::string(model->tok_embd->name)) {
         add_tensor(model->tok_embd); // some models use the same tensor for tok_embd and output
     }
@@ -570,6 +571,8 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->hc_head_fn);
     add_tensor(model->hc_head_base);
     add_tensor(model->hc_head_scale);
+    add_tensor(model->altup_proj);
+    add_tensor(model->altup_unembd_proj);
     add_tensor(model->per_layer_tok_embd);
     add_tensor(model->per_layer_model_proj);
     add_tensor(model->per_layer_proj_norm);

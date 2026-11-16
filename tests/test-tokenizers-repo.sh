@@ -11,7 +11,7 @@ else
     toktest="./test-tokenizer-0"
 fi
 
-if [ ! -x $toktest ]; then
+if [ ! -x "$toktest" ]; then
     printf "Test executable \"$toktest\" not found!\n"
     exit 1
 fi
@@ -19,10 +19,10 @@ fi
 repo=$1
 folder=$2
 
-if [ -d $folder ] && [ -d $folder/.git ]; then
-    (cd $folder; git pull)
+if [ -d "$folder" ] && [ -d "$folder/.git" ]; then
+    (cd "$folder"; git pull) || exit 1
 else
-    git clone $repo $folder
+    git clone "$repo" "$folder" || exit 1
 
     # byteswap models if on big endian
     if [ "$(uname -m)" = s390x ]; then
@@ -32,12 +32,20 @@ else
     fi
 fi
 
-shopt -s globstar
-for gguf in $folder/**/*.gguf; do
-    if [ -f $gguf.inp ] && [ -f $gguf.out ]; then
-        $toktest $gguf
+status=0
+tested=0
+while IFS= read -r -d '' gguf; do
+    if [ -f "$gguf.inp" ] && [ -f "$gguf.out" ]; then
+        tested=$((tested + 1))
+        "$toktest" "$gguf" || status=1
     else
-        printf "Found \"$gguf\" without matching inp/out files, ignoring...\n"
+        printf 'Found "%s" without matching inp/out files, ignoring...\n' "$gguf"
     fi
-done
+done < <(find "$folder" -type f -name '*.gguf' -print0)
+
+if [ "$tested" -eq 0 ]; then
+    printf 'No tokenizer fixtures with matching inp/out files found.\n' >&2
+    exit 1
+fi
+exit "$status"
 

@@ -93,6 +93,10 @@ static std::vector<std::string> collect_models(const std::string & models_dir) {
 
     for (const auto & entry : std::filesystem::directory_iterator(models_dir)) {
         if (entry.is_regular_file() && entry.path().extension() == ".gguf") {
+            // a file of NextN layers alone is a draft that loads only for its target model, see test-graph-plan
+            if (entry.path().filename().string().find("-nextn-only.gguf") != std::string::npos) {
+                continue;
+            }
             models.push_back(entry.path().string());
         }
     }

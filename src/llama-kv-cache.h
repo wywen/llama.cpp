@@ -240,6 +240,8 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_v_storage(int32_t il) const; // nullptr for layers without a V cache
+
     // the layers whose K/V rows the caller stores have no K/V tensors, see llama_kv_cache_rows_scope
     bool has_caller_rows() const;
 
