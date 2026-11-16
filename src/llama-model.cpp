@@ -3451,8 +3451,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         GGML_ASSERT(hparams.is_swa_any());
 
                         if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
-                            llama_memory_t mem_other = llama_get_memory(cparams.ctx_other);
-
                             share = [&](int32_t il) {
                                 const llama_model * model_other = llama_get_model(cparams.ctx_other);
 
@@ -3475,7 +3473,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     cparams.n_ctx_seq,
                                     cparams.n_seq_max,
                                     cparams.n_ubatch,
-                                    mem_other,
+                                    params.mem_other,
                                     filter,
                                     reuse,
                                     share);
@@ -4122,6 +4120,10 @@ llama_model_base::nextn_flags_t llama_model_base::nextn_flags(llama_model_loader
     }
 
     if (!ml.load_mtp) {
+        // without its NextN layers, a file of NextN layers alone has nothing to run
+        if ((trunk & TENSOR_NOT_REQUIRED) && ml.get_weight(tn(LLM_TENSOR_TOKEN_EMBD, "weight").str().c_str()) == nullptr) {
+            throw std::runtime_error("a file of NextN layers alone loads only with load_mtp");
+        }
         mtp |= TENSOR_SKIP;
     }
 

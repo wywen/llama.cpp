@@ -237,6 +237,9 @@ LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch
 // Label of option i of a decision model ("<arch>.decision.labels"), nullptr past the last one
 LLAMA_API const char * llama_model_decision_label(const struct llama_model * model, uint32_t i);
 
+// The memory of ctx_other that this context's memory is a view of, or NULL when its memory is its own.
+// A context can read the weights of ctx_other and still keep its own memory.
+LLAMA_API llama_memory_t llama_get_memory_other(const struct llama_context * ctx);
 //
 // model/context data extraction
 //

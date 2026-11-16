@@ -182,7 +182,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int trunk_flags = nf.trunk;
     const int mtp_flags   = nf.mtp;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    // a file of NextN layers alone may leave these to the target model, whose own the MTP graph then reads
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
 
     // there is no output_norm: the final hyper-connection mixer carries it
     // the gammas load as [n_embd, hc] so the grouped norm multiplies them without a graph reshape
@@ -192,7 +193,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
     if (output == NULL) {
-        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
+        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED | trunk_flags);
     }
 
     // flat [ple_head_dim, n_rows] gather target
@@ -213,6 +214,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             ple_rows = ple_w->tensor->ne[1];
         }
 
+        // only trunk layers read it
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
     }
@@ -492,6 +494,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
     ggml_build_forward_expand(gf, res_hc);
 
     for (int il = 0; il < n_layer; ++il) {
+        // the previous layer's output goes into the graph before any node of this layer: a PLE layer
+        // gathers its conv state before it reads the residual, and would otherwise land among the
+        // previous layer's nodes
+        ggml_build_forward_expand(gf, res_hc);
+
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = hc_stream_mean(ctx0, res_hc);
             cb(res->t_layer_inp[il], "layer_inp", il);
@@ -598,9 +605,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
 
     inp->h = build_inp_embd_state(inp.get(), hparams.n_embd_out());
 
+    const llama_model & head = model_head();
+
     ggml_tensor * tok_embd;
     if (ubatch.token) {
-        tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
+        tok_embd = ggml_get_rows(ctx0, head.tok_embd, inp->tokens);
     } else {
         tok_embd = inp->embd;
     }
@@ -616,8 +625,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
     // the draft memory has no recurrent layer, but its input still has to be allocated
     ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
 
+    // a file may give the MTP layer a compress ratio of 0: it then attends densely and reads no k-pool input
     llm_graph_input_kpool * inp_kpool = nullptr;
-    if (mctx_hyb->get_idx() && hparams.indexer_kpool > 0) {
+    if (mctx_hyb->get_idx() && hparams.indexer_kpool > 0 && hparams.dsv4_compress_ratios[il] > 0) {
         GGML_ASSERT(mctx_hyb->get_idx()->get_n_kv() == mctx_hyb->get_attn()->get_n_kv() &&
                 "the indexer cache must track the attention cache cell for cell");
         inp_kpool = build_inp_kpool(mctx_hyb);
@@ -645,6 +655,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
     cur    = ffn_mix.cur;
     cur    = build_layer_ffn(cur, il);
     res_hc = build_hc_combine(res_hc, cur, ffn_mix.inject, il);
+    cb(res_hc, "mtp_post_ffn", il);
 
     // the next draft step reads this residual as its h
     ggml_tensor * flat     = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, n_tokens);
@@ -660,7 +671,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(head.output, cur, head.output_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }

@@ -1271,11 +1271,27 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         // skip unused tensors
         if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
+            if (!skipped.insert(tn.str()).second) {
+                return nullptr;
+            }
             const size_t nbytes = ggml_nbytes(t_meta);
             LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
 
             size_data -= nbytes;
             n_created++;
+
+            // the generic pass creates the scales of a weight only beside the weight, so they go unused with it, e.g.
+            // those of a NextN layer loaded without MTP
+            if (tn.suffix != nullptr && strcmp(tn.suffix, "weight") == 0) {
+                for (const char * suffix : { "scale", "input_scale" }) {
+                    const std::string name = LLM_TN_IMPL(tn.arch, tn.tensor, suffix, tn.bid, tn.xid).str();
+                    const ggml_tensor * t_scale = get_tensor_meta(name.c_str());
+                    if (t_scale != nullptr && skipped.insert(name).second) {
+                        size_data -= ggml_nbytes(t_scale);
+                        n_created++;
+                    }
+                }
+            }
 
             return nullptr;
         }

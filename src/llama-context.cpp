@@ -283,6 +283,29 @@ llama_context_params llama_context_params_resolve(const llama_model & model, lla
     return params;
 }
 
+static bool llama_model_borrows_head(const llama_model & model, enum llama_context_type ctx_type) {
+    return ctx_type == LLAMA_CONTEXT_TYPE_MTP && (model.tok_embd == nullptr || model.output == nullptr);
+}
+
+// the model of ctx_other has the token embedding and the LM head that a model without its own reads in their place
+static void llama_check_borrowed_head(const llama_model & model, const llama_context * ctx_other) {
+    if (ctx_other == nullptr) {
+        throw std::runtime_error(model.arch_name() + " MTP context without a token embedding or an LM head of its own requires ctx_other to be set");
+    }
+    const llama_model & other = ctx_other->get_model();
+    const int64_t n_embd  = model.hparams.n_embd;
+    const int64_t n_vocab = model.vocab.n_tokens();
+    for (const ggml_tensor * t : { other.tok_embd, other.output }) {
+        if (t == nullptr || t->ne[0] != n_embd || t->ne[1] != n_vocab) {
+            throw std::runtime_error(format("the model of ctx_other has no [%" PRId64 ", %" PRId64 "] token embedding and LM head to read",
+                    n_embd, n_vocab));
+        }
+    }
+    if (!other.hdmd.rot.empty() || !other.hdmd.inv.empty()) {
+        throw std::runtime_error("reading the token embedding and LM head of a Hadamard-rotated model is not supported");
+    }
+}
+
 llama_memory_cparams llama_cparams_memory_shape(const llama_model & model, const llama_context_params & params) {
     const auto & hparams = model.hparams;
 
@@ -328,6 +351,12 @@ llama_memory_cparams llama_cparams_memory_shape(const llama_model & model, const
             // used to read the target's layer input device buffer
             cparams.ctx_other = params.ctx_other;
         }
+    }
+
+    // a file of NextN layers alone can leave its token embedding and LM head to the target model it drafts for:
+    //     the MTP graph reads those of ctx_other's model, and its memory stays its own
+    if (cparams.ctx_other == nullptr && llama_model_borrows_head(model, params.ctx_type)) {
+        cparams.ctx_other = params.ctx_other;
     }
 
     if (params.attention_type == LLAMA_ATTENTION_TYPE_UNSPECIFIED) {
@@ -423,6 +452,9 @@ llama_context::llama_context(
 
     static_cast<llama_memory_cparams &>(cparams) = llama_cparams_memory_shape(model, params);
 
+    // planning the memory does not need ctx_other, building the graphs does
+    if (llama_model_borrows_head(model, params.ctx_type)) {
+        llama_check_borrowed_head(model, cparams.ctx_other);
     }
 
     cparams.n_threads               = params.n_threads;
@@ -5426,6 +5458,12 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }
+
+llama_memory_t llama_get_memory_other(const struct llama_context * ctx) {
+    const auto & cparams = ctx->get_cparams();
+    return cparams.mem_shares_other ? llama_get_memory(cparams.ctx_other) : nullptr;
+}
+
 bool llama_output_reserve(struct llama_context * ctx, uint32_t n_outputs) {
     return ctx && ctx->reserve_outputs(n_outputs);
 }
