@@ -24,6 +24,7 @@
 #include <cstring>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 

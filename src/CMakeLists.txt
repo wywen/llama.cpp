@@ -31,6 +31,7 @@ set(LLAMA_CORE_SOURCES
     llama-memory-alloc.cpp
     llama-memory-plan.cpp
     llama-moe-cache.cpp
+    llama-moe-slots.cpp
     llama-memory-hybrid.cpp
     llama-memory-hybrid-iswa.cpp
     llama-memory-hybrid-idx.cpp

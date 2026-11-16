@@ -5197,6 +5197,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
         if (    op->op == GGML_OP_MUL_MAT &&
                 op->src[0]->buffer &&
                 (ggml_n_dims(op->src[0]) == 2) &&
+                ggml_is_contiguous(op->src[0]) &&
                 op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type() &&
                 ggml_repack_get_optimal_repack_type(op->src[0])
                 ) {
@@ -5213,6 +5214,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
         } else if (op->op == GGML_OP_MUL_MAT_ID
                 && op->src[0]->buffer
                 && (ggml_n_dims(op->src[0]) == 3)
+                && ggml_is_contiguous(op->src[0])
                 && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
                 && ggml_repack_get_optimal_repack_type(op->src[0])
                 ) {

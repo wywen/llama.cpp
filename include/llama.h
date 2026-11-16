@@ -260,6 +260,10 @@ extern "C" {
     // into `tensor`; `data` is valid only for the duration of the call
     typedef void (*llama_kv_rot_set_callback)(struct ggml_tensor * tensor, const void * data, size_t size, void * user_data);
 
+    // called during loading once for each MoE layer il, with the number of experts of its expert weights
+    // returns true if the layer reads its expert weights from slots, see llama_model_params.moe_slots
+    typedef bool (*llama_moe_slot_layer_callback)(int32_t il, int32_t n_expert, void * user_data);
+
     // Input data for llama_encode/llama_decode
     // A llama_batch object can contain input about one or many sequences
     // The provided arrays (i.e. token, embd, pos, etc.) must have size of n_tokens
@@ -361,6 +365,16 @@ extern "C" {
 
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
+
+        // if set, the MoE layers for which it returns true read their expert weights from slots that the caller
+        // fills, instead of loading them; NULL = every layer loads its expert weights
+        // the caller allocates the slots of these layers, see "MoE expert slots"
+        llama_moe_slot_layer_callback moe_slots;
+        void * moe_slots_user_data;
+
+        // the padding unit of the members and slots of a slot layer, see "MoE expert slots"
+        // a power of two, at least the alignment of the layer's buffer type; 0 = 16384
+        size_t moe_slot_alignment;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
@@ -715,6 +729,71 @@ extern "C" {
 
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
+
+    //
+    // MoE expert slots
+    //
+    // A MoE layer that reads its experts from slots (see llama_model_params.moe_slots) does not load its expert
+    // weights: its stock expert weights hold no data, and the caller allocates and fills the slots. A slot holds one
+    // expert's weights in compute order, each member at a multiple of llama_model_params.moe_slot_alignment. The model
+    // fixes the geometry of a layer's slots (llama_model_moe_slot_geometry) and the file ranges that fill a slot
+    // (llama_model_moe_expert_runs), for slots laid out as
+    //
+    //   offset 0          map_size          map_size + slot_size
+    //   | slot map | pad | slot 0          | slot 1          | ... n_slots slots
+    //
+    // where the slot map is an I32 [1, n_expert] tensor holding the slot of each expert.
+    //
+    // The graphs llama builds read the stock expert weights: a caller rewrites each graph
+    // (llama_context_params.cb_graph_rewrite) to remap the router's expert ids through its slot map and read each
+    // expert weight from its slots, with per-expert scales and biases still indexed by the expert ids. A graph that
+    // still reads a stock expert weight after the rewrite must not be computed. A caller whose rewrite reads different
+    // slots for graphs of the same shape tells them apart with llama_set_graph_variant.
+    //
+    // A tensor that reads a member from slots strides its experts by slot_size, which need not be a whole number of
+    // blocks: the model places a slot layer's stock expert weights on a buffer type whose device supports such a
+    // tensor, with one slot per expert.
+    //
+
+    // the most expert weights a slot of a slot layer holds
+#define LLAMA_MOE_SLOT_MAX_MEMBERS 3
+
+    // a range of a model file that holds part of an expert's slot contents
+    struct llama_moe_expert_run {
+        const char * path;        // the model file, NULL if the model does not record the paths of its files
+        uint32_t     file;        // index of the file among the model's files (splits)
+        uint64_t     offset;      // in the file
+        uint64_t     size;
+        uint64_t     slot_offset; // in the slot, from the start of the slot (slot p starts at map_size + p*slot_size in the region)
+    };
+
+    // the slot geometry of layer il, see "MoE expert slots"; returns false,
+    // leaving the outputs untouched, if the layer does not read its experts from slots
+    LLAMA_API bool llama_model_moe_slot_geometry(
+            const struct llama_model * model,
+                             int32_t   il,
+                              size_t * slot_size,
+                              size_t * map_size,
+                             int32_t * n_expert);
+
+    // the file ranges that fill a slot with expert `expert` of layer il, in slot order, covering every member
+    // a run spans several members when the file stores them with the same gaps as the slot
+    // writes up to n_max runs and returns their number, or -1 if layer il has no slots or `expert` is out of range
+    LLAMA_API int32_t llama_model_moe_expert_runs(
+            const struct llama_model * model,
+                             int32_t   il,
+                             int32_t   expert,
+              struct llama_moe_expert_run * runs,
+                             int32_t   n_max);
+
+    // the MoE layer that follows MoE layer il, the layer whose router a caller applies to layer il's router input to
+    // predict its choice of experts, or -1 if il is not a MoE layer or is the last one (the next-token prediction
+    // layers are not counted)
+    LLAMA_API int32_t llama_model_moe_router_ahead_layer(const struct llama_model * model, int32_t il);
+
+    // the weight tensor of model named `name`, as the model file names it ("blk.<il>.ffn_gate_inp.weight"), or NULL if
+    // the model has none; it lives as long as the model
+    LLAMA_API struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name);
 
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(

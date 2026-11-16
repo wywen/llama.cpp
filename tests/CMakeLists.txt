@@ -242,6 +242,18 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_test(test-fp8 NAME test-fp8-kv LABEL "main behavior backend"
         ARGS --models "${FP8_MODEL_DIR}" --kv)
     set_tests_properties(test-fp8-requantize test-fp8-kv PROPERTIES FIXTURES_REQUIRED fp8-models)
+
+    set(MOE_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-moe")
+    file(MAKE_DIRECTORY "${MOE_MODEL_DIR}")
+    llama_test(test-llama-archs NAME test-generate-moe-models LABEL "main behavior backend"
+        ARGS -a "^(qwen3moe|qwen35moe|gemma4|qwen4exp|deepseek2)$" -o "${MOE_MODEL_DIR}")
+    set_tests_properties(test-generate-moe-models PROPERTIES FIXTURES_SETUP moe-models)
+
+    llama_build(test-moe-slots.cpp)
+    llama_test(test-moe-slots LABEL "main behavior backend"
+        ARGS --models "${MOE_MODEL_DIR}")
+    set_tests_properties(test-moe-slots PROPERTIES FIXTURES_REQUIRED moe-models)
+
 endif()
 
 set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")

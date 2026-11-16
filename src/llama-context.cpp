@@ -809,6 +809,9 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
+            if (!model.moe_slots.empty()) {
+                throw std::runtime_error("the MoE cache cannot be used with a model that reads expert weights from MoE slots");
+            }
             moe_cache = std::make_unique<llama_moe_cache>(model, no_alloc, backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
         }
 
@@ -2093,7 +2096,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
+        try {
+            gf = model.build_graph(gparams);
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: failed to build the graph: %s\n", __func__, err.what());
+            gf = nullptr;
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -3310,7 +3318,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
 
     res->reset();
 
