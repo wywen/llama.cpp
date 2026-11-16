@@ -11,8 +11,6 @@ extern "C" {
 //
 
 typedef struct ggml_metal * ggml_metal_t;
-struct ggml_metal_tensor_copy_pair;
-struct ggml_metal_tensor_range_copy;
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev);
 void ggml_metal_free(ggml_metal_t ctx);
@@ -40,41 +38,10 @@ void ggml_metal_commit_fence(ggml_metal_t ctx);
 
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev);
 void ggml_metal_event_wait  (ggml_metal_t ctx, ggml_metal_event_t ev);
-void ggml_metal_event_signal(ggml_metal_t ctx, ggml_metal_event_t ev, uint64_t value);
 
 ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx);
 
 ggml_metal_device_t ggml_metal_get_device(ggml_metal_t ctx);
-
-void ggml_metal_set_boundary_schedule(
-        ggml_metal_t ctx,
-        int n_cuts,  struct ggml_tensor * const * cut_nodes,  ggml_metal_event_t * sig_ev, const uint64_t * sig_val,
-        int n_waits, struct ggml_tensor * const * wait_nodes, ggml_metal_event_t * wait_ev, const uint64_t * wait_val);
-
-void ggml_metal_set_paged_gate_abort_ms(ggml_metal_t ctx, uint32_t ms);
-
-void ggml_metal_set_boundary_entry_signal(ggml_metal_t ctx, ggml_metal_event_t ev, uint64_t value);
-
-// See ggml_backend_metal_set_host_cuts.
-void ggml_metal_set_host_cuts(
-        ggml_metal_t ctx,
-        int n, struct ggml_tensor * const * nodes,
-        ggml_metal_event_t ev, uint64_t base_value,
-        bool (*fn)(void * user_data, int i, struct ggml_tensor * node), void * user_data);
-
-void ggml_metal_set_encode_window(
-        ggml_metal_t ctx,
-        struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
-        size_t n_ingress,     const struct ggml_metal_tensor_copy_pair * ingress,
-        size_t n_egress,      const struct ggml_metal_tensor_copy_pair * egress,
-        size_t n_out_of_band, struct ggml_tensor * const * out_of_band);
-bool ggml_metal_set_encode_window_ranged(
-        ggml_metal_t ctx,
-        struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
-        size_t n_ingress,     const struct ggml_metal_tensor_range_copy * ingress,
-        size_t n_egress,      const struct ggml_metal_tensor_range_copy * egress,
-        size_t n_out_of_band, struct ggml_tensor * const * out_of_band);
-void ggml_metal_clear_encode_window(ggml_metal_t ctx);
 
 // See ggml_backend_metal_set_reorder_barriers.
 void ggml_metal_set_reorder_barriers(ggml_metal_t ctx, bool enable);
