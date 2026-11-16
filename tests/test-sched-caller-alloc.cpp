@@ -80,6 +80,8 @@ struct caller {
     int  n_refused      = 0;
     int  n_allocs       = 0;
     int  n_measures     = 0;
+    bool keep_assigned  = false;   // place leaves a node that already has a backend on it
+    ggml_backend_t out_backend = nullptr; // the backend of "out" in the last measured graph
 };
 
 static ggml_backend_buffer_type_t storage_buft(ggml_backend_sched_t sched, ggml_tensor * t) {
@@ -105,6 +107,9 @@ static bool place(ggml_backend_sched_t sched, ggml_cgraph * graph, void * user_d
             if (ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched, node->view_src)) {
                 ggml_backend_sched_set_tensor_backend(sched, node, b);
             }
+            continue;
+        }
+        if (c->keep_assigned && ggml_backend_sched_get_tensor_backend(sched, node) != nullptr) {
             continue;
         }
         ggml_backend_sched_set_tensor_backend(sched, node, strcmp(node->name, "h") == 0 ? c->cpu : c->backend);
@@ -252,10 +257,26 @@ static bool measure(ggml_backend_sched_t sched, ggml_cgraph * graph, void * user
     auto * c = static_cast<caller *>(user_data);
     c->n_measures++;
     CHECK(graph == ggml_backend_sched_get_graph(sched));
+    c->out_backend = nullptr;
     for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
         ggml_tensor * node = ggml_graph_node(graph, i);
         CHECK(node->data == nullptr);
         CHECK(node->view_src != nullptr || !ggml_backend_sched_alloc_tensor(sched, node, 0, 0));
+        if (strcmp(node->name, "out") == 0) {
+            c->out_backend = ggml_backend_sched_get_tensor_backend(sched, node);
+        }
+    }
+    return true;
+}
+
+// a graph rewrite that assigns "out" to the CPU, which the place callback would otherwise put on the other backend
+static bool pin_out_to_cpu(ggml_backend_sched_t sched, ggml_cgraph * graph, ggml_backend_sched_rewrite_purpose /*purpose*/, void * user_data) {
+    auto * c = static_cast<caller *>(user_data);
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        ggml_tensor * node = ggml_graph_node(graph, i);
+        if (strcmp(node->name, "out") == 0) {
+            ggml_backend_sched_set_tensor_backend(sched, node, c->cpu);
+        }
     }
     return true;
 }
@@ -451,6 +472,41 @@ static void test_backend(ggml_backend_t backend) {
             CHECK(c.n_allocs == 1);
             ggml_backend_sched_reset(sched);
             ggml_free(g.ctx);
+        }
+
+        // both reserves split the graph with the backends assigned to its nodes, before the call (as a graph's builder
+        // pins a node) and by the graph rewrite
+        if (on_cpu) {
+            printf("  a single backend: the backends assigned to a graph's nodes are not checked\n");
+        } else {
+            c.keep_assigned = true;
+            for (const bool by_rewrite : { false, true }) {
+                ggml_backend_sched_set_graph_rewrite_callback(sched, by_rewrite ? pin_out_to_cpu : nullptr, &c);
+                const auto build_pinned = [&]() {
+                    test_graph g = build_graph(w);
+                    if (!by_rewrite) {
+                        ggml_backend_sched_set_tensor_backend(sched, g.out, cpu);
+                    }
+                    c.out_backend = nullptr;
+                    return g;
+                };
+                {
+                    test_graph g = build_pinned();
+                    CHECK(ggml_backend_sched_reserve(sched, g.graph));
+                    CHECK(c.out_backend == cpu);
+                    ggml_free(g.ctx);
+                }
+                {
+                    test_graph g = build_pinned();
+                    std::vector<size_t> sizes(backends.size(), 1);
+                    CHECK(ggml_backend_sched_reserve_size(sched, g.graph, sizes.data()));
+                    CHECK(c.out_backend == cpu);
+                    ggml_free(g.ctx);
+                }
+            }
+            CHECK(c.n_measures == 6);
+            c.keep_assigned = false;
+            ggml_backend_sched_set_graph_rewrite_callback(sched, nullptr, nullptr);
         }
         ggml_free(c.ctx_copies);
         c.ctx_copies = ggml_init(cparams);
