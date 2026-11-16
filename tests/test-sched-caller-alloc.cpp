@@ -78,6 +78,8 @@ struct caller {
     bool name_copies    = true;
     int  n_copies       = 0;
     int  n_refused      = 0;
+    int  n_allocs       = 0;
+    int  n_measures     = 0;
 };
 
 static ggml_backend_buffer_type_t storage_buft(ggml_backend_sched_t sched, ggml_tensor * t) {
@@ -153,6 +155,7 @@ static size_t align_to(size_t n, size_t a) {
 
 static bool alloc(ggml_backend_sched_t sched, ggml_cgraph * graph, bool /*reserve*/, void * user_data) {
     auto * c = static_cast<caller *>(user_data);
+    c->n_allocs++;
 
     // the tensors that need memory, in the order the graph computes them, and the last node reading each
     std::vector<ggml_tensor *> tensors;
@@ -244,6 +247,19 @@ static bool alloc(ggml_backend_sched_t sched, ggml_cgraph * graph, bool /*reserv
     return true;
 }
 
+// measures the graph the backends compute, which has no memory yet and cannot be given any
+static bool measure(ggml_backend_sched_t sched, ggml_cgraph * graph, void * user_data) {
+    auto * c = static_cast<caller *>(user_data);
+    c->n_measures++;
+    CHECK(graph == ggml_backend_sched_get_graph(sched));
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        ggml_tensor * node = ggml_graph_node(graph, i);
+        CHECK(node->data == nullptr);
+        CHECK(node->view_src != nullptr || !ggml_backend_sched_alloc_tensor(sched, node, 0, 0));
+    }
+    return true;
+}
+
 static void test_backend(ggml_backend_t backend) {
     printf("%s: %s\n", __func__, ggml_backend_name(backend));
 
@@ -296,7 +312,7 @@ static void test_backend(ggml_backend_t backend) {
     c.ctx_copies = ggml_init(cparams);
 
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends.data(), nullptr, (int) backends.size(), 64, false, true);
-    ggml_backend_sched_caller_alloc calls = { place, alloc, &c };
+    ggml_backend_sched_caller_alloc calls = { place, alloc, &c, nullptr };
     CHECK(ggml_backend_sched_set_caller_alloc(sched, &calls));
     reserve_counts reserves;
     ggml_backend_sched_set_reserve_callback(sched, count_reserve, &reserves);
@@ -385,6 +401,61 @@ static void test_backend(ggml_backend_t backend) {
         c.name_copies = true;
     }
 
+    // a caller allocator that measures: the reserves measure the split graph in place of allocating it, a split alone
+    // measures nothing, and a computed graph is allocated as before
+    {
+        ggml_backend_sched_caller_alloc measuring = calls;
+        measuring.measure = measure;
+        CHECK(ggml_backend_sched_set_caller_alloc(sched, &measuring));
+        for (auto & [buft, bufs] : c.buffers) {
+            CHECK(ggml_backend_sched_set_compute_buffers(sched, buft, bufs.data(), (int) bufs.size()));
+        }
+        c.mode = ALLOC_PACKED;
+
+        const int n_calls = reserves.n_calls;
+        c.n_allocs   = 0;
+        c.n_measures = 0;
+        {
+            test_graph g = build_graph(w);
+            CHECK(ggml_backend_sched_reserve(sched, g.graph));
+            CHECK(g.out->data == nullptr);
+            ggml_free(g.ctx);
+        }
+        {
+            test_graph g = build_graph(w);
+            std::vector<size_t> sizes(backends.size(), 1);
+            CHECK(ggml_backend_sched_reserve_size(sched, g.graph, sizes.data()));
+            CHECK(g.out->data == nullptr);
+            for (size_t size : sizes) {
+                CHECK(size == 0);
+            }
+            ggml_backend_sched_reset(sched);
+            ggml_free(g.ctx);
+        }
+        CHECK(c.n_measures == 2);
+        CHECK(c.n_allocs == 0);
+        CHECK(reserves.n_calls == n_calls + 2);
+        {
+            test_graph g = build_graph(w);
+            CHECK(ggml_backend_sched_split_graph(sched, g.graph));
+            CHECK(c.n_measures == 2);
+            ggml_backend_sched_reset(sched);
+            ggml_free(g.ctx);
+        }
+        {
+            test_graph g = build_graph(w);
+            std::vector<float> out;
+            CHECK(compute(sched, g, out));
+            CHECK(out == ref);
+            CHECK(c.n_measures == 2);
+            CHECK(c.n_allocs == 1);
+            ggml_backend_sched_reset(sched);
+            ggml_free(g.ctx);
+        }
+        ggml_free(c.ctx_copies);
+        c.ctx_copies = ggml_init(cparams);
+    }
+
     // without the caller allocator the graph allocator runs again
     ggml_backend_sched_set_reserve_callback(sched, nullptr, nullptr);
     CHECK(ggml_backend_sched_set_caller_alloc(sched, nullptr));
@@ -419,7 +490,7 @@ int main() {
     {
         ggml_backend_t cpu = ggml_backend_cpu_init();
         ggml_backend_sched_t sched = ggml_backend_sched_new(&cpu, nullptr, 1, 64, true, true);
-        ggml_backend_sched_caller_alloc calls = { place, alloc, nullptr };
+        ggml_backend_sched_caller_alloc calls = { place, alloc, nullptr, nullptr };
         CHECK(ggml_backend_sched_get_n_copies(sched) == 1 || !ggml_backend_sched_set_caller_alloc(sched, &calls));
         ggml_backend_sched_free(sched);
         ggml_backend_free(cpu);
