@@ -337,14 +337,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-memory-plan PROPERTIES FIXTURES_REQUIRED generate-models)
 
-    # Test graph planning against the graphs real contexts reserve, using the generated dummy models
-    llama_build(test-graph-plan.cpp)
+    # Test that plan contexts reserve the graphs real contexts reserve and allocate nothing, using the generated dummy models
+    llama_build(test-plan-context.cpp)
     llama_test(
-        test-graph-plan
+        test-plan-context
         LABEL main
-        ARGS --models "${MODEL_DIR}" -b CPU
+        ARGS --models "${MODEL_DIR}"
     )
-    set_tests_properties(test-graph-plan PROPERTIES FIXTURES_REQUIRED generate-models)
+    set_tests_properties(test-plan-context PROPERTIES FIXTURES_REQUIRED generate-models)
 
     llama_build(test-swa-ring-placement.cpp)
     llama_test(

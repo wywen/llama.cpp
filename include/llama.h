@@ -446,9 +446,8 @@ extern "C" {
         // see ggml_backend_sched_graph_rewrite_callback; runs on every graph that the context's scheduler reserves,
         // measures or allocates, each time after llama builds it; a graph that llama reuses without building it
         // again keeps its rewritten nodes and is not passed to the callback again
-        // its purpose is GGML_BACKEND_SCHED_REWRITE_RESERVE for a graph llama reserves or measures,
-        // GGML_BACKEND_SCHED_REWRITE_ALLOC for a graph llama computes, and GGML_BACKEND_SCHED_REWRITE_PLAN for a graph
-        // that llama_graph_plan_build plans
+        // its purpose is GGML_BACKEND_SCHED_REWRITE_RESERVE for a graph llama reserves or measures, and
+        // GGML_BACKEND_SCHED_REWRITE_ALLOC for a graph llama computes
         // the callback must not replace the input tensors or the output tensors (logits, embeddings, sampled tokens)
         // that llama reads and writes: it may rewire their readers, or change such a tensor's op and srcs in place
         ggml_backend_sched_graph_rewrite_callback cb_graph_rewrite;
@@ -1378,8 +1377,7 @@ extern "C" {
     // its graph rewrite (llama_context_params.cb_graph_rewrite) keys on, e.g. to read other tensors in a graph of the
     // same shape. llama does not reuse a graph built for another variant: the next graph is built again and passed to
     // the rewrite. A change of variant does not reserve the scheduler again, so a rewrite of a graph llama reserves
-    // (GGML_BACKEND_SCHED_REWRITE_RESERVE) must cover every variant the caller uses; the graphs that
-    // llama_graph_plan_build plans are built for variant 0.
+    // (GGML_BACKEND_SCHED_REWRITE_RESERVE) must cover every variant the caller uses.
     LLAMA_API void llama_set_graph_variant(struct llama_context * ctx, uint32_t variant);
 
     // Set abort callback

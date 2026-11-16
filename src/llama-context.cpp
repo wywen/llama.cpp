@@ -3385,50 +3385,6 @@ ggml_cgraph * llama_context::graph_reserve(
     return gf;
 }
 
-llm_graph_result_ptr llama_context::graph_plan(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool backend_sampling) {
-    GGML_ASSERT(n_outputs >= 1);
-    GGML_ASSERT(n_seqs >= 1);
-
-    // as graph_reserve shapes its dummy ubatch
-    if (n_tokens % n_seqs != 0) {
-        n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs;
-    }
-
-    const auto save_n_outputs = this->n_outputs;
-    this->n_outputs = n_outputs;
-
-    // the graph of a context its samplers have not attached to yet; restored below
-    std::map<llama_seq_id, llama_sampler *> save_samplers;
-    if (!backend_sampling) {
-        save_samplers.swap(sampling.samplers);
-    }
-
-    llama_batch_allocr balloc_plan(model.hparams.n_pos_per_embd());
-    llama_ubatch ubatch = balloc_plan.ubatch_reserve(n_tokens/n_seqs, n_seqs);
-
-    ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
-
-    // the capacity of the context's own graph results, which sched_reserve sizes
-    const uint32_t max_nodes = graph_max_nodes();
-    llm_graph_result_ptr res(new llm_graph_result(max_nodes));
-
-    auto gparams = graph_params(res.get(), ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
-
-    ggml_cgraph * gf = model.build_graph(gparams);
-
-    this->n_outputs = save_n_outputs;
-    if (!backend_sampling) {
-        sampling.samplers.swap(save_samplers);
-    }
-
-    if (gf == nullptr || !ggml_backend_sched_rewrite_graph(sched.get(), gf, GGML_BACKEND_SCHED_REWRITE_PLAN)) {
-        return nullptr;
-    }
-
-    return res;
-}
-
 llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -4878,6 +4834,17 @@ llama_context * llama_init_from_model(
     }
 
     return nullptr;
+}
+
+llama_context * llama_init_plan_from_model(
+                 llama_model * model,
+        llama_context_params   params) {
+    // the plan context replays the construction logs; leave them to the real construction
+    const llama_log_thread_quiet log_quiet;
+
+    // the memory, the MoE slots and the scheduler reserves of the context allocate nothing
+    llama_memory_alloc_recorder recorder(llama_memory_alloc_mode::plan);
+    return llama_init_from_model(model, params);
 }
 
 void llama_free(llama_context * ctx) {
