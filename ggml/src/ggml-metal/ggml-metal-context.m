@@ -42,13 +42,9 @@ struct ggml_metal {
     bool use_concurrency;
     bool use_graph_optimize;
 
-    // stop the graph reorder at boundary marker nodes (see ggml_metal_set_reorder_barriers)
-    bool use_reorder_barriers;
-
-    // node-name prefixes the graph reorder treats as barriers (see ggml_metal_set_reorder_barrier_prefixes)
-    // owned copies, replaced on each set
-    int     reorder_n_prefixes;
-    char ** reorder_prefixes;
+    // the caller predicate of the nodes the graph reorder keeps in place (see ggml_metal_set_reorder_barrier)
+    ggml_backend_metal_reorder_barrier_t reorder_barrier;
+    void *                               reorder_barrier_ud;
 
     int debug_graph;
 
@@ -169,9 +165,8 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
             res->n_cb = 0;
         }
 
-        res->use_reorder_barriers = false;
-        res->reorder_n_prefixes   = 0;
-        res->reorder_prefixes     = NULL;
+        res->reorder_barrier    = NULL;
+        res->reorder_barrier_ud = NULL;
 
         GGML_LOG_INFO("%s: use fusion         = %s\n", __func__, ggml_metal_fusion_info_enabled(res->finfo) ? "true" : "false");
         GGML_LOG_INFO("%s: use concurrency    = %s\n", __func__, res->use_concurrency    ? "true" : "false");
@@ -252,8 +247,6 @@ void ggml_metal_free(ggml_metal_t ctx) {
     }
 
     Block_release(ctx->encode_async);
-
-    ggml_metal_set_reorder_barrier_prefixes(ctx, 0, NULL);
 
     //[ctx->queue release]; // [TAG_QUEUE_PER_BACKEND]
 
@@ -548,34 +541,18 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
-// stop the graph reorder at boundary marker nodes, see ggml_backend_metal_set_reorder_barriers
-void ggml_metal_set_reorder_barriers(ggml_metal_t ctx, bool enable) {
-    ctx->use_reorder_barriers = enable;
+// replace the barrier predicate of the graph reorder, see ggml_backend_metal_set_reorder_barrier
+void ggml_metal_set_reorder_barrier(ggml_metal_t ctx, ggml_backend_metal_reorder_barrier_t is_barrier, void * user_data) {
+    ctx->reorder_barrier    = is_barrier;
+    ctx->reorder_barrier_ud = is_barrier != NULL ? user_data : NULL;
 }
 
-// replace the barrier name prefixes of the graph reorder, see ggml_backend_metal_set_reorder_barrier_prefixes
-void ggml_metal_set_reorder_barrier_prefixes(ggml_metal_t ctx, int n, const char * const * prefixes) {
-    for (int i = 0; i < ctx->reorder_n_prefixes; ++i) {
-        free(ctx->reorder_prefixes[i]);
+ggml_backend_metal_reorder_barrier_t ggml_metal_get_reorder_barrier(ggml_metal_t ctx, void ** user_data) {
+    if (user_data != NULL) {
+        *user_data = ctx->reorder_barrier_ud;
     }
-    free(ctx->reorder_prefixes);
-    ctx->reorder_n_prefixes = 0;
-    ctx->reorder_prefixes   = NULL;
 
-    if (n <= 0) {
-        return;
-    }
-    GGML_ASSERT(prefixes != NULL);
-
-    ctx->reorder_prefixes = malloc(sizeof(char *) * n);
-    GGML_ASSERT(ctx->reorder_prefixes != NULL);
-    for (int i = 0; i < n; ++i) {
-        // an empty prefix would match every node and turn the reorder off
-        GGML_ASSERT(prefixes[i] != NULL && prefixes[i][0] != '\0');
-        ctx->reorder_prefixes[i] = strdup(prefixes[i]);
-        GGML_ASSERT(ctx->reorder_prefixes[i] != NULL);
-    }
-    ctx->reorder_n_prefixes = n;
+    return ctx->reorder_barrier;
 }
 
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
@@ -792,8 +769,7 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     //const int64_t t_start = ggml_time_us();
 
     if (ctx->use_graph_optimize) {
-        ggml_graph_optimize(gf, ctx->use_reorder_barriers,
-            ctx->reorder_n_prefixes, (const char * const *) ctx->reorder_prefixes);
+        ggml_graph_optimize(gf, ctx->reorder_barrier, ctx->reorder_barrier_ud);
     }
 
     //printf("%s: graph optimize took %.3f ms\n", __func__, (ggml_time_us() - t_start) / 1000.0);

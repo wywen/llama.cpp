@@ -70,13 +70,18 @@ GGML_BACKEND_API const char * ggml_backend_metal_last_error(ggml_backend_t backe
 // schedule, and may move a node across a cut it does not depend on. A barrier node keeps its place: no node moves
 // across it in either direction, and a fusion group that contains it stays where it is.
 
-// make the per-layer output tensors (named "l_out-<il>") barriers (default: off)
-GGML_BACKEND_API void ggml_backend_metal_set_reorder_barriers(ggml_backend_t backend, bool enable);
+// is `node` a reorder barrier? called once per graph node while a graph is reordered
+typedef bool (*ggml_backend_metal_reorder_barrier_t)(const struct ggml_tensor * node, void * user_data);
 
-// make every node whose name starts with one of `prefixes` a barrier; the strings are copied, n == 0 clears the list
-// applies to graphs reordered after the call, so register every prefix the caller may cut at before allocating the graph
-GGML_BACKEND_API void ggml_backend_metal_set_reorder_barrier_prefixes(
-        ggml_backend_t backend, int n, const char * const * prefixes);
+// make every node for which `is_barrier` returns true a barrier (default: none); NULL removes the predicate
+// applies to graphs reordered after the call, so install it before allocating the graph
+// `user_data` is passed to every call and must outlive the predicate's installation
+GGML_BACKEND_API void ggml_backend_metal_set_reorder_barrier(
+        ggml_backend_t backend, ggml_backend_metal_reorder_barrier_t is_barrier, void * user_data);
+
+// the installed predicate, NULL if there is none; `user_data` (may be NULL) receives its user data
+GGML_BACKEND_API ggml_backend_metal_reorder_barrier_t ggml_backend_metal_get_reorder_barrier(
+        ggml_backend_t backend, void ** user_data);
 
 //
 // buffers over caller host memory, resolved through a caller range table
