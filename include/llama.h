@@ -264,6 +264,11 @@ extern "C" {
     // returns true if the layer reads its expert weights from slots, see llama_model_params.moe_slots
     typedef bool (*llama_moe_slot_layer_callback)(int32_t il, int32_t n_expert, void * user_data);
 
+    // called during loading once for each lookup table whose rows the caller can serve, with its tensor name, number of
+    // rows and the bytes of one row
+    // returns true if the caller serves the table's rows, see llama_model_params.lookup_tables
+    typedef bool (*llama_lookup_table_callback)(const char * name, int64_t n_rows, size_t row_size, void * user_data);
+
     // Input data for llama_encode/llama_decode
     // A llama_batch object can contain input about one or many sequences
     // The provided arrays (i.e. token, embd, pos, etc.) must have size of n_tokens
@@ -376,8 +381,14 @@ extern "C" {
         // a power of two, at least the alignment of the layer's buffer type; 0 = 16384
         size_t moe_slot_alignment;
 
+        // if set, the lookup tables for which it returns true are not loaded: the caller serves their rows to the
+        // graphs that read them, see "Lookup tables served by the caller"; NULL = every table is loaded
+        llama_lookup_table_callback lookup_tables;
+        void * lookup_tables_user_data;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
+        bool use_mmap_prefetch; // prefetch the mmap'd model file
         bool check_tensors;   // validate model tensor data
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
@@ -785,6 +796,57 @@ extern "C" {
                              int32_t   expert,
               struct llama_moe_expert_run * runs,
                              int32_t   n_max);
+
+    //
+    // Lookup tables served by the caller
+    //
+    // A lookup table whose rows the caller serves (see llama_model_params.lookup_tables) is not loaded: it is created
+    // as metadata only, with no buffer. Only tables that the graph reads by row with ids known on the host can be
+    // served, e.g. per-layer token embeddings.
+    //
+    // The graphs read a served table as they read the loaded table: a GGML_OP_GET_ROWS of the table's tensor at an
+    // I32 graph input, which the context sets to the rows that the ubatch reads, in token order, rows_per_token per
+    // token, repeats included. A token's rows can depend on the tokens before it in its sequence (e.g. the n-gram
+    // hashes of qwen4exp); llama_model_lookup_table_rows names them ahead of a decode. A ubatch of input embeddings
+    // reads the rows that the architecture uses in place of a token's (row 0 once for gemma4, the rows of the image
+    // token for qwen4exp). The table holds no data, so the caller rewrites each such gather before the graph is
+    // allocated (llama_context_params.cb_graph_rewrite), e.g. to gather the bytes of the rows as the model file
+    // stores them, read from the file at offset + row*row_size (see llama_model_lookup_table_info) once the inputs
+    // are set; a graph that still reads the table computes over memory that holds nothing.
+    //
+
+    // a lookup table whose rows the caller serves
+    struct llama_lookup_table_info {
+        const char *   name;     // the stock tensor, e.g. per_layer_token_embd.weight
+        enum ggml_type type;
+        int64_t        n_cols;   // the elements of one row
+        int64_t        n_rows;
+        size_t         row_size;       // the bytes of one row
+        int32_t        rows_per_token; // the rows that one token reads, e.g. to size the rows of n tokens
+        const char *   path;     // the model file that holds the table, NULL if the model does not record the paths of its files
+        uint32_t       file;     // index of the file among the model's files (splits)
+        uint64_t       offset;   // of row 0 in the file; row r is at offset + r*row_size
+    };
+
+    // the number of served lookup tables of the model; table indices are in [0, n)
+    LLAMA_API int32_t llama_model_n_lookup_tables(const struct llama_model * model);
+
+    // the served lookup table `table`; returns false, leaving `info` untouched, if `table` is out of range
+    LLAMA_API bool llama_model_lookup_table_info(const struct llama_model * model, int32_t table, struct llama_lookup_table_info * info);
+
+    // the rows of served lookup table `table` that tokens[n_context, n_tokens) of one sequence read, with
+    //     tokens[0, n_context) as their predecessors: rows_per_token rows per token, in the order in which the graph's
+    //     row input holds them, e.g. to name the rows of draft tokens ahead of a decode
+    // a predecessor before tokens[0] reads as missing, as at the start of the sequence
+    // rows holds (n_tokens - n_context)*rows_per_token entries; returns false, leaving `rows` unspecified, if `table` is
+    //     out of range, the arguments are invalid or a row is out of range
+    LLAMA_API bool llama_model_lookup_table_rows(
+            const struct llama_model * model,
+                             int32_t   table,
+                   const llama_token * tokens,
+                             int32_t   n_tokens,
+                             int32_t   n_context,
+                             int32_t * rows);
 
     // the MoE layer that follows MoE layer il, the layer whose router a caller applies to layer il's router input to
     // predict its choice of experts, or -1 if il is not a MoE layer or is the last one (the next-token prediction

@@ -2125,7 +2125,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
-        res->set_inputs(&ubatch);
+        try {
+            res->set_inputs(&ubatch);
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: failed to set the graph inputs: %s\n", __func__, err.what());
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -4632,7 +4638,12 @@ void llama_context::opt_epoch_iter(
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
             ggml_opt_alloc(opt_ctx, train);
 
-            res->set_inputs(&ubatch);
+            try {
+                res->set_inputs(&ubatch);
+            } catch (const std::exception & err) {
+                LLAMA_LOG_ERROR("%s: failed to set the graph inputs: %s\n", __func__, err.what());
+                return;
+            }
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
                 GGML_ASSERT(labels->ne[1] == n_ubatch);
