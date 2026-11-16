@@ -96,9 +96,6 @@ struct llama_context {
 
     llama_memory_t get_memory() const;
 
-    // the caller's reader of the rows of the served lookup tables, nullptr if none
-    const llama_lookup_row_reader * get_lookup_rows() const;
-
     // return true if the memory was updated
     bool memory_update(bool optimize);
 
@@ -371,9 +368,6 @@ private:
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
 
-    // see llama_context_params.lookup_rows
-    std::unique_ptr<llama_lookup_row_reader> lookup_rows;
-
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 
@@ -514,9 +508,6 @@ private:
 
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;
-
-    // true after the check that no op reads a lookup table served by the caller passes on a reserved graph
-    bool lookup_tables_verified = false;
 
     // perf
     mutable int64_t t_start_us  = 0;

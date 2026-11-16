@@ -1374,14 +1374,10 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        const int64_t n_ids = served.table ? served.n_ids() : rows->ne[0];
-        return n_ids == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+        return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
-
-    // with the table served by the caller: the rows that the stock gather reads, in order
-    llm_graph_lookup_rows served;
 
     const llama_model & model;
 
@@ -1424,11 +1420,6 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
 
     for (int64_t i = 0; i < n_tokens; ++i) {
         qwen4exp_ple_rows(hparams, tok_of(i), prev.data() + i*n_prev, idx.data() + i*n_heads);
-    }
-
-    if (served.table) {
-        served.set(idx.data());
-        return;
     }
 
     {
@@ -1511,14 +1502,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
 
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb;
-    if (const llama_lookup_table * table = model.lookup_tables.of(model.per_layer_tok_embd)) {
-        emb = build_lookup_rows(ple_inp->served, *table, n_heads * n_tokens);
-    } else {
-        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-        ggml_set_input(ple_inp->rows);
-        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, ple_inp->rows);
-    }
+    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+    ggml_set_input(ple_inp->rows);
+    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, ple_inp->rows);
     res->add_input(std::move(ple_inp));
 
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);

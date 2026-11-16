@@ -1,7 +1,6 @@
 #include "llama-graph.h"
 
 #include "llama-impl.h"
-#include "llama-lookup-tables.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
 #include "llama-batch.h"
@@ -1593,7 +1592,6 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     moe_cache        (params.moe_cache),
-    lookup_rows      (params.lookup_rows),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
@@ -2961,47 +2959,6 @@ llm_graph_kv_staging llm_graph_context::build_attn_kv_rows(
 }
 
 // input embeddings with optional lora
-int64_t llm_graph_lookup_rows::n_ids() const {
-    return iota->ne[0];
-}
-
-void llm_graph_lookup_rows::set(const int32_t * ids) {
-    const int64_t n = n_ids();
-
-    const size_t size = ggml_nbytes(staging);
-    if (ggml_backend_buffer_is_host(staging->buffer)) {
-        reader->read_rows(*table, ids, n, staging->data);
-    } else {
-        scratch.resize(size);
-        reader->read_rows(*table, ids, n, scratch.data());
-        ggml_backend_tensor_set(staging, scratch.data(), 0, size);
-    }
-
-    std::vector<int32_t> seq(n);
-    for (int64_t i = 0; i < n; ++i) {
-        seq[i] = (int32_t) i;
-    }
-    ggml_backend_tensor_set(iota, seq.data(), 0, n*ggml_element_size(iota));
-}
-
-ggml_tensor * llm_graph_context::build_lookup_rows(llm_graph_lookup_rows & rows, const llama_lookup_table & table, int64_t n_ids) const {
-    if (lookup_rows == nullptr) {
-        throw std::runtime_error(format("lookup table '%s' is served by the caller, but the context has no row reader",
-            table.stock->name));
-    }
-    rows.reader = lookup_rows;
-    rows.table  = &table;
-
-    rows.staging = ggml_new_tensor_2d(ctx0, table.stock->type, table.stock->ne[0], n_ids);
-    ggml_set_input(rows.staging);
-    rows.iota = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_ids);
-    ggml_set_input(rows.iota);
-
-    ggml_tensor * cur = ggml_get_rows(ctx0, rows.staging, rows.iota);
-    ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
-    return cur;
-}
-
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float tok_scale) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
     const int64_t n_embd     = hparams.n_embd;

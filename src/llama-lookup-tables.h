@@ -11,7 +11,7 @@
 #include <vector>
 
 // a lookup table whose rows the caller serves, see llama_model_params.lookup_tables
-// the model holds its metadata and where the file stores it; each context asks the caller for the rows it reads
+// the model holds its metadata and where the file stores it; the caller's graph rewrite gathers the rows it reads
 struct llama_lookup_table {
     int32_t     index = -1;
     std::string name;
@@ -58,15 +58,3 @@ private:
     std::vector<ggml_context_ptr> ctxs; // stock metadata
 };
 
-// the caller's row reader of a context, see llama_context_params.lookup_rows
-struct llama_lookup_row_reader {
-    llama_lookup_rows_callback read      = nullptr;
-    void *                     user_data = nullptr;
-
-    // the bytes of the rows `ids` of `table`, row i at dst + i*row_size; throws if a row is out of range or the caller
-    // fails
-    void read_rows(const llama_lookup_table & table, const int32_t * ids, int64_t n_ids, void * dst) const;
-};
-
-// check that no op of gf reads a served table: it has no data, only rows that the caller provides can be read
-void llama_verify_lookup_tables_graph(ggml_cgraph * gf, const llama_lookup_tables & tables);
