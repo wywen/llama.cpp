@@ -126,3 +126,12 @@ const llama_context * llama_graph_plan_context(const llama_graph_plan * plan, si
 void llama_graph_plan_free(llama_graph_plan * plan) {
     delete plan;
 }
+
+llama_context * llama_init_plan_from_model(llama_model * model, llama_context_params params) {
+    // the plan context replays the construction logs; leave them to the real construction
+    const llama_log_thread_quiet log_quiet;
+
+    // the memory, the MoE slots and the scheduler reserves of the context allocate nothing
+    llama_memory_alloc_recorder recorder(llama_memory_alloc_mode::plan);
+    return llama_init_from_model(model, params);
+}

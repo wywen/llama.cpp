@@ -459,6 +459,9 @@ extern "C" {
         uint32_t n_graph_nodes_extra;
 
         // see ggml_backend_sched_set_caller_alloc; NULL = the scheduler allocates its graphs; the struct is copied
+        // its measure is kept only by a context that allocates nothing (a plan context, see llama_init_plan_from_model,
+        // or a model loaded without allocation), which then hands every graph it reserves to measure and allocates none;
+        // a context that allocates drops it, so one caller allocator serves both
         const struct ggml_backend_sched_caller_alloc * sched_caller_alloc;
 
         // called once per graph computed on the context's scheduler (each ubatch of encode and decode, each K-shift),

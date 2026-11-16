@@ -281,6 +281,19 @@ LLAMA_API const struct llama_context * llama_graph_plan_context(const llama_grap
 
 // frees the graphs, the contexts and the memory of a plan
 LLAMA_API void llama_graph_plan_free(llama_graph_plan * plan);
+
+// Creates a plan context: as llama_init_from_model would, over memory that allocates nothing (as llama_model_memory_plan
+// builds it), without an output buffer and with logs below errors silenced while it is created. Every graph the context
+// reserves (its scheduler reserve at creation, llama_graph_reserve and its variants, llama_sched_reserve_now) is built,
+// rewritten for GGML_BACKEND_SCHED_REWRITE_RESERVE, split and placed as the real context's, and then handed to the
+// measure of params.sched_caller_alloc, if any, in place of allocating its compute buffers; without one the compute
+// buffers are only sized. Unlike llama_graph_plan_build, every callback of params is installed. The context reads
+// placeholder memory and must never decode: query it, reserve graphs on it, or pass it as the ctx_other of another
+// plan context, and free it with llama_free. Returns NULL, as llama_init_from_model, when creation fails.
+LLAMA_API struct llama_context * llama_init_plan_from_model(
+                 struct llama_model * model,
+        struct llama_context_params   params);
+
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0

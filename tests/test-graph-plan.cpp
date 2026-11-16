@@ -7,6 +7,11 @@
 // the plan of a context sampling on the backend, and of the contexts of a speculative session, which output nextn
 // embeddings and sample the draft on the backend: each context reserves its graphs before these attach and again
 // after, and the plan builds each shape in the state its context reserved it in.
+//
+// On the CPU, a plan context (llama_init_plan_from_model) with a caller allocator that measures must hand measure, in
+// order, the graphs llama_graph_plan_build builds for the same shapes: those its creation reserves, those
+// llama_graph_reserve and its extent variants reserve, and those llama_sched_reserve_now reserves once backend samplers
+// attach; and of an MTP plan context reading it, where the model has a NextN layer. It must never allocate.
 
 #include "llama.h"
 #include "llama-cpp.h"
@@ -613,6 +618,179 @@ void check_bad_member_throws(const llama_model * model, outcome & out) {
     }
 }
 
+// a plan context's caller allocator: it places nothing, refuses to allocate, and records each graph handed to measure
+// as the context's graph rewrite recorded it before the split
+struct measuring_caller {
+    rewrite_state rewrite;
+    std::vector<std::vector<std::string>> measured;
+    std::vector<std::string> problems;
+    size_t n_allocs   = 0;
+    size_t n_reserves = 0;
+    ggml_backend_sched_caller_alloc calls = {};
+};
+
+bool measuring_place(ggml_backend_sched_t /*sched*/, ggml_cgraph * /*graph*/, void * /*user_data*/) {
+    return true;
+}
+
+bool measuring_alloc(ggml_backend_sched_t /*sched*/, ggml_cgraph * /*graph*/, bool /*reserve*/, void * user_data) {
+    static_cast<measuring_caller *>(user_data)->n_allocs++;
+    return false;
+}
+
+bool measuring_measure(ggml_backend_sched_t sched, ggml_cgraph * graph, void * user_data) {
+    auto * c = static_cast<measuring_caller *>(user_data);
+    const std::string what = "measured graph " + std::to_string(c->measured.size());
+    c->measured.push_back(c->rewrite.rewritten);
+    if (c->rewrite.rewritten.empty() || c->rewrite.recorded != GGML_BACKEND_SCHED_REWRITE_RESERVE) {
+        c->problems.push_back(what + " was not rewritten for a reserve");
+    }
+    if (graph != ggml_backend_sched_get_graph(sched)) {
+        c->problems.push_back(what + " is not the graph the backends compute");
+    }
+    if (const std::string tensor = allocated_tensor(graph, *c->rewrite.model, c->rewrite.other); !tensor.empty()) {
+        c->problems.push_back(what + " reads " + tensor + ", which owns data");
+    }
+    c->rewrite.rewritten.clear();
+    return true;
+}
+
+bool measuring_reserve(ggml_backend_sched_t /*sched*/, const ggml_backend_sched_buffer_reservation * /*reservations*/, size_t /*n*/, void * user_data) {
+    static_cast<measuring_caller *>(user_data)->n_reserves++;
+    return true;
+}
+
+llama_context_params make_measuring_params(const context_case & c, measuring_caller & caller) {
+    caller.calls = { measuring_place, measuring_alloc, &caller, measuring_measure };
+    llama_context_params params = make_params(c, caller.rewrite);
+    params.cb_reserve           = measuring_reserve;
+    params.cb_reserve_user_data = &caller;
+    params.sched_caller_alloc   = &caller.calls;
+    caller.rewrite.record = true;
+    return params;
+}
+
+void check_measured(const std::string & what, const measuring_caller & caller, const llama_graph_plan * plan, size_t member,
+        size_t n_shapes, const llama_context & ctx, outcome & out) {
+    for (const std::string & problem : caller.problems) {
+        fail(out, what + ": " + problem);
+    }
+    if (caller.n_allocs != 0) {
+        fail(out, what + ": the plan context allocated " + std::to_string(caller.n_allocs) + " graphs");
+    }
+    if (caller.n_reserves != caller.measured.size()) {
+        fail(out, what + ": " + std::to_string(caller.n_reserves) + " reserve callbacks for " + std::to_string(caller.measured.size()) + " measured graphs");
+    }
+    if (const size_t bytes = compute_bytes(ctx); bytes != 0) {
+        fail(out, what + ": the plan context holds " + std::to_string(bytes) + " compute bytes");
+    }
+    if (caller.measured.size() != n_shapes) {
+        fail(out, what + ": measured " + std::to_string(caller.measured.size()) + " graphs, planned " + std::to_string(n_shapes));
+        return;
+    }
+    for (size_t s = 0; s < n_shapes; ++s) {
+        out.graphs++;
+        if (const std::string diff = graph_difference(llama_graph_plan_graph(plan, member, s), caller.measured[s], caller.rewrite.model, caller.rewrite.other); !diff.empty()) {
+            fail(out, what + " graph " + std::to_string(s) + ": " + diff);
+        }
+    }
+}
+
+// the graphs a plan context reserves are the graphs llama_graph_plan_build plans for the same shapes; the prompt graph
+// its creation reserves first is the widest one for these architectures
+void check_plan_context(const plan_case & pc, outcome & out) {
+    for (const context_case & cc : context_cases) {
+        if (pc.draft != nullptr && !cc.drafts) {
+            continue;
+        }
+        const std::string label = pc.label + " [" + cc.name + ", plan context]";
+        const uint32_t n_seqs = cc.n_seq_max;
+
+        rewrite_state rewrite_plan;
+        std::vector<llama_graph_plan_member> members;
+        std::vector<llama_graph_plan_shape> created = { widest_shape(), ubatch_shape(n_seqs, n_seqs, n_seqs), widest_shape() };
+        members.push_back({ pc.target, make_params(cc, rewrite_plan), -1, created });
+        if (pc.extents) {
+            members[0].shapes.push_back(ubatch_shape(n_seqs, n_seqs, n_seqs, 256));
+            members[0].shapes.push_back(widest_shape(256));
+        }
+        members[0].shapes.push_back(ubatch_shape(cc.n_ubatch, n_seqs, n_seqs));
+        for (llama_graph_plan_shape shape : created) {
+            shape.backend_sampling = true;
+            members[0].shapes.push_back(shape);
+        }
+        sampler_chains plan_chains;
+        plan_chains.make(n_seqs);
+        members[0].params.samplers   = plan_chains.configs.data();
+        members[0].params.n_samplers = plan_chains.configs.size();
+        if (pc.draft != nullptr) {
+            llama_context_params draft_params = make_params(cc, rewrite_plan);
+            draft_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            members.push_back({ pc.draft, draft_params, 0, created });
+        }
+
+        llama_graph_plan * plan = nullptr;
+        try {
+            plan = llama_graph_plan_build(members);
+        } catch (const std::exception & e) {
+            fail(out, label + ": the plan failed: " + e.what());
+            continue;
+        }
+
+        measuring_caller target_caller;
+        target_caller.rewrite.model = pc.target;
+        llama_context_ptr target(llama_init_plan_from_model(const_cast<llama_model *>(pc.target),
+                make_measuring_params(cc, target_caller)));
+        if (!target) {
+            fail(out, label + ": the plan context failed");
+            llama_graph_plan_free(plan);
+            continue;
+        }
+
+        if (pc.extents) {
+            if (llama_graph_reserve_extent(target.get(), n_seqs, n_seqs, n_seqs, 256) == nullptr) {
+                fail(out, label + ": an extent reserve failed");
+            }
+            if (llama_graph_reserve_widest_extent(target.get(), 256) == nullptr) {
+                fail(out, label + ": a widest extent reserve failed");
+            }
+        }
+        if (llama_graph_reserve(target.get(), cc.n_ubatch, n_seqs, n_seqs) == nullptr) {
+            fail(out, label + ": a reserve failed");
+        }
+
+        sampler_chains ctx_chains;
+        ctx_chains.make(n_seqs);
+        for (const llama_sampler_seq_config & config : ctx_chains.configs) {
+            if (!llama_set_sampler(target.get(), config.seq_id, config.sampler)) {
+                fail(out, label + ": the plan context does not sample on the backend");
+            }
+        }
+        if (!llama_sched_reserve_pending(target.get()) || !llama_sched_reserve_now(target.get()) || llama_sched_reserve_pending(target.get())) {
+            fail(out, label + ": the pending scheduler reserve did not run");
+        }
+        check_measured(label + " member 0", target_caller, plan, 0, members[0].shapes.size(), *target, out);
+
+        if (pc.draft != nullptr) {
+            measuring_caller draft_caller;
+            draft_caller.rewrite.model = pc.draft;
+            draft_caller.rewrite.other = pc.target;
+            llama_context_params draft_params = make_measuring_params(cc, draft_caller);
+            draft_params.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
+            draft_params.ctx_other = target.get();
+            llama_context_ptr draft(llama_init_plan_from_model(const_cast<llama_model *>(pc.draft), draft_params));
+            if (!draft) {
+                fail(out, label + ": the MTP plan context failed");
+            } else {
+                check_measured(label + " member 1", draft_caller, plan, 1, members[1].shapes.size(), *draft, out);
+            }
+        }
+
+        target.reset();
+        llama_graph_plan_free(plan);
+    }
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -725,6 +903,10 @@ int main(int argc, char ** argv) {
         }
         if (pc.draft != nullptr) {
             check_nextn_changes_graph(pc, out);
+        }
+        // a caller allocator places nothing, so the copies between devices it would name are left out
+        if (backend == backend_choice::cpu) {
+            check_plan_context(pc, out);
         }
     }
 
