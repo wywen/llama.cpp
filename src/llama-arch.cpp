@@ -1479,6 +1479,11 @@ bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
     }
 }
 
+// these models have sparse attention layers whose K/V rows the caller can store, see llama_context_params.kv_rows_caller
+bool llm_arch_supports_kv_rows(const llm_arch & arch) {
+    return arch == LLM_ARCH_QWEN4EXP;
+}
+
 bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_CLOVER_MOE:

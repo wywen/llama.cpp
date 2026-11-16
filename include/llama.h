@@ -498,6 +498,8 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool kv_rows_caller; // the caller stores the K/V rows of the sparse attention layers, see "Sparse attention K/V
+                             // rows stored by the caller" [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -847,6 +849,27 @@ extern "C" {
                              int32_t   n_tokens,
                              int32_t   n_context,
                              int32_t * rows);
+
+    //
+    // Sparse attention K/V rows stored by the caller [EXPERIMENTAL]
+    //
+    // A sparse attention layer (the QSA layers of qwen4exp) attends to the cells that its indexer selects for each
+    // token, over the K/V cache view of the layer masked to the selection. With llama_context_params.kv_rows_caller the
+    // caller stores the K/V rows of these layers: the context keeps their cell metadata, their rotation matrices and
+    // the indexer cache, and gives each layer metadata-only K/V tensors "cache_k_l<il>" and "cache_v_l<il>", which are
+    // in no buffer and hold no data. The graphs are built as over a cache of the context's own: they store the
+    // ubatch's new rows into these tensors and attend over their views. The caller's graph rewrite
+    // (llama_context_params.cb_graph_rewrite) must replace every op that reads them, e.g. with an attention over the
+    // rows it stores; a graph that still reads one computes over memory that holds nothing.
+    //
+    // Without K/V data the context refuses:
+    //   - shifting positions (llama_memory_seq_add, llama_memory_seq_div): logged and nothing changes, and
+    //     llama_memory_can_shift is false;
+    //   - saving or loading the state (llama_state_*, llama_state_seq_*), except partial-only sequence states,
+    //     which hold no attention K/V: they fail with an error.
+    // Removing, copying and keeping sequences change the cell metadata only: a copied cell names the same rows, which
+    // the caller keeps by cell.
+    //
 
     // the MoE layer that follows MoE layer il, the layer whose router a caller applies to layer il's router input to
     // predict its choice of experts, or -1 if il is not a MoE layer or is the last one (the next-token prediction

@@ -428,6 +428,15 @@ llama_memory_i * llama_context_create_memory(
         /*.set_user_data =*/ params.cb_kv_rot_set_user_data,
     });
 
+    // the sparse attention layers whose K/V rows the caller stores get metadata-only K/V tensors
+    llama_kv_cache_rows_params rows_params;
+    if (params.kv_rows_caller) {
+        rows_params.caller_rows = [&model](uint32_t il) {
+            return llama_model_kv_rows_layer(model, il);
+        };
+    }
+    const llama_kv_cache_rows_scope rows_scope(rows_params);
+
     return model.create_memory(params_mem, cparams);
 }
 
@@ -873,9 +882,19 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             throw std::runtime_error(std::string("failed to reserve graph for ") + probe.name + " check");
         }
 
+        // a fused node that the caller's graph rewrite removed computes nothing, so its placement proves nothing
+        const auto in_graph = [gf](const ggml_tensor * t) {
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                if (ggml_graph_node(gf, i) == t) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
         bool device_mismatch = false;
         for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
-            if (node.op != probe.op) {
+            if (node.op != probe.op || !in_graph(node.tensor)) {
                 continue;
             }
 
@@ -4771,6 +4790,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.kv_rows_caller              =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

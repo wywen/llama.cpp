@@ -12,6 +12,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <string>
 
 struct ggml_cgraph;
 struct ggml_context;
