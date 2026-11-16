@@ -829,6 +829,32 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
+    // Where the sliding-window cache of a memory places a sequence's positions in its ring of cells.
+    //
+    // With position_modular, position p is written to cell p % n_cells; a decode that would need a cell still in use
+    // by the window, or the same cell twice in one ubatch, fails (llama_decode returns 1). A caller can then find the
+    // cell of any position from the position alone. A ubatch that follows its sequence never conflicts while
+    // n_swa + n_ubatch <= n_cells + 1, which the cache size ensures unless the context is smaller than the window.
+    //
+    // position_modular is fixed when the memory is built: it is set for the SWA cache of an iSWA memory whose
+    // sequences each own a stream (n_seq_max == 1 or kv_unified == false) and whose positions have one component.
+    //
+    // in_force is position_modular and every cell of the stream currently at its position's cell. Shifting positions
+    // (llama_memory_seq_add/div) or loading a state saved without the placement can break it; until the cells off the
+    // placement are removed, the cache searches for free cells as usual.
+    //
+    // All zero when the memory has no sliding-window cache.
+    struct llama_memory_swa_placement {
+        uint32_t n_cells;           // C, the cells in the ring of the sequence's stream
+        uint32_t n_swa;             // the sliding window the ring serves
+        bool     position_modular;  // the cache places position p at cell p % n_cells
+        bool     in_force;          // position_modular, and every cell of the stream is at its position's cell
+    };
+
+    LLAMA_API struct llama_memory_swa_placement llama_memory_seq_swa_placement(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
     // Snapshot and restore the cell metadata of a sequence (positions, sequence membership, search cursor), not the
     // cell data, so that the same ubatches can be submitted again and placed identically, e.g. to compute different
     // layers of the graph in several passes. Removing the positions is not enough: a sliding-window cache reuses the

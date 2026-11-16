@@ -76,6 +76,8 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
+    llama_memory_swa_placement swa_placement(llama_seq_id seq_id) const override;
+
     llama_memory_cells_t cells_snapshot(llama_seq_id seq_id) const override;
     void cells_restore(llama_seq_id seq_id, const llama_memory_cells_i * snap) override;
 

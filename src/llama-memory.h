@@ -158,6 +158,9 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    // see llama_memory_seq_swa_placement; all zero for a memory without a sliding-window cache
+    virtual llama_memory_swa_placement swa_placement(llama_seq_id /*seq_id*/) const { return {}; }
+
     // snapshot / restore a sequence's cell metadata (positions, sequence membership and the slot-search cursor), not the cell data
     // for a caller that submits the same ubatches in several passes and needs each pass placed identically, e.g. one
     // range of layers at a time: removing the span and submitting it again does not do that, because a sliding-window
