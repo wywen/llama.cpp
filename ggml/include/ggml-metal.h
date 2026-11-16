@@ -56,6 +56,18 @@ GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t bac
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
+// Reorder barriers: the graph reorder runs while the scheduler splits the graph, before a caller can install a
+// schedule, and may move a node across a cut it does not depend on. A barrier node keeps its place: no node moves
+// across it in either direction, and a fusion group that contains it stays where it is.
+
+// make the per-layer output tensors (named "l_out-<il>") barriers (default: off)
+GGML_BACKEND_API void ggml_backend_metal_set_reorder_barriers(ggml_backend_t backend, bool enable);
+
+// make every node whose name starts with one of `prefixes` a barrier; the strings are copied, n == 0 clears the list
+// applies to graphs reordered after the call, so register every prefix the caller may cut at before allocating the graph
+GGML_BACKEND_API void ggml_backend_metal_set_reorder_barrier_prefixes(
+        ggml_backend_t backend, int n, const char * const * prefixes);
+
 #ifdef __cplusplus
 }
 #endif

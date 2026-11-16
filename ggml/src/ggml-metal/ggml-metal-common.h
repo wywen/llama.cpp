@@ -44,11 +44,24 @@ bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, const struct ggml_tensor * tenso
 // - new dst range overlaps with any existing range (src or dst)
 bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const struct ggml_tensor * tensor);
 
+// is this node a segment boundary marker (a per-layer output tensor, "l_out-<il>")?
+//
+// the reorder runs before a boundary schedule can be installed, so it identifies the
+// cut nodes by name; callers must resolve their cuts and window endpoints by the same names
+bool ggml_graph_node_is_boundary_marker(const struct ggml_tensor * node);
+
 // reorder the nodes in the graph to improve concurrency, while respecting the fusions of a device with props
+//
+// with stop_at_boundary_markers, a boundary marker node (see above) is a barrier: no node is
+// moved across it in either direction, so an encode window computed over the reordered graph
+// stays valid
+//
+// a node whose name starts with one of the barrier_prefixes is a barrier too, whether or not
+// stop_at_boundary_markers is set (see ggml_backend_metal_set_reorder_barrier_prefixes)
 //
 // note: this implementation is generic and not specific to metal
 //       if it proves to work well, we can start using it for other backends in the future
-void ggml_graph_optimize(struct ggml_cgraph * gf);
+void ggml_graph_optimize(struct ggml_cgraph * gf, bool stop_at_boundary_markers, int n_barrier_prefixes, const char * const * barrier_prefixes);
 
 // mat-mat vs mat-vec dispatch; used by both supports_op and ggml_metal_op_mul_mat*
 bool ggml_metal_op_mul_mat_use_fwht (const struct ggml_tensor * op, size_t max_tg_mem);

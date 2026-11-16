@@ -5,6 +5,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <cstring>
 #include <vector>
 
 // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
@@ -30,6 +31,39 @@ bool ggml_metal_op_mul_mat_use_fwht(const struct ggml_tensor * op, size_t max_tg
            (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) && ggml_is_contiguous(op->src[1]) &&
            ggml_is_contiguous(op) && ggml_are_same_shape(op->src[1], op) &&
            ggml_metal_fwht_supported_size(op->src[1]->ne[0], max_tg_mem);
+}
+
+// the per-layer output tensors are named "l_out-<il>"; matching the name is the only handle
+// available at optimize time, before a boundary schedule is installed
+static const char GGML_GRAPH_BOUNDARY_MARKER_PREFIX[] = "l_out-";
+
+bool ggml_graph_node_is_boundary_marker(const struct ggml_tensor * node) {
+    if (node == nullptr) {
+        return false;
+    }
+
+    const size_t len = sizeof(GGML_GRAPH_BOUNDARY_MARKER_PREFIX) - 1;
+
+    const char * name = ggml_get_name(node);
+
+    if (strncmp(name, GGML_GRAPH_BOUNDARY_MARKER_PREFIX, len) != 0) {
+        return false;
+    }
+
+    // the suffix is the layer index: at least one digit and nothing else
+    const char * suffix = name + len;
+
+    if (*suffix == '\0') {
+        return false;
+    }
+
+    for (const char * p = suffix; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
@@ -370,7 +404,21 @@ struct node_info {
     }
 };
 
-static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node_info> & nodes) {
+// does the name of node start with one of the n prefixes?
+static bool ggml_graph_node_has_name_prefix(const ggml_tensor * node, int n, const char * const * prefixes) {
+    const char * name = ggml_get_name(node);
+
+    for (int i = 0; i < n; i++) {
+        if (strncmp(name, prefixes[i], strlen(prefixes[i])) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static std::vector<int> ggml_metal_graph_optimize_reorder(
+        const std::vector<node_info> & nodes, bool stop_at_boundary_markers, int n_barrier_prefixes, const char * const * barrier_prefixes) {
     // helper to add node src and dst ranges
     const auto & h_add = [](ggml_mem_ranges_t mrs, const node_info & node) {
         // only external sources matter: sources produced by the fused group are internal
@@ -477,6 +525,32 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
         }
     };
 
+    // helper to check if a node is a barrier that nothing may be moved across: a boundary
+    // marker when stop_at_boundary_markers is set, or a node with a barrier name prefix
+    //
+    // a fused group is a barrier if any of its nodes is one
+    const auto & h_is_barrier = [&](const ggml_tensor * t) {
+        if (stop_at_boundary_markers && ggml_graph_node_is_boundary_marker(t)) {
+            return true;
+        }
+
+        return ggml_graph_node_has_name_prefix(t, n_barrier_prefixes, barrier_prefixes);
+    };
+
+    const auto & h_barrier = [&](const node_info & node) {
+        if (h_is_barrier(node.node)) {
+            return true;
+        }
+
+        for (const auto * fused : node.fused) {
+            if (h_is_barrier(fused)) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
     const int n = nodes.size();
 
     std::vector<int> res;
@@ -512,12 +586,20 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             // that many nodes forward to search for a concurrent node
             constexpr int N_FORWARD = 64;
 
-            for (int i1 = i0 + 1; i1 < i0 + N_FORWARD && i1 < n; i1++) {
+            // selected nodes are emitted before node0, so a barrier node0 picks up nothing
+            const int i1_end = h_barrier(node0) ? i0 + 1 : (i0 + N_FORWARD < n ? i0 + N_FORWARD : n);
+
+            for (int i1 = i0 + 1; i1 < i1_end; i1++) {
                 if (used[i1]) {
                     continue;
                 }
 
                 const auto & node1 = nodes[i1];
+
+                // never hoist a node from beyond a barrier, nor the barrier itself
+                if (h_barrier(node1)) {
+                    break;
+                }
 
                 // disallow reordering of certain ops
                 if (!h_safe(node1.op())) {
@@ -559,7 +641,7 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
     return res;
 }
 
-void ggml_graph_optimize(ggml_cgraph * gf) {
+void ggml_graph_optimize(ggml_cgraph * gf, bool stop_at_boundary_markers, int n_barrier_prefixes, const char * const * barrier_prefixes) {
     const int n = gf->n_nodes;
 
     std::vector<node_info> nodes;
@@ -592,7 +674,7 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
 
 #if 1
     // reorder to improve concurrency
-    const auto order = ggml_metal_graph_optimize_reorder(nodes);
+    const auto order = ggml_metal_graph_optimize_reorder(nodes, stop_at_boundary_markers, n_barrier_prefixes, barrier_prefixes);
 #else
     std::vector<int> order(nodes.size());
     for (size_t i = 0; i < nodes.size(); i++) {
