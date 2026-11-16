@@ -515,6 +515,38 @@ typedef struct {
     int32_t  nrows;
 } ggml_metal_kargs_flash_attn_ext_vec_reduce;
 
+// merge two flash attention partials, rows of [O[DV], S, M]
+typedef struct {
+    int32_t  dv;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_flash_attn_ext_merge;
+
+// normalize a flash attention partial, rows of [O[DV], S, M] -> [DV]
+typedef struct {
+    int32_t  dv;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    int32_t  has_sinks;
+} ggml_metal_kargs_flash_attn_ext_finalize;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne02;
