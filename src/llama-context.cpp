@@ -480,6 +480,10 @@ llama_context::llama_context(
     cparams.cb_graph_rewrite_user_data = params.cb_graph_rewrite_user_data;
     cparams.has_sched_caller_alloc     = params.sched_caller_alloc != nullptr;
     cparams.sched_caller_alloc         = params.sched_caller_alloc ? *params.sched_caller_alloc : ggml_backend_sched_caller_alloc{};
+    if (!no_alloc) {
+        // a context that allocates reserves its graphs through the caller allocator's alloc
+        cparams.sched_caller_alloc.measure = nullptr;
+    }
     cparams.n_graph_nodes_extra        = params.n_graph_nodes_extra;
     cparams.cb_outputs_enqueued           = params.cb_outputs_enqueued;
     cparams.cb_outputs_enqueued_user_data = params.cb_outputs_enqueued_user_data;
@@ -1048,7 +1052,7 @@ void llama_context::sched_reserve() {
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
-                no_alloc, no_alloc ? backend_buf_exp_size.data() : nullptr);
+                false, no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
@@ -1075,7 +1079,7 @@ void llama_context::sched_reserve() {
         n_splits_tg = n_splits_pp;
         n_nodes_tg  = n_nodes_pp;
     } else {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), no_alloc);
+        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get());
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -1088,7 +1092,7 @@ void llama_context::sched_reserve() {
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
-        ggml_cgraph * gf = graph_reserve_widest(mctx.get(), no_alloc);
+        ggml_cgraph * gf = graph_reserve_widest(mctx.get());
 
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
@@ -1153,9 +1157,9 @@ std::array<uint32_t, 3> llama_context::graph_shape_widest() const {
     }
 }
 
-ggml_cgraph * llama_context::graph_reserve_widest(const llama_memory_context_i * mctx, bool split_only) {
+ggml_cgraph * llama_context::graph_reserve_widest(const llama_memory_context_i * mctx) {
     const auto [n_tokens, n_seqs, n_outputs] = graph_shape_widest();
-    return graph_reserve(n_tokens, n_seqs, n_outputs, mctx, split_only);
+    return graph_reserve(n_tokens, n_seqs, n_outputs, mctx);
 }
 
 void llama_context::synchronize() {
@@ -3156,9 +3160,20 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // initialize scheduler with the specified graph
     if (split_only) {
-        const bool ok = sizes ? ggml_backend_sched_reserve_size(sched.get(), gf, sizes) : ggml_backend_sched_split_graph(sched.get(), gf);
-        if (!ok) {
+        GGML_ASSERT(!sizes);
+        if (!ggml_backend_sched_split_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to rewrite the graph\n", __func__);
+            return nullptr;
+        }
+    } else if (no_alloc) {
+        // a context that allocates nothing sizes the compute buffers, or hands the graph to a caller allocator's measure
+        std::vector<size_t> sizes_unused;
+        if (!sizes) {
+            sizes_unused.resize(ggml_backend_sched_get_n_backends(sched.get()));
+            sizes = sizes_unused.data();
+        }
+        if (!ggml_backend_sched_reserve_size(sched.get(), gf, sizes)) {
+            LLAMA_LOG_ERROR("%s: failed to measure the compute buffers\n", __func__);
             return nullptr;
         }
     } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
