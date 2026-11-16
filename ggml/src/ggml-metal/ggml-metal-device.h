@@ -362,6 +362,10 @@ typedef struct ggml_metal_buffer * ggml_metal_buffer_t;
 
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared);
 ggml_metal_buffer_t ggml_metal_buffer_map (ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size);
+// see ggml_backend_metal_buffer_from_ranges: range i has sizes[i] bytes and the Metal buffer metals[i]
+ggml_metal_buffer_t ggml_metal_buffer_map_ranges(ggml_metal_device_t dev, void * base, size_t size, const size_t * sizes, void * const * metals, int n_ranges);
+// see ggml_backend_metal_buffer_set_range
+bool ggml_metal_buffer_set_range(ggml_metal_buffer_t buf, int i, void * metal);
 
 void   ggml_metal_buffer_free     (ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_base (ggml_metal_buffer_t buf);
@@ -381,6 +385,10 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 // Metal buffer based on the host memory pointer
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
+
+// the Metal buffer that holds t (or the tensor it views); aborts, naming t, when t has no buffer or its buffer is not a
+// Metal buffer, whose context would otherwise be read as one
+ggml_metal_buffer_t ggml_metal_tensor_buffer(const struct ggml_tensor * t);
 
 #ifdef __cplusplus
 }

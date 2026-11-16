@@ -56,6 +56,16 @@ GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t bac
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
+// set the number of extra command buffers a graph compute is encoded across (default: 1)
+// kernels are fused only within one command buffer, so with n_cb > 0 the split points can break a fusable group;
+// with n_cb == 0 the whole graph is encoded in one command buffer and fuses the same way however it is sized
+// obtained through ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_set_n_cb")
+typedef void (*ggml_backend_metal_set_n_cb_t)(ggml_backend_t backend, int n_cb);
+
+// the command buffer error that put the backend into its error state, or NULL if there is none
+// lets a caller tell a GPU timeout from a fault or an abandoned queue; valid until the backend computes again or is freed
+GGML_BACKEND_API const char * ggml_backend_metal_last_error(ggml_backend_t backend);
+
 // Reorder barriers: the graph reorder runs while the scheduler splits the graph, before a caller can install a
 // schedule, and may move a node across a cut it does not depend on. A barrier node keeps its place: no node moves
 // across it in either direction, and a fusion group that contains it stays where it is.
@@ -67,6 +77,81 @@ GGML_BACKEND_API void ggml_backend_metal_set_reorder_barriers(ggml_backend_t bac
 // applies to graphs reordered after the call, so register every prefix the caller may cut at before allocating the graph
 GGML_BACKEND_API void ggml_backend_metal_set_reorder_barrier_prefixes(
         ggml_backend_t backend, int n, const char * const * prefixes);
+
+//
+// buffers over caller host memory, resolved through a caller range table
+//
+// A buffer from ggml_backend_metal_buffer_from_ranges spans the caller's host memory [base, base + size), tiled by
+// n_ranges consecutive ranges: range 0 starts at base, each next one where the previous ends, and the last ends at
+// base + size. Each range has a Metal buffer that the caller supplies, or none. A kernel that uses a tensor binds the
+// Metal buffer of the range that holds the tensor, at the tensor's offset in the range. Encoding a kernel that uses a
+// tensor in a range with no Metal buffer, or a tensor that crosses a range boundary, aborts, naming the tensor. Host
+// access to the tensors (set, get, memset, clear) reads and writes the host memory and needs no Metal buffer.
+//
+// Ownership: the backend makes no Metal buffer and no residency set for such a buffer, and never retains, releases or
+// requests residency for the caller's objects. A range's Metal buffer is an id<MTLBuffer> of the device, passed as
+// void *, whose contents hold the whole range, e.g. a no-copy buffer over the range's pages. The backend reads it when it encodes or blits work that uses a tensor in the range, from the call that
+// installs it until the call that replaces it. The caller keeps it alive over that span, and after it until every
+// command buffer that binds it has completed: the backend encodes with unretained references. Freeing the backend
+// buffer releases nothing of the caller's.
+//
+// A buffer type that a caller makes with a Metal device as its device is supported by that device, like the device's
+// own types; its buffers must place every tensor in Metal buffers, e.g. in buffers from
+// ggml_backend_metal_buffer_from_ranges.
+//
+
+// a range of a buffer from ggml_backend_metal_buffer_from_ranges
+struct ggml_backend_metal_range {
+    size_t size;  // bytes, > 0
+    void * metal; // id<MTLBuffer> over the range, or NULL for none
+};
+
+// NULL, with a log line, when dev is not a Metal device, the ranges do not tile [base, base + size), or a Metal buffer
+// is not of the device or does not hold its range; the range table is copied
+GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_metal_buffer_from_ranges(
+        ggml_backend_dev_t dev, void * base, size_t size, const struct ggml_backend_metal_range * ranges, int n_ranges);
+
+// replace range i's Metal buffer with `metal` (NULL: none), checked as above; false, with a log line and nothing
+// changed, when the buffer is not from ggml_backend_metal_buffer_from_ranges, i is not one of its ranges or `metal` is
+// refused. Work that binds other ranges may be encoded or in flight meanwhile. Before replacing a range's Metal buffer
+// the caller ensures that no encode that uses the range is running; command buffers in flight that bind the previous
+// one still use it, so the caller releases it only once they have completed.
+GGML_BACKEND_API bool ggml_backend_metal_buffer_set_range(ggml_backend_buffer_t buffer, int i, void * metal);
+
+// the id<MTLDevice> of a Metal device, as void *, not retained: valid while the device is; NULL, with a log line, for
+// a device that is not a Metal device
+GGML_BACKEND_API void * ggml_backend_metal_device_get_mtl_device(ggml_backend_dev_t dev);
+
+//
+// encoding into caller command buffers
+//
+// A caller that schedules a graph itself encodes ranges of its nodes into command buffers it makes from the device's
+// queue, commits them in the order it chooses, and owns them throughout. The backend holds nothing of the caller's.
+//
+
+// Encode nodes [i0, i1) of `graph` into `cmd_buf`, an id<MTLCommandBuffer> of the backend's device passed as void *,
+// as a graph compute encodes the same nodes into one of its command buffers: the same pipelines, the same fusion (a
+// fused run never crosses i0 or i1), the same concurrency, with memory barriers between dependent nodes of the range.
+// Every tensor the range uses must be in a Metal buffer of the device.
+// The call makes and ends its own encoders on cmd_buf and neither enqueues, commits, retains nor waits for it; it
+// holds nothing once it returns. The caller keeps cmd_buf and every buffer the range binds alive until cmd_buf has
+// completed: the backend encodes with unretained references.
+// GGML_STATUS_FAILED, logging why, for a range outside the graph, a NULL command buffer or a backend that is not Metal.
+GGML_BACKEND_API enum ggml_status ggml_backend_metal_encode_nodes(
+        ggml_backend_t backend, struct ggml_cgraph * graph, int i0, int i1, void * cmd_buf);
+
+// the id<MTLCommandQueue> the device's backends commit to, as void *, not retained: valid while the device is;
+// NULL, with a log line, for a device that is not a Metal device
+GGML_BACKEND_API void * ggml_backend_metal_device_get_mtl_queue(ggml_backend_dev_t dev);
+
+// the id<MTLBuffer> that holds t's data, as void *, not retained, and in *offs the offset of the data in it; valid
+// until the range holding t is replaced (ggml_backend_metal_buffer_set_range) or its buffer is freed; aborts, naming
+// t, when t is not in a Metal buffer or its range has no Metal buffer
+GGML_BACKEND_API void * ggml_backend_metal_tensor_mtl_buffer(const struct ggml_tensor * t, size_t * offs);
+
+// commit an empty command buffer to the backend's queue and make it the one ggml_backend_synchronize waits for, so a
+// synchronize also waits for every command buffer the caller committed to the queue before the call
+GGML_BACKEND_API void ggml_backend_metal_commit_fence(ggml_backend_t backend);
 
 #ifdef __cplusplus
 }

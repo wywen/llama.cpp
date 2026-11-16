@@ -1263,10 +1263,9 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     }
                 }
 
-                dev->props.use_residency_sets = true;
-#if defined(GGML_METAL_HAS_RESIDENCY_SETS)
-                dev->props.use_residency_sets = getenv("GGML_METAL_NO_RESIDENCY") == nil;
-#endif
+                // ggml's residency sets are disconnected whatever GGML_METAL_NO_RESIDENCY says: a buffer built
+                // over caller-supplied Metal buffers leaves keeping them resident to the caller
+                dev->props.use_residency_sets = false;
 
                 dev->props.use_shared_buffers = dev->props.has_unified_memory;
 #if TARGET_OS_OSX && TARGET_CPU_X86_64
@@ -2065,6 +2064,17 @@ struct ggml_metal_buffer_wrapper {
     id<MTLBuffer> metal;
 };
 
+// a range of a buffer whose Metal buffers the caller supplies (see ggml_backend_metal_buffer_from_ranges): its host
+// bytes, the caller's id<MTLBuffer> over them or NULL, never retained here, and the offset of the range's first byte
+// in that Metal buffer
+struct ggml_metal_buffer_range {
+    void   * data;
+    size_t   size;
+
+    _Atomic(void *) metal;
+    size_t          metal_offs;
+};
+
 struct ggml_metal_buffer {
     void * all_data;
     size_t all_size;
@@ -2076,6 +2086,10 @@ struct ggml_metal_buffer {
     // multiple buffers are used only to avoid the maximum buffer size limitation when using mmap
     int n_buffers;
     struct ggml_metal_buffer_wrapper buffers[GGML_METAL_MAX_BUFFERS];
+
+    // set for a buffer whose Metal buffers the caller supplies: n_buffers is 0 and there is no residency set
+    int n_ranges;
+    struct ggml_metal_buffer_range * ranges;
 
     bool use_residency_sets;
 
@@ -2343,6 +2357,105 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
     return res;
 }
 
+// whether `metal` (an id<MTLBuffer> or NULL) may back range i of buf: NULL, or a buffer of buf's device whose contents
+// hold the whole range, with *offs set to the offset of the range in them (0 for NULL); false with a log line otherwise
+static bool ggml_metal_buffer_range_accepts(ggml_metal_buffer_t buf, int i, void * metal, size_t * offs, const char * caller) {
+    *offs = 0;
+
+    if (metal == NULL) {
+        return true;
+    }
+
+    id<MTLBuffer> mtl = (id<MTLBuffer>) metal;
+    const struct ggml_metal_buffer_range * range = &buf->ranges[i];
+
+    if (mtl.device != buf->dev->mtl_device) {
+        GGML_LOG_ERROR("%s: the Metal buffer of range %d is not of this device\n", caller, i);
+        return false;
+    }
+
+    const uintptr_t contents = (uintptr_t) mtl.contents;
+    const uintptr_t beg      = (uintptr_t) range->data;
+    if (contents == 0 || beg < contents || beg - contents > mtl.length || range->size > mtl.length - (beg - contents)) {
+        GGML_LOG_ERROR("%s: the Metal buffer of range %d does not hold the range's %zu bytes\n", caller, i, range->size);
+        return false;
+    }
+
+    *offs = beg - contents;
+
+    return true;
+}
+
+ggml_metal_buffer_t ggml_metal_buffer_map_ranges(ggml_metal_device_t dev, void * base, size_t size,
+        const size_t * sizes, void * const * metals, int n_ranges) {
+    if (base == NULL || size == 0 || n_ranges <= 0 || sizes == NULL || metals == NULL) {
+        GGML_LOG_ERROR("%s: the buffer must be non-empty and have at least one range\n", __func__);
+        return NULL;
+    }
+
+    ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
+
+    res->dev = dev;
+
+    res->all_data = base;
+    res->all_size = size;
+
+    res->is_shared = true;
+    res->owned = false;
+
+    res->n_ranges = n_ranges;
+    res->ranges = calloc(n_ranges, sizeof(struct ggml_metal_buffer_range));
+
+    size_t offs = 0;
+    for (int i = 0; i < n_ranges; ++i) {
+        if (sizes[i] == 0 || sizes[i] > size - offs) {
+            GGML_LOG_ERROR("%s: range %d (%zu bytes at offset %zu) is empty or ends past the buffer's %zu bytes\n",
+                    __func__, i, sizes[i], offs, size);
+            ggml_metal_buffer_free(res);
+            return NULL;
+        }
+        res->ranges[i].data = (uint8_t *) base + offs;
+        res->ranges[i].size = sizes[i];
+        atomic_init(&res->ranges[i].metal, NULL);
+        offs += sizes[i];
+    }
+    if (offs != size) {
+        GGML_LOG_ERROR("%s: the ranges cover %zu of the buffer's %zu bytes\n", __func__, offs, size);
+        ggml_metal_buffer_free(res);
+        return NULL;
+    }
+
+    for (int i = 0; i < n_ranges; ++i) {
+        if (!ggml_metal_buffer_range_accepts(res, i, metals[i], &res->ranges[i].metal_offs, __func__)) {
+            ggml_metal_buffer_free(res);
+            return NULL;
+        }
+        atomic_init(&res->ranges[i].metal, metals[i]);
+    }
+
+    return res;
+}
+
+bool ggml_metal_buffer_set_range(ggml_metal_buffer_t buf, int i, void * metal) {
+    if (buf->ranges == NULL) {
+        GGML_LOG_ERROR("%s: not a buffer from ggml_backend_metal_buffer_from_ranges\n", __func__);
+        return false;
+    }
+    if (i < 0 || i >= buf->n_ranges) {
+        GGML_LOG_ERROR("%s: range %d is not in [0, %d)\n", __func__, i, buf->n_ranges);
+        return false;
+    }
+    size_t offs = 0;
+    if (!ggml_metal_buffer_range_accepts(buf, i, metal, &offs, __func__)) {
+        return false;
+    }
+
+    buf->ranges[i].metal_offs = offs;
+    atomic_store_explicit(&buf->ranges[i].metal, metal, memory_order_release);
+
+    return true;
+}
+
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
     @autoreleasepool {
         ggml_metal_device_rsets_rm(buf->dev, buf->rset);
@@ -2358,6 +2471,7 @@ void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
         vm_deallocate((vm_map_t)mach_task_self(), (vm_address_t)buf->all_data, buf->all_size);
     }
 
+    free(buf->ranges);
     free(buf);
 }
 
@@ -2386,7 +2500,7 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
             id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
             [encoder fillBuffer:bid_dst.metal
-                          range:NSMakeRange(bid_dst.offs, bid_dst.offs + size)
+                          range:NSMakeRange(bid_dst.offs, size)
                           value:value];
 
             [encoder endEncoding];
@@ -2556,8 +2670,7 @@ void ggml_metal_buffer_set_tensor_n(ggml_metal_buffer_t buf, struct ggml_tensor 
                     continue;
                 }
 
-                ggml_backend_buffer_t tensor_buf_ggml = tensors[i]->view_src ? tensors[i]->view_src->buffer : tensors[i]->buffer;
-                ggml_metal_buffer_t tensor_buf = (ggml_metal_buffer_t) tensor_buf_ggml->context;
+                ggml_metal_buffer_t tensor_buf = ggml_metal_tensor_buffer(tensors[i]);
                 struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(tensor_buf, tensors[i]);
                 bid_dst.offs += offsets[i];
 
@@ -2613,8 +2726,7 @@ void ggml_metal_buffer_get_tensor_n(ggml_metal_buffer_t buf, const struct ggml_t
                     continue;
                 }
 
-                ggml_backend_buffer_t tensor_buf_ggml = tensors[i]->view_src ? tensors[i]->view_src->buffer : tensors[i]->buffer;
-                ggml_metal_buffer_t tensor_buf = (ggml_metal_buffer_t) tensor_buf_ggml->context;
+                ggml_metal_buffer_t tensor_buf = ggml_metal_tensor_buffer(tensors[i]);
                 struct ggml_metal_buffer_id bid_src = ggml_metal_buffer_get_id(tensor_buf, tensors[i]);
                 bid_src.offs += offsets[i];
 
@@ -2636,7 +2748,7 @@ void ggml_metal_buffer_get_tensor_n(ggml_metal_buffer_t buf, const struct ggml_t
 }
 
 bool ggml_metal_buffer_cpy_tensor(ggml_metal_buffer_t buf_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
-    ggml_metal_buffer_t buf_src = (ggml_metal_buffer_t)src->buffer->context;
+    ggml_metal_buffer_t buf_src = ggml_metal_tensor_buffer(src);
 
     const size_t size = ggml_nbytes(src);
 
@@ -2683,8 +2795,7 @@ bool ggml_metal_buffer_cpy_tensor_n(ggml_metal_buffer_t buf_dst, const struct gg
 
     bool all_shared = true;
     for (size_t i = 0; i < n_tensors; ++i) {
-        ggml_backend_buffer_t src_buf = srcs[i]->view_src ? srcs[i]->view_src->buffer : srcs[i]->buffer;
-        ggml_metal_buffer_t buf_src = (ggml_metal_buffer_t) src_buf->context;
+        ggml_metal_buffer_t buf_src = ggml_metal_tensor_buffer(srcs[i]);
         if (!buf_dst->is_shared || !buf_src->is_shared) {
             all_shared = false;
             break;
@@ -2704,10 +2815,8 @@ bool ggml_metal_buffer_cpy_tensor_n(ggml_metal_buffer_t buf_dst, const struct gg
         struct ggml_metal_buffer_id * bid_dsts = malloc(n_tensors * sizeof(struct ggml_metal_buffer_id));
 
         for (size_t i = 0; i < n_tensors; ++i) {
-            ggml_backend_buffer_t src_buf = srcs[i]->view_src ? srcs[i]->view_src->buffer : srcs[i]->buffer;
-            ggml_backend_buffer_t dst_buf = dsts[i]->view_src ? dsts[i]->view_src->buffer : dsts[i]->buffer;
-            ggml_metal_buffer_t buf_src = (ggml_metal_buffer_t) src_buf->context;
-            ggml_metal_buffer_t buf_dst_i = (ggml_metal_buffer_t) dst_buf->context;
+            ggml_metal_buffer_t buf_src = ggml_metal_tensor_buffer(srcs[i]);
+            ggml_metal_buffer_t buf_dst_i = ggml_metal_tensor_buffer(dsts[i]);
             bid_srcs[i] = ggml_metal_buffer_get_id(buf_src, srcs[i]);
             bid_dsts[i] = ggml_metal_buffer_get_id(buf_dst_i, dsts[i]);
 
@@ -2768,7 +2877,50 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
     }
 }
 
+// the caller's Metal buffer of the range that holds t, and t's offset in it; aborts, naming t, when t crosses a range
+// boundary or lies outside the buffer, or when its range has no Metal buffer
+static struct ggml_metal_buffer_id ggml_metal_buffer_get_range_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {
+    const uintptr_t beg = (uintptr_t) t->data;
+    const uintptr_t end = beg + ggml_nbytes(t);
+
+    // the last range that starts at or before t; an empty tensor on a boundary ends in the range before it
+    int lo = 0;
+    int hi = buf->n_ranges;
+    while (hi - lo > 1) {
+        const int mid = lo + (hi - lo)/2;
+        if ((uintptr_t) buf->ranges[mid].data <= beg) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    if (beg == end && lo > 0 && beg == (uintptr_t) buf->ranges[lo].data &&
+            atomic_load_explicit(&buf->ranges[lo - 1].metal, memory_order_acquire) != NULL) {
+        lo--;
+    }
+
+    const struct ggml_metal_buffer_range * range = &buf->ranges[lo];
+    if (beg < (uintptr_t) range->data || end > (uintptr_t) range->data + range->size) {
+        GGML_ABORT("%s: tensor '%s' crosses a range boundary of a buffer from ggml_backend_metal_buffer_from_ranges, "
+                "or lies outside it; no single Metal buffer contains it", __func__, t->name);
+    }
+
+    void * metal = atomic_load_explicit(&range->metal, memory_order_acquire);
+    if (metal == NULL) {
+        GGML_ABORT("%s: tensor '%s' is in range %d of a buffer from ggml_backend_metal_buffer_from_ranges, which has "
+                "no Metal buffer; set one with ggml_backend_metal_buffer_set_range before encoding work that uses it",
+                __func__, t->name, lo);
+    }
+
+    return (struct ggml_metal_buffer_id) { metal, range->metal_offs + (beg - (uintptr_t) range->data) };
+}
+
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {
+    if (buf->ranges != NULL) {
+        return ggml_metal_buffer_get_range_id(buf, t);
+    }
+
     struct ggml_metal_buffer_id res = { nil, 0 };
 
     const int64_t tsize = ggml_nbytes(t);
@@ -2777,12 +2929,9 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
     for (int i = 0; i < buf->n_buffers; ++i) {
         const int64_t ioffs = (int64_t) t->data - (int64_t) buf->buffers[i].data;
 
-        //GGML_LOG_INFO("ioffs = %10ld, tsize = %10ld, sum = %10ld, buf->buffers[%d].size = %10ld\n", ioffs, tsize, ioffs + tsize, i, buf->buffers[i].size);
         if (ioffs >= 0 && ioffs + tsize <= (int64_t) buf->buffers[i].size) {
             res.metal = buf->buffers[i].metal;
             res.offs  = (size_t) ioffs;
-
-            //GGML_LOG_INFO("%s: tensor '%16s', offs = %8ld\n", __func__, t->name, *offs);
 
             return res;
         }

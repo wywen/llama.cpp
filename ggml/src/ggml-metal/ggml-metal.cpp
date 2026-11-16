@@ -11,6 +11,7 @@
 
 #include <mutex>
 #include <string>
+#include <vector>
 
 #define GGML_METAL_NAME "MTL"
 #define GGML_METAL_MAX_DEVICES 16
@@ -718,6 +719,41 @@ void ggml_backend_metal_set_abort_callback(ggml_backend_t backend, ggml_abort_ca
     ggml_metal_set_abort_callback(ctx, abort_callback, user_data);
 }
 
+const char * ggml_backend_metal_last_error(ggml_backend_t backend) {
+    if (!ggml_backend_is_metal(backend)) {
+        return NULL;
+    }
+
+    return ggml_metal_last_error((ggml_metal_t)backend->context);
+}
+
+enum ggml_status ggml_backend_metal_encode_nodes(
+        ggml_backend_t backend, struct ggml_cgraph * graph, int i0, int i1, void * cmd_buf) {
+    if (!ggml_backend_is_metal(backend)) {
+        GGML_LOG_ERROR("%s: not a Metal backend\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+    if (graph == NULL || i0 < 0 || i1 < i0 || i1 > graph->n_nodes) {
+        GGML_LOG_ERROR("%s: nodes [%d, %d) are not a range of a graph of %d nodes\n", __func__,
+                i0, i1, graph != NULL ? graph->n_nodes : 0);
+        return GGML_STATUS_FAILED;
+    }
+    if (cmd_buf == NULL) {
+        GGML_LOG_ERROR("%s: no command buffer\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+
+    ggml_metal_encode_nodes((ggml_metal_t)backend->context, graph, i0, i1, cmd_buf);
+
+    return GGML_STATUS_SUCCESS;
+}
+
+void ggml_backend_metal_commit_fence(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_commit_fence((ggml_metal_t)backend->context);
+}
+
 void ggml_backend_metal_set_reorder_barriers(ggml_backend_t backend, bool enable) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
 
@@ -832,6 +868,10 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
 
     ggml_metal_buffer_t res = ggml_metal_buffer_map(ctx_dev, ptr, size, max_tensor_size);
 
+    if (res == NULL) {
+        return NULL;
+    }
+
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
 
     return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_mapped(props_dev->device), ggml_backend_metal_buffer_shared_i, res, size);
@@ -843,14 +883,10 @@ static bool ggml_backend_metal_device_supports_op(ggml_backend_dev_t dev, const 
     return ggml_metal_device_supports_op(ctx_dev, op);
 }
 
+// the device's own buffer types, and any buffer type a caller makes for the device: such a type's buffers place
+// their tensors in Metal buffers, e.g. in buffers from ggml_backend_metal_buffer_from_ranges
 static bool ggml_backend_metal_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    return
-        buft->device == dev && (
-        buft->iface.get_name == ggml_backend_metal_buffer_type_shared_get_name ||
-        buft->iface.get_name == ggml_backend_metal_buffer_type_private_get_name ||
-        buft->iface.get_name == ggml_backend_metal_buffer_type_mapped_get_name);
-
-    GGML_UNUSED(dev);
+    return buft->device == dev;
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
@@ -1033,6 +1069,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
     }
+    if (strcmp(name, "ggml_backend_metal_set_n_cb") == 0) {
+        return (void *)ggml_backend_metal_set_n_cb;
+    }
     if (strcmp(name, "ggml_backend_metal_tuning_set_fa_vec_override") == 0) {
         return (void *)ggml_backend_metal_tuning_set_fa_vec_override;
     }
@@ -1141,6 +1180,93 @@ ggml_backend_reg_t ggml_backend_metal_reg(void) {
     }
 
     return &reg;
+}
+
+//
+// buffers over caller host memory, resolved through a caller range table
+//
+
+static bool ggml_backend_dev_is_metal(ggml_backend_dev_t dev) {
+    return dev != NULL && dev->iface.buffer_from_host_ptr == ggml_backend_metal_device_buffer_mapped;
+}
+
+void * ggml_backend_metal_device_get_mtl_device(ggml_backend_dev_t dev) {
+    if (!ggml_backend_dev_is_metal(dev)) {
+        GGML_LOG_ERROR("%s: not a Metal device\n", __func__);
+        return NULL;
+    }
+
+    return ggml_metal_device_get_obj((ggml_metal_device_t)dev->context);
+}
+
+void * ggml_backend_metal_device_get_mtl_queue(ggml_backend_dev_t dev) {
+    if (!ggml_backend_dev_is_metal(dev)) {
+        GGML_LOG_ERROR("%s: not a Metal device\n", __func__);
+        return NULL;
+    }
+
+    return ggml_metal_device_get_queue((ggml_metal_device_t)dev->context);
+}
+
+ggml_backend_buffer_t ggml_backend_metal_buffer_from_ranges(
+        ggml_backend_dev_t dev, void * base, size_t size, const struct ggml_backend_metal_range * ranges, int n_ranges) {
+    if (!ggml_backend_dev_is_metal(dev)) {
+        GGML_LOG_ERROR("%s: not a Metal device\n", __func__);
+        return NULL;
+    }
+    if (n_ranges <= 0 || ranges == NULL) {
+        GGML_LOG_ERROR("%s: a buffer needs at least one range\n", __func__);
+        return NULL;
+    }
+
+    std::vector<size_t> sizes(n_ranges);
+    std::vector<void *> metals(n_ranges);
+    for (int i = 0; i < n_ranges; ++i) {
+        sizes[i]  = ranges[i].size;
+        metals[i] = ranges[i].metal;
+    }
+
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+
+    ggml_metal_buffer_t res = ggml_metal_buffer_map_ranges(ctx_dev, base, size, sizes.data(), metals.data(), n_ranges);
+
+    if (res == NULL) {
+        return NULL;
+    }
+
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
+
+    return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_mapped(props_dev->device), ggml_backend_metal_buffer_shared_i, res, size);
+}
+
+ggml_metal_buffer_t ggml_metal_tensor_buffer(const struct ggml_tensor * t) {
+    ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;
+
+    if (buffer == NULL || !ggml_backend_buffer_is_metal(buffer)) {
+        GGML_ABORT("%s: tensor '%s' is not in a Metal buffer", __func__, t->name);
+    }
+
+    return (ggml_metal_buffer_t) buffer->context;
+}
+
+void * ggml_backend_metal_tensor_mtl_buffer(const struct ggml_tensor * t, size_t * offs) {
+    const ggml_metal_buffer_id id = ggml_metal_buffer_get_id(ggml_metal_tensor_buffer(t), t);
+    if (id.metal == NULL) {
+        GGML_ABORT("%s: tensor '%s' is in no Metal buffer of its buffer", __func__, t->name);
+    }
+
+    *offs = id.offs;
+
+    return id.metal;
+}
+
+bool ggml_backend_metal_buffer_set_range(ggml_backend_buffer_t buffer, int i, void * metal) {
+    if (buffer == NULL || !ggml_backend_buffer_is_metal(buffer)) {
+        GGML_LOG_ERROR("%s: not a Metal buffer\n", __func__);
+        return false;
+    }
+
+    return ggml_metal_buffer_set_range((ggml_metal_buffer_t)buffer->context, i, metal);
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_metal_reg)
