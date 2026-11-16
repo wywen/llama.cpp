@@ -15,6 +15,9 @@
 
 extern const double NMSE_THRESHOLD;
 
+// a restored state continues bitwise: any difference fails
+extern const double NMSE_BITWISE;
+
 //
 // comparison
 //

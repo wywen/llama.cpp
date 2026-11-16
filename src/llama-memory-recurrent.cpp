@@ -384,6 +384,8 @@ void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
             auto & cell = cells[tail_id];
             if (cell.has_seq_id(seq_id) && p0 <= cell.pos && cell.pos < p1) {
                 cell.pos /= d;
+                // positions no longer count tokens, so a rollback by position would not match the snapshots
+                cell.rs_max = 0;
             }
         }
     }
@@ -415,6 +417,55 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     }
 
     return result;
+}
+
+void llama_memory_recurrent::cells_snapshot_to(llama_memory_recurrent_cells & out) const {
+    out.cells    = cells;
+    out.head     = head;
+    out.size     = size;
+    out.used     = used;
+    out.n        = n;
+    out.rs_z     = rs_z;
+    out.rs_idx   = rs_idx;
+}
+
+bool llama_memory_recurrent::cells_can_restore(const llama_memory_recurrent_cells & in) const {
+    return in.size == size && in.cells.size() == cells.size() &&
+           in.rs_idx.size() == rs_idx.size();
+}
+
+void llama_memory_recurrent::cells_restore_from(const llama_memory_recurrent_cells & in) {
+    GGML_ASSERT(cells_can_restore(in));
+
+    cells = in.cells;
+    head  = in.head;
+    used  = in.used;
+    n     = in.n;
+    rs_z  = in.rs_z;
+
+    // a rollback pending at snapshot time is pending again, even if a decode since consumed it
+    rs_idx = in.rs_idx;
+}
+
+llama_memory_cells_t llama_memory_recurrent::cells_snapshot(llama_seq_id seq_id) const {
+    GGML_ASSERT(seq_id >= 0 && (uint32_t) seq_id < n_seq_max);
+
+    auto * res = new llama_memory_recurrent_cells();
+    cells_snapshot_to(*res);
+
+    return res;
+}
+
+void llama_memory_recurrent::cells_restore(llama_seq_id seq_id, const llama_memory_cells_i * snap) {
+    GGML_ASSERT(seq_id >= 0 && (uint32_t) seq_id < n_seq_max);
+
+    const auto * s = dynamic_cast<const llama_memory_recurrent_cells *>(snap);
+    if (!s || !cells_can_restore(*s)) {
+        LLAMA_LOG_ERROR("%s: the snapshot was not taken from a recurrent memory of this size, memory left unchanged\n", __func__);
+        return;
+    }
+
+    cells_restore_from(*s);
 }
 
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
@@ -643,8 +694,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             auto & dst_cell = cells[dst_id];
             auto & src_cell = cells[src_id];
 
-            std::swap(dst_cell.pos, src_cell.pos);
-            std::swap(dst_cell.src, src_cell.src);
+            std::swap(dst_cell.pos,    src_cell.pos);
+            std::swap(dst_cell.src,    src_cell.src);
+            std::swap(dst_cell.rs_max, src_cell.rs_max);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
 
             // swap tails
@@ -709,6 +761,16 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 // Stage the source ids for all used cells to allow correct seq_* behavior
                 // and still make these values available when setting the inputs
                 cells[i].src0 = cells[i].src;
+            }
+            // a moved or rolled back cell only gets snapshot 0 refreshed, so its other snapshots are stale
+            if (i >= min + (int) n_seqs) {
+                bool rolled_back = false;
+                for (const llama_seq_id seq_id : cells[i].seq_id) {
+                    rolled_back = rolled_back || (n_rs_seq > 0 && rs_idx[seq_id] != 0);
+                }
+                if (cells[i].src0 != i || rolled_back) {
+                    cells[i].rs_max = 0;
+                }
             }
             cells[i].src = i; // avoid moving or clearing twice
         }

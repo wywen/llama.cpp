@@ -17,6 +17,16 @@ struct llama_context;
 // llama_kv_cache
 //
 
+// saved cell metadata of one or more KV caches: one entry per cache, in snapshot order
+struct llama_kv_cache_cells : llama_memory_cells_i {
+    struct entry {
+        llama_kv_cells cells;
+        uint32_t       head = 0;
+    };
+
+    std::vector<entry> entries;
+};
+
 class llama_kv_cache : public llama_memory_i {
 public:
     struct stream_copy_info {
@@ -145,6 +155,14 @@ public:
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
+
+    llama_memory_cells_t cells_snapshot(llama_seq_id seq_id) const override;
+    void cells_restore(llama_seq_id seq_id, const llama_memory_cells_i * snap) override;
+
+    // append this cache's (cells, head) pair for `seq_id` to `out`, and restore from the entry of `in` at `idx`, advancing it
+    // for llama_kv_cache_iswa, which snapshots its two sub-caches through one handle
+    void cells_snapshot_append(llama_seq_id seq_id, llama_kv_cache_cells & out) const;
+    void cells_restore_at(llama_seq_id seq_id, const llama_kv_cache_cells & in, size_t & idx);
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 

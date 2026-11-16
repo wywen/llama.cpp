@@ -13,6 +13,7 @@
 #include <stdexcept>
 
 const double NMSE_THRESHOLD = 1e-5;
+const double NMSE_BITWISE   = 0.0;
 
 //
 // comparison

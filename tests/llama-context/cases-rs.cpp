@@ -487,11 +487,301 @@ struct case_shared_seq_reserve : ctx_test {
     }
 };
 
+// a rollback reads snapshots that only the last ubatch of the sequence wrote into its own cell: after a state load
+// (which restores the final state only) or after a decode of other sequences moved the cell (which copies the final
+// state only), the other snapshots are stale and every rollback must be refused
+struct case_rollback_stale : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "rollback_stale"; }
+
+    const char * description() const override {
+        return "seq_rm refuses rollbacks after a state load or after a decode of other sequences moved the state";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr llama_pos n_prefix = 16;
+        constexpr llama_pos n_tail   = 3; // a ubatch whose snapshots serve rollbacks of 1 and 2
+
+        char arch_name[64] = {};
+        llama_model_meta_val_str(mr.model, "general.architecture", arch_name, sizeof(arch_name));
+        const llm_arch arch = llama_arch_from_string(arch_name);
+        const bool is_dsv4 = arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41;
+
+        const auto make_ctx = [&](uint32_t n_seq_max) {
+            ctx_opts opts;
+            opts.n_batch   = 64;
+            opts.n_ubatch  = 64;
+            opts.n_seq_max = n_seq_max;
+            opts.n_rs_seq  = 8;
+            return mr.ctx(opts);
+        };
+
+        const auto decode_with_tail = [&](llama_context * ctx, llama_seq_id seq_id) {
+            return decode_gen(ctx, n_vocab, seq_id, 0, n_prefix) &&
+                   decode_gen(ctx, n_vocab, seq_id, n_prefix, n_prefix + n_tail);
+        };
+
+        // state load
+        {
+            llama_context_ptr ctx_src = make_ctx(1);
+            llama_context_ptr ctx_dst = make_ctx(1);
+            if (!ctx_src || !ctx_dst) {
+                return case_result::fail();
+            }
+            if (llama_n_rs_seq(ctx_src.get()) == 0) {
+                return case_result::skip("n_rs_seq is disabled");
+            }
+
+            CTX_REQUIRE(decode_with_tail(ctx_src.get(), 0), "the source decode failed");
+
+            std::vector<uint8_t> state;
+            CTX_REQUIRE(get_seq_state(ctx_src.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, state) &&
+                        set_seq_state(ctx_dst.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE, state),
+                    "the state save / load failed");
+
+            // control: the source still serves the rollback
+            CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx_src.get()), 0, n_prefix + n_tail - 1, -1),
+                    "a rollback of 1 after a 3-token ubatch was refused");
+            CTX_REQUIRE(!llama_memory_seq_rm(llama_get_memory(ctx_dst.get()), 0, n_prefix + n_tail - 1, -1),
+                    "a rollback after a state load was accepted");
+            CTX_REQUIRE(llama_memory_seq_pos_max(llama_get_memory(ctx_dst.get()), 0) == n_prefix + n_tail - 1,
+                    "a refused rollback changed the position");
+        }
+
+        // the DSV4 cache keeps its snapshots per sequence, not in cells that move
+        if (is_dsv4 || arch_reserves_single_seq(mr.model)) {
+            return case_result::pass();
+        }
+
+        // moved state: seqs 0, 2, 1 take cells 0, 1, 2; a decode of seqs 0 and 1 gathers them into cells 0 and 1,
+        // which moves seq 2 to cell 2 with only its final state copied
+        {
+            llama_context_ptr ctx = make_ctx(3);
+            if (!ctx) {
+                return case_result::fail();
+            }
+
+            CTX_REQUIRE(decode_with_tail(ctx.get(), 0) && decode_with_tail(ctx.get(), 2) && decode_with_tail(ctx.get(), 1),
+                    "the per-sequence decodes failed");
+
+            const llama_pos pos = n_prefix + n_tail;
+            common_batch batch(ctx.get());
+            for (const llama_seq_id s : { 0, 1 }) {
+                batch.add(gen_token(n_vocab, s, pos), pos, s, true);
+            }
+            CTX_REQUIRE(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0, "the two-sequence decode failed");
+
+            CTX_REQUIRE(!llama_memory_seq_rm(llama_get_memory(ctx.get()), 2, n_prefix + n_tail - 1, -1),
+                    "a rollback of a sequence whose state another decode moved was accepted");
+            CTX_REQUIRE(llama_memory_seq_pos_max(llama_get_memory(ctx.get()), 2) == n_prefix + n_tail - 1,
+                    "a refused rollback changed the position");
+        }
+
+        return case_result::pass();
+    }
+};
+
+// A restored cells snapshot must place the next ubatches exactly as the memory would have placed them at snapshot time.
+// Cell data is not restored, so each comparison reads only state the detour between snapshot and restore left untouched,
+// against a context that never took the detour. Memories that keep no cells snapshot (DeepSeek V4, and the hybrid
+// memories with sliding window attention) must return none.
+struct case_cells_snapshot : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "cells_snapshot"; }
+
+    const char * description() const override {
+        return "a restored recurrent cells snapshot places the next ubatches like a context that never took the detour, and replays them alike";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+
+        constexpr uint32_t n_ubatch = 16;
+
+        char arch_name[64] = {};
+        llama_model_meta_val_str(mr.model, "general.architecture", arch_name, sizeof(arch_name));
+        const llm_arch arch = llama_arch_from_string(arch_name);
+        const bool no_snapshot = arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || llama_model_n_swa(mr.model) > 0;
+
+        const auto make_ctx = [&](uint32_t n_seq_max, uint32_t n_rs_seq) {
+            ctx_opts opts;
+            opts.n_ctx      = 256*n_seq_max;
+            opts.n_batch    = 256;
+            opts.n_ubatch   = n_ubatch;
+            opts.n_seq_max  = n_seq_max;
+            opts.n_rs_seq   = n_rs_seq;
+            opts.kv_unified = 0;
+            return mr.ctx(opts);
+        };
+
+        // decode tokens [p0, p1) of `stream` into seq 0 in one batch; with `logits`, every token is an output and its logits are appended
+        const auto decode_stream = [&](llama_context * ctx, llama_seq_id stream, llama_pos p0, llama_pos p1, std::vector<float> * logits) {
+            common_batch batch(ctx);
+            for (llama_pos pos = p0; pos < p1; ++pos) {
+                batch.add(gen_token(n_vocab, stream, pos), pos, 0, logits != nullptr || pos + 1 == p1);
+            }
+            bool ok = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+            for (int32_t i = 0; ok && logits != nullptr && i < p1 - p0; ++i) {
+                const float * l = llama_get_logits_ith(ctx, i);
+                ok = l != nullptr;
+                if (ok) {
+                    logits->insert(logits->end(), l, l + n_vocab);
+                }
+            }
+            return ok;
+        };
+
+        const auto pos_max = [](llama_context * ctx) {
+            return llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+        };
+
+        // same ubatch shapes of more than 8 tokens on both sides, so a correct restore matches bitwise
+        const auto max_diff = [](const std::vector<float> & a, const std::vector<float> & b) {
+            float diff = a.size() == b.size() ? 0.0f : INFINITY;
+            for (size_t i = 0; i < a.size() && i < b.size(); ++i) {
+                diff = std::max(diff, std::fabs(a[i] - b[i]));
+            }
+            return diff;
+        };
+
+        if (no_snapshot) {
+            llama_context_ptr ctx = make_ctx(1, 0);
+            if (!ctx) {
+                return case_result::fail();
+            }
+            llama_memory_cells_t snap = llama_memory_cells_snapshot(llama_get_memory(ctx.get()), 0);
+            const bool none = snap == nullptr;
+            llama_memory_cells_free(snap);
+            CTX_REQUIRE(none, std::string("unexpected cells snapshot for ") + arch_name);
+            return case_result::pass();
+        }
+
+        for (const uint32_t n_rs_seq : { 0u, 2u, 8u }) {
+            const std::string tag = "n_rs_seq " + std::to_string(n_rs_seq) + ": ";
+
+            // a fresh sequence: after the restore its cell has no source again, so the next decode starts from the
+            // zeroed state and position 0, as if the multi-ubatch detour never happened
+            {
+                llama_context_ptr ctx     = make_ctx(1, n_rs_seq);
+                llama_context_ptr ctx_ref = make_ctx(1, n_rs_seq);
+                if (!ctx || !ctx_ref) {
+                    return case_result::fail();
+                }
+
+                llama_memory_cells_t snap = llama_memory_cells_snapshot(llama_get_memory(ctx.get()), 0);
+                CTX_REQUIRE(snap != nullptr, tag + "no cells snapshot for a recurrent memory");
+
+                const bool detour_ok = decode_stream(ctx.get(), 1, 0, 3*n_ubatch, nullptr) && pos_max(ctx.get()) == 3*n_ubatch - 1;
+                llama_memory_cells_restore(llama_get_memory(ctx.get()), 0, snap);
+                llama_memory_cells_free(snap);
+                CTX_REQUIRE(detour_ok, tag + "the fresh detour failed");
+                CTX_REQUIRE(pos_max(ctx.get()) == -1, tag + "the restored fresh sequence is not empty");
+
+                std::vector<float> logits;
+                std::vector<float> logits_ref;
+                CTX_REQUIRE(decode_stream(ctx.get(),     2, 0, 2*n_ubatch, &logits) &&
+                            decode_stream(ctx_ref.get(), 2, 0, 2*n_ubatch, &logits_ref), tag + "the fresh decode failed");
+                const float diff = max_diff(logits, logits_ref);
+                CTX_REQUIRE(diff == 0.0f, tag + "fresh sequence logits differ from the reference, max diff " + std::to_string(diff));
+            }
+
+            // a replayed prompt: the same ubatches submitted again after a restore are placed, and with an indexer cache
+            // re-pooled, as the first submission was, so every pass computes the same logits
+            {
+                llama_context_ptr ctx = make_ctx(1, n_rs_seq);
+                if (!ctx) {
+                    return case_result::fail();
+                }
+
+                llama_memory_cells_t snap = llama_memory_cells_snapshot(llama_get_memory(ctx.get()), 0);
+                CTX_REQUIRE(snap != nullptr, tag + "no cells snapshot to replay from");
+
+                std::vector<float> logits_first;
+                std::vector<float> logits_replay;
+                bool ok = decode_stream(ctx.get(), 2, 0, 3*n_ubatch, &logits_first);
+                for (int pass = 0; ok && pass < 2; ++pass) {
+                    llama_memory_cells_restore(llama_get_memory(ctx.get()), 0, snap);
+                    logits_replay.clear();
+                    ok = pos_max(ctx.get()) == -1 && decode_stream(ctx.get(), 2, 0, 3*n_ubatch, &logits_replay);
+                }
+                llama_memory_cells_free(snap);
+                CTX_REQUIRE(ok, tag + "the replayed decode failed");
+                const float diff = max_diff(logits_first, logits_replay);
+                CTX_REQUIRE(diff == 0.0f, tag + "replayed prompt logits differ from the first pass, max diff " + std::to_string(diff));
+            }
+
+            // a pending partial removal: the restore must make it pending again though the detour consumed it; the detour
+            // decodes n_rollback tokens, so it writes snapshots 0 .. n_rollback - 1 and leaves snapshot n_rollback, the one
+            // the pending removal restores, as the prompt decode left it
+            {
+                llama_context_ptr ctx     = make_ctx(1, n_rs_seq);
+                llama_context_ptr ctx_ref = make_ctx(1, n_rs_seq);
+                if (!ctx || !ctx_ref) {
+                    return case_result::fail();
+                }
+
+                const uint32_t n_rollback = std::min<uint32_t>(llama_n_rs_seq(ctx.get()), 3);
+                if (n_rollback > 0) {
+                    const llama_pos n_prompt = 2*n_ubatch;
+                    const llama_pos p0       = n_prompt - (llama_pos) n_rollback;
+                    // the prompt ends in a ubatch of n_rollback + 1 tokens, whose snapshots serve the removal
+                    const llama_pos p_tail   = p0 - 1;
+
+                    const auto decode_prompt = [&](llama_context * c) {
+                        return decode_stream(c, 1, 0, p_tail, nullptr) && decode_stream(c, 1, p_tail, n_prompt, nullptr) &&
+                               llama_memory_seq_rm(llama_get_memory(c), 0, p0, -1);
+                    };
+                    CTX_REQUIRE(decode_prompt(ctx.get()) && decode_prompt(ctx_ref.get()), tag + "the prompt decode and removal failed");
+
+                    llama_memory_cells_t snap = llama_memory_cells_snapshot(llama_get_memory(ctx.get()), 0);
+                    const bool detour_ok = snap != nullptr && decode_stream(ctx.get(), 3, p0, n_prompt, nullptr) && pos_max(ctx.get()) == n_prompt - 1;
+                    llama_memory_cells_restore(llama_get_memory(ctx.get()), 0, snap);
+                    llama_memory_cells_free(snap);
+                    CTX_REQUIRE(detour_ok, tag + "the pending detour failed");
+                    CTX_REQUIRE(pos_max(ctx.get()) == p0 - 1, tag + "the restore did not bring back the removal");
+
+                    std::vector<float> logits;
+                    std::vector<float> logits_ref;
+                    CTX_REQUIRE(decode_stream(ctx.get(),     2, p0, p0 + n_ubatch, &logits) &&
+                                decode_stream(ctx_ref.get(), 2, p0, p0 + n_ubatch, &logits_ref), tag + "the pending decode failed");
+                    const float diff = max_diff(logits, logits_ref);
+                    CTX_REQUIRE(diff == 0.0f, tag + "pending removal logits differ from the reference, max diff " + std::to_string(diff));
+                }
+            }
+
+            // a snapshot of a memory with other cell counts leaves the cells alone
+            {
+                llama_context_ptr ctx   = make_ctx(1, n_rs_seq);
+                llama_context_ptr ctx_2 = make_ctx(2, n_rs_seq);
+                if (!ctx || !ctx_2) {
+                    return case_result::fail();
+                }
+
+                llama_memory_cells_t snap = llama_memory_cells_snapshot(llama_get_memory(ctx_2.get()), 0);
+                const bool ok = snap != nullptr && decode_stream(ctx.get(), 1, 0, n_ubatch, nullptr);
+                if (ok) {
+                    llama_memory_cells_restore(llama_get_memory(ctx.get()), 0, snap);
+                }
+                llama_memory_cells_free(snap);
+                CTX_REQUIRE(ok && pos_max(ctx.get()) == n_ubatch - 1, tag + "a snapshot of another memory size changed the cells");
+            }
+        }
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
     cases.push_back(std::make_unique<case_rollback>());
     cases.push_back(std::make_unique<case_rollback_bound>());
+    cases.push_back(std::make_unique<case_rollback_stale>());
+    cases.push_back(std::make_unique<case_cells_snapshot>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
 

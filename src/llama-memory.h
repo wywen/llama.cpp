@@ -99,6 +99,13 @@ struct llama_memory_context_i {
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
 
+// opaque owner of a sequence's saved cell metadata (see cells_snapshot), released with llama_memory_cells_free
+struct llama_memory_cells_i {
+    virtual ~llama_memory_cells_i() = default;
+};
+
+using llama_memory_cells_t = llama_memory_cells_i *;
+
 // general concept of LLM memory
 // the KV cache is a type of LLM memory, but there can be other types
 struct llama_memory_i {
@@ -147,6 +154,14 @@ struct llama_memory_i {
 
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
+
+    // snapshot / restore a sequence's cell metadata (positions, sequence membership and the slot-search cursor), not the cell data
+    // for a caller that submits the same ubatches in several passes and needs each pass placed identically, e.g. one
+    // range of layers at a time: removing the span and submitting it again does not do that, because a sliding-window
+    // cache recycles cells as positions scroll out
+    // restore reports no failure; the recurrent and hybrid memories log a snapshot they cannot take and leave their cells unchanged
+    virtual llama_memory_cells_t cells_snapshot(llama_seq_id /*seq_id*/) const { return nullptr; }
+    virtual void cells_restore(llama_seq_id /*seq_id*/, const llama_memory_cells_i * /*snap*/) {}
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 

@@ -16,6 +16,12 @@
 // utilizes instances of llama_memory_recurrent and llama_kv_cache to
 //   support models where each layer may be either attention-based or recurrent
 
+// saved cell metadata of both caches; neither cache accepts this handle in place of its own
+struct llama_memory_hybrid_cells : llama_memory_cells_i {
+    llama_kv_cache_cells         attn;
+    llama_memory_recurrent_cells recr;
+};
+
 class llama_memory_hybrid : public llama_memory_i {
 public:
     llama_memory_hybrid(
@@ -68,6 +74,11 @@ public:
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
+
+    // the attention part is scoped like llama_kv_cache (the stream of seq_id), the recurrent part covers every sequence
+    // restore is all or nothing
+    llama_memory_cells_t cells_snapshot(llama_seq_id seq_id) const override;
+    void cells_restore(llama_seq_id seq_id, const llama_memory_cells_i * snap) override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 

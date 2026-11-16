@@ -354,6 +354,12 @@ int main(int argc, char ** argv) {
         params.model.path = models_dir;
     }
 
+    // a restore must continue bitwise like the uninterrupted run; without flash attention over an F32 cache,
+    // CPU attention sums in cell order, so misplaced cells change the logits (the command line still overrides these)
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    params.cache_type_k    = GGML_TYPE_F32;
+    params.cache_type_v    = GGML_TYPE_F32;
+
     if (!common_params_parse(fargc, filtered_argv.data(), params, LLAMA_EXAMPLE_COMMON, print_usage)) {
         return 1;
     }
