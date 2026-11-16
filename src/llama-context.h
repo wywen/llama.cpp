@@ -321,13 +321,6 @@ public:
     // the ubatch shape graph_reserve_widest reserves: n_tokens, n_seqs, n_outputs
     std::array<uint32_t, 3> graph_shape_widest() const;
 
-    // builds a graph with a dummy ubatch of the specified size, as graph_reserve does, into a graph result of its own,
-    // and runs the scheduler's graph rewrite on it; nothing is split, placed or allocated, and the context's own graph
-    // results are left as they are. The graph reads `mctx` while it is built, and the memory tensors after. Its
-    // sequences sample with the context's backend samplers where `backend_sampling`, as before none attached elsewhere.
-    llm_graph_result_ptr graph_plan(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool backend_sampling);
-
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
@@ -382,7 +375,7 @@ private:
     const llama_model & model;
 
     // the context backs its memory with placeholders and reserves its graphs without allocating compute buffers: its
-    // model was loaded without allocation, or it is built for a plan (llama_graph_plan_build, llama_init_plan_from_model)
+    // model was loaded without allocation, or it is a plan context (llama_init_plan_from_model)
     const bool no_alloc;
 
     llama_cparams cparams{};
