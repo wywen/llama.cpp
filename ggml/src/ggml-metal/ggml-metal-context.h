@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ggml-metal.h"
 #include "ggml-metal-device.h"
 
 #ifdef __cplusplus
@@ -41,11 +42,11 @@ void ggml_metal_event_wait  (ggml_metal_t ctx, ggml_metal_event_t ev);
 
 ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx);
 
-// See ggml_backend_metal_set_reorder_barriers.
-void ggml_metal_set_reorder_barriers(ggml_metal_t ctx, bool enable);
+// See ggml_backend_metal_set_reorder_barrier.
+void ggml_metal_set_reorder_barrier(ggml_metal_t ctx, ggml_backend_metal_reorder_barrier_t is_barrier, void * user_data);
 
-// See ggml_backend_metal_set_reorder_barrier_prefixes.
-void ggml_metal_set_reorder_barrier_prefixes(ggml_metal_t ctx, int n, const char * const * prefixes);
+// See ggml_backend_metal_get_reorder_barrier.
+ggml_backend_metal_reorder_barrier_t ggml_metal_get_reorder_barrier(ggml_metal_t ctx, void ** user_data);
 
 void ggml_metal_set_n_cb            (ggml_metal_t ctx, int n_cb);
 void ggml_metal_set_abort_callback  (ggml_metal_t ctx, ggml_abort_callback abort_callback, void * user_data);
