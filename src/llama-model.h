@@ -1144,7 +1144,7 @@ struct llama_model_base : public llama_model {
 
 const char * llm_type_name(llm_type type);
 
-// a sparse attention layer whose K/V rows the caller can store and serve, see llama_context_params.kv_rows
+// a sparse attention layer whose K/V rows the caller can store, see llama_context_params.kv_rows_caller
 bool llama_model_kv_rows_layer(const llama_model & model, uint32_t il);
 
 // convenience macro for loading local variables for load_tensors() in llama_model_base
