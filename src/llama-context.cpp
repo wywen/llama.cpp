@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-memory-alloc.h"
 #include "llama-mmap.h"
@@ -391,6 +392,12 @@ llama_memory_i * llama_context_create_memory(
         /*.mem_other =*/ cparams.mem_shares_other ? llama_get_memory(cparams.ctx_other) : nullptr,
         /*.no_alloc  =*/ model.no_alloc(),
     };
+
+    const llama_kv_cache_rot_scope rot_scope({
+        /*.buft          =*/ params.kv_rot_buft,
+        /*.set           =*/ params.cb_kv_rot_set,
+        /*.set_user_data =*/ params.cb_kv_rot_set_user_data,
+    });
 
     return model.create_memory(params_mem, cparams);
 }
@@ -4586,6 +4593,9 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.kv_rot_buft                 =*/ nullptr,
+        /*.cb_kv_rot_set               =*/ nullptr,
+        /*.cb_kv_rot_set_user_data     =*/ nullptr,
         /*.moe_cache_size              =*/ 0,
         /*.moe_cache_cpu_share         =*/ 0.0f,
         /*.abort_callback              =*/ nullptr,

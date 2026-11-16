@@ -256,6 +256,10 @@ extern "C" {
 
     typedef bool (*llama_progress_callback)(float progress, void * user_data);
 
+    // receives the contents of one KV cache attention rotation matrix, `size` bytes at `data`, in place of the host write
+    // into `tensor`; `data` is valid only for the duration of the call
+    typedef void (*llama_kv_rot_set_callback)(struct ggml_tensor * tensor, const void * data, size_t size, void * user_data);
+
     // Input data for llama_encode/llama_decode
     // A llama_batch object can contain input about one or many sequences
     // The provided arrays (i.e. token, embd, pos, etc.) must have size of n_tokens
@@ -405,6 +409,14 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+
+        // buffer type for the KV cache attention rotation matrices, NULL = the buffer type of each layer's cache [EXPERIMENTAL]
+        ggml_backend_buffer_type_t kv_rot_buft;
+
+        // receives the contents of each KV cache attention rotation matrix instead of llama writing them, NULL = llama writes them [EXPERIMENTAL]
+        // for a buffer type that cannot take host writes: the callback puts the bytes into `tensor`
+        llama_kv_rot_set_callback cb_kv_rot_set;
+        void *                    cb_kv_rot_set_user_data;
 
         size_t moe_cache_size;      // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
         float  moe_cache_cpu_share; // share of the MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]

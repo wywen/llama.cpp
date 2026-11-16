@@ -17,6 +17,31 @@ struct llama_context;
 // llama_kv_cache
 //
 
+// how every llama_kv_cache constructed on this thread while in scope places and fills its attention rotation matrices
+// a context opens one around building its memory; scopes nest, the innermost applies
+struct llama_kv_cache_rot_params {
+    // buffer type of the matrices, nullptr keeps the buffer type of each layer's cache tensor
+    ggml_backend_buffer_type_t buft = nullptr;
+    // receives each matrix's contents in place of the host write into it, nullptr writes them
+    llama_kv_rot_set_callback set = nullptr;
+    void * set_user_data = nullptr;
+};
+
+class llama_kv_cache_rot_scope {
+public:
+    explicit llama_kv_cache_rot_scope(const llama_kv_cache_rot_params & params);
+    ~llama_kv_cache_rot_scope();
+
+    llama_kv_cache_rot_scope(const llama_kv_cache_rot_scope &) = delete;
+    llama_kv_cache_rot_scope & operator=(const llama_kv_cache_rot_scope &) = delete;
+
+    // the params of the innermost scope on this thread, the defaults outside any scope
+    static const llama_kv_cache_rot_params & current();
+
+private:
+    llama_kv_cache_rot_params outer;
+};
+
 // saved cell metadata of one or more KV caches: one entry per cache, in snapshot order
 struct llama_kv_cache_cells : llama_memory_cells_i {
     struct entry {

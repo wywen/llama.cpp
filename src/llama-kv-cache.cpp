@@ -60,6 +60,24 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 }
 
 //
+// llama_kv_cache_rot_scope
+//
+
+static thread_local llama_kv_cache_rot_params kv_cache_rot_params;
+
+llama_kv_cache_rot_scope::llama_kv_cache_rot_scope(const llama_kv_cache_rot_params & params) : outer(kv_cache_rot_params) {
+    kv_cache_rot_params = params;
+}
+
+llama_kv_cache_rot_scope::~llama_kv_cache_rot_scope() {
+    kv_cache_rot_params = outer;
+}
+
+const llama_kv_cache_rot_params & llama_kv_cache_rot_scope::current() {
+    return kv_cache_rot_params;
+}
+
+//
 // llama_kv_cache
 //
 
@@ -391,6 +409,9 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
         return;
     }
 
+    const llama_kv_cache_rot_params rot_params = llama_kv_cache_rot_scope::current();
+    const ggml_backend_buffer_type_t rot_buft = rot_params.buft;
+
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr> ctx_map;
     for (auto & layer : layers) {
         for (bool is_k : { true, false }) {
@@ -400,7 +421,7 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
                 continue;
             }
 
-            const auto buft = ggml_backend_buffer_get_type(cache->buffer);
+            const auto buft = rot_buft ? rot_buft : ggml_backend_buffer_get_type(cache->buffer);
             auto & ctx = ctx_map[buft];
             if (!ctx) {
                 ggml_init_params params = { 2*layers.size()*ggml_tensor_overhead(), nullptr, true };
@@ -426,8 +447,14 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
     if (!attn_rot_bufs.no_alloc) {
         for (const auto & layer : layers) {
             for (auto * t : { layer.k_rot, layer.v_rot }) {
-                if (t) {
-                    ggml_backend_tensor_set(t, attn_rot_hadamard.at(t->ne[0]).data(), 0, ggml_nbytes(t));
+                if (!t) {
+                    continue;
+                }
+                const float * data = attn_rot_hadamard.at(t->ne[0]).data();
+                if (rot_params.set) {
+                    rot_params.set(t, data, ggml_nbytes(t), rot_params.set_user_data);
+                } else {
+                    ggml_backend_tensor_set(t, data, 0, ggml_nbytes(t));
                 }
             }
         }
