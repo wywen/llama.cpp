@@ -418,15 +418,22 @@ static size_t ggml_vbuffer_size(struct vbuffer * buf) {
     return size;
 }
 
-static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage) {
+static int ggml_vbuffer_n_chunks(struct vbuffer * buf) {
+    int n = 0;
+    while (buf != NULL && n < GGML_VBUFFER_MAX_CHUNKS && buf->chunks[n] != NULL) {
+        n++;
+    }
+    return n;
+}
+
+static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const size_t * chunk_sizes, int n_chunks, enum ggml_backend_buffer_usage usage) {
     struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
     if (buf == NULL) {
         return NULL;
     }
 
-    for (int n = 0; n < talloc->n_chunks; n++) {
-        size_t chunk_size = talloc->chunks[n]->max_size;
-        buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
+    for (int n = 0; n < n_chunks; n++) {
+        buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_sizes[n]);
         if (buf->chunks[n] == NULL) {
             ggml_vbuffer_free(buf);
             return NULL;
@@ -482,6 +489,9 @@ struct ggml_gallocr {
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
     int n_buffers;
 
+    ggml_gallocr_reserve_callback callback_reserve;
+    void * callback_reserve_user_data;
+
     struct ggml_hash_set hash_set;
     struct hash_node * hash_values; // [hash_set.size]
 
@@ -490,6 +500,9 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // bytes of each chunk addressed by the last graph allocated with ggml_gallocr_alloc_graph
+    size_t * chunk_extents; // [n_buffers * GGML_VBUFFER_MAX_CHUNKS]
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -525,11 +538,20 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
     }
     galloc->n_buffers = n_bufs;
 
+    galloc->chunk_extents = calloc((size_t) n_bufs * GGML_VBUFFER_MAX_CHUNKS, sizeof(size_t));
+    GGML_ASSERT(galloc->chunk_extents != NULL);
+
     return galloc;
 }
 
 ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft) {
     return ggml_gallocr_new_n(&buft, 1);
+}
+
+void ggml_gallocr_set_reserve_callback(ggml_gallocr_t galloc, ggml_gallocr_reserve_callback callback, void * user_data) {
+    GGML_ASSERT(galloc != NULL);
+    galloc->callback_reserve = callback;
+    galloc->callback_reserve_user_data = user_data;
 }
 
 void ggml_gallocr_free(ggml_gallocr_t galloc) {
@@ -571,6 +593,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->bufts);
     free(galloc->buffers);
     free(galloc->buf_tallocs);
+    free(galloc->chunk_extents);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
     free(galloc);
@@ -844,6 +867,56 @@ static bool ggml_gallocr_reserve_n_impl(
     // allocate in hash table
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
 
+    if (!no_alloc && galloc->callback_reserve != NULL) {
+        if ((size_t) galloc->n_buffers > SIZE_MAX / GGML_VBUFFER_MAX_CHUNKS ||
+            (size_t) galloc->n_buffers * GGML_VBUFFER_MAX_CHUNKS >
+                SIZE_MAX / sizeof(struct ggml_backend_sched_buffer_reservation)) {
+            return false;
+        }
+        const size_t capacity = (size_t) galloc->n_buffers * GGML_VBUFFER_MAX_CHUNKS;
+        struct ggml_backend_sched_buffer_reservation * reservations =
+            malloc(capacity * sizeof(*reservations));
+        GGML_ASSERT(reservations != NULL);
+
+        size_t n_reservations = 0;
+        for (int i = 0; i < galloc->n_buffers; i++) {
+            bool shared = false;
+            for (int j = 0; j < i; j++) {
+                if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
+                    shared = true;
+                    break;
+                }
+            }
+            if (shared) {
+                continue;
+            }
+
+            struct vbuffer * buffer = galloc->buffers[i];
+            for (int c = 0; c < GGML_VBUFFER_MAX_CHUNKS; c++) {
+                const size_t current_size = buffer ? ggml_vbuffer_chunk_size(buffer, c) : 0;
+                const size_t planned_size = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
+                const size_t candidate_size = MAX(current_size, planned_size);
+                if (candidate_size == 0) {
+                    continue;
+                }
+                reservations[n_reservations++] =
+                    (struct ggml_backend_sched_buffer_reservation) {
+                        .backend_index = i,
+                        .size = candidate_size,
+                    };
+            }
+        }
+
+        const bool accepted = galloc->callback_reserve(
+            reservations, n_reservations, galloc->callback_reserve_user_data);
+        free(reservations);
+        if (!accepted) {
+            return false;
+        }
+    }
+
+    // publish the planned layout only after the reserve callback accepts, so a refusal keeps the
+    // previous layout paired with its buffers
     // set the node_allocs from the hash table
     if (galloc->n_nodes < graph->n_nodes) {
         free(galloc->node_allocs);
@@ -910,12 +983,15 @@ static bool ggml_gallocr_reserve_n_impl(
 
         // even if there are no tensors allocated in this buffer, we still need to allocate it to initialize views
         bool realloc = galloc->buffers[i] == NULL;
+        size_t chunk_sizes[GGML_VBUFFER_MAX_CHUNKS] = {0};
+        const int n_chunks = MAX(galloc->buf_tallocs[i]->n_chunks, ggml_vbuffer_n_chunks(galloc->buffers[i]));
         size_t new_size = 0;
-        for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
+        for (int c = 0; c < n_chunks; c++) {
             size_t cur_chunk_size = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], c) : 0;
-            size_t new_chunk_size = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
-            new_size += new_chunk_size;
-            if (new_chunk_size > cur_chunk_size) {
+            size_t planned_size   = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
+            chunk_sizes[c] = MAX(cur_chunk_size, planned_size);
+            new_size += chunk_sizes[c];
+            if (planned_size > cur_chunk_size) {
                 realloc = true;
             }
         }
@@ -933,11 +1009,31 @@ static bool ggml_gallocr_reserve_n_impl(
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
-                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], chunk_sizes, n_chunks, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     return false;
                 }
+            }
+        }
+    }
+
+    if (!no_alloc) {
+        // extents are reported under the first buffer id that shares the allocator
+        memset(galloc->chunk_extents, 0, (size_t) galloc->n_buffers * GGML_VBUFFER_MAX_CHUNKS * sizeof(size_t));
+        for (int i = 0; i < galloc->n_buffers; i++) {
+            bool shared = false;
+            for (int j = 0; j < i; j++) {
+                if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
+                    shared = true;
+                    break;
+                }
+            }
+            if (shared) {
+                continue;
+            }
+            for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
+                galloc->chunk_extents[(size_t) i * GGML_VBUFFER_MAX_CHUNKS + c] = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
             }
         }
     }
@@ -964,6 +1060,20 @@ bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
     return ggml_gallocr_reserve_n(galloc, graph, NULL, NULL);
 }
 
+// account the bytes a placed tensor addresses in its chunk
+static void ggml_gallocr_note_extent(ggml_gallocr_t galloc, const struct ggml_tensor * tensor, const struct tensor_alloc * tensor_alloc) {
+    const int buffer_id = tensor_alloc->buffer_id;
+    int owner = buffer_id;
+    for (int j = 0; j < buffer_id; j++) {
+        if (galloc->buf_tallocs[j] == galloc->buf_tallocs[buffer_id]) {
+            owner = j;
+            break;
+        }
+    }
+    size_t * extent = &galloc->chunk_extents[(size_t) owner * GGML_VBUFFER_MAX_CHUNKS + tensor_alloc->addr.chunk];
+    *extent = MAX(*extent, tensor_alloc->addr.offset + ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor));
+}
+
 static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor, struct tensor_alloc * tensor_alloc) {
     int buffer_id = tensor_alloc->buffer_id;
     assert(tensor->data || tensor->view_src || ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
@@ -982,6 +1092,7 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
             assert(tensor_alloc->addr.offset != SIZE_MAX);
             assert(ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
             ggml_vbuffer_tensor_alloc(galloc->buffers[buffer_id], tensor, tensor_alloc->addr);
+            ggml_gallocr_note_extent(galloc, tensor, tensor_alloc);
         } else {
             if (tensor->buffer == NULL) {
                 // this tensor was allocated without ggml-backend
@@ -1069,6 +1180,8 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
             ggml_vbuffer_reset(galloc->buffers[i]);
         }
     }
+
+    memset(galloc->chunk_extents, 0, (size_t) galloc->n_buffers * GGML_VBUFFER_MAX_CHUNKS * sizeof(size_t));
 
     // allocate the graph tensors from the previous assignments
     // leafs
@@ -1167,4 +1280,32 @@ size_t ggml_backend_alloc_ctx_tensors_from_buft_size(struct ggml_context * ctx, 
 
 ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors(struct ggml_context * ctx, ggml_backend_t backend) {
     return ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(backend));
+}
+
+size_t ggml_gallocr_get_chunk_extent(ggml_gallocr_t galloc, int buffer_id, int chunk, ggml_backend_buffer_t * chunk_buffer) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+
+    if (chunk_buffer != NULL) {
+        *chunk_buffer = NULL;
+    }
+
+    if (chunk < 0 || chunk >= GGML_VBUFFER_MAX_CHUNKS || galloc->buffers[buffer_id] == NULL) {
+        return 0;
+    }
+
+    for (int i = 0; i < buffer_id; i++) {
+        if (galloc->buf_tallocs[i] == galloc->buf_tallocs[buffer_id]) {
+            // extents are reported under the first buffer id that shares the allocator
+            return 0;
+        }
+    }
+
+    ggml_backend_buffer_t buffer = galloc->buffers[buffer_id]->chunks[chunk];
+    if (buffer == NULL) {
+        return 0;
+    }
+    if (chunk_buffer != NULL) {
+        *chunk_buffer = buffer;
+    }
+    return galloc->chunk_extents[(size_t) buffer_id * GGML_VBUFFER_MAX_CHUNKS + chunk];
 }

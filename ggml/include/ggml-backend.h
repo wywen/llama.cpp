@@ -349,12 +349,75 @@ extern "C" {
     // `graph_size_changed` is true if the graph size changed since the last allocation
     typedef void (*ggml_backend_sched_realloc_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
+    // a compute buffer chunk that a reserve would allocate
+    // allocators shared by several backends are listed once, under the first backend index
+    struct ggml_backend_sched_buffer_reservation {
+        int    backend_index;
+        size_t size;
+    };
+
+    // Callback after a graph allocation has been planned, before any compute buffer is reallocated
+    // the size of each chunk is max(current size, required size); returning false fails the allocation
+    // under a caller allocator it runs once per reserve, after the split, with no chunk
+    typedef bool (*ggml_backend_sched_reserve_callback)(ggml_backend_sched_t sched, const struct ggml_backend_sched_buffer_reservation * reservations, size_t n_reservations, void * user_data);
+
+    // Callback once per graph compute, after the graph is split and allocated and before any split is computed
+    // unlike the eval callback it does not run per node, so it does not prevent op fusion
+    typedef void (*ggml_backend_sched_graph_compute_callback)(ggml_backend_sched_t sched, void * user_data);
+
+    // Callback once per graph compute, after the first split is submitted or when the submission fails before that
+    typedef void (*ggml_backend_sched_graph_submit_callback)(ggml_backend_sched_t sched, enum ggml_status status, void * user_data);
+
+    // Callback that computes `graph` on `backend` in place of ggml_backend_graph_compute_async. The scheduler calls it
+    // for every graph it would hand a backend while computing splits: each split's graph, or, with an eval callback, each
+    // view of a split between the nodes the eval callback asks for. `split_id` is the split's index and `first` the index
+    // in the split's graph of `graph`'s first node. A status other than GGML_STATUS_SUCCESS fails the compute as a
+    // failing backend compute does. The callback may compute the graph itself or call ggml_backend_graph_compute_async.
+    typedef enum ggml_status (*ggml_backend_sched_split_compute_callback)(
+            ggml_backend_sched_t sched, int split_id, int first,
+            ggml_backend_t backend, struct ggml_cgraph * graph, void * user_data);
+
+    // Callback once per allocated graph, after every tensor has its address and before the inputs are set
+    // returning false fails ggml_backend_sched_alloc_graph
+    // a graph that is computed again without ggml_backend_sched_alloc_graph needs ggml_backend_sched_prepare_graph
+    typedef bool (*ggml_backend_sched_graph_prepare_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * user_data);
+
+    // What the scheduler rewrites a graph for
+    enum ggml_backend_sched_rewrite_purpose {
+        // ggml_backend_sched_reserve, ggml_backend_sched_reserve_size and ggml_backend_sched_split_graph: the graph
+        // measures or reserves the compute buffers, and is not computed
+        GGML_BACKEND_SCHED_REWRITE_RESERVE,
+        // ggml_backend_sched_alloc_graph: the graph is allocated to be computed
+        GGML_BACKEND_SCHED_REWRITE_ALLOC,
+        // a caller's ggml_backend_sched_rewrite_graph: the graph is inspected as rewritten, and is not split, placed or
+        // allocated
+        GGML_BACKEND_SCHED_REWRITE_PLAN,
+    };
+
+    // Callback that rewrites a graph in place before the scheduler splits it
+    // it runs at the start of ggml_backend_sched_alloc_graph, ggml_backend_sched_reserve, ggml_backend_sched_reserve_size
+    // and ggml_backend_sched_split_graph, so a reserved compute buffer is planned for the rewritten graph;
+    // returning false fails the call
+    // the callback may add nodes with ggml_build_forward_expand, change the srcs and op params of nodes, and remove a
+    // node by setting its entry in ggml_graph_nodes(graph) to NULL; the tensors it adds come from a ggml_context that the caller owns and keeps alive while the
+    // graph is in use; the graph's node capacity bounds the nodes it can add
+    // after the callback returns, the scheduler moves each node that is out of order to just before its first reader,
+    // keeping the relative order of the other nodes, and recounts the uses of each tensor; the call fails if a node
+    // reads a tensor that is neither a node nor a leaf of the graph
+    // the callback sees a graph each time it is allocated or reserved: a graph that is passed again keeps the
+    // nodes of an earlier rewrite, so the callback must recognize a graph that it has already rewritten
+    // a graph that is computed again without ggml_backend_sched_alloc_graph is not rewritten again
+    // `purpose` says what the rewritten graph is for, so a callback can rewrite a graph whose compute buffers are
+    // reserved differently from one that is about to be computed
+    typedef bool (*ggml_backend_sched_graph_rewrite_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, enum ggml_backend_sched_rewrite_purpose purpose, void * user_data);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
     // Initialize backend buffers from a measure graph
-    GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
+    // both return false if the graph-rewrite callback fails
+    GGML_API bool                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
 
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
@@ -364,14 +427,20 @@ extern "C" {
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
+    GGML_API struct ggml_cgraph * ggml_backend_sched_get_graph(ggml_backend_sched_t sched);
+
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
-    // Split graph without allocating it
-    GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    // Split graph without allocating it (returns false if the graph-rewrite callback fails, or a caller allocator
+    // refuses the graph, see ggml_backend_sched_set_caller_alloc)
+    // afterwards ggml_backend_sched_get_graph is the graph in the order the backends compute it: each split's nodes as
+    // its backend's graph_optimize ordered them, after the copies of the split's inputs, and a view node after each node
+    // until which a backend asked a tensor to stay allocated
+    GGML_API bool                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
@@ -386,6 +455,73 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_reserve_callback(ggml_backend_sched_t sched, ggml_backend_sched_reserve_callback callback, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_graph_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_compute_callback callback, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_graph_submit_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_submit_callback callback, void * user_data);
+    // NULL computes each split with ggml_backend_graph_compute_async (the default)
+    GGML_API void                 ggml_backend_sched_set_split_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_split_compute_callback callback, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_graph_prepare_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_prepare_callback callback, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_graph_rewrite_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_rewrite_callback callback, void * user_data);
+
+    // Runs the graph-rewrite callback, if one is set, on a graph for `purpose` and restores its invariants, as a reserve
+    // or an allocation does before it splits the graph; the graph is not split, placed or allocated
+    // returns false if the callback fails or the rewritten graph reads a tensor that is neither a node nor a leaf of it
+    GGML_API bool                 ggml_backend_sched_rewrite_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph, enum ggml_backend_sched_rewrite_purpose purpose);
+
+    // Bytes of chunk `chunk` of the compute buffer of a backend that the last allocated or reserved graph uses
+    // the chunk's buffer is returned in *chunk_buffer; returns 0 and NULL past the last chunk, and for a backend
+    // that shares its allocator with an earlier backend
+    GGML_API size_t               ggml_backend_sched_get_compute_extent(ggml_backend_sched_t sched, int backend_index, int chunk, ggml_backend_buffer_t * chunk_buffer);
+
+    //
+    // Caller allocation: a scheduler with a caller allocator does not run its graph allocator. The caller places the
+    // nodes of each graph, names the copies of the tensors a backend reads from another, and gives every tensor of
+    // the split graph its memory in compute buffers the caller owns.
+    //
+
+    // the most compute buffers a caller gives one buffer type
+#define GGML_SCHED_MAX_CALLER_BUFFERS 16
+
+    struct ggml_backend_sched_caller_alloc {
+        // after the graph-rewrite callback and before the graph is split: the caller assigns a backend to the nodes with
+        // ggml_backend_sched_set_tensor_backend, and names with ggml_backend_sched_set_tensor_copy the copy of each tensor
+        // a split reads on a backend that cannot address it; returning false fails the call
+        bool (*place)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * user_data);
+        // after the graph is split, with the graph the backends compute (ggml_backend_sched_get_graph): the caller gives
+        // each of its tensors that views nothing and has no memory its memory with ggml_backend_sched_alloc_tensor; the
+        // scheduler then sets up the views, and fails the call if a tensor is left without memory or the callback
+        // returns false
+        // `reserve` is true for ggml_backend_sched_reserve and ggml_backend_sched_reserve_size, whose tensors keep the
+        // memory given to them
+        bool (*alloc)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool reserve, void * user_data);
+        void * user_data;
+    };
+
+    // Sets the caller allocator, or with NULL hands allocation back to the graph allocator; resets the scheduler and
+    // forgets the compute buffers of an earlier caller allocator
+    // returns false, changing nothing, for a scheduler with more than one copy of its inputs (pipeline parallelism)
+    GGML_API bool                 ggml_backend_sched_set_caller_alloc(ggml_backend_sched_t sched, const struct ggml_backend_sched_caller_alloc * alloc);
+
+    // The compute buffers of buffer type `buft` a caller allocator allocates in, as chunks 0 to n_buffers - 1; replaces
+    // earlier ones. They serve every backend whose compute buffer type (ggml_backend_sched_get_buffer_type) is `buft`,
+    // and stay owned by the caller, which keeps them alive while the scheduler uses them
+    // returns false, changing nothing, without a caller allocator, for a buffer of another type, or past
+    // GGML_SCHED_MAX_CALLER_BUFFERS buffers
+    GGML_API bool                 ggml_backend_sched_set_compute_buffers(ggml_backend_sched_t sched, ggml_backend_buffer_type_t buft, ggml_backend_buffer_t * buffers, int n_buffers);
+
+    // Names `copy` as the copy of `tensor` that the nodes on `backend` read: a tensor of the layout of `tensor`, without
+    // memory, that the caller allocator gives memory like any other. Call it from the place callback; the copy lasts
+    // until the scheduler is reset. A split that reads a tensor its backend cannot address fails without a named copy
+    GGML_API void                 ggml_backend_sched_set_tensor_copy(ggml_backend_sched_t sched, struct ggml_tensor * tensor, ggml_backend_t backend, struct ggml_tensor * copy);
+
+    // Gives `tensor` its memory at `offset` of compute buffer `chunk` of its backend's buffer type. Call it from the
+    // alloc callback, for a tensor of the split graph that views nothing and has no memory
+    // returns false, changing nothing, past the buffer's end, at an offset its alignment does not admit, for a chunk the
+    // caller did not give, or for a tensor that has no backend or already has memory
+    GGML_API bool                 ggml_backend_sched_alloc_tensor(ggml_backend_sched_t sched, struct ggml_tensor * tensor, int chunk, size_t offset);
+
+    // Call the graph-prepare callback for a graph that is already allocated (returns true if none is set)
+    GGML_API bool                 ggml_backend_sched_prepare_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
