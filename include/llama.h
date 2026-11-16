@@ -431,37 +431,33 @@ extern "C" {
 
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
-        ggml_backend_sched_reserve_callback cb_reserve;
-        void * cb_reserve_user_data;
+
+        // called each time the context creates its backend scheduler (at creation, and when a reserve needs a scheduler
+        // the current one cannot serve), right after creating it and before the scheduler splits, reserves, measures
+        // or computes any graph; a scheduler that the context reuses keeps what the callback installed on it
+        // `ctx` is the context that owns `sched`, which may still be under construction: identify it, do not query it
+        // its purpose is to install the scheduler's callbacks (ggml_backend_sched_set_reserve_callback,
+        // ggml_backend_sched_set_graph_prepare_callback, ggml_backend_sched_set_graph_rewrite_callback) and its caller
+        // allocator (ggml_backend_sched_set_caller_alloc); returning false fails the context's creation or reserve
+        // a graph rewrite runs on every graph that the scheduler reserves, measures or allocates, each time after llama
+        // builds it; a graph that llama reuses without building it again keeps its rewritten nodes and is not passed to
+        // the rewrite again. A graph llama reserves or measures is rewritten for GGML_BACKEND_SCHED_REWRITE_RESERVE, a
+        // graph llama computes for GGML_BACKEND_SCHED_REWRITE_ALLOC. The rewrite must not replace the input tensors or the output tensors (logits, embeddings, sampled
+        // tokens) that llama reads and writes: it may rewire their readers, or change such a tensor's op and srcs in place
+        // a caller allocator with a measure belongs only on a context that allocates nothing (a plan context, see
+        // llama_init_plan_from_model, or a model loaded without allocation), which then hands every graph it reserves to
+        // measure and allocates none
+        bool (*cb_sched_new)(ggml_backend_sched_t sched, struct llama_context * ctx, void * user_data);
+        void * cb_sched_new_user_data;
 
         // returns the compute buffer type to use for a backend in place of buft (return buft to keep it)
         // called once per backend when the context creates its scheduler
         ggml_backend_buffer_type_t (*cb_compute_buft)(ggml_backend_t backend, ggml_backend_buffer_type_t buft, void * user_data);
         void * cb_compute_buft_user_data;
 
-        // see ggml_backend_sched_set_graph_prepare_callback
-        ggml_backend_sched_graph_prepare_callback cb_graph_prepare;
-        void * cb_graph_prepare_user_data;
-
-        // see ggml_backend_sched_graph_rewrite_callback; runs on every graph that the context's scheduler reserves,
-        // measures or allocates, each time after llama builds it; a graph that llama reuses without building it
-        // again keeps its rewritten nodes and is not passed to the callback again
-        // its purpose is GGML_BACKEND_SCHED_REWRITE_RESERVE for a graph llama reserves or measures, and
-        // GGML_BACKEND_SCHED_REWRITE_ALLOC for a graph llama computes
-        // the callback must not replace the input tensors or the output tensors (logits, embeddings, sampled tokens)
-        // that llama reads and writes: it may rewire their readers, or change such a tensor's op and srcs in place
-        ggml_backend_sched_graph_rewrite_callback cb_graph_rewrite;
-        void * cb_graph_rewrite_user_data;
-
-        // node capacity that each graph and the scheduler reserve beyond the nodes llama builds, for the nodes that
-        // cb_graph_rewrite adds; 0 = no capacity is reserved for a rewrite
+        // node capacity that each graph and the scheduler reserve beyond the nodes llama builds, for the nodes that a
+        // graph rewrite (see cb_sched_new) adds; 0 = no capacity is reserved for a rewrite
         uint32_t n_graph_nodes_extra;
-
-        // see ggml_backend_sched_set_caller_alloc; NULL = the scheduler allocates its graphs; the struct is copied
-        // its measure is kept only by a context that allocates nothing (a plan context, see llama_init_plan_from_model,
-        // or a model loaded without allocation), which then hands every graph it reserves to measure and allocates none;
-        // a context that allocates drops it, so one caller allocator serves both
-        const struct ggml_backend_sched_caller_alloc * sched_caller_alloc;
 
         // called once per graph computed on the context's scheduler (each ubatch of encode and decode, each K-shift),
         // after the asynchronous copies of its outputs have been enqueued and before the inputs of a later graph are
@@ -760,7 +756,7 @@ extern "C" {
     // where the slot map is an I32 [1, n_expert] tensor holding the slot of each expert.
     //
     // The graphs llama builds read the stock expert weights: a caller rewrites each graph
-    // (llama_context_params.cb_graph_rewrite) to remap the router's expert ids through its slot map and read each
+    // (installed from llama_context_params.cb_sched_new) to remap the router's expert ids through its slot map and read each
     // expert weight from its slots, with per-expert scales and biases still indexed by the expert ids. A graph that
     // still reads a stock expert weight after the rewrite must not be computed. A caller whose rewrite reads different
     // slots for graphs of the same shape tells them apart with llama_set_graph_variant.
@@ -814,7 +810,7 @@ extern "C" {
     // hashes of qwen4exp); llama_model_lookup_table_rows names them ahead of a decode. A ubatch of input embeddings
     // reads the rows that the architecture uses in place of a token's (row 0 once for gemma4, the rows of the image
     // token for qwen4exp). The table holds no data, so the caller rewrites each such gather before the graph is
-    // allocated (llama_context_params.cb_graph_rewrite), e.g. to gather the bytes of the rows as the model file
+    // allocated (installed from llama_context_params.cb_sched_new), e.g. to gather the bytes of the rows as the model file
     // stores them, read from the file at offset + row*row_size (see llama_model_lookup_table_info) once the inputs
     // are set; a graph that still reads the table computes over memory that holds nothing.
     //
@@ -861,7 +857,7 @@ extern "C" {
     // the indexer cache, and gives each layer metadata-only K/V tensors "cache_k_l<il>" and "cache_v_l<il>", which are
     // in no buffer and hold no data. The graphs are built as over a cache of the context's own: they store the
     // ubatch's new rows into these tensors and attend over their views. The caller's graph rewrite
-    // (llama_context_params.cb_graph_rewrite) must replace every op that reads them, e.g. with an attention over the
+    // (installed from llama_context_params.cb_sched_new) must replace every op that reads them, e.g. with an attention over the
     // rows it stores; a graph that still reads one computes over memory that holds nothing.
     //
     // Without K/V data the context refuses:
@@ -1374,7 +1370,7 @@ extern "C" {
     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
 
     // Set the variant of the graphs the context builds from now on: an opaque value of the caller, initially 0, that
-    // its graph rewrite (llama_context_params.cb_graph_rewrite) keys on, e.g. to read other tensors in a graph of the
+    // its graph rewrite (installed from llama_context_params.cb_sched_new) keys on, e.g. to read other tensors in a graph of the
     // same shape. llama does not reuse a graph built for another variant: the next graph is built again and passed to
     // the rewrite. A change of variant does not reserve the scheduler again, so a rewrite of a graph llama reserves
     // (GGML_BACKEND_SCHED_REWRITE_RESERVE) must cover every variant the caller uses.

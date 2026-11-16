@@ -314,7 +314,7 @@ public:
     // reserve a graph with a dummy ubatch of the specified size
     // `split_only` splits and places the graph without reserving it, to inspect its placement
     // a no_alloc context allocates nothing: it sizes the compute buffers into `sizes`, if given, or hands the graph to the
-    // caller allocator's measure (see llama_context_params.sched_caller_alloc); `sizes` is for a no_alloc context only
+    // caller allocator's measure (see llama_context_params.cb_sched_new); `sizes` is for a no_alloc context only
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 

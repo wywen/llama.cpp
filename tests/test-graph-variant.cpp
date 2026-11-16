@@ -30,6 +30,11 @@ bool count_rewrite(ggml_backend_sched_t /*sched*/, ggml_cgraph * /*gf*/, ggml_ba
     return true;
 }
 
+bool install_count_rewrite(ggml_backend_sched_t sched, llama_context * /*ctx*/, void * user_data) {
+    ggml_backend_sched_set_graph_rewrite_callback(sched, count_rewrite, user_data);
+    return true;
+}
+
 struct step {
     uint32_t variant;
     bool     rebuilds;
@@ -66,8 +71,8 @@ int check_model(const std::string & path) {
     cparams.n_seq_max                  = 1;
     cparams.n_threads                  = 2;
     cparams.n_threads_batch            = 2;
-    cparams.cb_graph_rewrite           = count_rewrite;
-    cparams.cb_graph_rewrite_user_data = &count;
+    cparams.cb_sched_new               = install_count_rewrite;
+    cparams.cb_sched_new_user_data     = &count;
     llama_context_ptr ctx(llama_init_from_model(model.get(), cparams));
     if (!ctx) {
         fprintf(stderr, "%s: could not create a context\n", name.c_str());

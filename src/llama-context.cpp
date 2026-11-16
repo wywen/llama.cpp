@@ -496,20 +496,10 @@ llama_context::llama_context(
 
     cparams.cb_eval              = params.cb_eval;
     cparams.cb_eval_user_data    = params.cb_eval_user_data;
-    cparams.cb_reserve           = params.cb_reserve;
-    cparams.cb_reserve_user_data = params.cb_reserve_user_data;
+    cparams.cb_sched_new               = params.cb_sched_new;
+    cparams.cb_sched_new_user_data     = params.cb_sched_new_user_data;
     cparams.cb_compute_buft            = params.cb_compute_buft;
     cparams.cb_compute_buft_user_data  = params.cb_compute_buft_user_data;
-    cparams.cb_graph_prepare           = params.cb_graph_prepare;
-    cparams.cb_graph_prepare_user_data = params.cb_graph_prepare_user_data;
-    cparams.cb_graph_rewrite           = params.cb_graph_rewrite;
-    cparams.cb_graph_rewrite_user_data = params.cb_graph_rewrite_user_data;
-    cparams.has_sched_caller_alloc     = params.sched_caller_alloc != nullptr;
-    cparams.sched_caller_alloc         = params.sched_caller_alloc ? *params.sched_caller_alloc : ggml_backend_sched_caller_alloc{};
-    if (!no_alloc) {
-        // a context that allocates reserves its graphs through the caller allocator's alloc
-        cparams.sched_caller_alloc.measure = nullptr;
-    }
     cparams.n_graph_nodes_extra        = params.n_graph_nodes_extra;
     cparams.cb_outputs_enqueued           = params.cb_outputs_enqueued;
     cparams.cb_outputs_enqueued_user_data = params.cb_outputs_enqueued_user_data;
@@ -1012,11 +1002,8 @@ void llama_context::sched_new(const sched_params & params) {
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
-    ggml_backend_sched_set_reserve_callback(sched.get(), cparams.cb_reserve, cparams.cb_reserve_user_data);
-    ggml_backend_sched_set_graph_prepare_callback(sched.get(), cparams.cb_graph_prepare, cparams.cb_graph_prepare_user_data);
-    ggml_backend_sched_set_graph_rewrite_callback(sched.get(), cparams.cb_graph_rewrite, cparams.cb_graph_rewrite_user_data);
-    if (cparams.has_sched_caller_alloc && !ggml_backend_sched_set_caller_alloc(sched.get(), &cparams.sched_caller_alloc)) {
-        throw std::runtime_error("the scheduler refuses a caller allocator");
+    if (cparams.cb_sched_new && !cparams.cb_sched_new(sched.get(), this, cparams.cb_sched_new_user_data)) {
+        throw std::runtime_error("the scheduler callback refused the new scheduler");
     }
 
     sched_params_cur = params;
@@ -4774,16 +4761,11 @@ llama_context_params llama_context_default_params() {
         /*.yarn_orig_ctx               =*/ 0,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
-        /*.cb_reserve                  =*/ nullptr,
-        /*.cb_reserve_user_data        =*/ nullptr,
+        /*.cb_sched_new                =*/ nullptr,
+        /*.cb_sched_new_user_data      =*/ nullptr,
         /*.cb_compute_buft             =*/ nullptr,
         /*.cb_compute_buft_user_data   =*/ nullptr,
-        /*.cb_graph_prepare            =*/ nullptr,
-        /*.cb_graph_prepare_user_data  =*/ nullptr,
-        /*.cb_graph_rewrite            =*/ nullptr,
-        /*.cb_graph_rewrite_user_data  =*/ nullptr,
         /*.n_graph_nodes_extra         =*/ 0,
-        /*.sched_caller_alloc          =*/ nullptr,
         /*.cb_outputs_enqueued         =*/ nullptr,
         /*.cb_outputs_enqueued_user_data =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,

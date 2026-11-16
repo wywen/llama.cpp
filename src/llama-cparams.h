@@ -86,17 +86,11 @@ struct llama_cparams : llama_memory_cparams {
     // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_ctx_state_src()
     llama_context * ctx_state_src;
 
-    ggml_backend_sched_reserve_callback cb_reserve;
-    void * cb_reserve_user_data;
+    bool (*cb_sched_new)(ggml_backend_sched_t sched, llama_context * ctx, void * user_data);
+    void * cb_sched_new_user_data;
     ggml_backend_buffer_type_t (*cb_compute_buft)(ggml_backend_t backend, ggml_backend_buffer_type_t buft, void * user_data);
     void * cb_compute_buft_user_data;
-    ggml_backend_sched_graph_prepare_callback cb_graph_prepare;
-    void * cb_graph_prepare_user_data;
-    ggml_backend_sched_graph_rewrite_callback cb_graph_rewrite;
-    void * cb_graph_rewrite_user_data;
     uint32_t n_graph_nodes_extra;
-    bool has_sched_caller_alloc;
-    ggml_backend_sched_caller_alloc sched_caller_alloc;
     void (*cb_outputs_enqueued)(ggml_backend_sched_t sched, void * user_data);
     void * cb_outputs_enqueued_user_data;
 };
