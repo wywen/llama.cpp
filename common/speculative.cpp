@@ -588,8 +588,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         backend_chains.assign(n_seq, nullptr);
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                llama_sampler * chain = common_speculative_draft_backend_chain();
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -1104,8 +1103,7 @@ protected:
         backend_chains.assign(n_seq, nullptr);
         if (this->params.backend_sampling && opt.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                llama_sampler * chain = common_speculative_draft_backend_chain();
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -1875,8 +1873,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         backend_chains.assign(n_seq, nullptr);
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                llama_sampler * chain = common_speculative_draft_backend_chain();
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -3187,6 +3184,12 @@ common_speculative_output_limits common_speculative_get_output_limits(
 
 // initialization of the speculative decoding system
 //
+llama_sampler * common_speculative_draft_backend_chain() {
+    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+    return chain;
+}
+
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
