@@ -719,40 +719,6 @@ void ggml_backend_metal_set_abort_callback(ggml_backend_t backend, ggml_abort_ca
     ggml_metal_set_abort_callback(ctx, abort_callback, user_data);
 }
 
-ggml_metal_event_t ggml_backend_metal_event_init(ggml_backend_t backend) {
-    GGML_ASSERT(ggml_backend_is_metal(backend));
-
-    ggml_metal_t ctx = (ggml_metal_t)backend->context;
-
-    return ggml_metal_device_event_init(ggml_metal_get_device(ctx));
-}
-
-void ggml_backend_metal_event_free(ggml_backend_t backend, ggml_metal_event_t ev) {
-    GGML_ASSERT(ggml_backend_is_metal(backend));
-
-    ggml_metal_t ctx = (ggml_metal_t)backend->context;
-
-    ggml_metal_device_event_free(ggml_metal_get_device(ctx), ev);
-}
-
-void ggml_backend_metal_event_host_signal(ggml_metal_event_t ev, uint64_t value) {
-    ggml_metal_event_host_signal(ev, value);
-}
-
-bool ggml_backend_metal_event_host_wait(ggml_metal_event_t ev, uint64_t value, uint64_t timeout_ms) {
-    return ggml_metal_event_host_wait(ev, value, timeout_ms);
-}
-
-uint64_t ggml_backend_metal_event_host_value(ggml_metal_event_t ev) {
-    return ggml_metal_event_host_value(ev);
-}
-
-void ggml_backend_metal_event_signal(ggml_backend_t backend, ggml_metal_event_t ev, uint64_t value) {
-    GGML_ASSERT(ggml_backend_is_metal(backend));
-
-    ggml_metal_event_signal((ggml_metal_t)backend->context, ev, value);
-}
-
 const char * ggml_backend_metal_last_error(ggml_backend_t backend) {
     if (!ggml_backend_is_metal(backend)) {
         return NULL;
@@ -786,75 +752,6 @@ void ggml_backend_metal_commit_fence(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
 
     ggml_metal_commit_fence((ggml_metal_t)backend->context);
-}
-
-void ggml_backend_metal_set_boundary_schedule(
-        ggml_backend_t backend,
-        int n_cuts,  struct ggml_tensor * const * cut_nodes,  ggml_metal_event_t * sig_ev,  const uint64_t * sig_val,
-        int n_waits, struct ggml_tensor * const * wait_nodes, ggml_metal_event_t * wait_ev, const uint64_t * wait_val) {
-    GGML_ASSERT(ggml_backend_is_metal(backend));
-
-    ggml_metal_t ctx = (ggml_metal_t)backend->context;
-
-    ggml_metal_set_boundary_schedule(ctx, n_cuts, cut_nodes, sig_ev, sig_val, n_waits, wait_nodes, wait_ev, wait_val);
-}
-
-void ggml_backend_metal_set_paged_gate_abort_ms(ggml_backend_t backend, uint32_t ms) {
-    GGML_ASSERT(ggml_backend_is_metal(backend));
-
-    ggml_metal_set_paged_gate_abort_ms((ggml_metal_t)backend->context, ms);
-}
-
-void ggml_backend_metal_set_boundary_entry_signal(ggml_backend_t backend, ggml_metal_event_t ev, uint64_t value) {
-    GGML_ASSERT(ggml_backend_is_metal(backend));
-
-    ggml_metal_t ctx = (ggml_metal_t)backend->context;
-
-    ggml_metal_set_boundary_entry_signal(ctx, ev, value);
-}
-
-void ggml_backend_metal_set_host_cuts(
-        ggml_backend_t backend,
-        int n, struct ggml_tensor * const * nodes,
-        ggml_metal_event_t ev, uint64_t base_value,
-        ggml_backend_metal_host_cut_fn fn, void * user_data) {
-    GGML_ASSERT(ggml_backend_is_metal(backend));
-
-    ggml_metal_set_host_cuts((ggml_metal_t)backend->context, n, nodes, ev, base_value, fn, user_data);
-}
-
-void ggml_backend_metal_set_encode_window(
-        ggml_backend_t backend,
-        struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
-        size_t n_ingress,     const struct ggml_metal_tensor_copy_pair * ingress,
-        size_t n_egress,      const struct ggml_metal_tensor_copy_pair * egress,
-        size_t n_out_of_band, struct ggml_tensor * const * out_of_band) {
-    GGML_ASSERT(ggml_backend_is_metal(backend));
-
-    ggml_metal_t ctx = (ggml_metal_t)backend->context;
-
-    ggml_metal_set_encode_window(ctx, first_node, last_node, n_ingress, ingress, n_egress, egress, n_out_of_band, out_of_band);
-}
-
-bool ggml_backend_metal_set_encode_window_ranged(
-        ggml_backend_t backend,
-        struct ggml_tensor * first_node,  struct ggml_tensor * last_node,
-        size_t n_ingress,     const struct ggml_metal_tensor_range_copy * ingress,
-        size_t n_egress,      const struct ggml_metal_tensor_range_copy * egress,
-        size_t n_out_of_band, struct ggml_tensor * const * out_of_band) {
-    GGML_ASSERT(ggml_backend_is_metal(backend));
-
-    ggml_metal_t ctx = (ggml_metal_t)backend->context;
-
-    return ggml_metal_set_encode_window_ranged(ctx, first_node, last_node, n_ingress, ingress, n_egress, egress, n_out_of_band, out_of_band);
-}
-
-void ggml_backend_metal_clear_encode_window(ggml_backend_t backend) {
-    GGML_ASSERT(ggml_backend_is_metal(backend));
-
-    ggml_metal_t ctx = (ggml_metal_t)backend->context;
-
-    ggml_metal_clear_encode_window(ctx);
 }
 
 void ggml_backend_metal_set_reorder_barriers(ggml_backend_t backend, bool enable) {

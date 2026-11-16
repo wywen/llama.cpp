@@ -11,7 +11,6 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
-#include <time.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -1464,70 +1463,6 @@ void ggml_metal_event_encode_wait(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cm
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
 
     [cmd_buf encodeWaitForEvent:event value:atomic_load_explicit(&ev->value, memory_order_relaxed)];
-}
-
-void ggml_metal_event_encode_signal_value(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw, uint64_t value) {
-    id<MTLSharedEvent>   event   = (id<MTLSharedEvent>)   ev->obj;
-    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
-
-    [cmd_buf encodeSignalEvent:event value:value];
-}
-
-void ggml_metal_event_signal_on_complete(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw, uint64_t value) {
-    id<MTLSharedEvent>   event   = (id<MTLSharedEvent>)   ev->obj;
-    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
-
-    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull unused) {
-        (void) unused;
-        event.signaledValue = value;
-    }];
-}
-
-void ggml_metal_event_encode_wait_value(ggml_metal_event_t ev, ggml_metal_cmd_buf_t cmd_buf_raw, uint64_t value) {
-    id<MTLSharedEvent>   event   = (id<MTLSharedEvent>)   ev->obj;
-    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
-
-    [cmd_buf encodeWaitForEvent:event value:value];
-}
-
-void ggml_metal_event_host_signal(ggml_metal_event_t ev, uint64_t value) {
-    id<MTLSharedEvent> event = (id<MTLSharedEvent>) ev->obj;
-    event.signaledValue = value;
-}
-
-bool ggml_metal_event_host_wait(ggml_metal_event_t ev, uint64_t value, uint64_t timeout_ms) {
-    id<MTLSharedEvent> event = (id<MTLSharedEvent>) ev->obj;
-    return [event waitUntilSignaledValue:value timeoutMS:timeout_ms];
-}
-
-// Polls signaledValue instead of blocking in waitUntilSignaledValue:timeoutMS:, whose wake-up
-// adds tens of microseconds once the value lands. The calling thread stays busy for the whole wait.
-bool ggml_metal_event_host_spin(ggml_metal_event_t ev, uint64_t value, uint64_t timeout_ms) {
-    id<MTLSharedEvent> event = (id<MTLSharedEvent>) ev->obj;
-    if (event.signaledValue >= value) {
-        return true;
-    }
-
-    const uint64_t start_ns   = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    const uint64_t timeout_ns = timeout_ms > UINT64_MAX / 1000000 ? UINT64_MAX : timeout_ms * 1000000;
-    while (true) {
-#if defined(__aarch64__)
-        __builtin_arm_yield();
-#elif defined(__x86_64__)
-        __builtin_ia32_pause();
-#endif
-        if (event.signaledValue >= value) {
-            return true;
-        }
-        if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start_ns >= timeout_ns) {
-            return false;
-        }
-    }
-}
-
-uint64_t ggml_metal_event_host_value(ggml_metal_event_t ev) {
-    id<MTLSharedEvent> event = (id<MTLSharedEvent>) ev->obj;
-    return event.signaledValue;
 }
 
 ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev) {

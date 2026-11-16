@@ -441,10 +441,6 @@ if (APPLE)
 endif()
 
 if (GGML_METAL AND NOT GGML_BACKEND_DL)
-    # drives the encode window through the public Metal API on a real device; skips without one
-    llama_build_and_test(test-metal-encode-window.cpp  LABEL "main behavior backend"  LINK ggml ggml-metal)
-    # drives host cuts through the public Metal API on a real device and prints the cost of a cut; skips without one
-    llama_build_and_test(test-metal-host-cuts.cpp  LABEL "main behavior backend"  LINK ggml ggml-metal)
     # resolves tensors of a buffer over caller-made Metal buffers through its range table and computes on them; skips
     # without a device
     llama_build_and_test(test-metal-range-buffer.cpp metal-nocopy-buffer.mm  LABEL "main behavior backend"  LINK ggml ggml-metal)
