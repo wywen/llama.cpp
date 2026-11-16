@@ -2712,8 +2712,6 @@ bool ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     }
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
 
-    ggml_backend_sched_reset(sched);
-
     ggml_backend_sched_synchronize(sched);
 
     if (!ggml_backend_sched_split_graph_impl(sched, measure_graph)) {
@@ -2730,10 +2728,11 @@ bool ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
                 sizes[b] += sched->caller_extents[b][c];
             }
         }
-        return true;
+    } else {
+        ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
     }
 
-    ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+    ggml_backend_sched_reset(sched);
 
     return true;
 }
