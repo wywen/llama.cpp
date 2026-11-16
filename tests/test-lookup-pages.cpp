@@ -370,6 +370,11 @@ static bool rewrite_gathers(ggml_backend_sched_t sched, ggml_cgraph * gf, ggml_b
     return ((row_stager *) ud)->rewrite(sched, gf, purpose);
 }
 
+static bool install_rewrite_gathers(ggml_backend_sched_t sched, llama_context *, void * ud) {
+    ggml_backend_sched_set_graph_rewrite_callback(sched, rewrite_gathers, ud);
+    return true;
+}
+
 static void stage_rows(ggml_backend_sched_t, void * ud) {
     ((row_stager *) ud)->stage();
 }
@@ -409,8 +414,8 @@ static llama_context_params context_params(row_stager * stager, context_shape sh
     cparams.n_ubatch        = shape.n_ubatch;
     cparams.n_seq_max       = shape.n_seq_max;
     if (stager) {
-        cparams.cb_graph_rewrite           = rewrite_gathers;
-        cparams.cb_graph_rewrite_user_data = stager;
+        cparams.cb_sched_new               = install_rewrite_gathers;
+        cparams.cb_sched_new_user_data     = stager;
         cparams.n_graph_nodes_extra        = 2;
     }
     return cparams;

@@ -271,6 +271,11 @@ const context_case context_cases[] = {
     { "two-seq-no-fa",   512, 2, 32, LLAMA_FLASH_ATTN_TYPE_DISABLED, false },
 };
 
+bool install_rewrite(ggml_backend_sched_t sched, llama_context * /*ctx*/, void * user_data) {
+    ggml_backend_sched_set_graph_rewrite_callback(sched, rewrite_graph, user_data);
+    return true;
+}
+
 llama_context_params make_params(const context_case & c, rewrite_state & rewrite) {
     llama_context_params params = llama_context_default_params();
     params.n_ctx               = c.n_ctx;
@@ -280,8 +285,8 @@ llama_context_params make_params(const context_case & c, rewrite_state & rewrite
     params.flash_attn_type     = c.flash_attn_type;
     params.n_threads           = 2;
     params.n_threads_batch     = 2;
-    params.cb_graph_rewrite           = rewrite_graph;
-    params.cb_graph_rewrite_user_data = &rewrite;
+    params.cb_sched_new               = install_rewrite;
+    params.cb_sched_new_user_data     = &rewrite;
     params.n_graph_nodes_extra        = 1;
     return params;
 }
@@ -335,6 +340,7 @@ struct measuring_caller {
     std::vector<std::string> problems;
     size_t n_allocs   = 0;
     size_t n_reserves = 0;
+    ggml_backend_sched_t sched = nullptr; // the last scheduler the context created
     ggml_backend_sched_caller_alloc calls = {};
 };
 
@@ -369,12 +375,20 @@ bool measuring_reserve(ggml_backend_sched_t /*sched*/, const ggml_backend_sched_
     return true;
 }
 
+// installs the caller's graph rewrite, reserve callback and caller allocator
+bool install_measuring(ggml_backend_sched_t sched, llama_context * /*ctx*/, void * user_data) {
+    auto * caller = static_cast<measuring_caller *>(user_data);
+    caller->sched = sched;
+    ggml_backend_sched_set_reserve_callback(sched, measuring_reserve, caller);
+    ggml_backend_sched_set_graph_rewrite_callback(sched, rewrite_graph, &caller->rewrite);
+    return ggml_backend_sched_set_caller_alloc(sched, &caller->calls);
+}
+
 llama_context_params make_measuring_params(const context_case & c, measuring_caller & caller) {
     caller.calls = { measuring_place, measuring_alloc, &caller, measuring_measure };
     llama_context_params params = make_params(c, caller.rewrite);
-    params.cb_reserve           = measuring_reserve;
-    params.cb_reserve_user_data = &caller;
-    params.sched_caller_alloc   = &caller.calls;
+    params.cb_sched_new           = install_measuring;
+    params.cb_sched_new_user_data = &caller;
     caller.rewrite.record = true;
     return params;
 }
@@ -416,6 +430,9 @@ void check_measured(const std::string & what, const measuring_caller & caller, s
     }
     if (caller.n_reserves != caller.measured.size()) {
         fail(out, what + ": " + std::to_string(caller.n_reserves) + " reserve callbacks for " + std::to_string(caller.measured.size()) + " measured graphs");
+    }
+    if (caller.sched != ctx.get_sched()) {
+        fail(out, what + ": the scheduler callback did not see the context's scheduler");
     }
     if (const size_t bytes = compute_bytes(ctx); bytes != 0) {
         fail(out, what + ": the plan context holds " + std::to_string(bytes) + " compute bytes");

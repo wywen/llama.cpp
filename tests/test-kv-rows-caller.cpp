@@ -129,6 +129,11 @@ static bool rewrite_caches(ggml_backend_sched_t, ggml_cgraph * gf, ggml_backend_
     return ((row_backer *) ud)->rewrite(gf);
 }
 
+static bool install_rewrite_caches(ggml_backend_sched_t sched, llama_context *, void * ud) {
+    ggml_backend_sched_set_graph_rewrite_callback(sched, rewrite_caches, ud);
+    return true;
+}
+
 static llama_model_ptr load_model(const std::string & path, const std::vector<ggml_backend_dev_t> & devs) {
     std::vector<llama_model_kv_override> overrides(2);
     overrides[0].tag = LLAMA_KV_OVERRIDE_TYPE_INT;
@@ -173,8 +178,8 @@ static llama_context_ptr new_context(llama_model * model, row_backer * backer, c
     cparams.type_v          = shape.type_kv;
     if (backer) {
         cparams.kv_rows_caller             = true;
-        cparams.cb_graph_rewrite           = rewrite_caches;
-        cparams.cb_graph_rewrite_user_data = backer;
+        cparams.cb_sched_new               = install_rewrite_caches;
+        cparams.cb_sched_new_user_data     = backer;
     }
     g_log.clear();
     llama_context_ptr lctx(llama_init_from_model(model, cparams));
