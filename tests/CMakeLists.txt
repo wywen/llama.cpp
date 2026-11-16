@@ -291,6 +291,19 @@ set_tests_properties(test-llama-context PROPERTIES
     FIXTURES_REQUIRED generate-models
 )
 
+# Test memory planning against real context construction, using the generated dummy models
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    # uses internal functions not exported with LLAMA_API
+    llama_build(test-memory-plan.cpp)
+    llama_test(
+        test-memory-plan
+        LABEL main
+        ARGS --models "${MODEL_DIR}"
+    )
+    set_tests_properties(test-memory-plan PROPERTIES FIXTURES_REQUIRED generate-models)
+
+endif()
+
 llama_build(test-fusion.cpp)
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp  LABEL behavior)

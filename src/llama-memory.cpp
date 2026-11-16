@@ -2,6 +2,7 @@
 
 #include "llama-ext.h"
 #include "llama-io.h"
+#include "llama-memory-alloc.h"
 
 #include <set>
 #include <stdexcept>
@@ -86,8 +87,10 @@ ggml_backend_buffer_ptr llama_memory_bufs::alloc_buf(ggml_context * ctx, ggml_ba
     return buf;
 }
 
-ggml_backend_buffer_t llama_memory_bufs::emplace(ggml_context_ptr ctx, ggml_backend_buffer_type_t buft, const char * name) {
-    ggml_backend_buffer_ptr buf = alloc_buf(ctx.get(), buft, no_alloc, name);
+llama_memory_bufs::llama_memory_bufs(bool no_alloc) : no_alloc(no_alloc || llama_memory_alloc_planning()) {}
+
+ggml_backend_buffer_t llama_memory_bufs::emplace(ggml_context_ptr ctx, ggml_backend_buffer_type_t buft, const char * name, llama_memory_plan_buffer_kind kind) {
+    ggml_backend_buffer_ptr buf = llama_memory_alloc_buffer(ctx.get(), buft, no_alloc, kind, name);
 
     // initialize the buffer to avoid NaNs in the padding
     ggml_backend_buffer_clear(buf.get(), 0);

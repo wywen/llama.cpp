@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-alloc.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -166,10 +167,239 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+llama_context_params llama_context_params_resolve(const llama_model & model, llama_context_params params) {
+    if (params.n_batch == 0 && params.n_ubatch == 0) {
+        throw std::runtime_error("n_batch and n_ubatch cannot both be zero");
+    }
+
+    if (params.n_ctx == 0 && model.hparams.n_ctx_train == 0) {
+        throw std::runtime_error("n_ctx and model->hparams.n_ctx_train cannot both be zero");
+    }
+
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model.arch == LLM_ARCH_GROK) {
+        LLAMA_LOG_WARN("%s: flash_attn is not compatible with Grok - forcing off\n", __func__);
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
+
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
+        if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+            throw std::runtime_error("SPLIT_MODE_TENSOR requires flash_attn to be enabled");
+        }
+        if (model.get_split_state_ud.n_devices == 1) {
+            LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
+        }
+    }
+
+    if ((model.hparams.is_mla() || model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41) && params.type_k != params.type_v) {
+        throw std::runtime_error(format("model does not support different K (%s) and V (%s) cache types",
+                ggml_type_name(params.type_k), ggml_type_name(params.type_v)));
+    }
+
+    const bool fp8_cache = params.type_k == GGML_TYPE_F8_E4M3 || params.type_v == GGML_TYPE_F8_E4M3;
+    // Direct cache consumers do not use the shared attention scaling helpers.
+    if (fp8_cache && (model.hparams.is_mla() ||
+            model.arch == LLM_ARCH_DEEPSEEK32 ||
+            model.arch == LLM_ARCH_DEEPSEEK4 ||
+            model.arch == LLM_ARCH_DEEPSEEK41 ||
+            model.arch == LLM_ARCH_GLM_DSA ||
+            model.arch == LLM_ARCH_GLM5_NEXT ||
+            model.arch == LLM_ARCH_DOTS3NOTE ||
+            model.arch == LLM_ARCH_MISTRAL_LARGE4 ||
+            model.arch == LLM_ARCH_HY_V4 ||
+            model.arch == LLM_ARCH_MINIMAX_M3 ||
+            model.arch == LLM_ARCH_QWEN4EXP ||
+            model.arch == LLM_ARCH_DFLASH)) {
+        throw std::runtime_error(format("FP8 cache is not supported for architecture '%s'", llm_arch_name(model.arch)));
+    }
+
+    if (fp8_cache) {
+        for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
+            if (!model.hparams.has_kv(il)) {
+                continue;
+            }
+
+            for (ggml_tensor * scale : { model.layers[il].k_cache_s, model.layers[il].v_cache_s }) {
+                if (!scale || !scale->data) {
+                    continue;
+                }
+
+                float value;
+                ggml_backend_tensor_get(scale, &value, 0, sizeof(value));
+                if (!std::isfinite(value) || value == 0.0f) {
+                    throw std::runtime_error(format("FP8 cache scale '%s' must be finite and nonzero", ggml_get_name(scale)));
+                }
+            }
+        }
+    }
+
+    if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            throw std::runtime_error("quantized V cache requires flash_attn to be enabled");
+        }
+    }
+
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
+        const uint32_t blck_size = ggml_blck_size(params.type_k);
+        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            if (model.hparams.n_embd_head_k(il) % blck_size != 0) {
+                throw std::runtime_error(format("K cache type %s with block size %u does not divide n_embd_head_k=%u",
+                        ggml_type_name(params.type_k), blck_size, model.hparams.n_embd_head_k(il)));
+            }
+        }
+    }
+
+    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
+        const uint32_t blck_size = ggml_blck_size(params.type_v);
+        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            if (model.hparams.n_embd_head_v(il) % blck_size != 0) {
+                throw std::runtime_error(format("V cache type %s with block size %u does not divide n_embd_head_v=%u",
+                        ggml_type_name(params.type_v), blck_size, model.hparams.n_embd_head_v(il)));
+            }
+        }
+    }
+
+    if (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&
+        params.pooling_type != model.hparams.pooling_type) {
+        //user-specified pooling-type is different from the model default
+        LLAMA_LOG_WARN("%s: model default pooling_type is [%d], but [%d] was specified\n", __func__,
+                       model.hparams.pooling_type, params.pooling_type);
+    }
+
+    // router_layer >= 0 means n_layer_nextn is repurposed for a router layer, not real MTP
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+        (model.hparams.n_layer_nextn == 0 || model.hparams.router_layer >= 0)) {
+        throw std::runtime_error("context type MTP requested but model doesn't contain MTP layers");
+    }
+
+    return params;
+}
+
+llama_memory_cparams llama_cparams_memory_shape(const llama_model & model, const llama_context_params & params) {
+    const auto & hparams = model.hparams;
+
+    llama_memory_cparams cparams{};
+
+    cparams.n_seq_max = std::max(1u, params.n_seq_max);
+    if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
+        throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
+    }
+
+    cparams.n_rs_seq = params.n_rs_seq;
+    if (cparams.n_rs_seq > 0 && (!llm_arch_supports_rs_rollback(model.arch) || !hparams.causal_attn)) {
+        LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
+                        __func__, cparams.n_rs_seq);
+        cparams.n_rs_seq = 0;
+    }
+
+    cparams.offload_kqv = params.offload_kqv;
+    cparams.ctx_type    = params.ctx_type;
+    cparams.n_ctx       = params.n_ctx == 0 ? hparams.n_ctx_train : params.n_ctx;
+
+    cparams.ctx_other        = nullptr;
+    cparams.mem_shares_other = false;
+
+    // TODO: more generic
+    if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        if (params.ctx_other == nullptr) {
+            // TODO: change from runtime_error to llama_exception to avoid printing error message
+            throw std::runtime_error("Gemma4Assistant requires ctx_other to be set (this warning is normal during memory fitting)");
+        }
+
+        cparams.ctx_other        = params.ctx_other;
+        cparams.mem_shares_other = true;
+    }
+
+    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
+        if (model.tok_embd == nullptr || model.output == nullptr) {
+            if (params.ctx_other == nullptr) {
+                throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
+            }
+            cparams.ctx_other = params.ctx_other;
+        } else if (model.arch == LLM_ARCH_DFLASH) {
+            // used to read the target's layer input device buffer
+            cparams.ctx_other = params.ctx_other;
+        }
+    }
+
+    if (params.attention_type == LLAMA_ATTENTION_TYPE_UNSPECIFIED) {
+        cparams.causal_attn = hparams.causal_attn;
+    } else {
+        cparams.causal_attn = params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
+    }
+
+    cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
+
+    // the KV cache is shared with ctx_other, so follow its flash attention setting instead of resolving it here:
+    // the probe disables it when the layers and the shared KV are on different devices, which breaks a quantized V cache
+    if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        const bool flash_attn_other = cparams.ctx_other->get_cparams().flash_attn;
+        if (!cparams.auto_fa && cparams.flash_attn != flash_attn_other) {
+            LLAMA_LOG_WARN("%s: flash_attn = %d does not match the context the KV cache is shared with, using %d\n",
+                    __func__, cparams.flash_attn, flash_attn_other);
+        }
+        cparams.flash_attn = flash_attn_other;
+        cparams.auto_fa    = false;
+    }
+
+    // with causal attention, the batch size is limited by the context size
+    cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
+
+    cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+
+    cparams.kv_unified = params.kv_unified;
+
+    // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
+    cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
+
+    if (cparams.kv_unified) {
+        cparams.n_ctx_seq = cparams.n_ctx;
+    } else {
+        cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
+        cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
+
+        if (cparams.n_ctx_seq == 0) {
+            throw std::runtime_error("n_ctx_seq == 0");
+        }
+
+        if (cparams.n_ctx != cparams.n_ctx_seq * cparams.n_seq_max) {
+            cparams.n_ctx =  cparams.n_ctx_seq * cparams.n_seq_max;
+            LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
+        }
+    }
+
+    return cparams;
+}
+
+llama_memory_i * llama_context_create_memory(
+        const llama_model          & model,
+        const llama_context_params & params,
+        const llama_memory_cparams & cparams) {
+    llama_memory_params params_mem = {
+        /*.type_k    =*/ params.type_k,
+        /*.type_v    =*/ params.type_v,
+        /*.swa_full  =*/ params.swa_full,
+        /*.ctx_type  =*/ cparams.ctx_type,
+        /*.mem_other =*/ cparams.mem_shares_other ? llama_get_memory(cparams.ctx_other) : nullptr,
+        /*.no_alloc  =*/ model.no_alloc(),
+    };
+
+    return model.create_memory(params_mem, cparams);
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
     model(model),
+    no_alloc(model.no_alloc() || llama_memory_alloc_planning()),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     // MTP uses the embd input for the hidden state
@@ -184,16 +414,8 @@ llama_context::llama_context(
 
     const auto & hparams = model.hparams;
 
-    cparams.n_seq_max = std::max(1u, params.n_seq_max);
-    if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
-        throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
-    }
+    static_cast<llama_memory_cparams &>(cparams) = llama_cparams_memory_shape(model, params);
 
-    cparams.n_rs_seq = params.n_rs_seq;
-    if (cparams.n_rs_seq > 0 && (!llm_arch_supports_rs_rollback(model.arch) || !hparams.causal_attn)) {
-        LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
-                        __func__, cparams.n_rs_seq);
-        cparams.n_rs_seq = 0;
     }
 
     cparams.n_threads               = params.n_threads;
@@ -205,7 +427,6 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
-    cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
@@ -215,11 +436,9 @@ llama_context::llama_context(
     cparams.ctx_state_src            = nullptr;
     embd_layer_inp.resize(hparams.n_layer() + 1);
 
-    cparams.ctx_type          = params.ctx_type;
     cparams.rope_scaling_type = params.rope_scaling_type;
     cparams.pooling_type      = params.pooling_type;
 
-    cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
 
@@ -227,32 +446,8 @@ llama_context::llama_context(
                                hparams.n_ctx_orig_yarn != 0 ? hparams.n_ctx_orig_yarn :
                                                               hparams.n_ctx_train;
 
-    cparams.cb_eval           = params.cb_eval;
-    cparams.cb_eval_user_data = params.cb_eval_user_data;
-
-    cparams.ctx_other = nullptr;
-
-    // TODO: more generic
-    if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
-        if (params.ctx_other == nullptr) {
-            // TODO: change from runtime_error to llama_exception to avoid printing error message
-            throw std::runtime_error("Gemma4Assistant requires ctx_other to be set (this warning is normal during memory fitting)");
-        }
-
-        cparams.ctx_other = params.ctx_other;
-    }
-
-    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
-        if (model.tok_embd == nullptr || model.output == nullptr) {
-            if (params.ctx_other == nullptr) {
-                throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
-            }
-            cparams.ctx_other = params.ctx_other;
-        } else if (model.arch == LLM_ARCH_DFLASH) {
-            // used to read the target's layer input device buffer
-            cparams.ctx_other = params.ctx_other;
-        }
-    }
+    cparams.cb_eval              = params.cb_eval;
+    cparams.cb_eval_user_data    = params.cb_eval_user_data;
 
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         cparams.rope_scaling_type = hparams.rope_scaling_type_train;
@@ -313,26 +508,7 @@ llama_context::llama_context(
         }
     }
 
-    if (params.attention_type == LLAMA_ATTENTION_TYPE_UNSPECIFIED) {
-        cparams.causal_attn = hparams.causal_attn;
-    } else {
-        cparams.causal_attn = params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
-    }
 
-    cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
-    cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
-
-    // the KV cache is shared with ctx_other, so follow its flash attention setting instead of resolving it here:
-    // the probe disables it when the layers and the shared KV are on different devices, which breaks a quantized V cache
-    if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
-        const bool flash_attn_other = cparams.ctx_other->get_cparams().flash_attn;
-        if (!cparams.auto_fa && cparams.flash_attn != flash_attn_other) {
-            LLAMA_LOG_WARN("%s: flash_attn = %d does not match the context the KV cache is shared with, using %d\n",
-                    __func__, cparams.flash_attn, flash_attn_other);
-        }
-        cparams.flash_attn = flash_attn_other;
-        cparams.auto_fa    = false;
-    }
 
     cparams.fused_lid = true;
     cparams.auto_flid = false;
@@ -345,11 +521,6 @@ llama_context::llama_context(
     // only the indexer models build this mask, skip the probe for the others
     cparams.fused_top_k_mask = true;
     cparams.auto_ftkm        = hparams.indexer_top_k > 0;
-
-    // with causal attention, the batch size is limited by the context size
-    cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
-
-    cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -375,7 +546,6 @@ llama_context::llama_context(
     }
 
     cparams.op_offload     = params.op_offload;
-    cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size      = params.moe_cache_size;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
 
@@ -402,25 +572,6 @@ llama_context::llama_context(
 
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
-        }
-    }
-
-    // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
-    cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
-
-    if (cparams.kv_unified) {
-        cparams.n_ctx_seq = cparams.n_ctx;
-    } else {
-        cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
-        cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
-
-        if (cparams.n_ctx_seq == 0) {
-            throw std::runtime_error("n_ctx_seq == 0");
-        }
-
-        if (cparams.n_ctx != cparams.n_ctx_seq * cparams.n_seq_max) {
-            cparams.n_ctx =  cparams.n_ctx_seq * cparams.n_seq_max;
-            LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
         }
     }
 
@@ -530,16 +681,7 @@ llama_context::llama_context(
 
     // init the memory module
     if (!hparams.vocab_only) {
-        llama_memory_params params_mem = {
-            /*.type_k    =*/ params.type_k,
-            /*.type_v    =*/ params.type_v,
-            /*.swa_full  =*/ params.swa_full,
-            /*.ctx_type  =*/ cparams.ctx_type,
-            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
-            /*.no_alloc  =*/ model.no_alloc(),
-        };
-
-        memory.reset(model.create_memory(params_mem, cparams));
+        memory.reset(llama_context_create_memory(model, params, cparams));
     }
 
     // init backends
@@ -607,7 +749,7 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
+            moe_cache = std::make_unique<llama_moe_cache>(model, no_alloc, backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
         }
 
         sched_reserve();
@@ -635,7 +777,7 @@ llama_context::~llama_context() {
     synchronize();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
-    if (!model.no_alloc() && !opt_ctx) {
+    if (!no_alloc && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
             ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -852,7 +994,7 @@ void llama_context::sched_reserve() {
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
-                model.no_alloc(), model.no_alloc() ? backend_buf_exp_size.data() : nullptr);
+                no_alloc, no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
@@ -883,7 +1025,7 @@ void llama_context::sched_reserve() {
         n_splits_tg = n_splits_pp;
         n_nodes_tg  = n_nodes_pp;
     } else {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.no_alloc());
+        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -919,7 +1061,7 @@ void llama_context::sched_reserve() {
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
-        if (!model.no_alloc()) {
+        if (!no_alloc) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
         if (backend_buf_exp_size[i] > 1) {
@@ -4156,7 +4298,7 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
-    if (model.no_alloc()) {
+    if (no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
@@ -4470,128 +4612,8 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
-    if (params.n_batch == 0 && params.n_ubatch == 0) {
-        LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
-        return nullptr;
-    }
-
-    if (params.n_ctx == 0 && model->hparams.n_ctx_train == 0) {
-        LLAMA_LOG_ERROR("%s: n_ctx and model->hparams.n_ctx_train cannot both be zero\n", __func__);
-        return nullptr;
-    }
-
-    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {
-        LLAMA_LOG_WARN("%s: flash_attn is not compatible with Grok - forcing off\n", __func__);
-        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
-    }
-
-    if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
-            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
-            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-        }
-        if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
-            LLAMA_LOG_ERROR("%s: SPLIT_MODE_TENSOR requires flash_attn to be enabled\n", __func__);
-            return nullptr;
-        }
-        if (model->get_split_state_ud.n_devices == 1) {
-            LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
-        }
-    }
-
-    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) && params.type_k != params.type_v) {
-        LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
-        return nullptr;
-    }
-
-    const bool fp8_cache = params.type_k == GGML_TYPE_F8_E4M3 || params.type_v == GGML_TYPE_F8_E4M3;
-    // Direct cache consumers do not use the shared attention scaling helpers.
-    if (fp8_cache && (model->hparams.is_mla() ||
-            model->arch == LLM_ARCH_DEEPSEEK32 ||
-            model->arch == LLM_ARCH_DEEPSEEK4 ||
-            model->arch == LLM_ARCH_DEEPSEEK41 ||
-            model->arch == LLM_ARCH_GLM_DSA ||
-            model->arch == LLM_ARCH_GLM5_NEXT ||
-            model->arch == LLM_ARCH_DOTS3NOTE ||
-            model->arch == LLM_ARCH_MISTRAL_LARGE4 ||
-            model->arch == LLM_ARCH_HY_V4 ||
-            model->arch == LLM_ARCH_MINIMAX_M3 ||
-            model->arch == LLM_ARCH_QWEN4EXP ||
-            model->arch == LLM_ARCH_DFLASH)) {
-        LLAMA_LOG_ERROR("%s: FP8 cache is not supported for architecture '%s'\n", __func__, llm_arch_name(model->arch));
-        return nullptr;
-    }
-
-    if (fp8_cache) {
-        for (uint32_t il = 0; il < model->hparams.n_layer_all; ++il) {
-            if (!model->hparams.has_kv(il)) {
-                continue;
-            }
-
-            for (ggml_tensor * scale : { model->layers[il].k_cache_s, model->layers[il].v_cache_s }) {
-                if (!scale || !scale->data) {
-                    continue;
-                }
-
-                float value;
-                ggml_backend_tensor_get(scale, &value, 0, sizeof(value));
-                if (!std::isfinite(value) || value == 0.0f) {
-                    LLAMA_LOG_ERROR("%s: FP8 cache scale '%s' must be finite and nonzero\n", __func__, ggml_get_name(scale));
-                    return nullptr;
-                }
-            }
-        }
-    }
-
-    if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
-        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
-            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);
-            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-        }
-        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-            LLAMA_LOG_ERROR("%s: quantized V cache requires flash_attn to be enabled\n", __func__);
-            return nullptr;
-        }
-    }
-
-    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
-        const uint32_t blck_size = ggml_blck_size(params.type_k);
-        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
-            if (model->hparams.n_embd_head_k(il) % blck_size != 0) {
-                LLAMA_LOG_ERROR("%s: K cache type %s with block size %u does not divide n_embd_head_k=%u\n",
-                    __func__, ggml_type_name(params.type_k), blck_size, model->hparams.n_embd_head_k(il));
-                return nullptr;
-            }
-        }
-    }
-
-    if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_v)) {
-        const uint32_t blck_size = ggml_blck_size(params.type_v);
-        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
-            if (model->hparams.n_embd_head_v(il) % blck_size != 0) {
-                LLAMA_LOG_ERROR("%s: V cache type %s with block size %u does not divide n_embd_head_v=%u\n",
-                    __func__, ggml_type_name(params.type_v), blck_size, model->hparams.n_embd_head_v(il));
-                return nullptr;
-            }
-        }
-    }
-
-    if (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&
-        params.pooling_type != model->hparams.pooling_type) {
-        //user-specified pooling-type is different from the model default
-        LLAMA_LOG_WARN("%s: model default pooling_type is [%d], but [%d] was specified\n", __func__,
-                       model->hparams.pooling_type, params.pooling_type);
-    }
-
-    // router_layer >= 0 means n_layer_nextn is repurposed for a router layer, not real MTP
-    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-        (model->hparams.n_layer_nextn == 0 || model->hparams.router_layer >= 0)) {
-        LLAMA_LOG_WARN("%s: context type MTP requested but model doesn't contain MTP layers\n", __func__);
-        return nullptr;
-    }
-
     try {
-        auto * ctx = new llama_context(*model, params);
+        auto * ctx = new llama_context(*model, llama_context_params_resolve(*model, params));
         const auto & cparams = ctx->get_cparams();
 
         if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && cparams.rope_freq_scale != model->hparams.rope_freq_scale_train) {

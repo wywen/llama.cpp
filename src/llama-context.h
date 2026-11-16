@@ -42,6 +42,20 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+// Applies the adjustments and checks context creation makes to the caller's parameters.
+// Throws std::runtime_error when the parameters cannot build a context for the model.
+llama_context_params llama_context_params_resolve(const llama_model & model, llama_context_params params);
+
+// Derives the parameters shared by context construction and memory planning from resolved parameters.
+// Throws std::runtime_error when the parameters are invalid for the model.
+llama_memory_cparams llama_cparams_memory_shape(const llama_model & model, const llama_context_params & params);
+
+// Builds the memory module a context owns; nullptr when the architecture keeps no memory.
+llama_memory_i * llama_context_create_memory(
+        const llama_model          & model,
+        const llama_context_params & params,
+        const llama_memory_cparams & cparams);
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -336,7 +350,11 @@ private:
 
     const llama_model & model;
 
-    llama_cparams cparams;
+    // the context backs its memory with placeholders and reserves its graphs without allocating compute buffers: its
+    // model was loaded without allocation, or it is built for a graph plan (llama_graph_plan_build)
+    const bool no_alloc;
+
+    llama_cparams cparams{};
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

@@ -7,13 +7,30 @@
 
 #define LLAMA_MAX_SEQ 256
 
-struct llama_cparams {
+// Parameters shared by context construction and memory planning.
+struct llama_memory_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;
     uint32_t n_ubatch;
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
+
+    bool causal_attn;
+    bool offload_kqv;
+    bool flash_attn;
+    bool auto_fa;
+    bool kv_unified;
+
+    enum llama_context_type ctx_type;
+
+    // the context whose model weights or results this context reads, if any
+    llama_context * ctx_other;
+    // the memory is a view of ctx_other's memory (its cells, and its layers where shared), not one of its own
+    bool mem_shares_other;
+};
+
+struct llama_cparams : llama_memory_cparams {
     uint32_t n_outputs_max;   // max outputs supported by the context
     uint32_t n_outputs_max_per_seq;
     int32_t  n_threads;       // number of threads to use for generation
@@ -35,10 +52,7 @@ struct llama_cparams {
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
-    bool causal_attn;
-    bool offload_kqv;
-    bool flash_attn;
-    bool auto_fa;
+
     bool fused_lid;          // use fused lightning indexer
     bool auto_flid;
     bool fused_dsv4_hc_pre;
@@ -51,7 +65,6 @@ struct llama_cparams {
     bool auto_fkvr;
     bool no_perf;
     bool op_offload;
-    bool kv_unified;
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
 
@@ -62,14 +75,11 @@ struct llama_cparams {
     bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host
     bool embeddings_nextn_dev;     // write the unmasked h_nextn rows to a device buffer instead of host, see llama_set_embeddings_nextn_dev()
 
-    enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
-
-    llama_context * ctx_other;
 
     // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_ctx_state_src()
     llama_context * ctx_state_src;
