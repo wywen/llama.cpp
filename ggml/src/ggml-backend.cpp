@@ -1233,9 +1233,6 @@ struct ggml_backend_sched {
     ggml_backend_sched_realloc_callback callback_realloc;
     void * callback_realloc_user_data;
 
-    ggml_backend_sched_reserve_callback callback_reserve;
-    void * callback_reserve_user_data;
-
     // called once per graph compute, after split and alloc and before any split is computed
     ggml_backend_sched_graph_compute_callback callback_graph;
     void * callback_graph_user_data;
@@ -1284,7 +1281,6 @@ struct ggml_backend_sched {
     // compute buffers by the first backend of their buffer type
     ggml_backend_buffer_t caller_buffers[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_CALLER_BUFFERS];
     int                   n_caller_buffers[GGML_SCHED_MAX_BACKENDS];
-    size_t                caller_extents[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_CALLER_BUFFERS];
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -2108,13 +2104,6 @@ static bool ggml_backend_sched_caller_init_tensor(struct ggml_tensor * t) {
 }
 
 static bool ggml_backend_sched_caller_alloc_graph(ggml_backend_sched_t sched, bool reserve) {
-    memset(sched->caller_extents, 0, sizeof(sched->caller_extents));
-
-    // no compute buffer grows: a reserve offers no chunk
-    if (reserve && sched->callback_reserve != NULL && !sched->callback_reserve(sched, NULL, 0, sched->callback_reserve_user_data)) {
-        return false;
-    }
-
     struct ggml_cgraph * graph = &sched->graph;
     if (reserve && sched->caller_alloc.measure != NULL) {
         if (!sched->caller_alloc.measure(sched, graph, sched->caller_alloc.user_data)) {
@@ -2723,10 +2712,7 @@ bool ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
             return false;
         }
         for (int b = 0; b < sched->n_backends; b++) {
-            sizes[b] = 0;
-            for (int c = 0; c < sched->n_caller_buffers[b]; c++) {
-                sizes[b] += sched->caller_extents[b][c];
-            }
+            sizes[b] = ggml_backend_sched_get_buffer_size(sched, sched->backends[b]);
         }
     } else {
         ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
@@ -2841,24 +2827,6 @@ void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_ba
     sched->callback_realloc_user_data = user_data;
 }
 
-static bool ggml_backend_sched_reserve_callback_impl(
-        const struct ggml_backend_sched_buffer_reservation * reservations,
-        size_t n_reservations,
-        void * user_data) {
-    ggml_backend_sched_t sched = (ggml_backend_sched_t) user_data;
-    return sched->callback_reserve(
-        sched, reservations, n_reservations, sched->callback_reserve_user_data);
-}
-
-void ggml_backend_sched_set_reserve_callback(ggml_backend_sched_t sched, ggml_backend_sched_reserve_callback callback, void * user_data) {
-    GGML_ASSERT(sched);
-    sched->callback_reserve = callback;
-    sched->callback_reserve_user_data = user_data;
-    ggml_gallocr_set_reserve_callback(sched->galloc,
-            callback ? ggml_backend_sched_reserve_callback_impl : nullptr,
-            callback ? sched : nullptr);
-}
-
 void ggml_backend_sched_set_graph_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_compute_callback callback, void * user_data) {
     GGML_ASSERT(sched);
     sched->callback_graph = callback;
@@ -2875,25 +2843,6 @@ void ggml_backend_sched_set_graph_rewrite_callback(ggml_backend_sched_t sched, g
     GGML_ASSERT(sched);
     sched->callback_graph_rewrite = callback;
     sched->callback_graph_rewrite_user_data = user_data;
-}
-
-size_t ggml_backend_sched_get_compute_extent(ggml_backend_sched_t sched, int backend_index, int chunk, ggml_backend_buffer_t * chunk_buffer) {
-    GGML_ASSERT(sched);
-    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
-    if (sched->has_caller_alloc) {
-        const bool owner = ggml_backend_sched_buft_owner(sched, backend_index) == backend_index;
-        if (!owner || chunk < 0 || chunk >= sched->n_caller_buffers[backend_index]) {
-            if (chunk_buffer != NULL) {
-                *chunk_buffer = NULL;
-            }
-            return 0;
-        }
-        if (chunk_buffer != NULL) {
-            *chunk_buffer = sched->caller_buffers[backend_index][chunk];
-        }
-        return sched->caller_extents[backend_index][chunk];
-    }
-    return ggml_gallocr_get_chunk_extent(sched->galloc, backend_index, chunk, chunk_buffer);
 }
 
 bool ggml_backend_sched_set_caller_alloc(ggml_backend_sched_t sched, const struct ggml_backend_sched_caller_alloc * alloc) {
@@ -2915,7 +2864,6 @@ bool ggml_backend_sched_set_caller_alloc(ggml_backend_sched_t sched, const struc
         sched->hv_named_copies = NULL;
     }
     memset(sched->n_caller_buffers, 0, sizeof(sched->n_caller_buffers));
-    memset(sched->caller_extents,   0, sizeof(sched->caller_extents));
     ggml_backend_sched_reset(sched);
     return true;
 }
@@ -2943,7 +2891,6 @@ bool ggml_backend_sched_set_compute_buffers(ggml_backend_sched_t sched, ggml_bac
     }
     for (int c = 0; c < n_buffers; c++) {
         sched->caller_buffers[owner][c] = buffers[c];
-        sched->caller_extents[owner][c] = 0;
     }
     sched->n_caller_buffers[owner] = n_buffers;
     return true;
@@ -2994,11 +2941,7 @@ bool ggml_backend_sched_alloc_tensor(ggml_backend_sched_t sched, struct ggml_ten
         GGML_LOG_ERROR("%s: %s: %zu bytes at offset %zu pass the end of a buffer of %zu bytes\n", __func__, tensor->name, size, offset, limit);
         return false;
     }
-    if (ggml_backend_tensor_alloc(buffer, tensor, base + offset) != GGML_STATUS_SUCCESS) {
-        return false;
-    }
-    sched->caller_extents[owner][chunk] = std::max(sched->caller_extents[owner][chunk], offset + size);
-    return true;
+    return ggml_backend_tensor_alloc(buffer, tensor, base + offset) == GGML_STATUS_SUCCESS;
 }
 
 bool ggml_backend_sched_prepare_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
