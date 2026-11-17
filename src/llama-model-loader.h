@@ -207,9 +207,23 @@ struct llama_model_loader {
     void *                         lookup_tables_ud = nullptr;
     std::deque<lookup_table_plan>  lookup_table_plans; // in creation order, stable addresses
 
-    // by file, the ranges of the served tables: llama never reads them, so they are not prefetched, not locked, and
-    // unmapped once loading is done
-    std::map<uint32_t, llama_mmap::ranges> lookup_table_ranges;
+    // tensors the files do not hold, see llama_model_params::declared_tensors; metadata only, not in weights_map
+    ggml_context_ptr                  declared_ctx;
+    std::map<std::string, ggml_tensor *> declared;
+
+    // tensors of the files that the caller loads itself, see llama_model_params::claimed_tensors; in weights_map
+    std::set<std::string> claimed;
+
+    void declare_tensors(const llama_tensor_decl * decls, size_t n);
+    void claim_tensors(const char * const * names, size_t n);
+
+    bool is_declared(const std::string & name) const {
+        return declared.count(name) > 0;
+    }
+
+    // by file, the ranges of the served tables and the claimed tensors: llama never reads them, so they are not
+    // prefetched, not locked, and unmapped once loading is done
+    std::map<uint32_t, llama_mmap::ranges> caller_ranges;
 
     // the ranges of file idx that loading does not read whole: the lazy tables and the served tables
     llama_mmap::ranges unread_ranges(uint32_t idx) const;

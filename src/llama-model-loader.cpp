@@ -952,9 +952,77 @@ const llama_model_loader::llama_tensor_weight & llama_model_loader::require_weig
 struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) const {
     const auto * weight = get_weight(name);
     if (!weight) {
-        return nullptr;
+        const auto it = declared.find(name);
+        return it == declared.end() ? nullptr : it->second;
     }
     return weight->tensor;
+}
+
+void llama_model_loader::declare_tensors(const llama_tensor_decl * decls, size_t n) {
+    if (n == 0) {
+        return;
+    }
+    if (decls == nullptr) {
+        throw std::runtime_error("declared tensors are set, but the list is null");
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*n,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    declared_ctx.reset(ggml_init(params));
+    if (!declared_ctx) {
+        throw std::runtime_error("failed to create ggml context");
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        const llama_tensor_decl & d = decls[i];
+        if (d.name == nullptr || d.name[0] == '\0' || strlen(d.name) >= GGML_MAX_NAME) {
+            throw std::runtime_error(format("declared tensor %zu has no name or a name that is too long", i));
+        }
+        if (get_weight(d.name) != nullptr || declared.count(d.name) > 0) {
+            throw std::runtime_error(format("declared tensor '%s' is already in the model files or declared twice", d.name));
+        }
+        if ((int) d.type < 0 || d.type >= GGML_TYPE_COUNT || ggml_get_type_traits(d.type)->blck_size == 0) {
+            throw std::runtime_error(format("declared tensor '%s' has an invalid type", d.name));
+        }
+        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            if (d.ne[dim] < 1) {
+                throw std::runtime_error(format("declared tensor '%s' has an empty dimension", d.name));
+            }
+        }
+        if (d.ne[0] % ggml_blck_size(d.type) != 0) {
+            throw std::runtime_error(format("declared tensor '%s' has a row that is not a whole number of %s blocks", d.name, ggml_type_name(d.type)));
+        }
+
+        ggml_tensor * t = ggml_new_tensor(declared_ctx.get(), d.type, GGML_MAX_DIMS, d.ne);
+        ggml_set_name(t, d.name);
+        declared.emplace(d.name, t);
+        n_tensors++;
+    }
+}
+
+void llama_model_loader::claim_tensors(const char * const * names, size_t n) {
+    if (n == 0) {
+        return;
+    }
+    if (names == nullptr) {
+        throw std::runtime_error("claimed tensors are set, but the list is null");
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        const llama_tensor_weight * w = get_weight(names[i] == nullptr ? "" : names[i]);
+        if (w == nullptr) {
+            throw std::runtime_error(format("claimed tensor '%s' is not in the model files", names[i] == nullptr ? "(null)" : names[i]));
+        }
+        if (!claimed.insert(names[i]).second) {
+            continue;
+        }
+        // the model never creates it, and llama never reads it
+        n_created++;
+        caller_ranges[w->idx].emplace_back(w->offs, w->offs + ggml_nbytes(w->tensor));
+    }
 }
 
 struct ggml_tensor * llama_model_loader::require_tensor_meta(const std::string & name) const {
@@ -1356,7 +1424,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             const size_t nbytes = ggml_nbytes(t_meta);
             LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
 
-            size_data -= nbytes;
+            // a declared tensor is not among the weights that size_data sums
+            if (!is_declared(tn.str())) {
+                size_data -= nbytes;
+            }
             n_created++;
 
             // the generic pass creates the scales of a weight only beside the weight, so they go unused with it, e.g.
@@ -1525,6 +1596,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
+    if (claimed.count(tn.str()) > 0) {
+        throw std::runtime_error(format("tensor '%s' is claimed by the caller, but the model creates it", tn.str().c_str()));
+    }
     const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
     if (cur == NULL) {
         return NULL;
@@ -1537,6 +1611,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (plan.slots) {
             slot_plan = &plan;
         }
+    }
+
+    // a declared tensor has no data, so it is valid only where a weight is created as metadata only, or skipped
+    const bool declared_tensor = is_declared(tn.str());
+    if (declared_tensor && !(flags & TENSOR_SKIP) && (slot_plan == nullptr || (flags & TENSOR_DUPLICATED))) {
+        throw std::runtime_error(format("tensor '%s' is declared by the caller, but is not an expert weight of a layer that reads its experts from MoE slots", tn.str().c_str()));
     }
 
     // a pageable table whose rows the caller serves is metadata only
@@ -1628,14 +1708,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (slot_member) {
         // the caller fills the slots, nothing of the tensor is loaded
         slot_member->stock = tensor;
-        size_data -= ggml_nbytes(&t_meta);
+        if (!declared_tensor) {
+            // a declared tensor is not among the weights that size_data sums
+            size_data -= ggml_nbytes(&t_meta);
+        }
     }
     if (table_plan) {
         // the caller serves the rows, nothing of the table is loaded
         table_plan->stock = tensor;
         size_data -= ggml_nbytes(&t_meta);
         if (const llama_tensor_weight * w = get_weight(tn.str().c_str())) {
-            lookup_table_ranges[w->idx].emplace_back(w->offs, w->offs + ggml_nbytes(&t_meta));
+            caller_ranges[w->idx].emplace_back(w->offs, w->offs + ggml_nbytes(&t_meta));
         }
     }
 
@@ -1662,8 +1745,8 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 
 llama_mmap::ranges llama_model_loader::unread_ranges(uint32_t idx) const {
     llama_mmap::ranges res = lazy.for_file(idx);
-    const auto it = lookup_table_ranges.find(idx);
-    if (it != lookup_table_ranges.end()) {
+    const auto it = caller_ranges.find(idx);
+    if (it != caller_ranges.end()) {
         res.insert(res.end(), it->second.begin(), it->second.end());
     }
     return res;
@@ -1695,9 +1778,9 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
-                // a later tensor locks the file up to its end, but not the served tables
-                const auto it = lookup_table_ranges.find(idx);
-                mlock_mmap->init(mapping->addr(), it == lookup_table_ranges.end() ? llama_mmap::ranges() : it->second);
+                // a later tensor locks the file up to its end, but not the served tables or the claimed tensors
+                const auto it = caller_ranges.find(idx);
+                mlock_mmap->init(mapping->addr(), it == caller_ranges.end() ? llama_mmap::ranges() : it->second);
                 mlock_mmaps->emplace_back(std::move(mlock_mmap));
             }
             mappings.emplace_back(std::move(mapping));
@@ -1706,7 +1789,10 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
     // compute the total size of all tensors for progress reporting
     for (const auto & it : weights_map) {
-        size_data += ggml_nbytes(it.second.tensor);
+        // the caller loads a claimed tensor itself
+        if (claimed.count(it.first) == 0) {
+            size_data += ggml_nbytes(it.second.tensor);
+        }
     }
 }
 
@@ -2133,9 +2219,9 @@ bool llama_model_loader::load_all_data(
                 if (mmap_used.second != 0) {
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
                 }
-                // the served tables lie outside every buffer that wraps the mapping
-                const auto it = lookup_table_ranges.find(idx);
-                if (it != lookup_table_ranges.end()) {
+                // the served tables and the claimed tensors lie outside every buffer that wraps the mapping
+                const auto it = caller_ranges.find(idx);
+                if (it != caller_ranges.end()) {
                     for (const auto & range : it->second) {
                         mapping->unmap_fragment(range.first, range.second);
                     }

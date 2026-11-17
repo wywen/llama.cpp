@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -41,7 +42,8 @@ static size_t get_slot_layer(int32_t il, int32_t n_expert, void * ud) {
     return req->stride;
 }
 
-static llama_model_ptr load_model(const std::string & path, std::vector<ggml_backend_dev_t> devs, slot_request * req) {
+static llama_model_ptr load_model(const std::string & path, std::vector<ggml_backend_dev_t> devs, slot_request * req,
+        const std::function<void(llama_model_params &)> & set_params = nullptr) {
     llama_model_params mparams = llama_model_default_params();
     if (req) {
         mparams.moe_slots           = get_slot_layer;
@@ -52,6 +54,9 @@ static llama_model_ptr load_model(const std::string & path, std::vector<ggml_bac
     } else {
         devs.push_back(nullptr);
         mparams.devices = devs.data();
+    }
+    if (set_params) {
+        set_params(mparams);
     }
     g_log.clear();
     llama_model_ptr model(llama_model_load_from_file(path.c_str(), mparams));
@@ -145,6 +150,33 @@ static void test_model(const std::string & path, const std::vector<ggml_backend_
             refused = g_log.find("MoE slot stride") != std::string::npos;
         }
         check(refused, stem + ": the MoE slot stride " + std::to_string(stride) + " is refused");
+    }
+
+    // a declared tensor that the files hold, a claimed tensor that the files do not hold, and a declared tensor that
+    // is not an expert weight of a slot layer are refused
+    {
+        const llama_tensor_decl in_files = { "token_embd.weight", GGML_TYPE_F32, { 1, 1, 1, 1 } };
+        const llama_tensor_decl stray    = { "stray.weight",      GGML_TYPE_F32, { 32, 1, 1, 1 } };
+        const char * missing = "no.such.weight";
+        const struct {
+            const char * what;
+            const char * message;
+            std::function<void(llama_model_params &)> set;
+        } cases[] = {
+            { "a declared tensor of the files", "already in the model files", [&](llama_model_params & p) { p.declared_tensors = &in_files; p.n_declared_tensors = 1; } },
+            { "a claimed tensor not in the files", "not in the model files", [&](llama_model_params & p) { p.claimed_tensors = &missing; p.n_claimed_tensors = 1; } },
+            { "a declared tensor the model does not use", "wrong number of tensors", [&](llama_model_params & p) { p.declared_tensors = &stray; p.n_declared_tensors = 1; } },
+        };
+        for (const auto & c : cases) {
+            slot_request req = { STRIDE, {} };
+            bool refused = false;
+            try {
+                load_model(path, devs, &req, c.set);
+            } catch (const std::exception &) {
+                refused = g_log.find(c.message) != std::string::npos;
+            }
+            check(refused, stem + ": " + c.what + " is refused");
+        }
     }
 
     // the MoE cache keeps its own copies of the experts, it does not combine with slots
