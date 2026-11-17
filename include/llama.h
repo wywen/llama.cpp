@@ -454,8 +454,8 @@ extern "C" {
         // the current one cannot serve), right after creating it and before the scheduler splits, reserves, measures
         // or computes any graph; a scheduler that the context reuses keeps what the callback installed on it
         // `ctx` is the context that owns `sched`, which may still be under construction: identify it, do not query it
-        // its purpose is to install the scheduler's callbacks (ggml_backend_sched_set_reserve_callback,
-        // ggml_backend_sched_set_graph_prepare_callback, ggml_backend_sched_set_graph_rewrite_callback) and its caller
+        // its purpose is to install the scheduler's callbacks (ggml_backend_sched_set_graph_prepare_callback,
+        // ggml_backend_sched_set_graph_rewrite_callback) and its caller
         // allocator (ggml_backend_sched_set_caller_alloc); returning false fails the context's creation or reserve
         // a graph rewrite runs on every graph that the scheduler reserves, measures or allocates, each time after llama
         // builds it; a graph that llama reuses without building it again keeps its rewritten nodes and is not passed to

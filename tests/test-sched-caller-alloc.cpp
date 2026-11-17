@@ -142,18 +142,6 @@ static bool place(ggml_backend_sched_t sched, ggml_cgraph * graph, void * user_d
     return true;
 }
 
-struct reserve_counts {
-    int n_calls        = 0;
-    int n_reservations = 0;
-};
-
-static bool count_reserve(ggml_backend_sched_t, const ggml_backend_sched_buffer_reservation *, size_t n, void * user_data) {
-    auto * counts = static_cast<reserve_counts *>(user_data);
-    counts->n_calls++;
-    counts->n_reservations += (int) n;
-    return true;
-}
-
 static size_t align_to(size_t n, size_t a) {
     return (n + a - 1)/a*a;
 }
@@ -335,8 +323,6 @@ static void test_backend(ggml_backend_t backend) {
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends.data(), nullptr, (int) backends.size(), 64, false, true);
     ggml_backend_sched_caller_alloc calls = { place, alloc, &c, nullptr };
     CHECK(ggml_backend_sched_set_caller_alloc(sched, &calls));
-    reserve_counts reserves;
-    ggml_backend_sched_set_reserve_callback(sched, count_reserve, &reserves);
     for (ggml_backend_t b : backends) {
         ggml_backend_buffer_type_t buft = ggml_backend_sched_get_buffer_type(sched, b);
         if (c.buffers.count(buft)) {
@@ -360,12 +346,8 @@ static void test_backend(ggml_backend_t backend) {
         // a reserve allocates the graph through the caller and leaves the scheduler reset
         {
             test_graph g = build_graph(w);
-            const int n_calls = reserves.n_calls;
             CHECK(ggml_backend_sched_reserve(sched, g.graph));
             CHECK(g.out->data != nullptr);
-            // the reserve callback runs, offering no chunk
-            CHECK(reserves.n_calls == n_calls + 1);
-            CHECK(reserves.n_reservations == 0);
             ggml_free(g.ctx);
             ggml_free(c.ctx_copies);
             c.ctx_copies = ggml_init(cparams);
@@ -378,18 +360,6 @@ static void test_backend(ggml_backend_t backend) {
         printf("  mode %d: %d copies named, %d splits\n", (int) mode, c.n_copies, ggml_backend_sched_get_n_splits(sched));
         CHECK(on_cpu ? c.n_copies == 0 : c.n_copies > 0);
 
-        // the extents are what the caller placed, in the caller's buffers
-        size_t total = 0;
-        for (int b = 0; b < (int) backends.size(); b++) {
-            for (int k = 0; k < GGML_SCHED_MAX_CALLER_BUFFERS; k++) {
-                ggml_backend_buffer_t chunk = nullptr;
-                const size_t extent = ggml_backend_sched_get_compute_extent(sched, b, k, &chunk);
-                CHECK(extent == 0 || chunk != nullptr);
-                CHECK(chunk == nullptr || extent <= ggml_backend_buffer_get_size(chunk));
-                total += extent;
-            }
-        }
-        CHECK(total > 0);
         CHECK(ggml_backend_sched_get_buffer_size(sched, backend) == 2u << 20);
 
         ggml_backend_sched_reset(sched);
@@ -433,7 +403,6 @@ static void test_backend(ggml_backend_t backend) {
         }
         c.mode = ALLOC_PACKED;
 
-        const int n_calls = reserves.n_calls;
         c.n_allocs   = 0;
         c.n_measures = 0;
         {
@@ -447,15 +416,16 @@ static void test_backend(ggml_backend_t backend) {
             std::vector<size_t> sizes(backends.size(), 1);
             CHECK(ggml_backend_sched_reserve_size(sched, g.graph, sizes.data()));
             CHECK(g.out->data == nullptr);
-            for (size_t size : sizes) {
-                CHECK(size == 0);
+            // the sizes are the compute buffers the caller gave each backend
+            for (size_t b = 0; b < backends.size(); b++) {
+                CHECK(sizes[b] == ggml_backend_sched_get_buffer_size(sched, backends[b]));
             }
+            CHECK(sizes[0] == 2u << 20);
             ggml_backend_sched_reset(sched);
             ggml_free(g.ctx);
         }
         CHECK(c.n_measures == 2);
         CHECK(c.n_allocs == 0);
-        CHECK(reserves.n_calls == n_calls + 2);
         {
             test_graph g = build_graph(w);
             CHECK(ggml_backend_sched_split_graph(sched, g.graph));
@@ -513,7 +483,6 @@ static void test_backend(ggml_backend_t backend) {
     }
 
     // without the caller allocator the graph allocator runs again
-    ggml_backend_sched_set_reserve_callback(sched, nullptr, nullptr);
     CHECK(ggml_backend_sched_set_caller_alloc(sched, nullptr));
     {
         test_graph g = build_graph(w);

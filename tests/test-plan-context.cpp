@@ -339,7 +339,6 @@ struct measuring_caller {
     std::vector<std::vector<std::string>> measured;
     std::vector<std::string> problems;
     size_t n_allocs   = 0;
-    size_t n_reserves = 0;
     ggml_backend_sched_t sched = nullptr; // the last scheduler the context created
     ggml_backend_sched_caller_alloc calls = {};
 };
@@ -370,16 +369,10 @@ bool measuring_measure(ggml_backend_sched_t sched, ggml_cgraph * graph, void * u
     return true;
 }
 
-bool measuring_reserve(ggml_backend_sched_t /*sched*/, const ggml_backend_sched_buffer_reservation * /*reservations*/, size_t /*n*/, void * user_data) {
-    static_cast<measuring_caller *>(user_data)->n_reserves++;
-    return true;
-}
-
-// installs the caller's graph rewrite, reserve callback and caller allocator
+// installs the caller's graph rewrite and caller allocator
 bool install_measuring(ggml_backend_sched_t sched, llama_context * /*ctx*/, void * user_data) {
     auto * caller = static_cast<measuring_caller *>(user_data);
     caller->sched = sched;
-    ggml_backend_sched_set_reserve_callback(sched, measuring_reserve, caller);
     ggml_backend_sched_set_graph_rewrite_callback(sched, rewrite_graph, &caller->rewrite);
     return ggml_backend_sched_set_caller_alloc(sched, &caller->calls);
 }
@@ -427,9 +420,6 @@ void check_measured(const std::string & what, const measuring_caller & caller, s
     }
     if (caller.n_allocs != 0) {
         fail(out, what + ": the plan context allocated " + std::to_string(caller.n_allocs) + " graphs");
-    }
-    if (caller.n_reserves != caller.measured.size()) {
-        fail(out, what + ": " + std::to_string(caller.n_reserves) + " reserve callbacks for " + std::to_string(caller.measured.size()) + " measured graphs");
     }
     if (caller.sched != ctx.get_sched()) {
         fail(out, what + ": the scheduler callback did not see the context's scheduler");
