@@ -1549,6 +1549,12 @@ void llama_context::layer_inp_dev_alloc() {
 bool llama_context::h_nextn_dev_alloc() {
     synchronize();
 
+    // a context reading these rows (ctx_state_src) may still have queued work on them; wait for its last
+    // read before the buffer is freed or replaced, as set_h_nextn_rows does before overwriting it
+    if (ev_h_nextn_read_recorded) {
+        ggml_backend_event_synchronize(ev_h_nextn_read.get());
+    }
+
     auto reset = [&]() {
         h_nextn_dev     = nullptr;
         h_nextn_dev_dev = nullptr;
