@@ -1714,6 +1714,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     ml.lookup_tables    = params.lookup_tables;
     ml.lookup_tables_ud = params.lookup_tables_user_data;
 
+    ml.declare_tensors(params.declared_tensors, params.n_declared_tensors);
+    ml.claim_tensors(params.claimed_tensors, params.n_claimed_tensors);
+
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
@@ -3674,6 +3677,10 @@ llama_model_params llama_model_default_params() {
         /*.moe_slots_user_data         =*/ nullptr,
         /*.lookup_tables               =*/ nullptr,
         /*.lookup_tables_user_data     =*/ nullptr,
+        /*.declared_tensors            =*/ nullptr,
+        /*.n_declared_tensors          =*/ 0,
+        /*.claimed_tensors             =*/ nullptr,
+        /*.n_claimed_tensors           =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.use_mmap_prefetch           =*/ true,
         /*.check_tensors               =*/ false,

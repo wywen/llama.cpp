@@ -265,6 +265,13 @@ extern "C" {
     // layer, a multiple of the alignment of the buffer type of its expert weights; see llama_model_params.moe_slots
     typedef size_t (*llama_moe_slot_layer_callback)(int32_t il, int32_t n_expert, void * user_data);
 
+    // a tensor that the model files do not hold, see llama_model_params.declared_tensors
+    struct llama_tensor_decl {
+        const char *   name;
+        enum ggml_type type;
+        int64_t        ne[4];
+    };
+
     // called during loading once for each lookup table whose rows the caller can serve, with its tensor name, number of
     // rows and the bytes of one row
     // returns true if the caller serves the table's rows, see llama_model_params.lookup_tables
@@ -382,6 +389,20 @@ extern "C" {
         // graphs that read them, see "Lookup tables served by the caller"; NULL = every table is loaded
         llama_lookup_table_callback lookup_tables;
         void * lookup_tables_user_data;
+
+        // tensors that the model files do not hold: the loader adds each one to the tensors of the model as a tensor
+        // with no data, and the model creates it as it creates a weight of that name. A declared tensor is valid only
+        // where llama creates a weight as metadata only, i.e. as an expert weight of a layer that reads its expert
+        // weights from slots (see "MoE expert slots"), or where the model skips the weight (e.g. the layers of a
+        // model part that is not loaded); anywhere else the load fails. A name that the files also hold fails the load
+        const struct llama_tensor_decl * declared_tensors;
+        size_t n_declared_tensors;
+
+        // tensors of the model files that the caller loads itself: the model never creates them, they count among the
+        // tensors that the model uses, and llama neither reads nor maps their data. A name that the files do not hold
+        // fails the load
+        const char * const * claimed_tensors;
+        size_t n_claimed_tensors;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
