@@ -1232,12 +1232,12 @@ llama_model_loader::moe_slot_plan & llama_model_loader::get_moe_slot_plan(llm_ar
         return plan;
     }
 
-    if (!moe_slots(il, plan.n_expert, moe_slots_ud)) {
+    plan.stride = moe_slots(il, plan.n_expert, moe_slots_ud);
+    if (plan.stride == 0) {
         return plan;
     }
     plan.slots = true;
 
-    // the slot layout is the same whatever the order and layout of the file
     const LLM_TN tn(arch);
     for (llm_tensor kind : { LLM_TENSOR_FFN_GATE_UP_EXPS, LLM_TENSOR_FFN_UP_EXPS, LLM_TENSOR_FFN_GATE_EXPS, LLM_TENSOR_FFN_DOWN_EXPS }) {
         const std::string name = tn(kind, "weight", il).str();
@@ -1250,13 +1250,14 @@ llama_model_loader::moe_slot_plan & llama_model_loader::get_moe_slot_plan(llm_ar
                 name.c_str(), llama_format_tensor_shape(t).c_str(), plan.n_expert));
         }
         moe_slot_plan::member m;
-        m.name   = name;
-        m.size   = t->nb[2];
-        m.offset = plan.slot_size;
-        plan.slot_size += GGML_PAD(m.size, moe_slot_alignment);
+        if (plan.stride < t->nb[2]) {
+            throw std::runtime_error(format("tensor '%s' has %zu bytes per expert, more than the MoE slot stride %zu of layer %d",
+                name.c_str(), (size_t) t->nb[2], plan.stride, il));
+        }
+        m.name = name;
         plan.members.push_back(std::move(m));
     }
-    GGML_ASSERT(!plan.members.empty() && plan.members.size() <= LLAMA_MOE_SLOT_MAX_MEMBERS);
+    GGML_ASSERT(!plan.members.empty());
 
     return plan;
 }
@@ -1578,16 +1579,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 slot_member = &m;
             }
         }
-        if (slot_member == nullptr || slot_member->stock != nullptr || t_meta.ne[2] != slot_plan->n_expert || t_meta.nb[2] != slot_member->size) {
+        if (slot_member == nullptr || slot_member->stock != nullptr || t_meta.ne[2] != slot_plan->n_expert) {
             throw std::runtime_error(format("tensor '%s' %s does not fit the MoE slots of its layer", tn.str().c_str(), llama_format_tensor_shape(&t_meta).c_str()));
         }
     }
 
-    // the buffer type of a slot layer's expert weight must support the member's slot tensor, strided by the slot size
+    // the buffer type of a slot layer's expert weight must support the member's slot tensor, strided by the slot stride
     // (the number of slots is chosen by the caller, the check takes one slot per expert)
     ggml_tensor t_slots = t_meta;
     if (slot_plan) {
-        t_slots.nb[2] = slot_plan->slot_size;
+        t_slots.nb[2] = slot_plan->stride;
         t_slots.nb[3] = t_slots.nb[2]*t_slots.ne[2];
     }
 
