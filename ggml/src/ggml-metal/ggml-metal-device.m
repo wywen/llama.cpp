@@ -2065,14 +2065,13 @@ struct ggml_metal_buffer_wrapper {
 };
 
 // a range of a buffer whose Metal buffers the caller supplies (see ggml_backend_metal_buffer_from_ranges): its host
-// bytes, the caller's id<MTLBuffer> over them or NULL, never retained here, and the offset of the range's first byte
-// in that Metal buffer
+// bytes and the caller's id<MTLBuffer> over a prefix of them or NULL, never retained here; the offset of the range in
+// the Metal buffer and the prefix it holds are read from the Metal buffer itself, so that one atomic load gives both
 struct ggml_metal_buffer_range {
     void   * data;
     size_t   size;
 
     _Atomic(void *) metal;
-    size_t          metal_offs;
 };
 
 struct ggml_metal_buffer {
@@ -2090,6 +2089,10 @@ struct ggml_metal_buffer {
     // set for a buffer whose Metal buffers the caller supplies: n_buffers is 0 and there is no residency set
     int n_ranges;
     struct ggml_metal_buffer_range * ranges;
+
+    // the caller's hook that grows a range's prefix on demand (see ggml_backend_metal_buffer_set_range_grow), or NULL
+    void (*range_grow)(void * user_data, int i, size_t bytes);
+    void * range_grow_user_data;
 
     bool use_residency_sets;
 
@@ -2357,11 +2360,21 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
     return res;
 }
 
-// whether `metal` (an id<MTLBuffer> or NULL) may back range i of buf: NULL, or a buffer of buf's device whose contents
-// hold the whole range, with *offs set to the offset of the range in them (0 for NULL); false with a log line otherwise
-static bool ggml_metal_buffer_range_accepts(ggml_metal_buffer_t buf, int i, void * metal, size_t * offs, const char * caller) {
-    *offs = 0;
+// the bytes of range i that `metal` (an id<MTLBuffer>) holds from the range's first byte: 0 when its contents do not
+// start at or before the range or end before the range's first byte; never more than the range
+static size_t ggml_metal_buffer_range_held(const struct ggml_metal_buffer_range * range, id<MTLBuffer> mtl) {
+    const uintptr_t contents = (uintptr_t) mtl.contents;
+    const uintptr_t beg      = (uintptr_t) range->data;
+    if (contents == 0 || beg < contents || beg - contents >= mtl.length) {
+        return 0;
+    }
+    const size_t held = mtl.length - (beg - contents);
+    return held < range->size ? held : range->size;
+}
 
+// whether `metal` (an id<MTLBuffer> or NULL) may back range i of buf: NULL, or a buffer of buf's device whose contents
+// hold a non-empty prefix of the range; false with a log line otherwise
+static bool ggml_metal_buffer_range_accepts(ggml_metal_buffer_t buf, int i, void * metal, const char * caller) {
     if (metal == NULL) {
         return true;
     }
@@ -2374,14 +2387,10 @@ static bool ggml_metal_buffer_range_accepts(ggml_metal_buffer_t buf, int i, void
         return false;
     }
 
-    const uintptr_t contents = (uintptr_t) mtl.contents;
-    const uintptr_t beg      = (uintptr_t) range->data;
-    if (contents == 0 || beg < contents || beg - contents > mtl.length || range->size > mtl.length - (beg - contents)) {
-        GGML_LOG_ERROR("%s: the Metal buffer of range %d does not hold the range's %zu bytes\n", caller, i, range->size);
+    if (ggml_metal_buffer_range_held(range, mtl) == 0) {
+        GGML_LOG_ERROR("%s: the Metal buffer of range %d holds no prefix of the range's %zu bytes\n", caller, i, range->size);
         return false;
     }
-
-    *offs = beg - contents;
 
     return true;
 }
@@ -2426,7 +2435,7 @@ ggml_metal_buffer_t ggml_metal_buffer_map_ranges(ggml_metal_device_t dev, void *
     }
 
     for (int i = 0; i < n_ranges; ++i) {
-        if (!ggml_metal_buffer_range_accepts(res, i, metals[i], &res->ranges[i].metal_offs, __func__)) {
+        if (!ggml_metal_buffer_range_accepts(res, i, metals[i], __func__)) {
             ggml_metal_buffer_free(res);
             return NULL;
         }
@@ -2445,13 +2454,23 @@ bool ggml_metal_buffer_set_range(ggml_metal_buffer_t buf, int i, void * metal) {
         GGML_LOG_ERROR("%s: range %d is not in [0, %d)\n", __func__, i, buf->n_ranges);
         return false;
     }
-    size_t offs = 0;
-    if (!ggml_metal_buffer_range_accepts(buf, i, metal, &offs, __func__)) {
+    if (!ggml_metal_buffer_range_accepts(buf, i, metal, __func__)) {
         return false;
     }
 
-    buf->ranges[i].metal_offs = offs;
     atomic_store_explicit(&buf->ranges[i].metal, metal, memory_order_release);
+
+    return true;
+}
+
+bool ggml_metal_buffer_set_range_grow(ggml_metal_buffer_t buf, void (*grow)(void * user_data, int i, size_t bytes), void * user_data) {
+    if (buf->ranges == NULL) {
+        GGML_LOG_ERROR("%s: not a buffer from ggml_backend_metal_buffer_from_ranges\n", __func__);
+        return false;
+    }
+
+    buf->range_grow           = grow;
+    buf->range_grow_user_data = user_data;
 
     return true;
 }
@@ -2878,7 +2897,8 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
 }
 
 // the caller's Metal buffer of the range that holds t, and t's offset in it; aborts, naming t, when t crosses a range
-// boundary or lies outside the buffer, or when its range has no Metal buffer
+// boundary or lies outside the buffer, when its range has no Metal buffer, or when t ends past the prefix of the range
+// that the Metal buffer holds
 static struct ggml_metal_buffer_id ggml_metal_buffer_get_range_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {
     const uintptr_t beg = (uintptr_t) t->data;
     const uintptr_t end = beg + ggml_nbytes(t);
@@ -2907,13 +2927,29 @@ static struct ggml_metal_buffer_id ggml_metal_buffer_get_range_id(ggml_metal_buf
     }
 
     void * metal = atomic_load_explicit(&range->metal, memory_order_acquire);
+    const size_t need = (size_t) (end - (uintptr_t) range->data);
+    if (buf->range_grow != NULL && (metal == NULL || ggml_metal_buffer_range_held(range, (id<MTLBuffer>) metal) < need)) {
+        buf->range_grow(buf->range_grow_user_data, lo, need);
+        metal = atomic_load_explicit(&range->metal, memory_order_acquire);
+    }
     if (metal == NULL) {
         GGML_ABORT("%s: tensor '%s' is in range %d of a buffer from ggml_backend_metal_buffer_from_ranges, which has "
                 "no Metal buffer; set one with ggml_backend_metal_buffer_set_range before encoding work that uses it",
                 __func__, t->name, lo);
     }
 
-    return (struct ggml_metal_buffer_id) { metal, range->metal_offs + (beg - (uintptr_t) range->data) };
+    // a kernel binding t may touch any of its ggml_nbytes(t) bytes, all of which must be in the Metal buffer: past its
+    // end the GPU would fault, or read and write pages it was never given
+    id<MTLBuffer> mtl = (id<MTLBuffer>) metal;
+    const size_t held = ggml_metal_buffer_range_held(range, mtl);
+    if (held < need) {
+        GGML_ABORT("%s: tensor '%s' ends %zu bytes into range %d of a buffer from ggml_backend_metal_buffer_from_ranges, "
+                "past the %zu bytes its Metal buffer holds; install one that holds the tensor with "
+                "ggml_backend_metal_buffer_set_range before encoding work that uses it",
+                __func__, t->name, need, lo, held);
+    }
+
+    return (struct ggml_metal_buffer_id) { metal, (size_t) (beg - (uintptr_t) mtl.contents) };
 }
 
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {

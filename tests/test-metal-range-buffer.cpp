@@ -8,9 +8,12 @@
 //
 // Each range's Metal buffer is also replaced on its own: while range 1 has none and its pages are mapped anew, kernels
 // over the other ranges compute; after the caller installs a new Metal buffer over the new pages the GPU reads and
-// writes them. Encoding a kernel on a tensor in a range with no Metal buffer, or on a view across a range boundary,
-// aborts, naming the tensor; the binary checks this by running itself in a child process. The backend takes no
-// reference to the caller's Metal buffers. It skips when there is no Metal device.
+// writes them. A range's Metal buffer may hold only a prefix of it: kernels over tensors inside the prefix compute,
+// and the prefix grows by installing a longer Metal buffer over the same pages, by the caller or by its grow hook when a
+// kernel reaches past the prefix. Encoding a kernel on a tensor in a range with no Metal buffer, on a view across a
+// range boundary, or on a tensor that ends past its range's prefix, aborts, naming the tensor; the binary checks this
+// by running itself in a child process. The backend takes no reference to the caller's Metal buffers. It skips when
+// there is no Metal device.
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -164,9 +167,9 @@ struct fixture {
         return (uint8_t *) mem + i*sub;
     }
 
-    // replaces range i's Metal buffer with a new one over its pages
-    bool rewrap(int i) {
-        void * m = test_metal_nocopy_buffer_new(dev, range_base(i), sub);
+    // replaces range i's Metal buffer with a new one over its first `bytes` bytes, all of it by default
+    bool rewrap(int i, size_t bytes = 0) {
+        void * m = test_metal_nocopy_buffer_new(dev, range_base(i), bytes == 0 ? sub : bytes);
         if (m == nullptr || !ggml_backend_metal_buffer_set_range(buf, i, m)) {
             if (m != nullptr) {
                 test_metal_buffer_release(m);
@@ -359,7 +362,14 @@ static void test_validation(fixture & f) {
     refused(f.dev, nullptr, 2*page, { { 2*page, nullptr } }, 1, "a null base is refused");
     refused(f.dev, f.mem, 0, { { 0, nullptr } }, 1, "an empty buffer is refused");
     refused(f.dev, f.range_base(1), f.sub, { { f.sub, m0 } }, 1, "a Metal buffer over other memory is refused");
-    refused(f.dev, f.mem, 8*page, { { 8*page, m0 } }, 1, "a Metal buffer shorter than its range is refused");
+    refused(f.dev, f.mem, f.sub, { { f.sub, f.metal[1] } }, 1, "a Metal buffer that starts past its range is refused");
+    {
+        ggml_backend_buffer_t b = ggml_backend_metal_buffer_from_ranges(f.dev, f.mem, 8*page, std::vector<ggml_backend_metal_range>{ { 8*page, m0 } }.data(), 1);
+        check(b != nullptr, sc, "a Metal buffer that holds a prefix of its range is accepted");
+        if (b != nullptr) {
+            ggml_backend_buffer_free(b);
+        }
+    }
 
     ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (cpu != nullptr) {
@@ -398,6 +408,102 @@ static void test_caller_buft(fixture & f) {
     if (cpu != nullptr) {
         buft.device = cpu;
         check(!ggml_backend_dev_supports_buft(f.dev, &buft), sc, "one for another device is not");
+    }
+}
+
+// range 1's Metal buffer holds only its first page: a kernel reading a view inside it computes, and once a Metal buffer
+// over the whole range replaces it the kernel writing the range's last bytes computes too; the shorter buffer is
+// released only after the work that bound it completed
+static void test_prefix(fixture & f) {
+    const char * sc = "prefix";
+
+    check(f.rewrap(1, f.page), sc, "range 1 gets a Metal buffer over its first page");
+    check(id_of(f.in[1]).metal == f.metal[1], sc, "a view inside the prefix resolves to it");
+
+    const std::vector<float> src = ramp(700.0f);
+    ggml_backend_tensor_set(f.in[1], src.data(), 0, kBytes);
+    ggml_backend_tensor_memset(f.out[1], 0xff, 0, kBytes);
+    check(ggml_backend_graph_compute(f.backend, graph_of(f, 1)) == GGML_STATUS_SUCCESS && holds(f.out[1], src, 3.0f), sc,
+            "a kernel reading a view inside the prefix computes");
+
+    // grown while work that binds the prefix is in flight: the old buffer stays alive until it completes
+    void * const short_metal = f.metal[1];
+    f.metal[1] = nullptr;
+    ggml_backend_tensor_memset(f.out[1], 0xff, 0, kBytes);
+    check(ggml_backend_graph_compute_async(f.backend, graph_of(f, 1)) == GGML_STATUS_SUCCESS, sc, "work over the prefix is submitted");
+    check(f.rewrap(1, 2*f.page), sc, "a longer prefix over the same pages replaces it meanwhile");
+    ggml_backend_synchronize(f.backend);
+    test_metal_buffer_release(short_metal);
+    check(holds(f.out[1], src, 3.0f), sc, "the work in flight over the shorter prefix computes correctly");
+
+    check(f.rewrap(1), sc, "a Metal buffer over the whole range replaces the prefix");
+    const std::vector<float> src0 = ramp(-700.0f);
+    ggml_backend_tensor_set(f.in[0], src0.data(), 0, kBytes);
+    ggml_backend_tensor_memset(f.out[0], 0xff, 0, kBytes);
+    check(ggml_backend_graph_compute(f.backend, graph_of(f, 0)) == GGML_STATUS_SUCCESS && holds(f.out[0], src0, 2.0f), sc,
+            "a kernel writing the range's last bytes computes once the range is held whole");
+}
+
+// the grow hook of test_grow: wraps the pages of range 1 that hold its first `bytes` bytes, keeping the Metal buffer it
+// replaces alive until the test has synchronized
+struct grow_state {
+    fixture * f = nullptr;
+    int calls = 0;
+    int range = -1;
+    size_t bytes = 0;
+    std::vector<void *> retired;
+};
+
+static void grow_range(void * user_data, int i, size_t bytes) {
+    grow_state & g = *(grow_state *) user_data;
+    g.calls++;
+    g.range = i;
+    g.bytes = bytes;
+    const size_t pages = (bytes + g.f->page - 1)/g.f->page*g.f->page;
+    void * m = test_metal_nocopy_buffer_new(g.f->dev, g.f->range_base(i), pages);
+    if (m == nullptr || !ggml_backend_metal_buffer_set_range(g.f->buf, i, m)) {
+        return;
+    }
+    if (g.f->metal[i] != nullptr) {
+        g.retired.push_back(g.f->metal[i]);
+    }
+    g.f->metal[i] = m;
+}
+
+// with a grow hook, a kernel on a tensor past range 1's one-page prefix grows it to the pages that hold the tensor,
+// and a kernel inside the prefix calls no hook
+static void test_grow(fixture & f) {
+    const char * sc = "grow";
+
+    grow_state g;
+    g.f = &f;
+    check(f.rewrap(1, f.page), sc, "range 1 gets a Metal buffer over its first page");
+    check(ggml_backend_metal_buffer_set_range_grow(f.buf, grow_range, &g), sc, "a grow hook is installed");
+
+    const std::vector<float> src = ramp(300.0f);
+    ggml_backend_tensor_set(f.in[1], src.data(), 0, kBytes);
+    check(ggml_backend_graph_compute(f.backend, graph_of(f, 1)) == GGML_STATUS_SUCCESS && holds(f.out[1], src, 3.0f) &&
+            g.calls == 0, sc, "a kernel inside the prefix computes without the hook");
+
+    const std::vector<float> src0 = ramp(-300.0f);
+    ggml_backend_tensor_set(f.in[0], src0.data(), 0, kBytes);
+    ggml_backend_tensor_memset(f.out[0], 0xff, 0, kBytes);
+    check(ggml_backend_graph_compute(f.backend, graph_of(f, 0)) == GGML_STATUS_SUCCESS && holds(f.out[0], src0, 2.0f), sc,
+            "a kernel writing past the prefix computes once the hook grew it");
+    check(g.calls == 1 && g.range == 1 && g.bytes == f.sub, sc, "the hook was asked for the bytes the tensor ends at");
+    check(id_of(f.out[0]).metal == f.metal[1], sc, "the tensor resolves to the grown Metal buffer");
+
+    ggml_backend_synchronize(f.backend);
+    for (void * m : g.retired) {
+        test_metal_buffer_release(m);
+    }
+    check(ggml_backend_metal_buffer_set_range_grow(f.buf, nullptr, nullptr), sc, "the hook is removed");
+
+    ggml_backend_buffer_t plain = ggml_backend_dev_buffer_from_host_ptr(f.dev, f.mem, f.sub, f.sub);
+    check(plain != nullptr && !ggml_backend_metal_buffer_set_range_grow(plain, grow_range, &g), sc,
+            "a hook on a host-pointer buffer is refused");
+    if (plain != nullptr) {
+        ggml_backend_buffer_free(plain);
     }
 }
 
@@ -484,6 +590,34 @@ static int encode_missing(fixture & f) {
     return 0;
 }
 
+// child mode: with range 1's Metal buffer over its first page, a kernel reading inside the prefix computes, then
+// encoding one that writes the range's last bytes must not return
+static int encode_past_prefix(fixture & f) {
+    if (!f.rewrap(1, f.page)) {
+        fprintf(stderr, "range 1 kept its whole Metal buffer\n");
+        return 1;
+    }
+    const std::vector<float> src = ramp(100.0f);
+    ggml_backend_tensor_set(f.in[1], src.data(), 0, kBytes);
+    if (ggml_backend_graph_compute(f.backend, graph_of(f, 1)) == GGML_STATUS_SUCCESS && holds(f.out[1], src, 3.0f)) {
+        fprintf(stderr, "the prefix computes\n");
+    }
+    ggml_backend_graph_compute(f.backend, graph_of(f, 0));
+    printf("encoding a kernel on a tensor past its range's prefix returned\n");
+    return 0;
+}
+
+static void test_encode_past_prefix(void) {
+    const char * sc = "encode-past-prefix";
+    int status = 0;
+    std::string err;
+    const bool waited = run_child("encode-past-prefix", &status, &err);
+    check(err.find("the prefix computes") != std::string::npos, sc, "a kernel inside the prefix computes");
+    check(waited && aborted(status), sc, "a kernel on a tensor past its range's prefix aborts");
+    check(err.find("tensor 'out-0' ends") != std::string::npos && err.find("into range 1") != std::string::npos, sc,
+            "the abort names the tensor and the range");
+}
+
 static void test_encode_across(void) {
     const char * sc = "encode-across";
     int status = 0;
@@ -520,6 +654,9 @@ int main(int argc, char ** argv) {
     if (argc > 1 && strcmp(argv[1], "encode-missing") == 0) {
         return encode_missing(f);
     }
+    if (argc > 1 && strcmp(argv[1], "encode-past-prefix") == 0) {
+        return encode_past_prefix(f);
+    }
 
     test_resolve(f, "resolve");
     test_compute(f, "compute", 1.0f);
@@ -529,8 +666,12 @@ int main(int argc, char ** argv) {
     test_empty_on_boundary(f);
     test_validation(f);
     test_caller_buft(f);
+    test_prefix(f);
+    test_grow(f);
+    test_resolve(f, "resolve-after-prefix");
     test_encode_across();
     test_encode_missing();
+    test_encode_past_prefix();
 
     const size_t refs = test_metal_buffer_retain_count(f.metal[0]);
     ggml_backend_buffer_free(f.buf);

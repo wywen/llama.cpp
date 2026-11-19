@@ -1270,4 +1270,14 @@ bool ggml_backend_metal_buffer_set_range(ggml_backend_buffer_t buffer, int i, vo
     return ggml_metal_buffer_set_range((ggml_metal_buffer_t)buffer->context, i, metal);
 }
 
+bool ggml_backend_metal_buffer_set_range_grow(
+        ggml_backend_buffer_t buffer, ggml_backend_metal_range_grow_t grow, void * user_data) {
+    if (buffer == NULL || !ggml_backend_buffer_is_metal(buffer)) {
+        GGML_LOG_ERROR("%s: not a Metal buffer\n", __func__);
+        return false;
+    }
+
+    return ggml_metal_buffer_set_range_grow((ggml_metal_buffer_t)buffer->context, grow, user_data);
+}
+
 GGML_BACKEND_DL_IMPL(ggml_backend_metal_reg)
