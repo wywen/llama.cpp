@@ -1002,3 +1002,174 @@ typedef decltype(kernel_top_k_mask<float, float4>) kernel_top_k_mask_f_t;
 
 template [[host_name("kernel_top_k_mask_f16")]] kernel kernel_top_k_mask_h_t kernel_top_k_mask<half,  half4>;
 template [[host_name("kernel_top_k_mask_f32")]] kernel kernel_top_k_mask_f_t kernel_top_k_mask<float, float4>;
+
+// a pick's score is live when above -inf; compared on the bits so that fast math keeps NaN not live
+static inline bool qsa_live_score(float s) {
+    const uint u = as_type<uint>(s);
+    return u != 0xff800000u && (u & 0x7fffffffu) <= 0x7f800000u;
+}
+
+static inline void qsa_mark(threadgroup atomic_uint * bits, int32_t c, int32_t n_kv) {
+    if (c >= 0 && c < n_kv) {
+        atomic_fetch_or_explicit(&bits[c >> 5], 1u << (c & 31), memory_order_relaxed);
+    }
+}
+
+// marks the member cells of pick j of token t, when it is live
+static inline void qsa_mark_pick(
+        constant ggml_metal_kargs_qsa_stage & args,
+        device const char * top_k,
+        device const char * score,
+        device const char * blocks,
+        threadgroup atomic_uint * bits,
+        int t,
+        int j) {
+    const int32_t p = *(device const int32_t *) (top_k + j*args.nbk0 + t*args.nbk1);
+    const float   s = *(device const float   *) (score + j*args.nbs0 + t*args.nbs1);
+    if (p < 0 || p >= args.n_pick || !qsa_live_score(s)) {
+        return;
+    }
+    for (int k = 0; k < args.n_blk; ++k) {
+        qsa_mark(bits, *(device const int32_t *) (blocks + k*args.nbb0 + p*args.nbb1), args.n_kv);
+    }
+}
+
+static inline void qsa_clear_bits(threadgroup atomic_uint * bits, int n_words, ushort tiitg, ushort ntg) {
+    for (int w = tiitg; w < n_words; w += ntg) {
+        atomic_store_explicit(&bits[w], 0u, memory_order_relaxed);
+    }
+}
+
+// one threadgroup: the union of every token's selected cells in a bitmap, less the tokens' own cells, then compacted
+// ascending after them by a threadgroup prefix sum over contiguous word ranges, then the pads
+kernel void kernel_qsa_stage_cells(
+        constant ggml_metal_kargs_qsa_stage & args,
+        device const char * top_k,
+        device const char * score,
+        device const char * blocks,
+        device const char * tail,
+        device const char * new_cells,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort   nsg[[simdgroups_per_threadgroup]],
+        ushort   ntg[[threads_per_threadgroup]]) {
+    threadgroup uint        * sums = (threadgroup uint        *) shmem;
+    threadgroup atomic_uint * bits = (threadgroup atomic_uint *) (shmem + 32*sizeof(uint));
+
+    device const int64_t * cells_new = (device const int64_t *) new_cells;
+    device       int32_t * res       = (device       int32_t *) dst;
+
+    const int n_words = (args.n_kv + 31)/32;
+
+    qsa_clear_bits(bits, n_words, tiitg, ntg);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int i = tiitg; i < args.n_tokens*args.n_top; i += ntg) {
+        const int t = i/args.n_top;
+        qsa_mark_pick(args, top_k, score, blocks, bits, t, i - t*args.n_top);
+    }
+    for (int i = tiitg; i < args.n_tokens*args.n_tail; i += ntg) {
+        const int t = i/args.n_tail;
+        const int j = i - t*args.n_tail;
+        qsa_mark(bits, *(device const int32_t *) (tail + j*args.nbt0 + t*args.nbt1), args.n_kv);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int t = tiitg; t < args.n_tokens; t += ntg) {
+        const int64_t c = cells_new[t];
+        if (c >= 0 && c < args.n_kv) {
+            const int32_t c32 = (int32_t) c;
+            atomic_fetch_and_explicit(&bits[c32 >> 5], ~(1u << (c32 & 31)), memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int wpt = (n_words + ntg - 1)/ntg;
+    const int w0  = min((int) tiitg*wpt, n_words);
+    const int w1  = min(w0 + wpt, n_words);
+
+    uint count = 0;
+    for (int w = w0; w < w1; ++w) {
+        count += popcount(atomic_load_explicit(&bits[w], memory_order_relaxed));
+    }
+
+    const uint before_in_sg = simd_prefix_exclusive_sum(count);
+    const uint sg_count     = simd_sum(count);
+    if (tiisg == 0) {
+        sums[sgitg] = sg_count;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint before = before_in_sg;
+    uint total  = 0;
+    for (ushort g = 0; g < nsg; ++g) {
+        const uint n = sums[g];
+        before += g < sgitg ? n : 0;
+        total  += n;
+    }
+
+    int s = args.n_tokens + (int) before;
+    for (int w = w0; w < w1; ++w) {
+        uint b = atomic_load_explicit(&bits[w], memory_order_relaxed);
+        while (b != 0) {
+            if (s < args.n_stage) {
+                res[s] = w*32 + (int) ctz(b);
+            }
+            ++s;
+            b &= b - 1;
+        }
+    }
+
+    for (int t = tiitg; t < args.n_tokens; t += ntg) {
+        res[t] = (int32_t) cells_new[t];
+    }
+    for (int i = args.n_tokens + (int) total + tiitg; i < args.n_stage; i += ntg) {
+        res[i] = args.pad_cell;
+    }
+}
+
+// one threadgroup per token: the token's selected cells in a bitmap, then 0 at each staging row whose cell is one
+kernel void kernel_qsa_stage_mask(
+        constant ggml_metal_kargs_qsa_stage & args,
+        device const char * cells,
+        device const char * top_k,
+        device const char * score,
+        device const char * blocks,
+        device const char * tail,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint    tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort    ntg[[threads_per_threadgroup]]) {
+    threadgroup atomic_uint * bits = (threadgroup atomic_uint *) (shmem + 32*sizeof(uint));
+
+    device const int32_t * cells_s = (device const int32_t *) cells;
+    device       half    * row     = (device       half    *) (dst + tgpig*args.nb1);
+
+    const int t       = tgpig;
+    const int n_words = (args.n_kv + 31)/32;
+
+    qsa_clear_bits(bits, n_words, tiitg, ntg);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int j = tiitg; j < args.n_top; j += ntg) {
+        qsa_mark_pick(args, top_k, score, blocks, bits, t, j);
+    }
+    for (int j = tiitg; j < args.n_tail; j += ntg) {
+        qsa_mark(bits, *(device const int32_t *) (tail + j*args.nbt0 + t*args.nbt1), args.n_kv);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const half keep = as_type<half>((ushort) 0x0000);
+    const half drop = as_type<half>((ushort) 0xfc00);
+
+    for (int s = tiitg; s < args.n_stage; s += ntg) {
+        const int32_t c = cells_s[s];
+        const bool    k = c >= 0 && c < args.n_kv &&
+            ((atomic_load_explicit(&bits[c >> 5], memory_order_relaxed) >> (c & 31)) & 1u) != 0;
+        row[s] = k ? keep : drop;
+    }
+}

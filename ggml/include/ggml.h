@@ -413,6 +413,8 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_QSA_STAGE_CELLS,
+        GGML_OP_QSA_STAGE_MASK,
         GGML_OP_FLASH_ATTN_EXT_PARTIAL,
         GGML_OP_FLASH_ATTN_EXT_MERGE,
         GGML_OP_FLASH_ATTN_EXT_FINALIZE,
@@ -2562,6 +2564,56 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // stored sparse attention staging: the rows a ubatch's attention reads, and each token's mask over them
+    //
+    // top_k:     [n_top,  n_tokens] i32, each token's picks
+    // score:     [n_top,  n_tokens] f32, the score of each pick (the score of top_k[j, t] at [j, t])
+    // blocks:    [n_blk,  n_pick]   i32, the member cells of each pick
+    // tail:      [n_tail, n_tokens] i32, each token's cells selected without a pick
+    // new_cells: [n_tokens]         i64, contiguous, the ubatch's own cells, distinct and within [0, n_kv)
+    //
+    // token t selects cell c when c is in [0, n_kv) and c is a member cell blocks[k, p] of a live pick p = top_k[j, t],
+    // or c is a tail cell tail[j, t]; a pick is live when p is in [0, n_pick) and score[j, t] > -inf (NaN is not live)
+    // repeats select once
+    //
+    // the staging cell list:
+    //   res[0, n_tokens)                    = new_cells, in token order
+    //   res[n_tokens, n_tokens + count)     = every other cell some token selects, ascending, count of them
+    //   res[n_tokens + count, n_stage)      = pad_cell
+    //   res: [n_stage] i32
+    //
+    // requires n_stage >= n_tokens + count; the CPU aborts past it, other backends drop the cells past n_stage
+    // requires pad_cell outside [0, n_kv), so that a pad is never a selected cell
+    // new_cells outside [0, n_kv) or repeated abort on the CPU and are undefined elsewhere
+    //
+    GGML_API struct ggml_tensor * ggml_qsa_stage_cells(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * tail,
+            struct ggml_tensor  * new_cells,
+            int64_t               n_kv,
+            int64_t               n_stage,
+            int32_t               pad_cell);
+
+    // each token's mask over the staging rows `cells`, selection as in ggml_qsa_stage_cells
+    //
+    // cells: [n_stage] i32, the staging cell list, as ggml_qsa_stage_cells gives it
+    // top_k, score, blocks, tail: as in ggml_qsa_stage_cells
+    // res:   [n_stage, n_tokens] f16
+    //
+    // res[s, t] = 0 when token t selects cells[s], else -inf; a cells[s] outside [0, n_kv), a pad, is -inf
+    //
+    GGML_API struct ggml_tensor * ggml_qsa_stage_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cells,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * tail,
+            int64_t               n_kv);
 
     // custom operators
 

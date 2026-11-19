@@ -1097,6 +1097,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "QSA_STAGE_CELLS",
+    "QSA_STAGE_MASK",
     "FLASH_ATTN_EXT_PARTIAL",
     "FLASH_ATTN_EXT_MERGE",
     "FLASH_ATTN_EXT_FINALIZE",
@@ -1117,7 +1119,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1213,6 +1215,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "qsa_stage_cells(top_k, score, blocks, tail, new_cells)",
+    "qsa_stage_mask(cells, top_k, score, blocks, tail)",
     "flash_attn_ext_partial(x)",
     "flash_attn_ext_merge(a, b)",
     "flash_attn_ext_finalize(x)",
@@ -1233,7 +1237,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6649,6 +6653,77 @@ struct ggml_tensor * ggml_top_k_mask(
     result->src[2] = score;
     result->src[3] = blocks;
     result->src[4] = extra;
+
+    return result;
+}
+
+// ggml_qsa_stage_cells, ggml_qsa_stage_mask
+
+static void ggml_qsa_stage_check_selection(
+        const struct ggml_tensor * top_k,
+        const struct ggml_tensor * score,
+        const struct ggml_tensor * blocks,
+        const struct ggml_tensor * tail,
+        int64_t                    n_kv) {
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32 && top_k->ne[2] == 1 && top_k->ne[3] == 1);
+    GGML_ASSERT(score->type == GGML_TYPE_F32 && ggml_are_same_shape(score, top_k));
+    GGML_ASSERT(blocks->type == GGML_TYPE_I32 && blocks->ne[2] == 1 && blocks->ne[3] == 1);
+    GGML_ASSERT(tail->type == GGML_TYPE_I32 && tail->ne[1] == top_k->ne[1] && tail->ne[2] == 1 && tail->ne[3] == 1);
+    GGML_ASSERT(n_kv >= 0 && n_kv <= INT32_MAX);
+}
+
+struct ggml_tensor * ggml_qsa_stage_cells(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * top_k,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * blocks,
+        struct ggml_tensor  * tail,
+        struct ggml_tensor  * new_cells,
+        int64_t               n_kv,
+        int64_t               n_stage,
+        int32_t               pad_cell) {
+    ggml_qsa_stage_check_selection(top_k, score, blocks, tail, n_kv);
+    GGML_ASSERT(new_cells->type == GGML_TYPE_I64 && ggml_is_contiguous(new_cells));
+    GGML_ASSERT(ggml_nelements(new_cells) == top_k->ne[1]);
+    GGML_ASSERT(n_stage >= top_k->ne[1]);
+    GGML_ASSERT(pad_cell < 0 || pad_cell >= n_kv);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_stage);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) n_kv);
+    ggml_set_op_params_i32(result, 1, pad_cell);
+
+    result->op     = GGML_OP_QSA_STAGE_CELLS;
+    result->src[0] = top_k;
+    result->src[1] = score;
+    result->src[2] = blocks;
+    result->src[3] = tail;
+    result->src[4] = new_cells;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_qsa_stage_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cells,
+        struct ggml_tensor  * top_k,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * blocks,
+        struct ggml_tensor  * tail,
+        int64_t               n_kv) {
+    ggml_qsa_stage_check_selection(top_k, score, blocks, tail, n_kv);
+    GGML_ASSERT(cells->type == GGML_TYPE_I32 && ggml_is_contiguous(cells) && ggml_is_vector(cells));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, cells->ne[0], top_k->ne[1]);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) n_kv);
+
+    result->op     = GGML_OP_QSA_STAGE_MASK;
+    result->src[0] = cells;
+    result->src[1] = top_k;
+    result->src[2] = score;
+    result->src[3] = blocks;
+    result->src[4] = tail;
 
     return result;
 }

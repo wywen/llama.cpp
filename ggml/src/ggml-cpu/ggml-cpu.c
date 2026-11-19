@@ -2117,6 +2117,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_top_k_mask(params, tensor);
             } break;
+        case GGML_OP_QSA_STAGE_CELLS:
+            {
+                ggml_compute_forward_qsa_stage_cells(params, tensor);
+            } break;
+        case GGML_OP_QSA_STAGE_MASK:
+            {
+                ggml_compute_forward_qsa_stage_mask(params, tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_EXT_PARTIAL:
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
@@ -2302,6 +2310,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MEAN:
         case GGML_OP_ARGMAX:
+        case GGML_OP_QSA_STAGE_CELLS:
             {
                 n_tasks = 1;
             } break;
@@ -2312,6 +2321,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
         case GGML_OP_TOP_K_MASK:
+        case GGML_OP_QSA_STAGE_MASK:
         case GGML_OP_FLASH_ATTN_EXT_PARTIAL:
         case GGML_OP_FLASH_ATTN_EXT_MERGE:
         case GGML_OP_FLASH_ATTN_EXT_FINALIZE:
@@ -3007,6 +3017,15 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_TOP_K:
                     {
                         cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
+                    } break;
+                case GGML_OP_QSA_STAGE_CELLS:
+                    {
+                        cur = sizeof(int32_t)*ggml_get_op_params_i32(node, 0);
+                    } break;
+                case GGML_OP_QSA_STAGE_MASK:
+                    {
+                        const int64_t n_words = (ggml_get_op_params_i32(node, 0) + 31)/32;
+                        cur = sizeof(uint32_t)*(n_words + CACHE_LINE_SIZE_F32)*n_tasks;
                     } break;
                 case GGML_OP_FLASH_ATTN_EXT:
                 case GGML_OP_FLASH_ATTN_EXT_PARTIAL:
