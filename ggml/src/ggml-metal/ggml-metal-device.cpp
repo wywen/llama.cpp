@@ -507,6 +507,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexe
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_qsa_stage(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_QSA_STAGE_CELLS || op->op == GGML_OP_QSA_STAGE_MASK);
+
+    const char * name = op->op == GGML_OP_QSA_STAGE_CELLS ? "kernel_qsa_stage_cells" : "kernel_qsa_stage_mask";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_mask(
         ggml_metal_library_t lib,
         const ggml_tensor * op,

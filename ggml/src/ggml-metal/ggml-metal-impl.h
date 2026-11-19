@@ -1380,6 +1380,26 @@ typedef struct {
 } ggml_metal_kargs_top_k_mask;
 
 typedef struct {
+    int32_t  n_kv;
+    int32_t  n_tokens;
+    int32_t  n_top;
+    int32_t  n_pick;
+    int32_t  n_blk;
+    int32_t  n_tail;
+    int32_t  n_stage;
+    int32_t  pad_cell;
+    uint64_t nb1;
+    uint64_t nbk0;
+    uint64_t nbk1;
+    uint64_t nbs0;
+    uint64_t nbs1;
+    uint64_t nbb0;
+    uint64_t nbb1;
+    uint64_t nbt0;
+    uint64_t nbt1;
+} ggml_metal_kargs_qsa_stage;
+
+typedef struct {
     int32_t  n_tokens;
     int32_t  n_iter;
     uint64_t nb_m0;

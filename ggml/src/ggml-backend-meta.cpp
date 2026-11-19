@@ -1113,7 +1113,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:
             case GGML_OP_DSV4_HC_POST:
-            case GGML_OP_TOP_K_MASK: {
+            case GGML_OP_TOP_K_MASK:
+            case GGML_OP_QSA_STAGE_CELLS:
+            case GGML_OP_QSA_STAGE_MASK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_UNARY: {

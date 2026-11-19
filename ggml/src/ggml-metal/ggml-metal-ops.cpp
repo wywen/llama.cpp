@@ -341,6 +341,11 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_top_k_mask(ctx, idx);
             } break;
+        case GGML_OP_QSA_STAGE_CELLS:
+        case GGML_OP_QSA_STAGE_MASK:
+            {
+                n_fuse = ggml_metal_op_qsa_stage(ctx, idx);
+            } break;
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -1557,6 +1562,76 @@ int ggml_metal_op_top_k_mask(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_dispatch_threadgroups(enc, op->ne[1], op->ne[2], op->ne[3], nth, 1, 1);
     }
+
+    return 1;
+}
+
+// QSA_STAGE_CELLS runs in one threadgroup, the scan of its bitmap spans the whole grid;
+// QSA_STAGE_MASK runs one threadgroup per token, each over its own bitmap
+int ggml_metal_op_qsa_stage(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const bool is_cells = op->op == GGML_OP_QSA_STAGE_CELLS;
+    const int  first    = is_cells ? 0 : 1;
+
+    const ggml_tensor * top_k  = op->src[first + 0];
+    const ggml_tensor * score  = op->src[first + 1];
+    const ggml_tensor * blocks = op->src[first + 2];
+    const ggml_tensor * tail   = op->src[first + 3];
+
+    const int32_t n_kv     = ggml_get_op_params_i32(op, 0);
+    const int32_t n_tokens = (int32_t) top_k->ne[1];
+    const int32_t n_stage  = (int32_t) op->ne[0];
+    const int32_t n_words  = (n_kv + 31)/32;
+
+    ggml_metal_kargs_qsa_stage args = {
+        /*.n_kv     =*/ n_kv,
+        /*.n_tokens =*/ n_tokens,
+        /*.n_top    =*/ (int32_t) top_k->ne[0],
+        /*.n_pick   =*/ (int32_t) blocks->ne[1],
+        /*.n_blk    =*/ (int32_t) blocks->ne[0],
+        /*.n_tail   =*/ (int32_t) tail->ne[0],
+        /*.n_stage  =*/ n_stage,
+        /*.pad_cell =*/ is_cells ? ggml_get_op_params_i32(op, 1) : 0,
+        /*.nb1      =*/ op->nb[1],
+        /*.nbk0     =*/ top_k->nb[0],
+        /*.nbk1     =*/ top_k->nb[1],
+        /*.nbs0     =*/ score->nb[0],
+        /*.nbs1     =*/ score->nb[1],
+        /*.nbb0     =*/ blocks->nb[0],
+        /*.nbb1     =*/ blocks->nb[1],
+        /*.nbt0     =*/ tail->nb[0],
+        /*.nbt1     =*/ tail->nb[1],
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_qsa_stage(lib, op);
+
+    const int32_t nth_max = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), 1024);
+    const int64_t n_work  = is_cells
+        ? std::max<int64_t>({ (int64_t) n_words, (int64_t) n_tokens*args.n_top, (int64_t) n_tokens*args.n_tail, n_stage })
+        : std::max<int64_t>({ (int64_t) n_words, (int64_t) args.n_top, (int64_t) args.n_tail, n_stage });
+
+    int nth = 32; // SIMD width
+
+    while (nth < nth_max && nth < n_work) {
+        nth *= 2;
+    }
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[2]), 3);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[3]), 4);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[4]), 5);
+    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),         6);
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, ggml_metal_op_qsa_stage_smem(op), 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, is_cells ? 1 : n_tokens, 1, 1, nth, 1, 1);
 
     return 1;
 }
