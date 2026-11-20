@@ -95,10 +95,16 @@ GGML_BACKEND_API ggml_backend_metal_reorder_barrier_t ggml_backend_metal_get_reo
 //
 // Ownership: the backend makes no Metal buffer and no residency set for such a buffer, and never retains, releases or
 // requests residency for the caller's objects. A range's Metal buffer is an id<MTLBuffer> of the device, passed as
-// void *, whose contents hold the whole range, e.g. a no-copy buffer over the range's pages. The backend reads it when it encodes or blits work that uses a tensor in the range, from the call that
-// installs it until the call that replaces it. The caller keeps it alive over that span, and after it until every
-// command buffer that binds it has completed: the backend encodes with unretained references. Freeing the backend
-// buffer releases nothing of the caller's.
+// void *, whose contents start at or before the range and hold a non-empty prefix of it, or the whole range, e.g. a
+// no-copy buffer over the range's first pages. The backend reads it when it encodes or blits work that uses a tensor in
+// the range, from the call that installs it until the call that replaces it. The caller keeps it alive over that span,
+// and after it until every command buffer that binds it has completed: the backend encodes with unretained references.
+// Freeing the backend buffer releases nothing of the caller's.
+//
+// Prefixes: a kernel may touch every byte of each tensor it uses, [data, data + ggml_nbytes), so encoding one whose
+// tensor ends past the prefix its range's Metal buffer holds aborts, naming the tensor; a view's bytes are those it
+// spans, not its source's. A caller that wraps only the bytes in use grows the prefix by installing a longer Metal
+// buffer over the same pages before encoding work that reaches further.
 //
 // A buffer type that a caller makes with a Metal device as its device is supported by that device, like the device's
 // own types; its buffers must place every tensor in Metal buffers, e.g. in buffers from
@@ -112,16 +118,31 @@ struct ggml_backend_metal_range {
 };
 
 // NULL, with a log line, when dev is not a Metal device, the ranges do not tile [base, base + size), or a Metal buffer
-// is not of the device or does not hold its range; the range table is copied
+// is not of the device or holds no prefix of its range; the range table is copied
 GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_metal_buffer_from_ranges(
         ggml_backend_dev_t dev, void * base, size_t size, const struct ggml_backend_metal_range * ranges, int n_ranges);
 
 // replace range i's Metal buffer with `metal` (NULL: none), checked as above; false, with a log line and nothing
 // changed, when the buffer is not from ggml_backend_metal_buffer_from_ranges, i is not one of its ranges or `metal` is
 // refused. Work that binds other ranges may be encoded or in flight meanwhile. Before replacing a range's Metal buffer
-// the caller ensures that no encode that uses the range is running; command buffers in flight that bind the previous
-// one still use it, so the caller releases it only once they have completed.
+// the caller ensures that no encode that uses the range is running, unless both Metal buffers map the same pages from
+// the same first byte (a longer or shorter prefix of them): an encode running meanwhile binds each tensor to one of the
+// two, whole. Command buffers in flight that bind the previous one still use it, so the caller releases it only once
+// they have completed.
 GGML_BACKEND_API bool ggml_backend_metal_buffer_set_range(ggml_backend_buffer_t buffer, int i, void * metal);
+
+// Growing a prefix on demand: the hook is called, before the encode would abort, when a kernel is encoded on a tensor in
+// range i whose range has no Metal buffer or holds a prefix that ends before the tensor does; `bytes` is how far into
+// the range the tensor ends. The hook installs a Metal buffer that holds at least `bytes` of the range with
+// ggml_backend_metal_buffer_set_range, and the encode binds it; or it installs none, and the encode aborts as without a
+// hook. It runs on the thread that encodes, and encodes may run on several threads at once, for any of the ranges.
+typedef void (*ggml_backend_metal_range_grow_t)(void * user_data, int i, size_t bytes);
+
+// install `grow` (NULL: none) as the hook of `buffer`, a buffer from ggml_backend_metal_buffer_from_ranges, before any
+// work that uses it is encoded; `user_data` is passed to every call and must outlive the buffer's encodes. False, with
+// a log line, for any other buffer
+GGML_BACKEND_API bool ggml_backend_metal_buffer_set_range_grow(
+        ggml_backend_buffer_t buffer, ggml_backend_metal_range_grow_t grow, void * user_data);
 
 // the id<MTLDevice> of a Metal device, as void *, not retained: valid while the device is; NULL, with a log line, for
 // a device that is not a Metal device
@@ -151,7 +172,7 @@ GGML_BACKEND_API void * ggml_backend_metal_device_get_mtl_queue(ggml_backend_dev
 
 // the id<MTLBuffer> that holds t's data, as void *, not retained, and in *offs the offset of the data in it; valid
 // until the range holding t is replaced (ggml_backend_metal_buffer_set_range) or its buffer is freed; aborts, naming
-// t, when t is not in a Metal buffer or its range has no Metal buffer
+// t, when t is not in a Metal buffer, its range has no Metal buffer or t ends past the prefix that buffer holds
 GGML_BACKEND_API void * ggml_backend_metal_tensor_mtl_buffer(const struct ggml_tensor * t, size_t * offs);
 
 // commit an empty command buffer to the backend's queue and make it the one ggml_backend_synchronize waits for, so a

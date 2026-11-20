@@ -367,6 +367,8 @@ ggml_metal_buffer_t ggml_metal_buffer_map (ggml_metal_device_t dev, void * ptr, 
 ggml_metal_buffer_t ggml_metal_buffer_map_ranges(ggml_metal_device_t dev, void * base, size_t size, const size_t * sizes, void * const * metals, int n_ranges);
 // see ggml_backend_metal_buffer_set_range
 bool ggml_metal_buffer_set_range(ggml_metal_buffer_t buf, int i, void * metal);
+// see ggml_backend_metal_buffer_set_range_grow
+bool ggml_metal_buffer_set_range_grow(ggml_metal_buffer_t buf, void (*grow)(void * user_data, int i, size_t bytes), void * user_data);
 
 void   ggml_metal_buffer_free     (ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_base (ggml_metal_buffer_t buf);
