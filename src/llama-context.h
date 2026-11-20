@@ -312,6 +312,8 @@ public:
     void notify_outputs_enqueued();
 
     // reserve a graph with a dummy ubatch of the specified size
+    // n_outputs may be 0: the graph of a ubatch with no output row, as decode builds for a ubatch whose batch has its
+    // outputs in a later one (an out_ids of no rows, the backend samplers reading the padding row)
     // `split_only` splits and places the graph without reserving it, to inspect its placement
     // a no_alloc context allocates nothing: it sizes the compute buffers into `sizes`, if given, or hands the graph to the
     // caller allocator's measure (see llama_context_params.cb_sched_new); `sizes` is for a no_alloc context only
