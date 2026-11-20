@@ -1,4 +1,7 @@
 #include "models.h"
+#include "llama-impl.h"
+
+#include <algorithm>
 
 void llama_model_gemma3n::load_arch_hparams(llama_model_loader & ml) {
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
@@ -41,7 +44,7 @@ void llama_model_gemma3n::load_arch_tensors(llama_model_loader &) {
     altup_proj        = create_tensor(tn(LLM_TENSOR_ALTUP_PROJ,        "weight"), {n_embd, n_embd, n_altup - 1}, 0);
     altup_unembd_proj = create_tensor(tn(LLM_TENSOR_ALTUP_UNEMBD_PROJ, "weight"), {n_embd, n_embd, n_altup - 1}, 0);
 
-    per_layer_tok_embd   = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"), {n_embd_altup * n_layer, n_vocab}, 0);
+    per_layer_tok_embd   = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"), {n_embd_altup * n_layer, n_vocab}, TENSOR_PAGEABLE);
     per_layer_model_proj = create_tensor(tn(LLM_TENSOR_PER_LAYER_MODEL_PROJ, "weight", 0), {n_embd, n_embd_altup * n_layer}, 0);
     per_layer_proj_norm  = create_tensor(tn(LLM_TENSOR_PER_LAYER_PROJ_NORM,  "weight", 0), {n_embd_altup}, 0);
 
@@ -313,10 +316,60 @@ ggml_tensor * llama_model_gemma3n::graph::calc_magnitude(ggml_tensor * x) {
     return ggml_sqrt(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, x)));
 }
 
+// each token reads the row of its id
+int32_t llama_model_gemma3n::lookup_rows_per_token(const llama_lookup_table & table) const {
+    return table.stock == per_layer_tok_embd ? 1 : 0;
+}
+
+bool llama_model_gemma3n::lookup_table_rows(const llama_lookup_table & table,
+                                            const llama_token *        tokens,
+                                            int32_t                    n_tokens,
+                                            int32_t                    n_context,
+                                            int32_t *                  rows) const {
+    if (table.stock != per_layer_tok_embd) {
+        return false;
+    }
+    std::copy(tokens + n_context, tokens + n_tokens, rows);
+    return true;
+}
+
+class llm_graph_input_gemma3n_ple : public llm_graph_input_i {
+public:
+    llm_graph_input_gemma3n_ple(const llama_model & model) : model(model) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        ggml_tensor * ple = model.per_layer_tok_embd;
+
+        const bool prefetch = model.can_prefetch.count(ple);
+
+        if (ubatch->token) {
+            if (prefetch) {
+                llama_prefetch_rows(ple, ubatch->token, ubatch->n_tokens);
+            }
+            ggml_backend_tensor_set(tokens, ubatch->token, 0, ubatch->n_tokens * ggml_element_size(tokens));
+        } else {
+            const int32_t padding = 0;
+            if (prefetch) {
+                llama_prefetch_rows(ple, &padding, 1);
+            }
+            ggml_backend_tensor_set(token0, &padding, 0, ggml_element_size(token0));
+        }
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return params.ubatch.token ? tokens && tokens->ne[0] == params.ubatch.n_tokens : tokens == nullptr;
+    }
+
+    ggml_tensor * tokens = nullptr;
+    ggml_tensor * token0 = nullptr;
+
+    const llama_model & model;
+};
+
 // equivalent to get_per_layer_inputs() in python code
 // output shape: [n_embd_altup, n_layer, n_tokens]
 ggml_tensor * llama_model_gemma3n::graph::build_inp_per_layer() {
-    auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+    auto inp = std::make_unique<llm_graph_input_gemma3n_ple>(model);
     ggml_tensor * inp_per_layer;
     float tok_embd_scale = sqrtf((float) n_embd_altup);
     // mixed ubatch: embd rows have token id 0, same padding row as below
@@ -328,21 +381,21 @@ ggml_tensor * llama_model_gemma3n::graph::build_inp_per_layer() {
         inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, n_embd_altup, n_layer, n_tokens);
         inp_per_layer = ggml_scale     (ctx0, inp_per_layer, tok_embd_scale);
         cb(inp_per_layer, "inp_per_layer_selected", -1);
-        res->add_input(std::move(inp));
     } else {
         // Multimodal embedding path: use padding token (ID=0) embedding
         // TODO: verify if this is the correct behavior in transformers implementation
-        const int64_t embd_size = model.per_layer_tok_embd->ne[0];  // n_embd_altup * n_layer
-
-        // Extract and dequantize padding token embedding (row 0)
-        ggml_tensor * padding = ggml_view_1d(ctx0, model.per_layer_tok_embd, embd_size, 0);
-        inp_per_layer = ggml_cast (ctx0, padding, GGML_TYPE_F32);
-        inp_per_layer = ggml_scale(ctx0, inp_per_layer, tok_embd_scale);
+        // the padding row is gathered like a token's row, so the table is read only by rows
+        inp->token0 = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        ggml_set_input(inp->token0);
+        res->t_inp_tokens = inp->token0;
+        inp_per_layer = ggml_get_rows(ctx0, model.per_layer_tok_embd, inp->token0);
+        inp_per_layer = ggml_scale   (ctx0, inp_per_layer, tok_embd_scale);
 
         // Reshape to [n_embd_altup, n_layer, 1]
         inp_per_layer = ggml_reshape_3d(ctx0, inp_per_layer, n_embd_altup, n_layer, 1);
         cb(inp_per_layer, "inp_per_layer_multimodal", -1);
     }
+    res->add_input(std::move(inp));
     return inp_per_layer;
 }
 
