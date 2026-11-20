@@ -36,6 +36,7 @@ LLAMA_API bool llama_arch_supports_mixed_batch(llm_arch arch);
 LLAMA_API bool llama_arch_supports_save(llm_arch arch);
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
+// n_outputs may be 0: the graph decode builds for a ubatch with no output row.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,
         uint32_t n_tokens,

@@ -3,12 +3,13 @@
 //
 // For every generated model of the architectures below, on the CPU, a plan context with a caller allocator that
 // measures and a real context of the same parameters make the same calls: creation, the extent and plain reserves of
-// llama_graph_reserve and its variants, and llama_sched_reserve_now once backend samplers attach; and likewise an MTP
-// context reading each, where the model has a NextN layer. A graph rewrite callback runs on both and records each
-// graph before the scheduler splits it. The plan context must rewrite, node by node, the graphs the real context
-// rewrites, in the same order: the same ops, shapes, strides, names and parameters, reading the same nodes, model
-// weights, memory tensors and inputs. Each of its reserves must reach measure with a graph rewritten for a reserve that
-// reads no data-owning tensor but the weights; it must never call alloc and must hold no compute buffer.
+// llama_graph_reserve and its variants, with outputs and with none, llama_sched_reserve_now once backend samplers
+// attach, and a reserve of no output with them; and likewise an MTP context reading each, where the model has a NextN
+// layer. A graph rewrite callback runs on both and records each graph before the scheduler splits it. The plan context
+// must rewrite, node by node, the graphs the real context rewrites, in the same order: the same ops, shapes, strides,
+// names and parameters, reading the same nodes, model weights, memory tensors and inputs. Each of its reserves must
+// reach measure with a graph rewritten for a reserve that reads no data-owning tensor but the weights; it must never
+// call alloc and must hold no compute buffer.
 
 #include "llama.h"
 #include "llama-cpp.h"
@@ -396,9 +397,15 @@ std::string reserve_after_creation(llama_context * ctx, const context_case & cc,
         if (llama_graph_reserve_widest_extent(ctx, 256) == nullptr) {
             return "a widest extent reserve failed";
         }
+        if (llama_graph_reserve_extent(ctx, n_seqs, n_seqs, 0, 256) == nullptr) {
+            return "an extent reserve of no output failed";
+        }
     }
     if (llama_graph_reserve(ctx, cc.n_ubatch, n_seqs, n_seqs) == nullptr) {
         return "a reserve failed";
+    }
+    if (llama_graph_reserve(ctx, cc.n_ubatch, n_seqs, 0) == nullptr) {
+        return "a reserve of no output failed";
     }
     chains.make(n_seqs);
     for (const llama_sampler_seq_config & config : chains.configs) {
@@ -408,6 +415,9 @@ std::string reserve_after_creation(llama_context * ctx, const context_case & cc,
     }
     if (!llama_sched_reserve_pending(ctx) || !llama_sched_reserve_now(ctx) || llama_sched_reserve_pending(ctx)) {
         return "the pending scheduler reserve did not run";
+    }
+    if (llama_graph_reserve(ctx, cc.n_ubatch, n_seqs, 0) == nullptr) {
+        return "a reserve of no output with backend samplers failed";
     }
     return {};
 }
@@ -444,14 +454,14 @@ void check_measured(const std::string & what, const measuring_caller & caller, s
 }
 
 // a context's creation reserves three graphs (prompt, token generation, widest); after it, the extent reserves, a plain
-// reserve, and the three again once the samplers attach
+// reserve and one of no output, the three again once the samplers attach, and one of no output with them
 void check_plan_context(const plan_case & pc, outcome & out) {
     for (const context_case & cc : context_cases) {
         if (pc.draft != nullptr && !cc.drafts) {
             continue;
         }
         const std::string label = pc.label + " [" + cc.name + "]";
-        const size_t n_target_measures = 3 + (pc.extents ? 2 : 0) + 1 + 3;
+        const size_t n_target_measures = 3 + (pc.extents ? 3 : 0) + 2 + 3 + 1;
         // a context's samplers outlive it
         sampler_chains real_chains;
         sampler_chains plan_chains;
