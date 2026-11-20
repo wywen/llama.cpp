@@ -246,7 +246,7 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     set(MOE_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-moe")
     file(MAKE_DIRECTORY "${MOE_MODEL_DIR}")
     llama_test(test-llama-archs NAME test-generate-moe-models LABEL "main behavior backend"
-        ARGS -a "^(qwen3moe|qwen35moe|gemma4|qwen4exp|deepseek2)$" -o "${MOE_MODEL_DIR}")
+        ARGS -a "^(qwen3moe|qwen35moe|gemma3n|gemma4|qwen4exp|deepseek2)$" -o "${MOE_MODEL_DIR}")
     set_tests_properties(test-generate-moe-models PROPERTIES FIXTURES_SETUP moe-models)
 
     llama_build(test-moe-slots.cpp)
@@ -443,6 +443,7 @@ else()
 endif()
 
 llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK ggml)
+llama_build_and_test(test-get-rows-cast.cpp LABEL "main behavior backend"  LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model behavior")
 llama_build_and_test(test-autorelease.cpp       LABEL "model behavior")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model behavior backend")

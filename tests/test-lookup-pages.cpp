@@ -68,6 +68,7 @@ static const model_case MODELS[] = {
     { "gemma4-dense.gguf", true, true, true, true },
     { "gemma4-moe.gguf", true, true, false, true },
     { "qwen4exp-moe.gguf", false, false, true, false },
+    { "gemma3n-dense.gguf", false, true, false, true },
 };
 
 // the tables that the loader offered; the per-layer token table is served
