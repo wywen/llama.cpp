@@ -1968,10 +1968,6 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op->src[1]) &&
                 ggml_is_contiguous_rows(op->src[2]) &&
                 (op->src[3] == NULL || ggml_is_contiguous_rows(op->src[3]));
-        case GGML_OP_QSA_STAGE_CELLS:
-        case GGML_OP_QSA_STAGE_MASK:
-            return has_simdgroup_reduction &&
-                ggml_metal_op_qsa_stage_smem(op) <= dev->props.max_theadgroup_memory_size;
         case GGML_OP_TOP_K_MASK:
             return (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
                 op->src[0]->type == op->type &&

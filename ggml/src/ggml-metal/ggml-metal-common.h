@@ -59,10 +59,6 @@ void ggml_graph_optimize(struct ggml_cgraph * gf, ggml_graph_optimize_barrier_t 
 
 // mat-mat vs mat-vec dispatch; used by both supports_op and ggml_metal_op_mul_mat*
 bool ggml_metal_op_mul_mat_use_fwht (const struct ggml_tensor * op, size_t max_tg_mem);
-
-// the threadgroup memory of a QSA_STAGE_CELLS or QSA_STAGE_MASK dispatch: a bitmap over the n_kv cells after
-// 32 simdgroup sums; used by both supports_op and ggml_metal_op_qsa_stage
-size_t ggml_metal_op_qsa_stage_smem(const struct ggml_tensor * op);
 bool ggml_metal_op_mul_mat_use_mm   (const struct ggml_tensor * op, bool has_simdgroup_mm);
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
 

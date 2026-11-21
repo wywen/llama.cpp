@@ -35,7 +35,6 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
-#include <numeric>
 #include <random>
 #include <regex>
 #include <set>
@@ -10333,152 +10332,6 @@ struct test_top_k_mask : public test_case {
     }
 };
 
-// GGML_OP_QSA_STAGE_CELLS and GGML_OP_QSA_STAGE_MASK: the staging cell list and the mask over it, both compared
-struct test_qsa_stage : public test_case {
-    enum class picks {
-        random,  // dead, repeated and out of range picks and cells, NaN scores
-        dense,   // every pick live, the blocks tile [0, n_kv): each token selects every cell
-        empty,   // no live pick, no tail cell in range: only the tokens' own cells are staged
-    };
-
-    const int64_t n_kv;
-    const int64_t n_tokens;
-    const int64_t n_top;
-    const int64_t n_pick;
-    const int64_t n_blk;
-    const int64_t n_tail;
-    const picks   mode;
-    const int64_t slack;  // staging rows past the engine's bound n_tokens + min(n_tokens*n_sel, n_kv)
-    const bool    at_end; // the tokens' cells are the last n_tokens cells, as a decode appends
-
-    std::string vars() override {
-        return VARS_TO_STR9(n_kv, n_tokens, n_top, n_pick, n_blk, n_tail, (int) mode, slack, at_end);
-    }
-
-    double max_err() override {
-        return 0.0;
-    }
-
-    double err(const float * a, const float * b, size_t n) override {
-        double result = 0.0;
-        for (size_t i = 0; i < n; ++i) {
-            if (std::isfinite(a[i]) && std::isfinite(b[i])) {
-                result = std::max(result, (double) fabsf(a[i] - b[i]));
-            }
-        }
-        return result;
-    }
-
-    bool deterministic(ggml_backend_t backend) override {
-        GGML_UNUSED(backend);
-        return true;
-    }
-
-    int64_t n_stage() const {
-        const int64_t n_sel = n_blk*n_top + n_tail;
-        return n_tokens + std::min(n_tokens*n_sel, n_kv) + slack;
-    }
-
-    // the zero row of a store of n_kv + 5 cells
-    int32_t pad_cell() const {
-        return (int32_t) n_kv + 5;
-    }
-
-    test_qsa_stage(int64_t n_kv = 1024, int64_t n_tokens = 1, int64_t n_top = 32, int64_t n_pick = 256,
-            int64_t n_blk = 4, int64_t n_tail = 3, picks mode = picks::random, int64_t slack = 0, bool at_end = true)
-        : n_kv(n_kv), n_tokens(n_tokens), n_top(n_top), n_pick(n_pick), n_blk(n_blk), n_tail(n_tail), mode(mode),
-          slack(slack), at_end(at_end) {}
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * top_k = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_top, n_tokens);
-        ggml_set_name(top_k, "top_k");
-
-        ggml_tensor * score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_top, n_tokens);
-        ggml_set_name(score, "score");
-
-        ggml_tensor * blocks = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_blk, n_pick);
-        ggml_set_name(blocks, "blocks");
-
-        ggml_tensor * tail = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_tail, n_tokens);
-        ggml_set_name(tail, "tail");
-
-        ggml_tensor * new_cells = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
-        ggml_set_name(new_cells, "new_cells");
-
-        ggml_tensor * cells = ggml_qsa_stage_cells(ctx, top_k, score, blocks, tail, new_cells, n_kv, n_stage(), pad_cell());
-        ggml_set_name(cells, "cells");
-
-        ggml_tensor * out = ggml_qsa_stage_mask(ctx, cells, top_k, score, blocks, tail, n_kv);
-        ggml_set_name(out, "out");
-
-        return out;
-    }
-
-    void initialize_tensors(ggml_context * ctx) override {
-        std::mt19937 gen(0x5153);
-
-        std::uniform_int_distribution<int32_t> any_cell(0, (int32_t) n_kv - 1);
-        const auto stray_cell = [&]() {
-            const uint32_t r = gen() % 4;
-            return r == 0 ? -1 : r == 1 ? (int32_t) n_kv : r == 2 ? pad_cell() : INT32_MAX;
-        };
-
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "new_cells") == 0) {
-                std::vector<int64_t> data(n_tokens);
-                if (at_end) {
-                    for (int64_t i = 0; i < n_tokens; ++i) {
-                        data[i] = n_kv - n_tokens + i;
-                    }
-                } else {
-                    std::vector<int64_t> order(n_kv);
-                    std::iota(order.begin(), order.end(), 0);
-                    std::shuffle(order.begin(), order.end(), gen);
-                    std::copy(order.begin(), order.begin() + n_tokens, data.begin());
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int64_t));
-            } else if (strcmp(t->name, "score") == 0) {
-                std::vector<float> data(ggml_nelements(t));
-                std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
-                for (auto & v : data) {
-                    const uint32_t r = gen() % 8;
-                    v = mode == picks::empty ? -INFINITY
-                      : mode == picks::dense ? dis(gen)
-                      : r == 0 ? -INFINITY : r == 1 ? NAN : r == 2 ? INFINITY : dis(gen);
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
-            } else if (strcmp(t->name, "top_k") == 0) {
-                std::vector<int32_t> data(ggml_nelements(t));
-                std::uniform_int_distribution<int32_t> any_pick(0, (int32_t) n_pick - 1);
-                for (int64_t i = 0; i < (int64_t) data.size(); ++i) {
-                    const uint32_t r = gen() % 16;
-                    data[i] = mode == picks::dense ? (int32_t) ((i % n_top) % n_pick)
-                            : r == 0 ? -1 : r == 1 ? (int32_t) n_pick : r == 2 && i > 0 ? data[i - 1] : any_pick(gen);
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
-            } else if (strcmp(t->name, "blocks") == 0) {
-                std::vector<int32_t> data(ggml_nelements(t));
-                for (int64_t i = 0; i < (int64_t) data.size(); ++i) {
-                    data[i] = mode == picks::dense ? (int32_t) (i < n_kv ? i : i % n_kv)
-                            : gen() % 16 == 0 ? stray_cell() : any_cell(gen);
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
-            } else if (strcmp(t->name, "tail") == 0) {
-                std::vector<int32_t> data(ggml_nelements(t));
-                for (int64_t i = 0; i < (int64_t) data.size(); ++i) {
-                    const int64_t own = at_end ? n_kv - n_tokens + i / n_tail : 0;
-                    data[i] = mode == picks::empty ? stray_cell()
-                            : gen() % 8 == 0 ? stray_cell()
-                            : at_end ? (int32_t) std::max<int64_t>(0, own - (i % n_tail)) : any_cell(gen);
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
-            } else {
-                init_tensor_uniform(t);
-            }
-        }
-    }
-};
-
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -11267,32 +11120,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 1));             // DeepSeek-V4-Flash decode
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true)); // Qwen4-Exp decode
-
-    {
-        using picks = test_qsa_stage::picks;
-        // decode and short prefill over a k-pool selection
-        test_cases.emplace_back(new test_qsa_stage());
-        test_cases.emplace_back(new test_qsa_stage(1024, 7, 32, 256, 4, 3));
-        test_cases.emplace_back(new test_qsa_stage(1001, 33, 16, 250, 4, 5, picks::random, 0, false));
-        test_cases.emplace_back(new test_qsa_stage(4096, 64, 64, 1024, 4, 3, picks::random, 9, false));
-        // every cell selected: the staging is full, n_stage = n_tokens + n_kv
-        test_cases.emplace_back(new test_qsa_stage(1000, 1, 250, 250, 4, 3, picks::dense));
-        test_cases.emplace_back(new test_qsa_stage(1000, 5, 250, 250, 4, 3, picks::dense, 0, false));
-        test_cases.emplace_back(new test_qsa_stage(33, 3, 9, 9, 4, 2, picks::dense));
-        // nothing selected: the tokens' own cells, then pads
-        test_cases.emplace_back(new test_qsa_stage(1024, 1, 32, 256, 4, 3, picks::empty));
-        test_cases.emplace_back(new test_qsa_stage(1024, 9, 32, 256, 4, 3, picks::empty, 0, false));
-        // one cell, one token
-        test_cases.emplace_back(new test_qsa_stage(1, 1, 4, 1, 1, 1));
-        // n_kv not a multiple of 32, words split unevenly across threads
-        test_cases.emplace_back(new test_qsa_stage(32*1024 + 17, 1, 512, 8192, 4, 3));
-        test_cases.emplace_back(new test_qsa_stage(49152, 4, 512, 12288, 4, 3, picks::random, 0, false));
-        // long contexts: 128k cells; the most cells a 32 KiB threadgroup bitmap holds after the sums, and past it (unsupported on Metal)
-        test_cases.emplace_back(new test_qsa_stage(131072, 1, 512, 32768, 4, 3));
-        test_cases.emplace_back(new test_qsa_stage(131072, 16, 512, 32768, 4, 3, picks::random, 0, false));
-        test_cases.emplace_back(new test_qsa_stage(260096, 1, 512, 65024, 4, 3));
-        test_cases.emplace_back(new test_qsa_stage(262144, 1, 512, 65536, 4, 3));
-    }
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         // blocks with extra cells and scores (k-pool)

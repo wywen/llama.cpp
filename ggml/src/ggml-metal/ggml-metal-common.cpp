@@ -32,12 +32,6 @@ bool ggml_metal_op_mul_mat_use_fwht(const struct ggml_tensor * op, size_t max_tg
            ggml_metal_fwht_supported_size(op->src[1]->ne[0], max_tg_mem);
 }
 
-size_t ggml_metal_op_qsa_stage_smem(const struct ggml_tensor * op) {
-    const size_t n_kv    = (size_t) ggml_get_op_params_i32(op, 0);
-    const size_t n_words = (n_kv + 31)/32;
-    return GGML_PAD(32*sizeof(uint32_t) + n_words*sizeof(uint32_t), 16);
-}
-
 bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne11 = op->src[1]->ne[1];
