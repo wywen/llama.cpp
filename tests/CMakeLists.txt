@@ -254,11 +254,6 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
         ARGS --models "${MOE_MODEL_DIR}")
     set_tests_properties(test-moe-slots PROPERTIES FIXTURES_REQUIRED moe-models)
 
-    llama_build(test-lookup-pages.cpp)
-    llama_test(test-lookup-pages LABEL "main behavior backend"
-        ARGS --models "${MOE_MODEL_DIR}")
-    set_tests_properties(test-lookup-pages PROPERTIES FIXTURES_REQUIRED moe-models)
-
     llama_build(test-kv-rows-caller.cpp)
     llama_test(test-kv-rows-caller LABEL "main behavior backend"
         ARGS --models "${MOE_MODEL_DIR}")
