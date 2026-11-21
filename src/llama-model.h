@@ -5,7 +5,6 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
-#include "llama-lookup-tables.h"
 #include "llama-moe-slots.h"
 #include "llama-vocab.h"
 
@@ -974,9 +973,6 @@ struct llama_model {
     // the MoE layers that read their expert weights from slots, see llama_model_params::moe_slots
     llama_moe_slots moe_slots;
 
-    // the lookup tables whose rows the caller serves, see llama_model_params::lookup_tables
-    llama_lookup_tables lookup_tables;
-
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 
@@ -1024,17 +1020,6 @@ struct llama_model {
     // same, for the keys of the lightning indexer
     virtual llama_rope_params get_rope_params_indexer(const llama_cparams & cparams, int il) const;
 
-    // the rows of the served lookup table `table` that one token reads; 0 if the architecture cannot name them
-    virtual int32_t lookup_rows_per_token(const llama_lookup_table & table) const;
-
-    // the rows that tokens[n_context, n_tokens) read, see llama_model_lookup_table_rows; returns false if the
-    //     architecture cannot name them
-    virtual bool lookup_table_rows(const llama_lookup_table & table,
-                                   const llama_token *        tokens,
-                                   int32_t                    n_tokens,
-                                   int32_t                    n_context,
-                                   int32_t *                  rows) const;
-
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
 
@@ -1079,7 +1064,6 @@ struct llama_model_base : public llama_model {
     const int TENSOR_SKIP_IF_VIRTUAL;
     const int TENSOR_ALLOW_RESHAPE;
     const int TENSOR_READ_LAZY;
-    const int TENSOR_PAGEABLE;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;
@@ -1113,9 +1097,6 @@ struct llama_model_base : public llama_model {
 
     // helper: the slot geometry and file runs of the MoE layers that read their expert weights from slots
     void load_tensors_moe_slots(llama_model_loader & ml);
-
-    // helper: the file range of the lookup tables whose rows the caller serves
-    void load_tensors_lookup_tables(llama_model_loader & ml);
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
