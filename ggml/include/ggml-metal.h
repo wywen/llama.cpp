@@ -179,6 +179,18 @@ GGML_BACKEND_API void * ggml_backend_metal_tensor_mtl_buffer(const struct ggml_t
 // synchronize also waits for every command buffer the caller committed to the queue before the call
 GGML_BACKEND_API void ggml_backend_metal_commit_fence(ggml_backend_t backend);
 
+//
+// Metal implementations of GGML_OP_CUSTOM nodes (ggml_backend_dev_add_custom_op in ggml-backend.h)
+//
+// On a Metal device, `native_ctx` is the backend's id<MTLComputeCommandEncoder>, as void *. The implementation sets
+// its own pipelines, binds the node's tensors with ggml_backend_metal_tensor_mtl_buffer and dispatches. The encoder
+// may be a concurrent one, so kernels of the implementation that depend on each other need a memory barrier
+// (memoryBarrierWithScope:) between them. The backend sets the pipeline and bindings of each of its own kernels, so
+// state the implementation leaves behind does not reach them. The backend encodes with unretained references: the
+// caller keeps its pipelines, and any buffers it binds besides the node's tensors, alive until the command buffers
+// that use them have completed. The graph reorder may move a CUSTOM node as it moves a stock op.
+//
+
 #ifdef __cplusplus
 }
 #endif

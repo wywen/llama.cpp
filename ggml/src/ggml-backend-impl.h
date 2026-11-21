@@ -224,6 +224,10 @@ extern "C" {
         ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
         void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
         void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
+
+        // (optional) register an implementation of GGML_OP_CUSTOM nodes (see ggml_backend_dev_add_custom_op);
+        // the backend keeps the registry and answers for the nodes in supports_op and its graph compute
+        bool (*add_custom_op)(ggml_backend_dev_t dev, const struct ggml_backend_custom_op * op);
     };
 
     struct ggml_backend_device {

@@ -10,6 +10,7 @@
 
 #include <Metal/Metal.h>
 
+#include <os/lock.h>
 #include <stdatomic.h>
 
 #ifndef TARGET_OS_VISION
@@ -899,6 +900,12 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
     [encoder->obj endEncoding];
 }
 
+void * ggml_metal_encoder_get_obj(ggml_metal_encoder_t encoder) {
+    return encoder->obj;
+}
+
+#define GGML_METAL_MAX_CUSTOM_OPS 64
+
 struct ggml_metal_device {
     id<MTLDevice> mtl_device;
 
@@ -918,6 +925,12 @@ struct ggml_metal_device {
 
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
+
+    // caller implementations of GGML_OP_CUSTOM nodes, append-only: an entry is written before n_custom_ops counts it,
+    // so readers take no lock; custom_ops_lock orders the writers
+    struct ggml_backend_custom_op custom_ops[GGML_METAL_MAX_CUSTOM_OPS];
+    atomic_int                          n_custom_ops;
+    os_unfair_lock                      custom_ops_lock;
 };
 
 //
@@ -1407,6 +1420,58 @@ ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev) {
     return dev->library;
 }
 
+bool ggml_metal_device_add_custom_op(ggml_metal_device_t dev, const struct ggml_backend_custom_op * op) {
+    if (op == NULL || op->key == NULL || op->encode == NULL) {
+        GGML_LOG_ERROR("%s: a custom op needs a key and an encode function\n", __func__);
+        return false;
+    }
+
+    bool ok = true;
+
+    os_unfair_lock_lock(&dev->custom_ops_lock);
+
+    const int n = atomic_load_explicit(&dev->n_custom_ops, memory_order_relaxed);
+
+    for (int i = 0; i < n; ++i) {
+        if (dev->custom_ops[i].key == op->key) {
+            GGML_LOG_ERROR("%s: the key is already registered\n", __func__);
+            ok = false;
+            break;
+        }
+    }
+
+    if (ok && n == GGML_METAL_MAX_CUSTOM_OPS) {
+        GGML_LOG_ERROR("%s: the device holds %d custom ops already\n", __func__, GGML_METAL_MAX_CUSTOM_OPS);
+        ok = false;
+    }
+
+    if (ok) {
+        dev->custom_ops[n] = *op;
+        atomic_store_explicit(&dev->n_custom_ops, n + 1, memory_order_release);
+    }
+
+    os_unfair_lock_unlock(&dev->custom_ops_lock);
+
+    return ok;
+}
+
+const struct ggml_backend_custom_op * ggml_metal_device_get_custom_op(ggml_metal_device_t dev, const struct ggml_tensor * node) {
+    GGML_ASSERT(node->op == GGML_OP_CUSTOM);
+
+    struct ggml_custom_op_params p;
+    memcpy(&p, node->op_params, sizeof(p));
+
+    const int n = atomic_load_explicit(&dev->n_custom_ops, memory_order_acquire);
+
+    for (int i = 0; i < n; ++i) {
+        if (dev->custom_ops[i].key == p.fun) {
+            return &dev->custom_ops[i];
+        }
+    }
+
+    return NULL;
+}
+
 void ggml_metal_device_rsets_add(ggml_metal_device_t dev, ggml_metal_rset_t rset) {
     if (rset == nil) {
         return;
@@ -1552,6 +1617,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
+
+    // a caller implementation decides alone which nodes it takes
+    if (op->op == GGML_OP_CUSTOM) {
+        const struct ggml_backend_custom_op * impl = ggml_metal_device_get_custom_op(dev, op);
+
+        return impl != NULL && (impl->supports == NULL || impl->supports(impl->user_data, op));
+    }
 
     if (!has_bfloat) {
         if (op->type == GGML_TYPE_BF16) {

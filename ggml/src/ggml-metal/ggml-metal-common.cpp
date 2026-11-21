@@ -479,6 +479,8 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(
             case GGML_OP_CPY:
             case GGML_OP_CONT:
             case GGML_OP_REPEAT:
+            // a caller implementation reads only the node's srcs and writes only the node (see ggml_backend_dev_add_custom_op)
+            case GGML_OP_CUSTOM:
                 return true;
             default:
                 return ggml_op_is_empty(op);

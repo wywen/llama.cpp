@@ -17876,6 +17876,7 @@ struct ggml_backend_device_i ggml_backend_opencl_device_i = {
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,
+    /* .add_custom_op        = */ NULL,
 };
 }
 
