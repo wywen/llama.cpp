@@ -526,6 +526,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_count_equal(ctx, idx);
             } break;
+        case GGML_OP_CUSTOM:
+            {
+                n_fuse = ggml_metal_op_custom(ctx, idx);
+            } break;
         default:
             {
                 GGML_LOG_ERROR("%s: error: node %3d, op = %8s not implemented\n", __func__, idx, ggml_op_name(node->op));
@@ -6501,6 +6505,20 @@ int ggml_metal_op_count_equal(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
+    }
+
+    return 1;
+}
+
+int ggml_metal_op_custom(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    // the device supports the node, so its implementation is registered
+    const ggml_backend_custom_op * impl = ggml_metal_device_get_custom_op(ctx->dev, op);
+    GGML_ASSERT(impl != nullptr);
+
+    if (!impl->encode(impl->user_data, op, ggml_metal_encoder_get_obj(ctx->enc))) {
+        GGML_ABORT("%s: failed to encode custom op node '%s'", __func__, op->name);
     }
 
     return 1;

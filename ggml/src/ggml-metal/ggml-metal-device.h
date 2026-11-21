@@ -91,6 +91,9 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 
+// the id<MTLComputeCommandEncoder>, not retained
+void * ggml_metal_encoder_get_obj(ggml_metal_encoder_t encoder);
+
 //
 // MTLLibrary wrapper
 //
@@ -347,6 +350,14 @@ void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_eve
 
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total);
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op);
+
+// caller implementations of GGML_OP_CUSTOM nodes, keyed by the node's CPU function (see ggml_backend_dev_add_custom_op)
+struct ggml_backend_custom_op;
+
+bool ggml_metal_device_add_custom_op(ggml_metal_device_t dev, const struct ggml_backend_custom_op * op);
+
+// the implementation registered for the function of `node`, a GGML_OP_CUSTOM node; NULL if there is none
+const struct ggml_backend_custom_op * ggml_metal_device_get_custom_op(ggml_metal_device_t dev, const struct ggml_tensor * node);
 
 const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev);
 

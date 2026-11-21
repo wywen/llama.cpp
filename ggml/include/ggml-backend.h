@@ -199,6 +199,52 @@ extern "C" {
     GGML_API bool                          ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
 
     //
+    // Device implementations of GGML_OP_CUSTOM nodes
+    //
+    // A GGML_OP_CUSTOM node (ggml_custom_4d, ggml_custom_inplace) carries the CPU function that computes it. A caller
+    // can register, on a device whose backend takes them, an implementation for the nodes of one CPU function, its key.
+    // The device then supports such a node when the implementation's `supports` accepts it, so the scheduler can place
+    // the node on the device, and the backend computes the node by calling `encode` in its place, with the backend's
+    // native encoding context. The same graph still runs on the CPU through the function itself wherever a device does
+    // not take the node.
+    //
+    // Contract:
+    // - the node's work reads only the node's srcs and writes only the node itself; a tensor it also touches is passed
+    //   as one more src (ggml_custom_4d takes up to GGML_MAX_SRC - 1 of them). The backend orders, synchronizes and
+    //   reorders the node by these tensors' memory alone, as it does a stock op, so the node costs no barrier, split
+    //   or encoder of its own; memory that is not a tensor of the graph is the caller's to order;
+    // - `encode` records the node's work into the native context and leaves it open (it does not end, commit or
+    //   submit it); returning false aborts the compute, naming the node;
+    // - `supports` gives the same answer for the same node every time it is asked;
+    // - `supports` and `encode` may be called from several threads at once;
+    // - a CUSTOM node is never fused with another node.
+    //
+    // The native context of each backend that takes implementations:
+    // - Metal: the id<MTLComputeCommandEncoder> the node is encoded into (see ggml-metal.h)
+    // Reserved for backends that may take them later:
+    // - CUDA: the cudaStream_t the node runs on
+    // - Vulkan: the command buffer the node is recorded into, with a helper to bind tensors
+    //
+
+    // may the device take `node`, a GGML_OP_CUSTOM node whose function is the implementation's key?
+    typedef bool (*ggml_backend_custom_supports_t)(void * user_data, const struct ggml_tensor * node);
+
+    // record `node` into `native_ctx`, the backend's native encoding context; false on failure
+    typedef bool (*ggml_backend_custom_encode_t)(void * user_data, const struct ggml_tensor * node, void * native_ctx);
+
+    struct ggml_backend_custom_op {
+        ggml_custom_op_t               key;       // the CPU function of the nodes it implements
+        ggml_backend_custom_supports_t supports;  // NULL: every node with the key
+        ggml_backend_custom_encode_t   encode;
+        void *                         user_data; // passed to both, and kept alive by the caller as long as the device
+    };
+
+    // register `op` on `device`, for the nodes asked about and graphs computed after the call; the entry is copied
+    // and stays for the device's lifetime. False when the device's backend takes no implementations; false, with a
+    // log line, when key or encode is NULL, the key is already registered on the device or the device holds no more
+    GGML_API bool                          ggml_backend_dev_add_custom_op(ggml_backend_dev_t device, const struct ggml_backend_custom_op * op);
+
+    //
     // Backend (reg)
     //
 

@@ -884,6 +884,12 @@ static bool ggml_backend_metal_device_supports_op(ggml_backend_dev_t dev, const 
     return ggml_metal_device_supports_op(ctx_dev, op);
 }
 
+static bool ggml_backend_metal_device_add_custom_op(ggml_backend_dev_t dev, const struct ggml_backend_custom_op * op) {
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+
+    return ggml_metal_device_add_custom_op(ctx_dev, op);
+}
+
 // the device's own buffer types, and any buffer type a caller makes for the device: such a type's buffers place
 // their tensors in Metal buffers, e.g. in buffers from ggml_backend_metal_buffer_from_ranges
 static bool ggml_backend_metal_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
@@ -957,6 +963,7 @@ static ggml_backend_device_i ggml_backend_metal_device_i = {
     /* .event_new            = */ ggml_backend_metal_device_event_new,
     /* .event_free           = */ ggml_backend_metal_device_event_free,
     /* .event_synchronize    = */ ggml_backend_metal_device_event_synchronize,
+    /* .add_custom_op        = */ ggml_backend_metal_device_add_custom_op,
 };
 
 // backend registry

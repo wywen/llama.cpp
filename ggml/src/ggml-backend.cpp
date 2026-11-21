@@ -1033,6 +1033,14 @@ bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_t
     return device->iface.supports_op(device, op);
 }
 
+bool ggml_backend_dev_add_custom_op(ggml_backend_dev_t device, const struct ggml_backend_custom_op * op) {
+    GGML_ASSERT(device);
+    if (device->iface.add_custom_op == NULL) {
+        return false;
+    }
+    return device->iface.add_custom_op(device, op);
+}
+
 bool ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(device);
     return device->iface.supports_buft(device, buft);
