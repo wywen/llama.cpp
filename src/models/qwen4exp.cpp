@@ -216,7 +216,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         // only trunk layers read it
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY | TENSOR_PAGEABLE | trunk_flags);
+                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY | trunk_flags);
     }
 
     auto load_block = [&](int il, int flags) {
@@ -1386,35 +1386,6 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
-}
-
-int32_t llama_model_qwen4exp::lookup_rows_per_token(const llama_lookup_table & table) const {
-    return table.stock == per_layer_tok_embd ? (int32_t) hparams.ple_n_heads : 0;
-}
-
-bool llama_model_qwen4exp::lookup_table_rows(const llama_lookup_table & table,
-                                             const llama_token *        tokens,
-                                             int32_t                    n_tokens,
-                                             int32_t                    n_context,
-                                             int32_t *                  rows) const {
-    if (table.stock != per_layer_tok_embd) {
-        return false;
-    }
-    const int64_t n_prev  = hparams.ple_ngram_size - 1;
-    const int64_t n_heads = hparams.ple_n_heads;
-
-    // the window of each token, oldest first, as the KV cells would give it
-    // this query runs on the caller's hot path and does not allocate
-    GGML_ASSERT(n_prev >= 1 && n_prev < LLAMA_MAX_PLE_NGRAM);
-    std::array<llama_token, LLAMA_MAX_PLE_NGRAM - 1> prev;
-    for (int64_t k = n_context; k < n_tokens; ++k) {
-        for (int64_t j = 0; j < n_prev; ++j) {
-            const int64_t p = k - n_prev + j;
-            prev[j]         = p >= 0 ? tokens[p] : LLAMA_TOKEN_NULL;
-        }
-        qwen4exp_ple_rows(hparams, tokens[k], prev.data(), rows + (k - n_context) * n_heads);
-    }
-    return true;
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.
