@@ -5,14 +5,18 @@
 //
 // - a graph compiled first, over tensors that have no memory, compiles every pipeline a compute of the same graph sets:
 //   the compute compiles nothing more; and a compile of it again compiles nothing;
-// - a graph computed first compiles every pipeline a compile of the same graph looks up: the compile compiles nothing;
+// - a compile cannot read whether the buffers allow a fusion, so it also compiles the kernels of the nodes unfused: a
+//   graph computed first, both fused and with fusion off, compiles every pipeline a compile of it looks up, while a
+//   graph computed fused only may leave the compile the unfused kernels to compile;
+// - a chain of additions, which fuses only addends in one Metal buffer, compiles without memory, and a compute of it
+//   with the addends in one buffer, in two or in three compiles nothing more;
 // - tensors in a buffer over caller ranges with no Metal buffer compile without the range's grow hook being called;
 // - fusion statistics do not count a compile;
 // - a range outside the graph and a backend that is not Metal fail.
 //
-// Each graph holds a fusable run (an RMS norm and the multiply after it) and matrix products of distinct types and widths,
-// so the walk takes the same fusion and kernel choices as the encode. The second graph's product and tail are kernels
-// the first does not set, so each order is read on pipelines of its own. Everything needs a Metal device, so the binary
+// Each graph holds a fusable run (an RMS norm and the multiply after it) and matrix products of distinct types and widths.
+// The second graph's product and tail are kernels the first does not set, and the addition chain's kernels are its own,
+// so each scenario is read on pipelines of its own. Everything needs a Metal device, so the binary
 // skips without one.
 
 #include "ggml.h"
@@ -113,6 +117,7 @@ struct fixture {
     ggml_backend_fusion_t finfo       = nullptr;
     fusion_stats_reset_t  stats_reset = nullptr;
     fusion_stats_get_t    stats_get   = nullptr;
+    fusion_set_enabled_t  set_enabled = nullptr;
 
     // false when there is no Metal device
     bool init() {
@@ -124,7 +129,7 @@ struct fixture {
 
         auto get         = (fusion_get_t)         ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_get");
         auto stats_init  = (fusion_stats_init_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_stats_init");
-        auto set_enabled = (fusion_set_enabled_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_set_enabled");
+        set_enabled = (fusion_set_enabled_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_set_enabled");
         stats_reset = (fusion_stats_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_stats_reset");
         stats_get   = (fusion_stats_get_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_stats_get");
         check(get && stats_init && set_enabled && stats_reset && stats_get, "setup", "the fusion debugging API is exported");
@@ -188,7 +193,8 @@ static void test_compile_first(fixture & f) {
     printf("     %-20s %zu pipelines compiled by the compile, none by the compute\n", sc, compiled - before);
 }
 
-// computed first, the graph's pipelines are every one its compile looks up
+// computed first, fused and with fusion off, the graph's pipelines are every one its compile looks up; the compile also
+// looks up the kernels of the fused nodes alone, which only the compute with fusion off sets
 static void test_compute_first(fixture & f) {
     const char * sc = "compute-first";
 
@@ -199,10 +205,128 @@ static void test_compute_first(fixture & f) {
     const size_t computed = f.n_pipelines();
     check(computed > before, sc, "the compute compiles the graph's pipelines");
 
+    f.set_enabled(f.finfo, false);
+    check(ggml_backend_graph_compute(f.backend, real.gf) == GGML_STATUS_SUCCESS, sc, "the graph computes unfused");
+    f.set_enabled(f.finfo, true);
+    const size_t both = f.n_pipelines();
+
     const built_graph bare(graph_kind::f16_narrow, f.backend, false);
     check(ggml_backend_metal_compile_nodes(f.backend, bare.gf, 0, bare.n_nodes()) == GGML_STATUS_SUCCESS, sc,
             "the graph without memory compiles");
-    check(f.n_pipelines() == computed, sc, "the compile looks up no pipeline the compute did not set");
+    check(f.n_pipelines() == both, sc, "the compile looks up no pipeline the fused and unfused computes did not set");
+    printf("     %-20s %zu pipelines compiled by the unfused compute, none by the compile\n", sc, both - computed);
+}
+
+// how the three addends of an addition chain are placed: in which buffer each is, or in none
+enum class addend_layout {
+    none,
+    one_buffer, // a b c
+    two_buffers, // a b | c
+    three_buffers, // a | b | c
+};
+
+// x + a + b + c with the addends in contexts of their own, one per buffer of `layout`; x and the sums are in one more
+struct add_chain_graph {
+    std::vector<ggml_context *>         ctxs;
+    std::vector<ggml_backend_buffer_t> bufs;
+    ggml_cgraph * gf        = nullptr;
+    bool          allocated = true;
+
+    add_chain_graph(addend_layout layout, ggml_backend_t backend) {
+        const std::array<int, 3> group = layout == addend_layout::three_buffers ? std::array<int, 3>{ 0, 1, 2 } :
+                                         layout == addend_layout::two_buffers   ? std::array<int, 3>{ 0, 0, 1 } :
+                                                                                  std::array<int, 3>{ 0, 0, 0 };
+        const int n_groups = group[2] + 1;
+
+        for (int i = 0; i <= n_groups; i++) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ ggml_tensor_overhead()*8 + (i == 0 ? ggml_graph_overhead() : 0),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ctxs.push_back(ggml_init(params));
+        }
+
+        ggml_tensor * cur = ggml_new_tensor_2d(ctxs[0], GGML_TYPE_F32, kRows, 4);
+        for (int i = 0; i < 3; i++) {
+            ggml_tensor * addend = ggml_new_tensor_2d(ctxs[1 + group[i]], GGML_TYPE_F32, kRows, 4);
+            cur = ggml_add(ctxs[0], cur, addend);
+        }
+
+        gf = ggml_new_graph(ctxs[0]);
+        ggml_build_forward_expand(gf, cur);
+
+        if (layout != addend_layout::none) {
+            for (ggml_context * ctx : ctxs) {
+                ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+                if (buf == nullptr) {
+                    allocated = false;
+                    continue;
+                }
+                ggml_backend_buffer_clear(buf, 0);
+                bufs.push_back(buf);
+            }
+        }
+    }
+
+    ~add_chain_graph() {
+        for (ggml_backend_buffer_t buf : bufs) {
+            ggml_backend_buffer_free(buf);
+        }
+        for (ggml_context * ctx : ctxs) {
+            ggml_free(ctx);
+        }
+    }
+
+    int n_nodes() const {
+        return ggml_graph_n_nodes(gf);
+    }
+};
+
+// the chain fuses only addends in one Metal buffer, which a compile cannot read, so it compiles the kernels of every
+// layout: the chain of three, of two, and the addition alone
+static void test_add_chain(fixture & f) {
+    const char * sc = "add-chain";
+
+    const add_chain_graph bare(addend_layout::none, f.backend);
+    const size_t before = f.n_pipelines();
+    check(ggml_backend_metal_compile_nodes(f.backend, bare.gf, 0, bare.n_nodes()) == GGML_STATUS_SUCCESS, sc,
+            "a chain whose tensors have no buffer compiles");
+    const size_t compiled = f.n_pipelines();
+    check(compiled > before, sc, "the compile compiles the chain's pipelines");
+
+    struct layout_case {
+        addend_layout layout;
+        bool          fuses;
+        const char *  what;
+    };
+    const std::array<layout_case, 3> cases = {{
+        { addend_layout::one_buffer,    true,  "addends in one buffer"    },
+        { addend_layout::two_buffers,   true,  "addends in two buffers"   },
+        { addend_layout::three_buffers, false, "addends in three buffers" },
+    }};
+
+    for (const layout_case & c : cases) {
+        const add_chain_graph real(c.layout, f.backend);
+        char what[128];
+        snprintf(what, sizeof(what), "%s: allocated", c.what);
+        check(real.allocated, sc, what);
+        if (!real.allocated) {
+            continue;
+        }
+
+        f.stats_reset(f.finfo);
+        snprintf(what, sizeof(what), "%s: computes", c.what);
+        check(ggml_backend_graph_compute(f.backend, real.gf) == GGML_STATUS_SUCCESS, sc, what);
+        snprintf(what, sizeof(what), "%s: %s", c.what, c.fuses ? "fuses" : "does not fuse");
+        check((f.fusions() > 0) == c.fuses, sc, what);
+        snprintf(what, sizeof(what), "%s: compiles no pipeline the compile did not", c.what);
+        check(f.n_pipelines() == compiled, sc, what);
+    }
+
+    check(ggml_backend_metal_compile_nodes(f.backend, bare.gf, 0, bare.n_nodes()) == GGML_STATUS_SUCCESS &&
+            f.n_pipelines() == compiled, sc, "compiling it again compiles nothing");
+    printf("     %-20s %zu pipelines compiled by the compile, none by the computes\n", sc, compiled - before);
 }
 
 static int g_grow_calls = 0;
@@ -289,6 +413,7 @@ int main(void) {
 
     test_compile_first(f);
     test_compute_first(f);
+    test_add_chain(f);
     test_unbacked_range(f);
     test_refused(f);
 

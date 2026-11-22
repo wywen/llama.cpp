@@ -46,7 +46,8 @@ struct ggml_metal_op {
         this->lib             = ggml_metal_device_get_library(dev);
         this->enc             = ggml_metal_encoder_init(cmd_buf, use_concurrency);
         this->binds_nothing   = cmd_buf == nullptr;
-        this->mem_ranges      = ggml_mem_ranges_init(debug_graph);
+        // the ranges only place barriers, and are read from the tensors' buffers, so a walk that binds nothing has none
+        this->mem_ranges      = binds_nothing ? nullptr : ggml_mem_ranges_init(debug_graph);
         this->finfo           = finfo;
         this->idx_start       = idx_start;
         this->idx_end         = idx_end;
@@ -88,11 +89,25 @@ struct ggml_metal_op {
 
     // consult the fusion table for the longest pattern starting at i0
     // returns the matching pattern (nullptr if no fusion) and sets *n_out to the number of nodes
+    // when binding nothing, the fusion is the candidate the walk chose for the node it encodes
     const ggml_metal_fusion * can_fuse(int i0, enum ggml_metal_fusion_mode mode, int * n_out) const {
         assert(use_fusion());
         assert(i0 >= 0 && i0 < n_nodes());
 
+        if (binds_nothing) {
+            const bool chosen = i0 == dry_idx && dry_fusion != nullptr;
+            *n_out = chosen ? dry_n_fuse : 1;
+            return chosen ? dry_fusion : nullptr;
+        }
+
         return ggml_metal_fusion_next(gf, idxs.data(), (int) idxs.size(), i0, mode, n_out);
+    }
+
+    // every fusion that may start at i0 for some placement of the tensors in memory (see ggml_metal_fusion_candidates)
+    int fusion_candidates(int i0, const ggml_metal_fusion ** fusions, int * n_fused, int n_max) const {
+        assert(i0 >= 0 && i0 < n_nodes());
+
+        return ggml_metal_fusion_candidates(gf, idxs.data(), (int) idxs.size(), i0, fusions, n_fused, n_max);
     }
 
     // whether the node at i, with the nodes fused into its kernel, can run concurrently with the pending nodes
@@ -130,6 +145,11 @@ struct ggml_metal_op {
     // made without a command buffer: the kernels' pipelines are looked up, compiling those not yet compiled, and
     // nothing is encoded, bound or counted
     bool binds_nothing;
+
+    // when binding nothing: the fusion can_fuse returns for the node at dry_idx (nullptr: none), and its node count
+    int                       dry_idx    = -1;
+    const ggml_metal_fusion * dry_fusion = nullptr;
+    int                       dry_n_fuse = 1;
 
 private:
     ggml_cgraph * gf;
@@ -564,7 +584,42 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     return n_fuse;
 }
 
+// a walk that binds nothing cannot tell which fusion the buffers allow, so it encodes the node once unfused and once
+// per fusion that may start at it, and steps one node: every node is also encoded alone, so the pipelines compiled are
+// those of every encode the graph may take in memory
+static int ggml_metal_op_compile(ggml_metal_op_t ctx, int idx) {
+    constexpr int n_max = 64;
+
+    const ggml_metal_fusion * fusions[n_max];
+    int                       n_fused[n_max];
+
+    int n_cand = 0;
+    if (ctx->use_fusion()) {
+        n_cand = ctx->fusion_candidates(idx, fusions, n_fused, n_max);
+        GGML_ASSERT(n_cand <= n_max);
+    }
+
+    ctx->dry_idx = idx;
+
+    for (int c = -1; c < n_cand; ++c) {
+        ctx->dry_fusion = c < 0 ? nullptr : fusions[c];
+        ctx->dry_n_fuse = c < 0 ? 1       : n_fused[c];
+
+        ggml_metal_op_encode_impl(ctx, idx);
+    }
+
+    ctx->dry_idx    = -1;
+    ctx->dry_fusion = nullptr;
+    ctx->dry_n_fuse = 1;
+
+    return 1;
+}
+
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
+    if (ctx->binds_nothing) {
+        return ggml_metal_op_compile(ctx, idx);
+    }
+
     if (ctx->use_capture) {
         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
     }
@@ -1499,6 +1554,11 @@ int ggml_metal_op_top_k_mask(ggml_metal_op_t ctx, int idx) {
     const bool has_extra  = extra  != NULL;
 
     const bool vec = n_elems % 4 == 0 && bid.offs % (4*ts) == 0;
+
+    // a walk that binds nothing reads offset 0, and the dst may be placed where the vector fill cannot store
+    if (ctx->binds_nothing && vec) {
+        ggml_metal_library_get_pipeline_top_k_mask(lib, op, true, false, false, false, false);
+    }
 
     ggml_metal_kargs_top_k_mask args = {
         /*.n_kv    =*/ n_kv,
