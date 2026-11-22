@@ -3659,6 +3659,16 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
 
+    // a partial with an active count (ggml_flash_attn_ext_partial_set_active): every kernel below reads the
+    // count and returns at once when it is not greater than the partial's index, so an inactive partial
+    // costs its launches only
+    const bool has_active = partial && op->src[6] != nullptr;
+    GGML_ASSERT(!has_active || op->src[6]->type == GGML_TYPE_I32);
+
+    ggml_metal_buffer_id bid_active = has_active ? ggml_metal_get_buffer_id(op->src[6]) : bid_src0;
+
+    int32_t active_index = has_active ? ggml_get_op_params_i32(op, 5) : 0;
+
     ggml_metal_buffer_id bid_pad = bid_dst;
     bid_pad.offs += ggml_nbytes(op);
 
@@ -3739,6 +3749,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_bytes   (enc, &args_k, sizeof(args_k), 0);
         ggml_metal_encoder_set_buffer  (enc, bid_src1,        1);
         ggml_metal_encoder_set_buffer  (enc, bid_kv_f16, 2);
+        ggml_metal_encoder_set_buffer  (enc, bid_active,      3);
+        ggml_metal_encoder_set_bytes   (enc, &active_index, sizeof(active_index), 4);
 
         ggml_metal_encoder_dispatch_threadgroups(enc, (nblocks1 + nth - 1)/nth, 1, 1, nth, 1, 1);
 
@@ -3764,6 +3776,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_bytes   (enc, &args_v, sizeof(args_v), 0);
             ggml_metal_encoder_set_buffer  (enc, bid_src2,        1);
             ggml_metal_encoder_set_buffer  (enc, bid_v_f16,       2);
+            ggml_metal_encoder_set_buffer  (enc, bid_active,      3);
+            ggml_metal_encoder_set_bytes   (enc, &active_index, sizeof(active_index), 4);
 
             ggml_metal_encoder_dispatch_threadgroups(enc, (nblocks2 + nth - 1)/nth, 1, 1, nth, 1, 1);
         }
@@ -3885,6 +3899,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
             ggml_metal_encoder_set_buffer  (enc, bid_src3, 1);
             ggml_metal_encoder_set_buffer  (enc, bid_blk,  2);
+            ggml_metal_encoder_set_buffer  (enc, bid_active, 3);
+            ggml_metal_encoder_set_bytes   (enc, &active_index, sizeof(active_index), 4);
 
             const int32_t nblk1 = ((ne01 + nqptg - 1)/nqptg);
             const int32_t nblk0 = ((ne30 + ncpsg - 1)/ncpsg);
@@ -3995,6 +4011,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, bid_v,    2);
             ggml_metal_encoder_set_buffer  (enc, bid_src3, 3);
             ggml_metal_encoder_set_buffer  (enc, bid_pad,  4);
+            ggml_metal_encoder_set_buffer  (enc, bid_active, 5);
+            ggml_metal_encoder_set_bytes   (enc, &active_index, sizeof(active_index), 6);
 
             assert(ne12 == ne22);
             assert(ne13 == ne23);
@@ -4024,6 +4042,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
             ggml_metal_encoder_set_buffer  (enc, bid_src3, 1);
             ggml_metal_encoder_set_buffer  (enc, bid_blk,  2);
+            ggml_metal_encoder_set_buffer  (enc, bid_active, 3);
+            ggml_metal_encoder_set_bytes   (enc, &active_index, sizeof(active_index), 4);
 
             const int32_t nblk1 = ((ne01 + nqptg - 1)/nqptg);
             const int32_t nblk0 = ((ne30 + ncpsg - 1)/ncpsg);
@@ -4104,6 +4124,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_pad,  6);
         ggml_metal_encoder_set_buffer  (enc, bid_blk,  7);
         ggml_metal_encoder_set_buffer  (enc, bid_dst,  8);
+        ggml_metal_encoder_set_buffer  (enc, bid_active, 9);
+        ggml_metal_encoder_set_bytes   (enc, &active_index, sizeof(active_index), 10);
 
         GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
 
@@ -4195,6 +4217,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, bid_v,    2);
             ggml_metal_encoder_set_buffer  (enc, bid_src3, 3);
             ggml_metal_encoder_set_buffer  (enc, bid_pad,  4);
+            ggml_metal_encoder_set_buffer  (enc, bid_active, 5);
+            ggml_metal_encoder_set_bytes   (enc, &active_index, sizeof(active_index), 6);
 
             assert(ne12 == ne22);
             assert(ne13 == ne23);
@@ -4317,6 +4341,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
         ggml_metal_encoder_set_buffer  (enc, use_sparse ? bid_idx : (has_rows ? ggml_metal_get_buffer_id(kv_rows) : bid_src0), 8);
+        ggml_metal_encoder_set_buffer  (enc, bid_active, 9);
+        ggml_metal_encoder_set_bytes   (enc, &active_index, sizeof(active_index), 10);
 
         const size_t smem = fa_vec_smem(nsg, nqptg);
 
@@ -4361,6 +4387,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
                 ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
                 ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
+                ggml_metal_encoder_set_buffer  (enc, bid_active, 3);
+                ggml_metal_encoder_set_bytes   (enc, &active_index, sizeof(active_index), 4);
 
                 ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nwg, 1, 1);
             }

@@ -12,6 +12,10 @@
 
 using namespace metal;
 
+// the flash attention kernels of a partial with an active count (ggml_flash_attn_ext_partial_set_active)
+// read the count and return at once when it is not greater than the partial's index
+constant bool FC_flash_attn_ext_has_active [[function_constant(FC_FLASH_ATTN_EXT_ACTIVE)]];
+
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 #define SWAP(x, y) { auto tmp = (x); (x) = (y); (y) = tmp; }

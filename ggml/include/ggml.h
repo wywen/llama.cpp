@@ -2313,6 +2313,16 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
+    // compute the partial only when the first element of n_active (I32, read at compute time) is greater
+    // than index: e.g. the partial of chunk `index` of a number of chunks known at compute time only.
+    // Otherwise the backend may skip the op, prepasses included, and the result is then unspecified (the
+    // CPU and Metal backends leave it unwritten): the caller must not depend on its contents, for example
+    // by discarding it under the same condition. Pass NULL to compute it unconditionally (the default).
+    GGML_API void ggml_flash_attn_ext_partial_set_active(
+            struct ggml_tensor * a,
+            struct ggml_tensor * n_active,
+            int32_t              index);
+
     // combine two partials of disjoint KV ranges of the same queries (same shape as a and b):
     //   M = max(Ma, Mb), O = Oa*exp(Ma - M) + Ob*exp(Mb - M), S = Sa*exp(Ma - M) + Sb*exp(Mb - M)
     GGML_API struct ggml_tensor * ggml_flash_attn_ext_merge(

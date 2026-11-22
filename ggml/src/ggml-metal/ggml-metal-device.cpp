@@ -1783,6 +1783,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_reduce(ggml_
     return res;
 }
 
+// a partial with an active count (ggml_flash_attn_ext_partial_set_active): its kernels return at once when the
+// count is not greater than the partial's index
+static bool ggml_metal_flash_attn_ext_has_active(const ggml_tensor * op) {
+    return op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL && op->src[6] != nullptr;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_pad(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
@@ -1797,10 +1803,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_p
     snprintf(base, 256, "kernel_%s",
             "flash_attn_ext_pad");
 
-    snprintf(name, 256, "%s_mask=%d_ncpsg=%d",
+    const bool has_active = ggml_metal_flash_attn_ext_has_active(op);
+
+    snprintf(name, 256, "%s_mask=%d_ncpsg=%d_act=%d",
             base,
             has_mask,
-            ncpsg);
+            ncpsg,
+            has_active);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1818,6 +1827,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_p
         //ggml_metal_cv_set_int32(cv, nqptg, FC_FLASH_ATTN_EXT_PAD + 24);
         ggml_metal_cv_set_int32(cv, ncpsg, FC_FLASH_ATTN_EXT_PAD + 25);
 
+        ggml_metal_cv_set_bool(cv, has_active, FC_FLASH_ATTN_EXT_ACTIVE);
+
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
         ggml_metal_cv_free(cv);
@@ -1832,12 +1843,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_k
     assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL);
 
     char base[256];
+    char name[256];
+
+    const bool has_active = ggml_metal_flash_attn_ext_has_active(op);
 
     snprintf(base, 256, "kernel_flash_attn_ext_kv_%s_f16", ggml_type_name(op->src[1]->type));
+    snprintf(name, 256, "%s_act=%d", base, has_active);
 
-    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
-        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_bool(cv, has_active, FC_FLASH_ATTN_EXT_ACTIVE);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
     }
 
     return res;
@@ -1857,10 +1878,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_b
     snprintf(base, 256, "kernel_%s",
             "flash_attn_ext_blk");
 
-    snprintf(name, 256, "%s_nqptg=%d_ncpsg=%d",
+    const bool has_active = ggml_metal_flash_attn_ext_has_active(op);
+
+    snprintf(name, 256, "%s_nqptg=%d_ncpsg=%d_act=%d",
             base,
             nqptg,
-            ncpsg);
+            ncpsg,
+            has_active);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1877,6 +1901,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_b
         //ggml_metal_cv_set_int32(cv, nwg,  FC_FLASH_ATTN_EXT_BLK + 23);
         ggml_metal_cv_set_int32(cv, nqptg, FC_FLASH_ATTN_EXT_BLK + 24);
         ggml_metal_cv_set_int32(cv, ncpsg, FC_FLASH_ATTN_EXT_BLK + 25);
+
+        ggml_metal_cv_set_bool(cv, has_active, FC_FLASH_ATTN_EXT_ACTIVE);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -1951,13 +1977,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
     // store the unnormalized output with its softmax sum and max
     const bool partial = op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL;
 
+    const bool has_active = ggml_metal_flash_attn_ext_has_active(op);
+
     snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
             "flash_attn_ext",
             type,
             dk,
             dv);
 
-    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_bcm=%d_ns10=%d_ns20=%d_nsg=%d_partial=%d",
+    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_bcm=%d_ns10=%d_ns20=%d_nsg=%d_partial=%d_act=%d",
             base,
             has_mask,
             has_sinks,
@@ -1968,7 +1996,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
             ns10,
             ns20,
             nsg,
-            partial);
+            partial,
+            has_active);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1986,6 +2015,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         ggml_metal_cv_set_int32(cv, ns10, FC_FLASH_ATTN_EXT + 20);
         ggml_metal_cv_set_int32(cv, ns20, FC_FLASH_ATTN_EXT + 21);
         ggml_metal_cv_set_int32(cv, nsg,  FC_FLASH_ATTN_EXT + 22);
+
+        ggml_metal_cv_set_bool(cv, has_active, FC_FLASH_ATTN_EXT_ACTIVE);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -2059,6 +2090,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
 
     const char * type = use_kv_f16 ? "f16" : ggml_type_name(op->src[1]->type);
 
+    const bool has_active = ggml_metal_flash_attn_ext_has_active(op);
+
     char qne_suffix[16] = {0};
     if (!(nqpsg == 1 && ne == ggml_metal_tuning::fa_vec_baseline_ne(dk, dv))) {
         snprintf(qne_suffix, sizeof(qne_suffix), "_q%d_ne%d", nqpsg, ne);
@@ -2071,7 +2104,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
             dv,
             qne_suffix);
 
-    snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_sparse=%d_rows=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d",
+    snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_sparse=%d_rows=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d_act=%d",
             base,
             has_mask,
             has_sinks,
@@ -2082,7 +2115,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
             has_rows,
             ns10,
             ns20,
-            nsg, nwg);
+            nsg, nwg,
+            has_active);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -2100,6 +2134,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         ggml_metal_cv_set_int32(cv, ns20, FC_FLASH_ATTN_EXT_VEC + 21);
         ggml_metal_cv_set_int32(cv, nsg,  FC_FLASH_ATTN_EXT_VEC + 22);
         ggml_metal_cv_set_int32(cv, nwg,  FC_FLASH_ATTN_EXT_VEC + 23);
+
+        ggml_metal_cv_set_bool(cv, has_active, FC_FLASH_ATTN_EXT_ACTIVE);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -2123,7 +2159,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     const bool partial = op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL;
 
     snprintf(base, 256, "kernel_flash_attn_ext_vec_reduce");
-    snprintf(name, 256, "%s_dv=%d_nwg=%d_partial=%d", base, dv, nwg, partial);
+    const bool has_active = ggml_metal_flash_attn_ext_has_active(op);
+
+    snprintf(name, 256, "%s_dv=%d_nwg=%d_partial=%d_act=%d", base, dv, nwg, partial, has_active);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -2132,6 +2170,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         ggml_metal_cv_set_int32(cv, dv,      FC_FLASH_ATTN_EXT_VEC_REDUCE + 0);
         ggml_metal_cv_set_int32(cv, nwg,     FC_FLASH_ATTN_EXT_VEC_REDUCE + 1);
         ggml_metal_cv_set_bool (cv, partial, FC_FLASH_ATTN_EXT_VEC_REDUCE + 2);
+
+        ggml_metal_cv_set_bool (cv, has_active, FC_FLASH_ATTN_EXT_ACTIVE);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
