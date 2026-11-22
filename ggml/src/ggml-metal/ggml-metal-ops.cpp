@@ -19,8 +19,12 @@
 // TODO: dedup
 static constexpr int64_t GGML_METAL_MIN_THREADGROUPS = 128;
 
+// whether the op context encoding on this thread binds nothing (made without a command buffer): it only looks up the
+// pipelines its kernels set, so its tensors need no memory and no Metal buffer, and none is looked up
+static thread_local bool ggml_metal_op_binds_nothing = false;
+
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
-    if (!t) {
+    if (!t || ggml_metal_op_binds_nothing) {
         return { nullptr, 0 };
     }
 
@@ -41,6 +45,7 @@ struct ggml_metal_op {
         this->dev             = dev;
         this->lib             = ggml_metal_device_get_library(dev);
         this->enc             = ggml_metal_encoder_init(cmd_buf, use_concurrency);
+        this->binds_nothing   = cmd_buf == nullptr;
         this->mem_ranges      = ggml_mem_ranges_init(debug_graph);
         this->finfo           = finfo;
         this->idx_start       = idx_start;
@@ -49,6 +54,8 @@ struct ggml_metal_op {
         this->use_capture     = use_capture;
         this->debug_graph     = debug_graph;
         this->gf              = gf;
+
+        ggml_metal_op_binds_nothing = binds_nothing;
 
         idxs.reserve(gf->n_nodes);
 
@@ -63,6 +70,8 @@ struct ggml_metal_op {
     }
 
     ~ggml_metal_op() {
+        ggml_metal_op_binds_nothing = false;
+
         ggml_metal_encoder_end_encoding(this->enc);
         ggml_metal_encoder_free(this->enc);
         ggml_mem_ranges_free(this->mem_ranges);
@@ -99,6 +108,9 @@ struct ggml_metal_op {
 
     // record that a fusion fired, indexed by the matching table entry
     void count_fusions(const ggml_metal_fusion * fusion) const {
+        if (binds_nothing) {
+            return;
+        }
         ggml_metal_fusion_info_count_fusion(finfo, fusion);
     }
 
@@ -114,6 +126,10 @@ struct ggml_metal_op {
     bool use_capture;
 
     int debug_graph;
+
+    // made without a command buffer: the kernels' pipelines are looked up, compiling those not yet compiled, and
+    // nothing is encoded, bound or counted
+    bool binds_nothing;
 
 private:
     ggml_cgraph * gf;
@@ -6441,6 +6457,11 @@ int ggml_metal_op_custom(ggml_metal_op_t ctx, int idx) {
     // the device supports the node, so its implementation is registered
     const ggml_backend_custom_op * impl = ggml_metal_device_get_custom_op(ctx->dev, op);
     GGML_ASSERT(impl != nullptr);
+
+    // the implementation's pipelines are its own, and it binds the node's tensors, so there is nothing to look up
+    if (ctx->binds_nothing) {
+        return 1;
+    }
 
     if (!impl->encode(impl->user_data, op, ggml_metal_encoder_get_obj(ctx->enc))) {
         GGML_ABORT("%s: failed to encode custom op node '%s'", __func__, op->name);

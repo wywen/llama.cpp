@@ -785,6 +785,13 @@ void ggml_metal_encode_nodes(ggml_metal_t ctx, struct ggml_cgraph * gf, int i0, 
     }
 }
 
+void ggml_metal_compile_nodes(ggml_metal_t ctx, struct ggml_cgraph * gf, int i0, int i1) {
+    // the range is walked as an encode into a command buffer walks it, by an encoder that encodes nothing
+    @autoreleasepool {
+        ggml_metal_encode_range(ctx, NULL, gf, i0, i1, false);
+    }
+}
+
 void ggml_metal_commit_fence(ggml_metal_t ctx) {
     @autoreleasepool {
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);

@@ -43,6 +43,7 @@ void ggml_metal_pipelines_free(ggml_metal_pipelines_t ppls);
 
 void                  ggml_metal_pipelines_add(ggml_metal_pipelines_t ppls, const char * name, ggml_metal_pipeline_t pipeline);
 ggml_metal_pipeline_t ggml_metal_pipelines_get(ggml_metal_pipelines_t ppls, const char * name);
+size_t                ggml_metal_pipelines_count(ggml_metal_pipelines_t ppls);
 
 struct ggml_metal_pipeline_with_params {
     ggml_metal_pipeline_t pipeline;
@@ -72,6 +73,7 @@ typedef void * ggml_metal_cmd_buf_t;
 
 typedef struct ggml_metal_encoder * ggml_metal_encoder_t;
 
+// with a NULL command buffer, an encoder that encodes nothing: every call on it does nothing and get_obj returns NULL
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent);
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder);
 
@@ -109,6 +111,9 @@ ggml_metal_device_t ggml_metal_library_get_device(ggml_metal_library_t lib);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline    (ggml_metal_library_t lib, const char * name);
 struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_metal_library_t lib, const char * base, const char * name, ggml_metal_cv_t cv);
+
+// the pipelines the library has compiled; it never frees one before it is freed itself
+size_t ggml_metal_library_n_pipelines(ggml_metal_library_t lib);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base              (ggml_metal_library_t lib, enum ggml_op op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy               (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst);
