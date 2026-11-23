@@ -29,6 +29,9 @@ typedef enum ggml_metal_fusion_mode {
     GGML_METAL_FUSION_STRUCTURAL = 0,
     // full checks, including buffer placement; used by the op encoders
     GGML_METAL_FUSION_FULL,
+    // the FULL checks that do not read buffers, with every check that does read them taken to pass; used to compile
+    // a graph's pipelines before its tensors have memory, so it accepts every fusion that FULL may accept
+    GGML_METAL_FUSION_DRY,
 } ggml_metal_fusion_mode;
 
 // identifier of each fusion pattern so the op encoders know which kernel to use
@@ -93,6 +96,18 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
         int idx,
         ggml_metal_fusion_mode mode,
         int * n_out);
+
+// compile phase: every fusion starting at idx (a position in node_idxs) that matches in DRY mode, i.e. that FULL may
+// choose for some placement of the graph's tensors in memory. writes up to n_max patterns to fusions and their node
+// counts to n_fused, and returns how many match (which may exceed n_max).
+int ggml_metal_fusion_candidates(
+        const struct ggml_cgraph * gf,
+        const int * node_idxs,
+        int n_idxs,
+        int idx,
+        const ggml_metal_fusion ** fusions,
+        int * n_fused,
+        int n_max);
 
 // compute phase: true if the node at idx (a position in node_idxs) can run concurrently with the ranges in mrs,
 // together with the nodes that the encoder fuses into its kernel when use_fusion is set

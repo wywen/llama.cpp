@@ -458,6 +458,10 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
     # without a device
     llama_build_and_test(test-metal-encode-nodes.cpp metal-command-buffer.mm metal-nocopy-buffer.mm  LABEL "main behavior backend"  LINK ggml ggml-metal)
     target_link_libraries(test-metal-encode-nodes PRIVATE "-framework Foundation" "-framework Metal")
+    # compiles the pipelines of a graph without encoding it and checks them against a compute of the same graph; skips
+    # without a device
+    llama_build_and_test(test-metal-compile-nodes.cpp  LABEL "main behavior backend"  LINK ggml ggml-metal)
+    target_link_libraries(test-metal-compile-nodes PRIVATE "-framework Foundation" "-framework Metal")
     # runs GGML_OP_CUSTOM nodes through a Metal kernel the test registers, compares them bitwise with the CPU and checks
     # their placement, barriers and reorder; skips without a device
     llama_build_and_test(test-metal-custom-op.cpp metal-custom-kernel.mm  LABEL "main behavior backend"  LINK ggml ggml-metal)

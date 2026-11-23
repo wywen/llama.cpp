@@ -748,6 +748,22 @@ enum ggml_status ggml_backend_metal_encode_nodes(
     return GGML_STATUS_SUCCESS;
 }
 
+enum ggml_status ggml_backend_metal_compile_nodes(ggml_backend_t backend, struct ggml_cgraph * graph, int i0, int i1) {
+    if (!ggml_backend_is_metal(backend)) {
+        GGML_LOG_ERROR("%s: not a Metal backend\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+    if (graph == NULL || i0 < 0 || i1 < i0 || i1 > graph->n_nodes) {
+        GGML_LOG_ERROR("%s: nodes [%d, %d) are not a range of a graph of %d nodes\n", __func__,
+                i0, i1, graph != NULL ? graph->n_nodes : 0);
+        return GGML_STATUS_FAILED;
+    }
+
+    ggml_metal_compile_nodes((ggml_metal_t)backend->context, graph, i0, i1);
+
+    return GGML_STATUS_SUCCESS;
+}
+
 void ggml_backend_metal_commit_fence(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
 
@@ -1214,6 +1230,15 @@ void * ggml_backend_metal_device_get_mtl_queue(ggml_backend_dev_t dev) {
     }
 
     return ggml_metal_device_get_queue((ggml_metal_device_t)dev->context);
+}
+
+size_t ggml_backend_metal_device_n_pipelines(ggml_backend_dev_t dev) {
+    if (!ggml_backend_dev_is_metal(dev)) {
+        GGML_LOG_ERROR("%s: not a Metal device\n", __func__);
+        return 0;
+    }
+
+    return ggml_metal_library_n_pipelines(ggml_metal_device_get_library((ggml_metal_device_t)dev->context));
 }
 
 ggml_backend_buffer_t ggml_backend_metal_buffer_from_ranges(

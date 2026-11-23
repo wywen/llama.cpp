@@ -166,6 +166,21 @@ GGML_BACKEND_API void * ggml_backend_metal_device_get_mtl_device(ggml_backend_de
 GGML_BACKEND_API enum ggml_status ggml_backend_metal_encode_nodes(
         ggml_backend_t backend, struct ggml_cgraph * graph, int i0, int i1, void * cmd_buf);
 
+// Compile the pipeline of every kernel that ggml_backend_metal_encode_nodes would set encoding nodes [i0, i1) of
+// `graph`, and encode nothing: the nodes are walked as that encode walks them, with the same fusion and the same
+// kernel choices, so the pipelines are the ones it would look up, and each one not yet compiled is compiled. The
+// tensors need no memory and no Metal buffer: none is looked up, bound or grown, and no range hook is called. The
+// device keeps a pipeline until it is freed, for every backend of it, so encoding the same nodes afterwards compiles
+// nothing. GGML_OP_CUSTOM nodes are skipped, since their implementations set pipelines of their own; fusion statistics
+// do not count the walk. Thread-safe with encodes and computes of any backend of the device.
+// GGML_STATUS_FAILED, logging why, for a range outside the graph or a backend that is not Metal.
+GGML_BACKEND_API enum ggml_status ggml_backend_metal_compile_nodes(
+        ggml_backend_t backend, struct ggml_cgraph * graph, int i0, int i1);
+
+// the number of pipelines a Metal device has compiled, which never decreases while the device lives; 0, with a log
+// line, for a device that is not a Metal device
+GGML_BACKEND_API size_t ggml_backend_metal_device_n_pipelines(ggml_backend_dev_t dev);
+
 // the id<MTLCommandQueue> the device's backends commit to, as void *, not retained: valid while the device is;
 // NULL, with a log line, for a device that is not a Metal device
 GGML_BACKEND_API void * ggml_backend_metal_device_get_mtl_queue(ggml_backend_dev_t dev);

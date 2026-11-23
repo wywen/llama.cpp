@@ -721,6 +721,16 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_meta
     return res;
 }
 
+size_t ggml_metal_library_n_pipelines(ggml_metal_library_t lib) {
+    [lib->lock lock];
+
+    const size_t res = ggml_metal_pipelines_count(lib->pipelines);
+
+    [lib->lock unlock];
+
+    return res;
+}
+
 struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_metal_library_t lib, const char * base, const char * name, ggml_metal_cv_t cv) {
     struct ggml_metal_pipeline_with_params res = {
         /*.pipeline =*/ nil,
@@ -836,6 +846,10 @@ struct ggml_metal_encoder {
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
+
+    if (cmd_buf_raw == NULL) {
+        return res;
+    }
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
 

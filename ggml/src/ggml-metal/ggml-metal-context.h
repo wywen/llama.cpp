@@ -34,6 +34,9 @@ void             ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph 
 // See ggml_backend_metal_encode_nodes; the range is valid and cmd_buf is not NULL.
 void ggml_metal_encode_nodes(ggml_metal_t ctx, struct ggml_cgraph * gf, int i0, int i1, ggml_metal_cmd_buf_t cmd_buf);
 
+// See ggml_backend_metal_compile_nodes; the range is valid.
+void ggml_metal_compile_nodes(ggml_metal_t ctx, struct ggml_cgraph * gf, int i0, int i1);
+
 // See ggml_backend_metal_commit_fence.
 void ggml_metal_commit_fence(ggml_metal_t ctx);
 

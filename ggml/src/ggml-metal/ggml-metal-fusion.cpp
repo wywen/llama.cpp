@@ -184,7 +184,7 @@ static bool ggml_metal_fusion_check_ssm_conv_silu(
 }
 
 // ADD x N: each ADD reads the previous ADD as src0, and all addends must share layout
-// (and, in FULL mode, live in the same Metal buffer)
+// (and, in FULL mode, live in the same Metal buffer; DRY mode takes them to)
 static bool ggml_metal_fusion_check_add_chain(
         const ggml_metal_fusion       * fusion,
         const ggml_tensor * const     * nodes,
@@ -750,20 +750,24 @@ static bool ggml_metal_tensor_is_weight(const struct ggml_tensor * t) {
     return base->buffer != NULL && ggml_backend_buffer_get_usage(base->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
 }
 
-static const struct ggml_tensor * ggml_metal_mul_mat_add_operand(const struct ggml_tensor * mm, const struct ggml_tensor * add) {
+// in DRY mode the buffers are not read, so the operand may be a non-weight in whichever buffer it is placed
+static const struct ggml_tensor * ggml_metal_mul_mat_add_operand(
+        const struct ggml_tensor * mm, const struct ggml_tensor * add, ggml_metal_fusion_mode mode) {
     if (add->op != GGML_OP_ADD || (add->src[0] == mm) == (add->src[1] == mm)) {
         return NULL;
     }
 
     const ggml_tensor * other = add->src[0] == mm ? add->src[1] : add->src[0];
 
-    const bool ok = other->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 && !ggml_metal_tensor_is_weight(other);
+    const bool ok = other->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 &&
+        (mode == GGML_METAL_FUSION_DRY || !ggml_metal_tensor_is_weight(other));
 
     return ok ? other : NULL;
 }
 
-static const struct ggml_tensor * ggml_metal_mul_mat_add_residual(const struct ggml_tensor * mm, const struct ggml_tensor * add) {
-    const ggml_tensor * res = ggml_metal_mul_mat_add_operand(mm, add);
+static const struct ggml_tensor * ggml_metal_mul_mat_add_residual(
+        const struct ggml_tensor * mm, const struct ggml_tensor * add, ggml_metal_fusion_mode mode) {
+    const ggml_tensor * res = ggml_metal_mul_mat_add_operand(mm, add, mode);
 
     const bool ok = res != NULL && ggml_are_same_shape(res, mm) &&
         ggml_is_contiguous(res) && ggml_is_contiguous(mm) && ggml_is_contiguous(add);
@@ -788,7 +792,7 @@ static bool ggml_metal_fusion_check_mul_mat_add(
     const ggml_tensor * mm  = nodes[0];
     const ggml_tensor * add = nodes[1];
 
-    if (ggml_metal_mul_mat_add_operand(mm, add) == nullptr ||
+    if (ggml_metal_mul_mat_add_operand(mm, add, mode) == nullptr ||
         !ggml_metal_op_mul_mat_may_use_mma(mm)) {
         return false;
     }
@@ -797,10 +801,15 @@ static bool ggml_metal_fusion_check_mul_mat_add(
         return true;
     }
 
-    const ggml_tensor * res = ggml_metal_mul_mat_add_residual(mm, add);
+    const ggml_tensor * res = ggml_metal_mul_mat_add_residual(mm, add, mode);
 
     if (res == nullptr || !ggml_metal_op_mul_mat_use_mma(mm)) {
         return false;
+    }
+
+    // whether the sum overlaps an operand depends on where the tensors are placed
+    if (mode == GGML_METAL_FUSION_DRY) {
+        return true;
     }
 
     return !ggml_metal_fusion_overlap(add, mm->src[0]) && !ggml_metal_fusion_overlap(add, mm->src[1]) &&
@@ -1192,6 +1201,75 @@ static bool ggml_metal_fusion_check_memory_ranges(
 
 // ---- queries -------------------------------------------------------------
 
+// true if the fusion matches the node sequence starting at idx in mode
+// (idx is a position in node_idxs, which maps to graph node indices)
+static bool ggml_metal_fusion_matches(
+        const ggml_metal_fusion & fusion,
+        const ggml_cgraph * gf,
+        const int * node_idxs,
+        int n_idxs,
+        int idx,
+        ggml_metal_fusion_mode mode) {
+    const int n_ops = (int) fusion.ops.size();
+
+    if (idx + n_ops > n_idxs) {
+        return false;
+    }
+
+    const ggml_tensor * nodes[GGML_METAL_FUSION_MAX];
+
+    // the op sequence must match exactly
+    for (int j = 0; j < n_ops; j++) {
+        nodes[j] = gf->nodes[node_idxs[idx + j]];
+        if (nodes[j]->op != fusion.ops[j]) {
+            return false;
+        }
+    }
+
+    if (!fusion.unsafe) {
+        // common element-wise chain constraints: each node reads the previous one,
+        // and all nodes have the same shape
+        for (int j = 1; j < n_ops; j++) {
+            if (nodes[j]->src[0] != nodes[j - 1] && nodes[j]->src[1] != nodes[j - 1]) {
+                return false;
+            }
+            if (!ggml_are_same_shape(nodes[j], nodes[j - 1])) {
+                return false;
+            }
+        }
+
+        // primary output is the last node; additional outputs come from fusion.outs
+        int outputs_buf[GGML_METAL_FUSION_MAX];
+        outputs_buf[0] = node_idxs[idx + n_ops - 1];
+        for (size_t i = 0; i < fusion.outs.size(); ++i) {
+            const int out_offset = fusion.outs[i];
+            GGML_ASSERT(out_offset >= 0 && out_offset < n_ops);
+            outputs_buf[i + 1] = node_idxs[idx + out_offset];
+        }
+
+        const int n_outputs = 1 + (int) fusion.outs.size();
+
+        // structural subgraph checks (op sequence, elidable uses, view containment)
+        if (!ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n_ops, fusion.ops.data(), outputs_buf, n_outputs)) {
+            return false;
+        }
+    }
+
+    // pattern-specific checks (the sole validator for unsafe patterns)
+    if (fusion.check && !fusion.check(&fusion, nodes, gf, node_idxs, idx, mode)) {
+        return false;
+    }
+
+    // the compute phase has allocated tensors and can detect aliasing between
+    // external sources and fused outputs; the optimizer phase cannot do this yet
+    if (mode == GGML_METAL_FUSION_FULL &&
+            !ggml_metal_fusion_check_memory_ranges(&fusion, nodes, n_ops)) {
+        return false;
+    }
+
+    return true;
+}
+
 // find the longest pattern matching the node sequence starting at idx
 // (idx is a position in node_idxs, which maps to graph node indices)
 const ggml_metal_fusion * ggml_metal_fusion_next(
@@ -1211,68 +1289,8 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
         if (n_ops <= best) {
             continue;
         }
-        if (idx + n_ops > n_idxs) {
-            continue;
-        }
 
-        const ggml_tensor * nodes[GGML_METAL_FUSION_MAX];
-
-        // the op sequence must match exactly
-        bool ok = true;
-        for (int j = 0; j < n_ops; j++) {
-            nodes[j] = gf->nodes[node_idxs[idx + j]];
-            if (nodes[j]->op != fusion.ops[j]) {
-                ok = false;
-                break;
-            }
-        }
-        if (!ok) {
-            continue;
-        }
-
-        if (!fusion.unsafe) {
-            // common element-wise chain constraints: each node reads the previous one,
-            // and all nodes have the same shape
-            for (int j = 1; j < n_ops && ok; j++) {
-                if (nodes[j]->src[0] != nodes[j - 1] && nodes[j]->src[1] != nodes[j - 1]) {
-                    ok = false;
-                    break;
-                }
-                if (!ggml_are_same_shape(nodes[j], nodes[j - 1])) {
-                    ok = false;
-                    break;
-                }
-            }
-            if (!ok) {
-                continue;
-            }
-
-            // primary output is the last node; additional outputs come from fusion.outs
-            int outputs_buf[GGML_METAL_FUSION_MAX];
-            outputs_buf[0] = node_idxs[idx + n_ops - 1];
-            for (size_t i = 0; i < fusion.outs.size(); ++i) {
-                const int out_offset = fusion.outs[i];
-                GGML_ASSERT(out_offset >= 0 && out_offset < n_ops);
-                outputs_buf[i + 1] = node_idxs[idx + out_offset];
-            }
-
-            const int n_outputs = 1 + (int) fusion.outs.size();
-
-            // structural subgraph checks (op sequence, elidable uses, view containment)
-            if (!ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n_ops, fusion.ops.data(), outputs_buf, n_outputs)) {
-                continue;
-            }
-        }
-
-        // pattern-specific checks (the sole validator for unsafe patterns)
-        if (fusion.check && !fusion.check(&fusion, nodes, gf, node_idxs, idx, mode)) {
-            continue;
-        }
-
-        // the compute phase has allocated tensors and can detect aliasing between
-        // external sources and fused outputs; the optimizer phase cannot do this yet
-        if (mode == GGML_METAL_FUSION_FULL &&
-                !ggml_metal_fusion_check_memory_ranges(&fusion, nodes, n_ops)) {
+        if (!ggml_metal_fusion_matches(fusion, gf, node_idxs, n_idxs, idx, mode)) {
             continue;
         }
 
@@ -1283,6 +1301,36 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
     *n_out = best;
 
     return res;
+}
+
+int ggml_metal_fusion_candidates(
+        const ggml_cgraph * gf,
+        const int * node_idxs,
+        int n_idxs,
+        int idx,
+        const ggml_metal_fusion ** fusions,
+        int * n_fused,
+        int n_max) {
+    int n = 0;
+
+    for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+        // a single-node pattern fuses nothing, as ggml_metal_fusion_next never returns one
+        if ((int) fusion.ops.size() <= 1) {
+            continue;
+        }
+
+        if (!ggml_metal_fusion_matches(fusion, gf, node_idxs, n_idxs, idx, GGML_METAL_FUSION_DRY)) {
+            continue;
+        }
+
+        if (n < n_max) {
+            fusions[n] = &fusion;
+            n_fused[n] = (int) fusion.ops.size();
+        }
+        n++;
+    }
+
+    return n;
 }
 
 bool ggml_metal_fusion_concurrent(
