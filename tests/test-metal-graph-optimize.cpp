@@ -1,6 +1,7 @@
 // checks the MUL_MAT+ADD packs of the Metal graph reorder (devices, pack readers, src1 rows), that the encoder fuses
 // no MUL_MAT+ADD the reorder leaves unpacked, the reorder's caller barriers, and that the encoder's concurrency check
-// covers the middle nodes of a fused group
+// covers the middle nodes of a fused group, and that the reorder places empty nodes by what they view, not by the
+// addresses their views' weights hold
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -665,6 +666,125 @@ static void run_barrier_cases() {
     check_reorder("barrier: fused group holds",     build_fused_group, &cut,    { "a", "b", "s", "cut-0" });
 }
 
+// two weights that interleave in one buffer, as the slots of an expert pool do: slot s of `a` at s*slot_bytes,
+// slot s of `b` right after it, so each one's bytes span the other's; with `placed`, in a buffer at those
+// addresses, otherwise in a buffer without storage that gives them no address yet
+struct interleaved_weights {
+    static constexpr size_t slot_bytes = 2*16*sizeof(float);
+
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_tensor * a = nullptr;
+    ggml_tensor * b = nullptr;
+
+    interleaved_weights(ggml_context * ctx, bool placed) {
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+        buffer = ggml_backend_buft_alloc_buffer(buft, placed ? 2*slot_bytes : 0);
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        a = member(ctx, "a", placed, 0);
+        b = member(ctx, "b", placed, slot_bytes/2);
+    }
+
+    ~interleaved_weights() {
+        ggml_backend_buffer_free(buffer);
+    }
+
+    ggml_tensor * member(ggml_context * ctx, const char * name, bool placed, size_t offset) {
+        ggml_tensor * t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 4, 2);
+        t->nb[2] = slot_bytes;
+        t->nb[3] = 2*slot_bytes;
+        ggml_set_name(t, name);
+        if (placed) {
+            GGML_ASSERT(ggml_backend_tensor_alloc(buffer, t, (char *) ggml_backend_buffer_get_base(buffer) + offset) == GGML_STATUS_SUCCESS);
+        } else {
+            t->buffer = buffer;
+        }
+        return t;
+    }
+};
+
+// a mat-mul over a view of one slot of `a`, then one over a view of one slot of `b`: the views are empty nodes,
+// which read and write nothing, so the reorder must not place them by the bytes their weights span
+static std::vector<std::string> reorder_weight_views(bool placed) {
+    test_ctx tc;
+    interleaved_weights w(tc.ctx, placed);
+
+    ggml_tensor * va = named(ggml_view_2d(tc.ctx, w.a, 4, 4, w.a->nb[1], 0), "a.s0");
+    ggml_tensor * ya = named(ggml_mul_mat(tc.ctx, va, leaf(tc.ctx, "x")), "ya");
+    ggml_tensor * vb = named(ggml_view_2d(tc.ctx, w.b, 4, 4, w.b->nb[1], 0), "b.s0");
+    ggml_tensor * yb = named(ggml_mul_mat(tc.ctx, vb, leaf(tc.ctx, "x2")), "yb");
+
+    ggml_cgraph * gf = ggml_new_graph(tc.ctx);
+    ggml_build_forward_expand(gf, ya);
+    ggml_build_forward_expand(gf, yb);
+    ggml_graph_optimize(gf, nullptr, nullptr);
+
+    return node_names(gf);
+}
+
+// a view of a node's output, and a reader of that view, are never reordered above the node, though the view
+// adds no memory ranges
+static void check_view_stays_below_its_source() {
+    test_ctx tc;
+
+    ggml_tensor * p = named(ggml_scale(tc.ctx, leaf(tc.ctx, "x"), scale), "p");
+    // q reads p, which the reorder has not run yet when it looks past p2, so q waits: its view must wait with it
+    ggml_tensor * q = named(ggml_scale(tc.ctx, p, scale), "q");
+    ggml_tensor * v = named(ggml_view_2d(tc.ctx, q, 4, 2, q->nb[1], 0), "q.v");
+    ggml_tensor * r = named(ggml_scale(tc.ctx, v, scale), "r");
+
+    ggml_cgraph * gf = ggml_new_graph(tc.ctx);
+    ggml_build_forward_expand(gf, p);
+    ggml_build_forward_expand(gf, ggml_add(tc.ctx, named(ggml_scale(tc.ctx, p, scale), "p2"), p));
+    ggml_build_forward_expand(gf, r);
+    ggml_graph_optimize(gf, nullptr, nullptr);
+
+    const std::vector<std::string> names = node_names(gf);
+    const auto at = [&](const char * name) {
+        for (size_t i = 0; i < names.size(); i++) {
+            if (names[i] == name) {
+                return (int) i;
+            }
+        }
+        return -1;
+    };
+    if (at("q") >= 0 && at("q") < at("q.v") && at("q.v") < at("r")) {
+        printf("PASS %-40s %s\n", "empty ops: a view stays below its source", join(names).c_str());
+        return;
+    }
+    printf("FAIL %-40s %s\n", "empty ops: a view stays below its source", join(names).c_str());
+    g_n_fail++;
+}
+
+// the cases of empty nodes; failures count into g_n_fail
+static void run_empty_op_cases() {
+    const std::vector<std::string> placed      = reorder_weight_views(true);
+    const std::vector<std::string> placeholder = reorder_weight_views(false);
+
+    // the order does not depend on whether the weights the views view have an address yet
+    if (placed == placeholder) {
+        printf("PASS %-40s %s\n", "empty ops: order without addresses", join(placed).c_str());
+    } else {
+        printf("FAIL %-40s placed [%s], placeholder [%s]\n", "empty ops: order without addresses",
+            join(placed).c_str(), join(placeholder).c_str());
+        g_n_fail++;
+    }
+
+    {
+        test_ctx      tc;
+        interleaved_weights w(tc.ctx, false);
+        check_order("empty ops: graph as built", [&]() {
+            ggml_cgraph * gf = ggml_new_graph(tc.ctx);
+            ggml_tensor * va = named(ggml_view_2d(tc.ctx, w.a, 4, 4, w.a->nb[1], 0), "a.s0");
+            ggml_build_forward_expand(gf, named(ggml_mul_mat(tc.ctx, va, leaf(tc.ctx, "x")), "ya"));
+            ggml_tensor * vb = named(ggml_view_2d(tc.ctx, w.b, 4, 4, w.b->nb[1], 0), "b.s0");
+            ggml_build_forward_expand(gf, named(ggml_mul_mat(tc.ctx, vb, leaf(tc.ctx, "x2")), "yb"));
+            return gf;
+        }(), { "a.s0", "ya", "b.s0", "yb" });
+    }
+
+    check_view_stays_below_its_source();
+}
+
 static void ignore_alloc_dep(void * /*user_data*/, ggml_tensor * /*tensor*/, ggml_tensor * /*until*/) {}
 
 // the predicate a caller installs on the backend reaches the reorder the scheduler runs, reads back
@@ -722,6 +842,7 @@ static void run_backend_barrier_cases() {
 static int run_reorder_barrier_cases() {
     run_barrier_cases();
     run_backend_barrier_cases();
+    run_empty_op_cases();
 
     return g_n_fail;
 }
