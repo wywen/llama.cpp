@@ -374,7 +374,14 @@ struct node_info {
 static std::vector<int> ggml_metal_graph_optimize_reorder(
         const std::vector<node_info> & nodes, ggml_graph_optimize_barrier_t is_barrier, void * user_data) {
     // helper to add node src and dst ranges
+    //
+    // an empty node (a view, a reshape, ...) reads and writes nothing: it adds no ranges, so where it sits in the
+    // order does not depend on whether its base tensor has an address yet
     const auto & h_add = [](ggml_mem_ranges_t mrs, const node_info & node) {
+        if (node.is_empty()) {
+            return true;
+        }
+
         // only external sources matter: sources produced by the fused group are internal
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             const ggml_tensor * src = node.node->src[i];
@@ -441,6 +448,37 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(
         }
 
         return true;
+    };
+
+    // helper to check if a node, or a node fused into it, reads one of the tensors, directly or through a view
+    const auto & reads_any = [](const node_info & node, const std::vector<const ggml_tensor *> & tensors) {
+        const auto & held = [&](const ggml_tensor * t) {
+            for (; t != nullptr; t = t->view_src) {
+                for (const ggml_tensor * u : tensors) {
+                    if (t == u) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+        const auto & reads = [&](const ggml_tensor * t) {
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                if (held(t->src[i])) {
+                    return true;
+                }
+            }
+            return held(t->view_src);
+        };
+        if (reads(node.node)) {
+            return true;
+        }
+        for (const auto * fused : node.fused) {
+            if (reads(fused)) {
+                return true;
+            }
+        }
+        return false;
     };
 
     // perform reorders only across these types of ops
@@ -535,6 +573,10 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(
             // initialize it with the current node
             h_add(mrs1, node0);
 
+            // the nodes that haven't been processed yet, which no node they produce or view is reordered above
+            std::vector<const ggml_tensor *> pending = { node0.node };
+            pending.insert(pending.end(), node0.fused.begin(), node0.fused.end());
+
             // that many nodes forward to search for a concurrent node
             constexpr int N_FORWARD = 64;
 
@@ -563,7 +605,9 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(
                 // to reorder a node and add it to the concurrent set, it has to be:
                 //   + empty or concurrent with all nodes in the existing concurrent set (mrs0)
                 //   + concurrent with all nodes prior to it that haven't been processed yet (mrs1)
-                if ((is_empty || h_check(mrs0, node1)) && h_check(mrs1, node1)) {
+                //   + reading none of those nodes, directly or through a view: an empty node adds no ranges, so this
+                //     is all that keeps a view below the node it views, and its readers below the view
+                if (!reads_any(node1, pending) && (is_empty || (h_check(mrs0, node1) && h_check(mrs1, node1)))) {
                     // add the node to the existing concurrent set (i.e. reorder it for early execution)
                     h_add(mrs0, node1);
                     res.push_back(i1);
@@ -573,6 +617,8 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(
                 } else {
                     // expand the set of nodes that haven't been processed yet
                     h_add(mrs1, node1);
+                    pending.push_back(node1.node);
+                    pending.insert(pending.end(), node1.fused.begin(), node1.fused.end());
                 }
             }
 
