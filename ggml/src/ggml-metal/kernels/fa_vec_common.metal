@@ -44,12 +44,18 @@ kernel void kernel_flash_attn_ext_vec(
         device const char * pad,
         device       char * dst,
         device const char * idx,
+        device const int32_t * active,
+        constant int32_t     & active_index,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
     static_assert(DK % 32 == 0, "DK must be divisible by 32");
     static_assert(DV % 32 == 0, "DV must be divisible by 32");
+
+    if (FC_flash_attn_ext_has_active && active[0] <= active_index) {
+        return;
+    }
 
 #define NWG  (FC_flash_attn_ext_vec_nwg)
 #define NSG  (FC_flash_attn_ext_vec_nsg)

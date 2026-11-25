@@ -9385,6 +9385,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
 
+    // an inactive partial does no work and leaves dst unwritten (ggml_flash_attn_ext_partial_set_active)
+    // every thread reads the same count and returns before the first barrier
+    const ggml_tensor * n_active = dst->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL ? dst->src[6] : nullptr;
+    if (n_active && *(const int32_t *) n_active->data <= ggml_get_op_params_i32(dst, 5)) {
+        return;
+    }
+
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];

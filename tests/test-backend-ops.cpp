@@ -9693,6 +9693,92 @@ struct test_flash_attn_ext_chunked : public test_case {
     }
 };
 
+// chunked flash attention whose partials carry an active count (ggml_flash_attn_ext_partial_set_active)
+// greater than their chunk index: each partial is computed as without a count. An inactive partial leaves its
+// result unspecified, so it is not compared here: test-flash-attn-partial-active checks that it is skipped
+struct test_flash_attn_ext_partial_active : public test_case {
+    const int64_t hsk; // K head size
+    const int64_t hsv; // V head size
+    const int64_t nb;  // batch size
+    const int64_t n_chunks;
+    const ggml_type type_KV;
+
+    static constexpr int64_t nh       = 2;
+    static constexpr int64_t nr2      = 2;
+    static constexpr int64_t kv_chunk = 256;
+
+    std::string vars() override {
+        return VARS_TO_STR5(hsk, hsv, nb, n_chunks, type_KV);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        return nmse_skip_equal_inf(a, b, n);
+    }
+
+    test_flash_attn_ext_partial_active(int64_t hsk = 128, int64_t hsv = 128, int64_t nb = 8, int64_t n_chunks = 3,
+                                       ggml_type type_KV = GGML_TYPE_F16)
+        : hsk(hsk), hsv(hsv), nb(nb), n_chunks(n_chunks), type_KV(type_KV) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t kv = kv_chunk*n_chunks;
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nb, nh*nr2, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hsk, kv, nh, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hsv, kv, nh, 1);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(m, "m");
+
+        // the number of chunks, known at compute time
+        ggml_tensor * n_active = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(n_active, "n_active");
+
+        const float scale = 1.0f/sqrtf(hsk);
+
+        ggml_tensor * acc = nullptr;
+        for (int64_t i = 0; i < n_chunks; ++i) {
+            const int64_t c0 = i*kv_chunk;
+
+            ggml_tensor * kc = ggml_view_4d(ctx, k, hsk, kv_chunk, nh, 1, k->nb[1], k->nb[2], k->nb[3], c0*k->nb[1]);
+            ggml_tensor * vc = ggml_view_4d(ctx, v, hsv, kv_chunk, nh, 1, v->nb[1], v->nb[2], v->nb[3], c0*v->nb[1]);
+            ggml_tensor * mc = ggml_view_4d(ctx, m, kv_chunk, nb, 1, 1, m->nb[1], m->nb[2], m->nb[3], c0*m->nb[0]);
+
+            ggml_tensor * p = ggml_flash_attn_ext_partial(ctx, q, kc, vc, mc, scale, 0.0f, 0.0f);
+            ggml_prec_set_acc(p, GGML_PREC_F32);
+            ggml_flash_attn_ext_partial_set_active(p, n_active, (int32_t) i);
+
+            acc = acc ? ggml_flash_attn_ext_merge(ctx, acc, p) : p;
+        }
+
+        ggml_tensor * out = ggml_flash_attn_ext_finalize(ctx, acc, nullptr);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue;
+            }
+            if (strcmp(t->name, "n_active") == 0) {
+                const int32_t n = (int32_t) n_chunks;
+                ggml_backend_tensor_set(t, &n, 0, sizeof(n));
+            } else if (strcmp(t->name, "m") == 0) {
+                init_fa_partial_mask(t, FA_PARTIAL_MASK_RANDOM);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -13735,6 +13821,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1024, nb, 3, 64, FA_PARTIAL_MASK_RANDOM, -1, false, 0.0f, 30.0f));
         test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1024, nb, 3, 64, FA_PARTIAL_MASK_RANDOM, -1, false, 0.0f, 0.0f, GGML_TYPE_F32));
         test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1024, nb, 3, 64, FA_PARTIAL_MASK_RANDOM, -1, false, 0.0f, 0.0f, GGML_TYPE_Q8_0));
+    }
+
+    // chunked flash attention whose partials carry an active count greater than their chunk index
+    for (int64_t nb : {1, 32}) {
+        test_cases.emplace_back(new test_flash_attn_ext_partial_active(128, 128, nb, 3));
+        test_cases.emplace_back(new test_flash_attn_ext_partial_active(128, 128, nb, 3, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext_partial_active( 64,  64, nb, 3, GGML_TYPE_F32));
     }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));

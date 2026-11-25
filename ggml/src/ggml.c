@@ -5570,6 +5570,21 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
+void ggml_flash_attn_ext_partial_set_active(
+        struct ggml_tensor * a,
+        struct ggml_tensor * n_active,
+        int32_t              index) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL);
+
+    if (n_active) {
+        GGML_ASSERT(n_active->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_nelements(n_active) >= 1);
+    }
+
+    a->src[6] = n_active;
+    ggml_set_op_params_i32(a, 5, n_active ? index : 0);
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

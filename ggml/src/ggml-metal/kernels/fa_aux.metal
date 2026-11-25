@@ -12,7 +12,13 @@ kernel void kernel_flash_attn_ext_kv_f16(
         constant ggml_metal_kargs_flash_attn_ext_kv_f16 & args,
         device const char * x,
         device       half * x_dst,
+        device const int32_t * active,
+        constant int32_t     & active_index,
         uint gid [[thread_position_in_grid]]) {
+    if (FC_flash_attn_ext_has_active && active[0] <= active_index) {
+        return;
+    }
+
     if (gid >= (uint) args.nblocks) {
         return;
     }
@@ -133,9 +139,15 @@ kernel void kernel_flash_attn_ext_pad(
         device const char * v,
         device const char * mask,
         device       char * dst,
+        device const int32_t * active,
+        constant int32_t     & active_index,
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiitg[[thread_index_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
+    if (FC_flash_attn_ext_has_active && active[0] <= active_index) {
+        return;
+    }
+
     const int32_t C = FC_flash_attn_ext_pad_ncpsg;
 
     device char * k_pad    = dst;
@@ -203,8 +215,14 @@ kernel void kernel_flash_attn_ext_blk(
         constant ggml_metal_kargs_flash_attn_ext_blk & args,
         device const char * mask,
         device       char * dst,
+        device const int32_t * active,
+        constant int32_t     & active_index,
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]]) {
+    if (FC_flash_attn_ext_has_active && active[0] <= active_index) {
+        return;
+    }
+
     // block size C x Q
     const int32_t Q = FC_flash_attn_ext_blk_nqptg;
     const int32_t C = FC_flash_attn_ext_blk_ncpsg;
@@ -366,9 +384,15 @@ kernel void kernel_flash_attn_ext_vec_reduce(
         constant ggml_metal_kargs_flash_attn_ext_vec_reduce & args,
         device  const char * htmp,
         device        char * dst,
+        device const int32_t * active,
+        constant int32_t     & active_index,
         uint   tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (FC_flash_attn_ext_has_active && active[0] <= active_index) {
+        return;
+    }
+
 #define NWG (FC_flash_attn_ext_vec_reduce_NWG)
 #define DV  (FC_flash_attn_ext_vec_reduce_DV)
 
