@@ -9,7 +9,10 @@
 //   CPU; every graph computes, bitwise, the bytes a CPU-only run of it computes;
 // - the encoder orders a CUSTOM node by the memory of its srcs and dst, as it does a stock op: it runs concurrently with
 //   nodes it does not conflict with, takes a barrier after a node it reads, and a node that reads it takes one after it;
-// - the graph reorder moves a CUSTOM node ahead of a node that waits for a barrier, as it moves a stock op.
+// - the graph reorder moves a CUSTOM node ahead of a node that waits for a barrier, as it moves a stock op;
+// - the device's buffer types size a node of an implementation with alloc_size by it, also in buffers over host
+//   memory, and a node of one without at ggml_nbytes; the encoder orders a node that lives in the scratch past the
+//   custom node's data after it, and one past the scratch concurrently with it.
 //
 // The encoder's concurrency decisions are read from its graph debug log (GGML_METAL_GRAPH_DEBUG). Everything but the
 // registration on the CPU device needs a Metal device, so the binary skips the rest without one.
@@ -21,6 +24,7 @@
 
 #include "metal-custom-kernel.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdint>
@@ -75,6 +79,15 @@ static void add_one_cpu_unregistered(ggml_tensor * dst, int ith, int nth, void *
     add_one_cpu(dst, ith, nth, userdata);
 }
 
+// the functions of implementations with alloc_size: one with scratch past the node's data, one below ggml_nbytes
+static void add_one_cpu_scratch(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    add_one_cpu(dst, ith, nth, userdata);
+}
+
+static void add_one_cpu_short(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    add_one_cpu(dst, ith, nth, userdata);
+}
+
 struct add_one_impl {
     void *           pipeline = nullptr;
     std::atomic<int> n_encodes{0};
@@ -96,6 +109,19 @@ static bool add_one_encode_unused(void * user_data, const ggml_tensor * node, vo
     (void) node;
     (void) encoder;
     return false;
+}
+
+constexpr size_t kScratch = 4096;
+
+static size_t add_one_alloc_size_scratch(void * user_data, const ggml_tensor * node) {
+    (void) user_data;
+    return ggml_nbytes(node) + kScratch;
+}
+
+static size_t add_one_alloc_size_short(void * user_data, const ggml_tensor * node) {
+    (void) user_data;
+    (void) node;
+    return 0;
 }
 
 static ggml_tensor * add_one(ggml_context * ctx, ggml_tensor * a, ggml_custom_op_t fun = add_one_cpu) {
@@ -325,7 +351,7 @@ static void build_refused(ggml_context * ctx_in, ggml_context * ctx, graph_def &
 //
 
 static void test_registration(ggml_backend_dev_t dev_metal, ggml_backend_dev_t dev_cpu, add_one_impl & impl) {
-    const ggml_backend_custom_op op = { add_one_cpu, add_one_supports, add_one_encode, &impl };
+    const ggml_backend_custom_op op = { add_one_cpu, add_one_supports, add_one_encode, &impl, nullptr };
 
     check(!ggml_backend_dev_add_custom_op(dev_cpu, &op), "registration", "the CPU device takes no implementation");
 
@@ -339,7 +365,7 @@ static void test_registration(ggml_backend_dev_t dev_metal, ggml_backend_dev_t d
 
     check(ggml_backend_dev_add_custom_op(dev_metal, &op), "registration", "the implementation is registered");
 
-    const ggml_backend_custom_op again = { add_one_cpu, nullptr, add_one_encode_unused, nullptr };
+    const ggml_backend_custom_op again = { add_one_cpu, nullptr, add_one_encode_unused, nullptr, nullptr };
     check(!ggml_backend_dev_add_custom_op(dev_metal, &again), "registration", "a key registered already is refused");
 }
 
@@ -422,6 +448,134 @@ static void test_placement_and_order(ggml_backend_t metal, ggml_backend_t cpu, a
     }
 }
 
+// the encode of c = x + 1, a node of add_one_cpu_scratch at the start of a buffer, and b = 2*y, a stock node at
+// `offs_b` in the same buffer
+static std::vector<encoded_node> encode_with_b_at(ggml_backend_t metal, size_t offs_b, bool & ok) {
+    ok = false;
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*8 + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx_in = ggml_init(params);
+    ggml_context * ctx    = ggml_init(params);
+
+    ggml_tensor * x = ggml_new_tensor_1d(ctx_in, GGML_TYPE_F32, kElems);
+    ggml_tensor * y = ggml_new_tensor_1d(ctx_in, GGML_TYPE_F32, kElems);
+    ggml_tensor * c = add_one(ctx, x, add_one_cpu_scratch);
+    ggml_tensor * b = ggml_scale(ctx, y, 2.0f);
+    ggml_set_name(c, "c");
+    ggml_set_name(b, "b");
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, c);
+    ggml_build_forward_expand(gf, b);
+
+    std::vector<encoded_node> encoded;
+
+    ggml_backend_buffer_t buf_in = ggml_backend_alloc_ctx_tensors(ctx_in, metal);
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(metal);
+    // c's scratch runs past its data: the buffer holds all of it, wherever b lies
+    const size_t size = std::max(offs_b + ggml_backend_buft_get_alloc_size(buft, b),
+                                 ggml_backend_buft_get_alloc_size(buft, c));
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, size);
+    if (buf_in != nullptr && buf != nullptr) {
+        ggml_backend_buffer_clear(buf_in, 0);
+        char * base = (char *) ggml_backend_buffer_get_base(buf);
+        if (ggml_backend_tensor_alloc(buf, c, base) == GGML_STATUS_SUCCESS &&
+            ggml_backend_tensor_alloc(buf, b, base + offs_b) == GGML_STATUS_SUCCESS) {
+            {
+                std::lock_guard<std::mutex> lock(g_log_mutex);
+                g_encoded.clear();
+                g_capturing = true;
+            }
+            ok = ggml_backend_graph_compute(metal, gf) == GGML_STATUS_SUCCESS;
+            ggml_backend_synchronize(metal);
+            {
+                std::lock_guard<std::mutex> lock(g_log_mutex);
+                g_capturing = false;
+                encoded = g_encoded;
+            }
+        }
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_backend_buffer_free(buf_in);
+    ggml_free(ctx);
+    ggml_free(ctx_in);
+
+    return encoded;
+}
+
+static void test_alloc_size(ggml_backend_dev_t dev_metal, ggml_backend_t metal, add_one_impl & impl) {
+    const ggml_backend_custom_op scratch = { add_one_cpu_scratch, nullptr, add_one_encode, &impl, add_one_alloc_size_scratch };
+    const ggml_backend_custom_op shorter = { add_one_cpu_short,   nullptr, add_one_encode, &impl, add_one_alloc_size_short   };
+    check(ggml_backend_dev_add_custom_op(dev_metal, &scratch), "alloc size", "an implementation with alloc_size is registered");
+    check(ggml_backend_dev_add_custom_op(dev_metal, &shorter), "alloc size", "one whose alloc_size is below nbytes is registered");
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*8,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+
+    ggml_tensor * x       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, kElems);
+    ggml_tensor * c_plain = add_one(ctx, x);
+    ggml_tensor * c_scr   = add_one(ctx, x, add_one_cpu_scratch);
+    ggml_tensor * c_short = add_one(ctx, x, add_one_cpu_short);
+    ggml_tensor * c_none  = add_one(ctx, x, add_one_cpu_unregistered);
+    const size_t nbytes = ggml_nbytes(c_scr);
+
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev_metal);
+    check(ggml_backend_buft_get_alloc_size(buft, c_scr) == nbytes + kScratch, "alloc size", "the device buffer type adds the scratch");
+    check(ggml_backend_buft_get_alloc_size(buft, c_plain) == nbytes, "alloc size", "a node of an implementation without alloc_size keeps nbytes");
+    check(ggml_backend_buft_get_alloc_size(buft, c_short) == nbytes, "alloc size", "an alloc_size below nbytes counts as nbytes");
+    check(ggml_backend_buft_get_alloc_size(buft, c_none) == nbytes, "alloc size", "a node of an unregistered function keeps nbytes");
+
+    // buffers over host memory: from a host pointer and from a range table with no Metal buffer, which host-side
+    // allocation needs none of
+    const size_t page = 16384;
+    const size_t size = GGML_PAD(nbytes + kScratch, page);
+    void * host = aligned_alloc(page, size);
+
+    ggml_backend_buffer_t buf_ptr = ggml_backend_dev_buffer_from_host_ptr(dev_metal, host, size, size);
+    check(buf_ptr != nullptr && ggml_backend_tensor_alloc(buf_ptr, c_scr, ggml_backend_buffer_get_base(buf_ptr)) == GGML_STATUS_SUCCESS &&
+          ggml_backend_buffer_get_alloc_size(c_scr->buffer, c_scr) == nbytes + kScratch,
+          "alloc size", "a node in a buffer from a host pointer has the scratch");
+    ggml_backend_buffer_free(buf_ptr);
+
+    const ggml_backend_metal_range range = { size, nullptr };
+    ggml_backend_buffer_t buf_ranges = ggml_backend_metal_buffer_from_ranges(dev_metal, host, size, &range, 1);
+    check(buf_ranges != nullptr && ggml_backend_tensor_alloc(buf_ranges, c_short, host) == GGML_STATUS_SUCCESS &&
+          ggml_backend_tensor_alloc(buf_ranges, c_plain, host) == GGML_STATUS_SUCCESS &&
+          ggml_backend_buffer_get_alloc_size(c_short->buffer, c_short) == nbytes &&
+          ggml_backend_buffer_get_alloc_size(c_plain->buffer, c_plain) == nbytes,
+          "alloc size", "nodes without scratch in a buffer from ranges keep nbytes");
+    ggml_tensor * c_scr2 = add_one(ctx, x, add_one_cpu_scratch);
+    check(buf_ranges != nullptr && ggml_backend_tensor_alloc(buf_ranges, c_scr2, host) == GGML_STATUS_SUCCESS &&
+          ggml_backend_buffer_get_alloc_size(c_scr2->buffer, c_scr2) == nbytes + kScratch,
+          "alloc size", "a node in a buffer from ranges has the scratch");
+    ggml_backend_buffer_free(buf_ranges);
+
+    free(host);
+    ggml_free(ctx);
+
+    // the encoder covers the scratch: a node in it waits for the custom node, one past it does not
+    const size_t align = ggml_backend_buft_get_alignment(ggml_backend_get_default_buffer_type(metal));
+    bool ok = false;
+
+    std::vector<encoded_node> encoded = encode_with_b_at(metal, GGML_PAD(nbytes, align), ok);
+    const encoded_node * b = find_encoded(encoded, "b");
+    check(ok && encoded_position(encoded, "c") == 0, "alloc size", "the custom node is encoded first");
+    check(b != nullptr && !b->concurrent, "alloc size", "a barrier before a node in the custom node's scratch");
+
+    encoded = encode_with_b_at(metal, GGML_PAD(nbytes + kScratch, align), ok);
+    b = find_encoded(encoded, "b");
+    check(ok && b != nullptr && b->concurrent, "alloc size", "no barrier before a node past the scratch");
+}
+
 int main(void) {
     // before any Metal backend exists, which reads it once
     setenv("GGML_METAL_GRAPH_DEBUG", "1", 1);
@@ -432,7 +586,7 @@ int main(void) {
 
     ggml_backend_reg_t reg = ggml_backend_metal_reg();
     if (reg == nullptr || ggml_backend_reg_dev_count(reg) == 0) {
-        const ggml_backend_custom_op op = { add_one_cpu, nullptr, add_one_encode_unused, nullptr };
+        const ggml_backend_custom_op op = { add_one_cpu, nullptr, add_one_encode_unused, nullptr, nullptr };
         check(!ggml_backend_dev_add_custom_op(dev_cpu, &op), "registration", "the CPU device takes no implementation");
         ggml_backend_free(cpu);
         printf("SKIP no Metal device\n");
@@ -459,6 +613,7 @@ int main(void) {
     test_registration(dev_metal, dev_cpu, impl);
     test_supports(dev_metal);
     test_placement_and_order(metal, cpu, impl);
+    test_alloc_size(dev_metal, metal, impl);
 
     // the registration stays for the device's lifetime, which outlives the binary's use of the pipeline
     ggml_backend_free(metal);

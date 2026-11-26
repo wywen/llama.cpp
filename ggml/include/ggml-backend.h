@@ -219,7 +219,10 @@ extern "C" {
     // - `supports` and `encode` may be called from several threads at once;
     // - a CUSTOM node is never fused with another node;
     // - a buffer type may size a CUSTOM node past ggml_nbytes (get_alloc_size), for scratch the implementation uses
-    //   past the node's data: the node then owns those bytes as it owns its data.
+    //   past the node's data: the node then owns those bytes as it owns its data. An implementation that needs such
+    //   scratch gives its size through `alloc_size`, and the device's buffer types then size its nodes with it;
+    // - `alloc_size` gives the same answer for the same node every time it is asked, and may be called from several
+    //   threads at once, also for a node the device does not compute.
     //
     // The native context of each backend that takes implementations:
     // - Metal: the id<MTLComputeCommandEncoder> the node is encoded into (see ggml-metal.h)
@@ -234,11 +237,17 @@ extern "C" {
     // record `node` into `native_ctx`, the backend's native encoding context; false on failure
     typedef bool (*ggml_backend_custom_encode_t)(void * user_data, const struct ggml_tensor * node, void * native_ctx);
 
+    // the bytes the buffer of `node`, a GGML_OP_CUSTOM node whose function is the implementation's key, holds for it:
+    // its data and the scratch past it; a value below ggml_nbytes(node) counts as ggml_nbytes(node)
+    typedef size_t (*ggml_backend_custom_alloc_size_t)(void * user_data, const struct ggml_tensor * node);
+
     struct ggml_backend_custom_op {
-        ggml_custom_op_t               key;       // the CPU function of the nodes it implements
-        ggml_backend_custom_supports_t supports;  // NULL: every node with the key
-        ggml_backend_custom_encode_t   encode;
-        void *                         user_data; // passed to both, and kept alive by the caller as long as the device
+        ggml_custom_op_t                 key;        // the CPU function of the nodes it implements
+        ggml_backend_custom_supports_t   supports;   // NULL: every node with the key
+        ggml_backend_custom_encode_t     encode;
+        void *                           user_data;  // passed to each function, and kept alive by the caller as long as
+                                                     // the device
+        ggml_backend_custom_alloc_size_t alloc_size; // NULL: ggml_nbytes(node), no scratch
     };
 
     // register `op` on `device`, for the nodes asked about and graphs computed after the call; the entry is copied
