@@ -206,6 +206,48 @@ GGML_BACKEND_API void ggml_backend_metal_commit_fence(ggml_backend_t backend);
 // that use them have completed. The graph reorder may move a CUSTOM node as it moves a stock op.
 //
 
+//
+// flash attention partial, for the Metal implementation of a GGML_OP_CUSTOM node
+//
+// A caller that computes a flash attention partial (ggml_flash_attn_ext_partial) as a GGML_OP_CUSTOM node of its own
+// encodes it with these from the implementation it registers on a Metal device. `dst` is laid out as a
+// GGML_OP_FLASH_ATTN_EXT_PARTIAL node, whatever its op: src[0..3] = q, k, v and the mask (NULL: none),
+// src[4] = src[5] = NULL, src[6] = the active count (I32, NULL: none; see ggml_flash_attn_ext_partial_set_active),
+// and the shape and type ggml_flash_attn_ext_partial gives. No op param of dst is read: the op parameters are passed
+// in ggml_metal_fa_partial_params.
+//
+// The kernels use scratch past dst's data: dst's buffer holds ggml_nbytes(dst) +
+// ggml_metal_flash_attn_ext_partial_extra_bytes(dst) bytes from dst's data, e.g. through a buffer type whose
+// get_alloc_size reports them for the node. The scratch is the node's own while it runs; its contents are unspecified
+// before and after.
+//
+
+struct ggml_metal_fa_partial_params {
+    float   scale;         // op param 0 of a partial node
+    float   max_bias;      // op param 1
+    float   logit_softcap; // op param 2
+    int32_t active_index;  // op param 5, read only when dst->src[6] is set
+};
+
+// does dev, a Metal device, take dst? the answer the device gives for a FLASH_ATTN_EXT_PARTIAL node of dst's layout;
+// false, with a log line, for a device that is not a Metal device
+GGML_BACKEND_API bool ggml_metal_flash_attn_ext_partial_supported(ggml_backend_dev_t dev, const struct ggml_tensor * dst);
+
+// the bytes past ggml_nbytes(dst) the kernels use: what a Metal buffer type's get_alloc_size adds for a
+// FLASH_ATTN_EXT_PARTIAL node of dst's layout
+GGML_BACKEND_API size_t ggml_metal_flash_attn_ext_partial_extra_bytes(const struct ggml_tensor * dst);
+
+// encode the partial into native_ctx, the id<MTLComputeCommandEncoder> the custom op's encode receives on dev, the
+// Metal device the implementation is registered on: the kernels, pipelines and barriers the backend encodes for a
+// FLASH_ATTN_EXT_PARTIAL node of dst's layout and these op parameters, so the bytes are the same. The tensors are bound
+// as ggml_backend_metal_tensor_mtl_buffer binds them, the scratch at dst's offset + ggml_nbytes(dst); the pipelines
+// are dev's and live as long as it does. Dependent kernels of the partial are separated by memory barriers, and the
+// encoder is left open. An inactive partial costs its launches only and leaves dst unwritten. False, encoding
+// nothing, when dev is not a Metal device, does not take dst, or native_ctx is not an encoder of dev's Metal device.
+GGML_BACKEND_API bool ggml_metal_flash_attn_ext_partial_encode(
+        ggml_backend_dev_t dev, void * native_ctx, const struct ggml_tensor * dst,
+        const struct ggml_metal_fa_partial_params * params);
+
 #ifdef __cplusplus
 }
 #endif

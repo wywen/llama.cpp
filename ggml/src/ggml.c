@@ -1098,8 +1098,6 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_POST",
     "TOP_K_MASK",
     "FLASH_ATTN_EXT_PARTIAL",
-    "FLASH_ATTN_EXT_MERGE",
-    "FLASH_ATTN_EXT_FINALIZE",
 
     "UNARY",
 
@@ -1117,7 +1115,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,8 +1212,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
     "flash_attn_ext_partial(x)",
-    "flash_attn_ext_merge(a, b)",
-    "flash_attn_ext_finalize(x)",
 
     "unary(x)",
 
@@ -1233,7 +1229,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5508,49 +5504,6 @@ struct ggml_tensor * ggml_flash_attn_ext_partial(
         float                 logit_softcap) {
     return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, NULL, scale, max_bias, logit_softcap, true);
 }
-
-struct ggml_tensor * ggml_flash_attn_ext_merge(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * a,
-        struct ggml_tensor  * b) {
-    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_are_same_shape(a, b));
-    GGML_ASSERT(a->ne[0] > 2);
-    GGML_ASSERT(ggml_is_contiguous_rows(a) && ggml_is_contiguous_rows(b));
-
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, a->ne);
-
-    result->op     = GGML_OP_FLASH_ATTN_EXT_MERGE;
-    result->src[0] = a;
-    result->src[1] = b;
-
-    return result;
-}
-
-struct ggml_tensor * ggml_flash_attn_ext_finalize(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * a,
-        struct ggml_tensor  * sinks) {
-    GGML_ASSERT(a->type == GGML_TYPE_F32);
-    GGML_ASSERT(a->ne[0] > 2);
-    GGML_ASSERT(ggml_is_contiguous_rows(a));
-
-    if (sinks) {
-        GGML_ASSERT(sinks->type == GGML_TYPE_F32);
-        GGML_ASSERT(ggml_is_contiguous(sinks));
-        GGML_ASSERT(sinks->ne[0] == a->ne[1]); // one sink per head
-    }
-
-    int64_t ne[4] = { a->ne[0] - 2, a->ne[1], a->ne[2], a->ne[3] };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
-
-    result->op     = GGML_OP_FLASH_ATTN_EXT_FINALIZE;
-    result->src[0] = a;
-    result->src[1] = sinks;
-
-    return result;
-}
-
 
 enum ggml_prec ggml_flash_attn_ext_get_prec(
         const struct ggml_tensor * a) {

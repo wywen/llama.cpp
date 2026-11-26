@@ -147,6 +147,38 @@ extern "C" {
     GGML_BACKEND_API void ggml_cpu_fp32_to_bf16(const float *, ggml_bf16_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_bf16_to_fp32(const ggml_bf16_t *, float *, int64_t);
 
+    //
+    // flash attention partial, for the function of a GGML_OP_CUSTOM node
+    //
+    // A caller that computes a flash attention partial (ggml_flash_attn_ext_partial) as a GGML_OP_CUSTOM node of its
+    // own calls these from the node's function. `dst` is laid out as a GGML_OP_FLASH_ATTN_EXT_PARTIAL node, whatever
+    // its op: src[0..3] = q, k, v and the mask (NULL: none), src[4] = src[5] = NULL, src[6] = the active count (I32,
+    // NULL: none; see ggml_flash_attn_ext_partial_set_active), and the shape and type ggml_flash_attn_ext_partial
+    // gives. No op param of dst is read: the op parameters are passed in ggml_cpu_fa_partial_params.
+    //
+
+    struct ggml_cpu_fa_partial_params {
+        float          scale;         // op param 0 of a partial node
+        float          max_bias;      // op param 1
+        float          logit_softcap; // op param 2
+        enum ggml_prec prec;          // op param 3 (ggml_prec_set_acc)
+        int32_t        active_index;  // op param 5, read only when dst->src[6] is set
+    };
+
+    // the bytes of work data ggml_cpu_flash_attn_ext_partial_compute needs with nth threads: the work size the CPU
+    // backend plans for a graph of one partial node of dst's layout, computed by nth threads
+    GGML_BACKEND_API size_t ggml_cpu_flash_attn_ext_partial_work_size(const struct ggml_tensor * dst, int nth);
+
+    // compute thread ith's share of the partial into dst's data. Each of the nth threads, ith in [0, nth), calls it
+    // once with the same dst, params and wdata (one buffer of at least the work size for nth, shared by the threads);
+    // the calls need no barrier between them, and dst is complete when all nth have returned. The bytes are those
+    // the CPU backend computes for a GGML_OP_FLASH_ATTN_EXT_PARTIAL node of the same sources and op parameters with
+    // nth threads. An inactive partial (the count is not greater than active_index) returns at once in every thread
+    // and leaves dst unwritten.
+    GGML_BACKEND_API void ggml_cpu_flash_attn_ext_partial_compute(
+            struct ggml_tensor * dst, const struct ggml_cpu_fa_partial_params * params,
+            int ith, int nth, void * wdata, size_t wsize);
+
 #ifdef __cplusplus
 }
 #endif

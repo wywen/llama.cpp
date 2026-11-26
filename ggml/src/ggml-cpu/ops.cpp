@@ -9492,11 +9492,17 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             nchunk = nth;
         }
 
-        if (ith == 0) {
-            ggml_threadpool_chunk_set(params->threadpool, nth);
-        }
+        // without a threadpool (ggml_cpu_flash_attn_ext_partial_compute) the chunks are dealt statically: thread ith
+        // takes chunks ith, ith + nth, ... The chunks, and so the bytes of each row, are those of the dynamic deal.
+        const bool deal_dynamic = params->threadpool != nullptr;
 
-        ggml_barrier(params->threadpool);
+        if (deal_dynamic) {
+            if (ith == 0) {
+                ggml_threadpool_chunk_set(params->threadpool, nth);
+            }
+
+            ggml_barrier(params->threadpool);
+        }
 
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
@@ -9526,7 +9532,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                 ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, n_kv_cols, nullptr, 0);
             }
 
-            current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+            current_chunk = deal_dynamic ? ggml_threadpool_chunk_add(params->threadpool, 1) : current_chunk + nth;
         }
     }
 }
@@ -9546,101 +9552,6 @@ void ggml_compute_forward_flash_attn_ext(
             {
                 GGML_ABORT("fatal error");
             }
-    }
-}
-
-// ggml_compute_forward_flash_attn_ext_merge
-
-// rows hold [O[DV], S, M]: the unnormalized output, the softmax sum and the running max
-void ggml_compute_forward_flash_attn_ext_merge(
-        const ggml_compute_params * params,
-        ggml_tensor * dst) {
-    const ggml_tensor * a = dst->src[0];
-    const ggml_tensor * b = dst->src[1];
-
-    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_are_same_shape(a, b) && ggml_are_same_shape(a, dst));
-
-    const int64_t DV = dst->ne[0] - 2;
-    const int64_t nr = ggml_nrows(dst);
-
-    const int64_t ne1 = dst->ne[1];
-    const int64_t ne2 = dst->ne[2];
-
-    for (int64_t ir = params->ith; ir < nr; ir += params->nth) {
-        const int64_t i3 = ir/(ne2*ne1);
-        const int64_t i2 = (ir - i3*ne2*ne1)/ne1;
-        const int64_t i1 = (ir - i3*ne2*ne1 - i2*ne1);
-
-        const float * pa = (const float *) ((const char *) a->data   + i1*a->nb[1]   + i2*a->nb[2]   + i3*a->nb[3]);
-        const float * pb = (const float *) ((const char *) b->data   + i1*b->nb[1]   + i2*b->nb[2]   + i3*b->nb[3]);
-        float       * pd = (float       *) ((char       *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
-
-        const float Ma = pa[DV + 1];
-        const float Mb = pb[DV + 1];
-        const float M  = fmaxf(Ma, Mb);
-
-        // a partial without finite scores has M == -inf and contributes nothing
-        const float sa = Ma == -INFINITY ? 0.0f : expf(Ma - M);
-        const float sb = Mb == -INFINITY ? 0.0f : expf(Mb - M);
-
-        for (int64_t i = 0; i < DV; ++i) {
-            pd[i] = pa[i]*sa + pb[i]*sb;
-        }
-
-        pd[DV + 0] = pa[DV + 0]*sa + pb[DV + 0]*sb;
-        pd[DV + 1] = M;
-    }
-}
-
-// ggml_compute_forward_flash_attn_ext_finalize
-
-void ggml_compute_forward_flash_attn_ext_finalize(
-        const ggml_compute_params * params,
-        ggml_tensor * dst) {
-    const ggml_tensor * a     = dst->src[0];
-    const ggml_tensor * sinks = dst->src[1];
-
-    GGML_ASSERT(a->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->nb[0] == sizeof(float));
-
-    const int64_t DV = dst->ne[0];
-    const int64_t nr = ggml_nrows(dst);
-
-    const int64_t ne1 = dst->ne[1];
-    const int64_t ne2 = dst->ne[2];
-
-    for (int64_t ir = params->ith; ir < nr; ir += params->nth) {
-        const int64_t i3 = ir/(ne2*ne1);
-        const int64_t i2 = (ir - i3*ne2*ne1)/ne1;
-        const int64_t i1 = (ir - i3*ne2*ne1 - i2*ne1);
-
-        const float * pa = (const float *) ((const char *) a->data   + i1*a->nb[1]   + i2*a->nb[2]   + i3*a->nb[3]);
-        float       * pd = (float       *) ((char       *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
-
-        const float M = pa[DV + 1];
-
-        float S = pa[DV + 0];
-
-        float ms = 1.0f; // rescale of O when the sink raises the max
-
-        if (sinks) {
-            // dim 1 is the head
-            const float s = ((const float *) sinks->data)[i1];
-
-            if (s > M) {
-                ms = M == -INFINITY ? 0.0f : expf(M - s);
-                S  = S*ms + 1.0f;
-            } else {
-                S += expf(s - M);
-            }
-        }
-
-        const float scale = S == 0.0f ? 0.0f : ms/S;
-
-        for (int64_t i = 0; i < DV; ++i) {
-            pd[i] = pa[i]*scale;
-        }
     }
 }
 

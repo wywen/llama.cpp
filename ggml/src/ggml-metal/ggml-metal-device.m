@@ -864,6 +864,16 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
     return res;
 }
 
+ggml_metal_encoder_t ggml_metal_encoder_wrap(void * obj) {
+    ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
+
+    // retained for the wrapper's lifetime, released by ggml_metal_encoder_free
+    res->obj = (id<MTLComputeCommandEncoder>) obj;
+    [res->obj retain];
+
+    return res;
+}
+
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder) {
     [encoder->obj release];
     free(encoder);
@@ -916,6 +926,10 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
 
 void * ggml_metal_encoder_get_obj(ggml_metal_encoder_t encoder) {
     return encoder->obj;
+}
+
+void * ggml_metal_encoder_get_device(ggml_metal_encoder_t encoder) {
+    return [encoder->obj device];
 }
 
 #define GGML_METAL_MAX_CUSTOM_OPS 64
@@ -1828,12 +1842,6 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_ROLL:
             return ggml_is_contiguous(op->src[0]);
-        case GGML_OP_FLASH_ATTN_EXT_MERGE:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                   ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]);
-        case GGML_OP_FLASH_ATTN_EXT_FINALIZE:
-            return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[0]) &&
-                   (!op->src[1] || op->src[1]->type == GGML_TYPE_F32);
         case GGML_OP_FLASH_ATTN_EXT_PARTIAL:
         case GGML_OP_FLASH_ATTN_EXT:
             // a partial attends over a column view of the mask: the kernels read mask columns in pairs

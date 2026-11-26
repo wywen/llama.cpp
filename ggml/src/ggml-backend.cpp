@@ -1408,7 +1408,6 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
 
     // skip FLASH_ATTN_EXT since the sinks tensor is too small to choose a based based on it
     allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT;
-    allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT_FINALIZE;
 
     if (allow) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
@@ -3054,6 +3053,8 @@ bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
         case GGML_OP_ARGMAX:
+        // a custom node's implementation may use scratch past the node's data
+        case GGML_OP_CUSTOM:
             return true;
         default:
             return false;

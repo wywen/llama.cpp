@@ -9417,144 +9417,53 @@ struct test_flash_attn_ext_partial : public test_case {
     }
 };
 
-// fill a partial [dv + 2, ...] with a valid online-softmax state: O, S > 0 and M finite
-// rows with (row % empty_mod) == empty_rem hold the empty state O = 0, S = 0, M = -inf
-static void init_fa_partial_state(ggml_tensor * t, uint32_t seed, int empty_mod, int empty_rem) {
-    const int64_t dv    = t->ne[0] - 2;
-    const int64_t nrows = ggml_nrows(t);
-
-    std::vector<float> f(ggml_nelements(t));
-
-    std::mt19937 gen(seed);
-    std::uniform_real_distribution<float> dis_o(-1.0f, 1.0f);
-    std::uniform_real_distribution<float> dis_s(0.5f, 8.0f);
-    std::uniform_real_distribution<float> dis_m(-10.0f, 10.0f);
-
-    for (int64_t r = 0; r < nrows; ++r) {
-        float * row = f.data() + r*(dv + 2);
-
-        if (empty_mod > 0 && r % empty_mod == empty_rem) {
-            for (int64_t i = 0; i < dv; ++i) {
-                row[i] = 0.0f;
-            }
-            row[dv + 0] = 0.0f;
-            row[dv + 1] = -INFINITY;
-            continue;
-        }
-
-        const float S = dis_s(gen);
-        for (int64_t i = 0; i < dv; ++i) {
-            row[i] = S*dis_o(gen); // |O| <= S*max|v|
-        }
-        row[dv + 0] = S;
-        row[dv + 1] = dis_m(gen);
+// combine the partials of the chunks of one (head, query) row and normalize them as a caller does, with the
+// sink of the row's head (nullptr: none): the output of ggml_flash_attn_ext over the chunks' cells
+// part holds n_chunks partials of dv + 2 values, one after the other
+static void fa_partials_combine(const float * part, int64_t n_chunks, int64_t dv, const float * sink, float * out) {
+    float M = -INFINITY;
+    for (int64_t i = 0; i < n_chunks; ++i) {
+        M = std::max(M, part[i*(dv + 2) + dv + 1]);
     }
 
-    ggml_backend_tensor_set(t, f.data(), 0, f.size()*sizeof(float));
+    float S = 0.0f;
+    for (int64_t j = 0; j < dv; ++j) {
+        out[j] = 0.0f;
+    }
+
+    // a partial without finite scores has M = -inf and contributes nothing
+    for (int64_t i = 0; i < n_chunks; ++i) {
+        const float * p  = part + i*(dv + 2);
+        const float   Mi = p[dv + 1];
+        const float   w  = Mi == -INFINITY ? 0.0f : expf(Mi - M);
+        for (int64_t j = 0; j < dv; ++j) {
+            out[j] += p[j]*w;
+        }
+        S += p[dv + 0]*w;
+    }
+
+    // the sink only adds to the denominator
+    float ms = 1.0f;
+    if (sink) {
+        if (*sink > M) {
+            ms = M == -INFINITY ? 0.0f : expf(M - *sink);
+            S  = S*ms + 1.0f;
+        } else {
+            S += expf(*sink - M);
+        }
+    }
+
+    const float scale = S == 0.0f ? 0.0f : ms/S;
+    for (int64_t j = 0; j < dv; ++j) {
+        out[j] *= scale;
+    }
 }
 
-// GGML_OP_FLASH_ATTN_EXT_MERGE
-struct test_flash_attn_ext_merge : public test_case {
-    const int64_t dv;
-    const int64_t nh;
-    const int64_t nb;
-    const int64_t ne3;
-    const bool empty_a; // every other row of a has no valid cells
-    const bool empty_b; // every third row of b has no valid cells
-
-    std::string vars() override {
-        return VARS_TO_STR6(dv, nh, nb, ne3, empty_a, empty_b);
-    }
-
-    double max_nmse_err() override {
-        return 1e-6;
-    }
-
-    double err(const float * a, const float * b, size_t n) override {
-        return nmse_skip_equal_inf(a, b, n);
-    }
-
-    test_flash_attn_ext_merge(int64_t dv = 128, int64_t nh = 8, int64_t nb = 4, int64_t ne3 = 1, bool empty_a = false, bool empty_b = false)
-        : dv(dv), nh(nh), nb(nb), ne3(ne3), empty_a(empty_a), empty_b(empty_b) {}
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv + 2, nh, nb, ne3);
-        ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv + 2, nh, nb, ne3);
-        ggml_set_name(a, "a");
-        ggml_set_name(b, "b");
-
-        ggml_tensor * out = ggml_flash_attn_ext_merge(ctx, a, b);
-        ggml_set_name(out, "out");
-
-        return out;
-    }
-
-    void initialize_tensors(ggml_context * ctx) override {
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "a") == 0) {
-                init_fa_partial_state(t, 1, empty_a ? 2 : 0, 0);
-            } else if (strcmp(t->name, "b") == 0) {
-                init_fa_partial_state(t, 2, empty_b ? 3 : 0, 0);
-            } else {
-                init_tensor_uniform(t);
-            }
-        }
-    }
-};
-
-// GGML_OP_FLASH_ATTN_EXT_FINALIZE
-struct test_flash_attn_ext_finalize : public test_case {
-    const int64_t dv;
-    const int64_t nh;
-    const int64_t nb;
-    const int64_t ne3;
-    const bool sinks;
-    const bool empty; // every other row has no valid cells
-
-    std::string vars() override {
-        return VARS_TO_STR6(dv, nh, nb, ne3, sinks, empty);
-    }
-
-    double max_nmse_err() override {
-        return 1e-6;
-    }
-
-    test_flash_attn_ext_finalize(int64_t dv = 128, int64_t nh = 8, int64_t nb = 4, int64_t ne3 = 1, bool sinks = false, bool empty = false)
-        : dv(dv), nh(nh), nb(nb), ne3(ne3), sinks(sinks), empty(empty) {}
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dv + 2, nh, nb, ne3);
-        ggml_set_name(a, "a");
-
-        ggml_tensor * s = nullptr;
-        if (sinks) {
-            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
-            ggml_set_name(s, "s");
-        }
-
-        ggml_tensor * out = ggml_flash_attn_ext_finalize(ctx, a, s);
-        ggml_set_name(out, "out");
-
-        return out;
-    }
-
-    void initialize_tensors(ggml_context * ctx) override {
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "a") == 0) {
-                init_fa_partial_state(t, 3, empty ? 2 : 0, 1);
-            } else if (strcmp(t->name, "s") == 0) {
-                init_tensor_uniform(t, -10.0f, 10.0f);
-            } else {
-                init_tensor_uniform(t);
-            }
-        }
-    }
-};
-
-// flash attention over n_kv split into chunks of disjoint KV cells: one partial per chunk, merged and
-// finalized, compared with the unchunked ggml_flash_attn_ext of the same inputs
-// the output stacks [chunked, unchunked] along dim 3, the error covers both the comparison between the
-// two halves on each backend and the comparison between the backends
+// flash attention over n_kv split into chunks of disjoint KV cells: one partial per chunk, combined and
+// normalized on the host, compared with the unchunked ggml_flash_attn_ext of the same inputs
+// the output concatenates [partial 0, ..., partial n_chunks-1, unchunked] along dim 0; the partials are compared
+// between the backends, and the error of the output also covers the host combination of the partials against the
+// unchunked rows on each backend
 struct test_flash_attn_ext_chunked : public test_case {
     const int64_t hsk;
     const int64_t hsv;
@@ -9579,20 +9488,42 @@ struct test_flash_attn_ext_chunked : public test_case {
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "FLASH_ATTN_EXT_FINALIZE";
+        return "FLASH_ATTN_EXT_PARTIAL";
     }
 
     double max_nmse_err() override {
         return 5e-4;
     }
 
+    // the sinks, read back by err_node; empty without sinks
+    std::vector<float> sink_values;
+
+    // the error of the host combination of the partials of `out` against its unchunked rows
+    double err_combined(const ggml_tensor * t, const float * f) const {
+        const int64_t row   = t->ne[0];
+        const int64_t nrows = ggml_nrows(t);
+        const int64_t dv    = hsv;
+
+        GGML_ASSERT(row == n_chunks*(dv + 2) + dv);
+
+        std::vector<float> got(nrows*dv);
+        std::vector<float> ref(nrows*dv);
+        for (int64_t r = 0; r < nrows; ++r) {
+            const float * fr   = f + r*row;
+            const float * sink = sink_values.empty() ? nullptr : &sink_values[r % t->ne[1]]; // dim 1 is the head
+
+            fa_partials_combine(fr, n_chunks, dv, sink, got.data() + r*dv);
+            memcpy(ref.data() + r*dv, fr + n_chunks*(dv + 2), dv*sizeof(float));
+        }
+
+        return nmse(got.data(), ref.data(), got.size());
+    }
+
     double err_node(const ggml_tensor * t, const float * a, const float * b, size_t n) override {
         double e = nmse_skip_equal_inf(a, b, n);
         if (strcmp(t->name, "out") == 0) {
-            // the stacked output: chunked vs unchunked on each backend
-            GGML_ASSERT(n % 2 == 0);
-            e = std::max(e, nmse(a, a + n/2, n/2));
-            e = std::max(e, nmse(b, b + n/2, n/2));
+            e = std::max(e, err_combined(t, a));
+            e = std::max(e, err_combined(t, b));
         }
         return e;
     }
@@ -9637,7 +9568,7 @@ struct test_flash_attn_ext_chunked : public test_case {
 
         const float scale = 1.0f/sqrtf(hsk);
 
-        ggml_tensor * acc = nullptr;
+        ggml_tensor * parts = nullptr;
         for (int64_t i = 0; i < n_chunks; ++i) {
             const int64_t c0 = bounds[i];
             const int64_t nc = bounds[i + 1] - c0;
@@ -9649,16 +9580,14 @@ struct test_flash_attn_ext_chunked : public test_case {
             ggml_tensor * p = ggml_flash_attn_ext_partial(ctx, q, kc, vc, mc, scale, max_bias, logit_softcap);
             ggml_prec_set_acc(p, GGML_PREC_F32);
 
-            acc = acc ? ggml_flash_attn_ext_merge(ctx, acc, p) : p;
+            parts = parts ? ggml_concat(ctx, parts, p, 0) : p;
         }
-
-        ggml_tensor * chunked = ggml_flash_attn_ext_finalize(ctx, acc, s);
 
         ggml_tensor * ref = ggml_flash_attn_ext(ctx, q, k, v, m, scale, max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(ref, s);
         ggml_prec_set_acc(ref, GGML_PREC_F32);
 
-        ggml_tensor * out = ggml_concat(ctx, chunked, ref, 3);
+        ggml_tensor * out = ggml_concat(ctx, parts, ref, 0);
         ggml_set_name(out, "out");
 
         return out;
@@ -9671,6 +9600,9 @@ struct test_flash_attn_ext_chunked : public test_case {
             }
             if (strcmp(t->name, "s") == 0) {
                 init_tensor_uniform(t, -10.0f, 10.0f);
+
+                sink_values.resize(ggml_nelements(t));
+                ggml_backend_tensor_get(t, sink_values.data(), 0, sink_values.size()*sizeof(float));
             } else if (strcmp(t->name, "m") == 0) {
                 init_fa_partial_mask(t, mask);
 
@@ -9696,6 +9628,7 @@ struct test_flash_attn_ext_chunked : public test_case {
 // chunked flash attention whose partials carry an active count (ggml_flash_attn_ext_partial_set_active)
 // greater than their chunk index: each partial is computed as without a count. An inactive partial leaves its
 // result unspecified, so it is not compared here: test-flash-attn-partial-active checks that it is skipped
+// the output concatenates the partials along dim 0
 struct test_flash_attn_ext_partial_active : public test_case {
     const int64_t hsk; // K head size
     const int64_t hsv; // V head size
@@ -9741,7 +9674,7 @@ struct test_flash_attn_ext_partial_active : public test_case {
 
         const float scale = 1.0f/sqrtf(hsk);
 
-        ggml_tensor * acc = nullptr;
+        ggml_tensor * out = nullptr;
         for (int64_t i = 0; i < n_chunks; ++i) {
             const int64_t c0 = i*kv_chunk;
 
@@ -9753,10 +9686,9 @@ struct test_flash_attn_ext_partial_active : public test_case {
             ggml_prec_set_acc(p, GGML_PREC_F32);
             ggml_flash_attn_ext_partial_set_active(p, n_active, (int32_t) i);
 
-            acc = acc ? ggml_flash_attn_ext_merge(ctx, acc, p) : p;
+            out = out ? ggml_concat(ctx, out, p, 0) : p;
         }
 
-        ggml_tensor * out = ggml_flash_attn_ext_finalize(ctx, acc, nullptr);
         ggml_set_name(out, "out");
 
         return out;
@@ -13770,31 +13702,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_partial(128, 128, 4, {2, 1}, 256, nb, FA_PARTIAL_MASK_RANDOM, false, 0.0f, 0.0f, GGML_TYPE_Q8_0));
     }
 
-    // FLASH_ATTN_EXT_MERGE
-    for (int64_t dv : {64, 128, 512}) {
-        for (int64_t nb : {1, 7}) {
-            for (bool empty_a : {false, true}) {
-                for (bool empty_b : {false, true}) {
-                    test_cases.emplace_back(new test_flash_attn_ext_merge(dv, 8, nb, 1, empty_a, empty_b));
-                }
-            }
-        }
-    }
-    test_cases.emplace_back(new test_flash_attn_ext_merge(128, 4, 5, 3, true, true));
-
-    // FLASH_ATTN_EXT_FINALIZE
-    for (int64_t dv : {64, 128, 512}) {
-        for (int64_t nb : {1, 7}) {
-            for (bool sinks : {false, true}) {
-                for (bool empty : {false, true}) {
-                    test_cases.emplace_back(new test_flash_attn_ext_finalize(dv, 8, nb, 1, sinks, empty));
-                }
-            }
-        }
-    }
-    test_cases.emplace_back(new test_flash_attn_ext_finalize(128, 4, 5, 3, true, true));
-
-    // chunked flash attention: partials over disjoint KV ranges, merged and finalized, against the unchunked op
+    // chunked flash attention: partials over disjoint KV ranges, combined on the host, against the unchunked op
     for (int64_t nr2 : {1, 4}) {
         for (int64_t nb : {1, 8, 32}) {
             for (int64_t n_chunks : {2, 3, 4}) {
@@ -13806,7 +13714,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (auto [hsk, hsv] : std::vector<std::pair<int64_t, int64_t>>{{64, 64}, {256, 256}, {576, 512}}) {
             test_cases.emplace_back(new test_flash_attn_ext_chunked(hsk, hsv, 2, {4, 1}, 1024, nb, 3));
         }
-        // a chunk without valid cells merges as the identity
+        // a chunk without valid cells contributes nothing
         test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1024, nb, 4, 64, FA_PARTIAL_MASK_RANDOM, 1));
         test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1024, nb, 4, 64, FA_PARTIAL_MASK_RANDOM, 0));
         // rows without valid cells in any chunk
@@ -13815,7 +13723,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1000, nb, 3, 2));
         test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1024, nb, 3, 64, FA_PARTIAL_MASK_NONE));
         test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 2}, 1024, nb, 3));
-        // sinks go to the finalize, once
+        // sinks are applied once, when the partials are normalized
         test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1024, nb, 3, 64, FA_PARTIAL_MASK_RANDOM, -1, true));
         test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1024, nb, 3, 64, FA_PARTIAL_MASK_RANDOM, -1, false, 8.0f));
         test_cases.emplace_back(new test_flash_attn_ext_chunked(128, 128, 4, {4, 1}, 1024, nb, 3, 64, FA_PARTIAL_MASK_RANDOM, -1, false, 0.0f, 30.0f));
