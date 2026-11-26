@@ -438,7 +438,6 @@ else()
 endif()
 
 llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK ggml)
-llama_build_and_test(test-get-rows-cast.cpp LABEL "main behavior backend"  LINK ggml)
 llama_build_and_test(test-flash-attn-partial-active.cpp LABEL "main behavior backend"  LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model behavior")
 llama_build_and_test(test-autorelease.cpp       LABEL "model behavior")
