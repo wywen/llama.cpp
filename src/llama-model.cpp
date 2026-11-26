@@ -4079,19 +4079,6 @@ int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
 }
 
-int32_t llama_model_moe_router_ahead_layer(const struct llama_model * model, int32_t il) {
-    const int32_t n_layer = model->hparams.n_layer();
-    if (il < 0 || il >= n_layer || model->layers[il].ffn_gate_inp == nullptr) {
-        return -1;
-    }
-    for (int32_t il_next = il + 1; il_next < n_layer; ++il_next) {
-        if (model->layers[il_next].ffn_gate_inp != nullptr) {
-            return il_next;
-        }
-    }
-    return -1;
-}
-
 struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name) {
     return const_cast<ggml_tensor *>(model->get_tensor(name));
 }
