@@ -790,11 +790,6 @@ extern "C" {
     // the caller keeps by cell.
     //
 
-    // the MoE layer that follows MoE layer il, the layer whose router a caller applies to layer il's router input to
-    // predict its choice of experts, or -1 if il is not a MoE layer or is the last one (the next-token prediction
-    // layers are not counted)
-    LLAMA_API int32_t llama_model_moe_router_ahead_layer(const struct llama_model * model, int32_t il);
-
     // the weight tensor of model named `name`, as the model file names it ("blk.<il>.ffn_gate_inp.weight"), or NULL if
     // the model has none; it lives as long as the model
     LLAMA_API struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name);
