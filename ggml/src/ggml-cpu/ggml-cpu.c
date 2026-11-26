@@ -2121,14 +2121,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
             } break;
-        case GGML_OP_FLASH_ATTN_EXT_MERGE:
-            {
-                ggml_compute_forward_flash_attn_ext_merge(params, tensor);
-            } break;
-        case GGML_OP_FLASH_ATTN_EXT_FINALIZE:
-            {
-                ggml_compute_forward_flash_attn_ext_finalize(params, tensor);
-            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2313,8 +2305,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_POST:
         case GGML_OP_TOP_K_MASK:
         case GGML_OP_FLASH_ATTN_EXT_PARTIAL:
-        case GGML_OP_FLASH_ATTN_EXT_MERGE:
-        case GGML_OP_FLASH_ATTN_EXT_FINALIZE:
             {
                 n_tasks = n_threads;
             } break;
@@ -2833,6 +2823,24 @@ void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
 #endif
 }
 
+// the work buffer of a flash attention node computed by n_tasks threads, without the per-thread cache line padding
+static size_t ggml_cpu_flash_attn_ext_node_work_size(const struct ggml_tensor * node, int n_tasks) {
+    const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
+    const int64_t DK = node->src[1]->ne[0];
+    const int64_t DV = node->src[2]->ne[0];
+
+    // Tiled flash attention scratch (tile sizes defined in common.h)
+    // Per-thread: Q_q + KQ + mask + VKQ32 + V32 + K_f32 + padding
+    size_t prefill  = sizeof(float)*(GGML_FA_TILE_Q*DK + 2*GGML_FA_TILE_Q*GGML_FA_TILE_KV + GGML_FA_TILE_Q*DV + GGML_FA_TILE_KV*DV + GGML_FA_TILE_KV*DK)*n_tasks;
+
+    // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
+    // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
+    size_t n_chunks = n_tasks;
+    size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
+
+    return MAX(prefill, decode);
+}
+
 struct ggml_cplan ggml_graph_plan(
           const struct ggml_cgraph * cgraph,
                                int   n_threads,
@@ -3011,20 +3019,7 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_FLASH_ATTN_EXT:
                 case GGML_OP_FLASH_ATTN_EXT_PARTIAL:
                     {
-                        const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
-                        const int64_t DK = node->src[1]->ne[0];
-                        const int64_t DV = node->src[2]->ne[0];
-
-                        // Tiled flash attention scratch (tile sizes defined in common.h)
-                        // Per-thread: Q_q + KQ + mask + VKQ32 + V32 + K_f32 + padding
-                        size_t prefill  = sizeof(float)*(GGML_FA_TILE_Q*DK + 2*GGML_FA_TILE_Q*GGML_FA_TILE_KV + GGML_FA_TILE_Q*DV + GGML_FA_TILE_KV*DV + GGML_FA_TILE_KV*DK)*n_tasks;
-
-                        // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
-                        // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
-                        size_t n_chunks = n_tasks;
-                        size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
-
-                        cur += MAX(prefill, decode);
+                        cur += ggml_cpu_flash_attn_ext_node_work_size(node, n_tasks);
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {
@@ -3082,6 +3077,51 @@ struct ggml_cplan ggml_graph_plan(
     cplan.work_data  = NULL;
 
     return cplan;
+}
+
+// the partial of a node laid out as a FLASH_ATTN_EXT_PARTIAL node, see ggml-cpu.h
+
+size_t ggml_cpu_flash_attn_ext_partial_work_size(const struct ggml_tensor * dst, int nth) {
+    GGML_ASSERT(nth > 0);
+
+    // as ggml_graph_plan sizes a graph of this one node: a partial runs on every thread
+    return ggml_cpu_flash_attn_ext_node_work_size(dst, nth) + CACHE_LINE_SIZE*nth;
+}
+
+void ggml_cpu_flash_attn_ext_partial_compute(
+        struct ggml_tensor * dst,
+        const struct ggml_cpu_fa_partial_params * params,
+        int ith, int nth, void * wdata, size_t wsize) {
+    GGML_ASSERT(nth > 0 && ith >= 0 && ith < nth);
+    GGML_ASSERT(wdata != NULL && wsize >= ggml_cpu_flash_attn_ext_partial_work_size(dst, nth));
+
+    // a partial takes no sinks and no K/V row lists
+    GGML_ASSERT(dst->src[4] == NULL && dst->src[5] == NULL);
+    GGML_ASSERT(dst->src[6] == NULL || dst->src[6]->type == GGML_TYPE_I32);
+
+    // the partial node dst stands for: dst's sources and data, the op parameters of `params`
+    struct ggml_tensor node = *dst;
+
+    node.op = GGML_OP_FLASH_ATTN_EXT_PARTIAL;
+    memset(node.op_params, 0, sizeof(node.op_params));
+
+    ggml_set_op_params_f32(&node, 0, params->scale);
+    ggml_set_op_params_f32(&node, 1, params->max_bias);
+    ggml_set_op_params_f32(&node, 2, params->logit_softcap);
+    ggml_set_op_params_i32(&node, 3, (int32_t) params->prec);
+    ggml_set_op_params_i32(&node, 5, dst->src[6] ? params->active_index : 0);
+
+    // no threadpool: the partial deals its rows to the threads statically and takes no barrier
+    struct ggml_compute_params cparams = {
+        /*.ith        =*/ ith,
+        /*.nth        =*/ nth,
+        /*.wsize      =*/ wsize,
+        /*.wdata      =*/ wdata,
+        /*.threadpool =*/ NULL,
+        /*.use_ref    =*/ false,
+    };
+
+    ggml_compute_forward_flash_attn_ext(&cparams, &node);
 }
 
 

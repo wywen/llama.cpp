@@ -217,7 +217,9 @@ extern "C" {
     //   submit it); returning false aborts the compute, naming the node;
     // - `supports` gives the same answer for the same node every time it is asked;
     // - `supports` and `encode` may be called from several threads at once;
-    // - a CUSTOM node is never fused with another node.
+    // - a CUSTOM node is never fused with another node;
+    // - a buffer type may size a CUSTOM node past ggml_nbytes (get_alloc_size), for scratch the implementation uses
+    //   past the node's data: the node then owns those bytes as it owns its data.
     //
     // The native context of each backend that takes implementations:
     // - Metal: the id<MTLComputeCommandEncoder> the node is encoded into (see ggml-metal.h)

@@ -75,6 +75,8 @@ typedef struct ggml_metal_encoder * ggml_metal_encoder_t;
 
 // with a NULL command buffer, an encoder that encodes nothing: every call on it does nothing and get_obj returns NULL
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent);
+// an encoder over obj, an id<MTLComputeCommandEncoder> someone else made and ends; free releases only the wrapper
+ggml_metal_encoder_t ggml_metal_encoder_wrap(void * obj);
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_debug_group_push(ggml_metal_encoder_t encoder, const char * name);
@@ -95,6 +97,9 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 
 // the id<MTLComputeCommandEncoder>, not retained
 void * ggml_metal_encoder_get_obj(ggml_metal_encoder_t encoder);
+
+// the id<MTLDevice> the encoder encodes for, not retained
+void * ggml_metal_encoder_get_device(ggml_metal_encoder_t encoder);
 
 //
 // MTLLibrary wrapper
@@ -259,8 +264,6 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         int32_t dv,
         int32_t nwg);
 
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_merge   (ggml_metal_library_t lib, const struct ggml_tensor * op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_finalize(ggml_metal_library_t lib, const struct ggml_tensor * op);
 
 // MTLResidencySet wrapper
 

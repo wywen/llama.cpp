@@ -297,12 +297,7 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_EXT_PARTIAL:
             {
-                res += ggml_metal_op_flash_attn_ext_extra_pad(tensor);
-                res += ggml_metal_op_flash_attn_ext_extra_blk(tensor);
-                res += ggml_metal_op_flash_attn_ext_extra_tmp(tensor);
-                res += ggml_metal_op_flash_attn_ext_extra_kv_f16(tensor);
-                res += ggml_metal_op_flash_attn_ext_extra_idx(tensor);
-                res += ggml_metal_op_flash_attn_ext_extra_rows(tensor);
+                res += ggml_metal_op_flash_attn_ext_extra(tensor);
             } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
@@ -1310,6 +1305,66 @@ bool ggml_backend_metal_buffer_set_range_grow(
     }
 
     return ggml_metal_buffer_set_range_grow((ggml_metal_buffer_t)buffer->context, grow, user_data);
+}
+
+//
+// flash attention partial, for the Metal implementation of a GGML_OP_CUSTOM node
+//
+
+// the partial node dst stands for: dst's sources, data and buffer, with the op parameters of `params`
+static ggml_tensor ggml_metal_flash_attn_ext_partial_node(const ggml_tensor * dst, const ggml_metal_fa_partial_params * params) {
+    ggml_tensor node = *dst;
+
+    node.op = GGML_OP_FLASH_ATTN_EXT_PARTIAL;
+    memset(node.op_params, 0, sizeof(node.op_params));
+
+    if (params) {
+        ggml_set_op_params_f32(&node, 0, params->scale);
+        ggml_set_op_params_f32(&node, 1, params->max_bias);
+        ggml_set_op_params_f32(&node, 2, params->logit_softcap);
+        ggml_set_op_params_i32(&node, 5, dst->src[6] ? params->active_index : 0);
+    }
+
+    return node;
+}
+
+bool ggml_metal_flash_attn_ext_partial_supported(ggml_backend_dev_t dev, const struct ggml_tensor * dst) {
+    if (!ggml_backend_dev_is_metal(dev)) {
+        GGML_LOG_ERROR("%s: not a Metal device\n", __func__);
+        return false;
+    }
+
+    // the layout a partial node has: no sinks and no K/V row lists
+    if (dst->src[4] != nullptr || dst->src[5] != nullptr) {
+        return false;
+    }
+
+    const ggml_tensor node = ggml_metal_flash_attn_ext_partial_node(dst, nullptr);
+
+    return ggml_metal_device_supports_op((ggml_metal_device_t) dev->context, &node);
+}
+
+size_t ggml_metal_flash_attn_ext_partial_extra_bytes(const struct ggml_tensor * dst) {
+    const ggml_tensor node = ggml_metal_flash_attn_ext_partial_node(dst, nullptr);
+
+    return ggml_metal_op_flash_attn_ext_extra(&node);
+}
+
+bool ggml_metal_flash_attn_ext_partial_encode(
+        ggml_backend_dev_t dev, void * native_ctx, const struct ggml_tensor * dst,
+        const struct ggml_metal_fa_partial_params * params) {
+    if (!ggml_backend_dev_is_metal(dev)) {
+        GGML_LOG_ERROR("%s: not a Metal device\n", __func__);
+        return false;
+    }
+
+    if (dst->src[4] != nullptr || dst->src[5] != nullptr || params == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor node = ggml_metal_flash_attn_ext_partial_node(dst, params);
+
+    return ggml_metal_op_flash_attn_ext_partial_encode((ggml_metal_device_t) dev->context, native_ctx, &node);
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_metal_reg)

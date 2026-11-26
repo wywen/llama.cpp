@@ -41,6 +41,8 @@ extern "C" {
     // [TAG_ALLOC_SIZE_EXPAND]
     // returns true for ops that may require additional memory for fleeting data on some backends,
     // i.e. the backend buffer type's get_alloc_size may return more than ggml_nbytes for the output tensor
+    // GGML_OP_CUSTOM is one of them: a custom node's buffer type may size it past ggml_nbytes, for scratch its
+    // device implementation uses past the node's data
     GGML_API bool ggml_op_alloc_size_may_expand(enum ggml_op op);
 
     //

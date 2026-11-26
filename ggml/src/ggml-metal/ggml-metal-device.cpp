@@ -2187,34 +2187,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     GGML_UNUSED(op);
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_merge(ggml_metal_library_t lib, const ggml_tensor * op) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT_MERGE);
-    GGML_UNUSED(op);
-
-    const char * name = "kernel_flash_attn_ext_merge";
-
-    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
-    if (!res.pipeline) {
-        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
-    }
-
-    return res;
-}
-
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_finalize(ggml_metal_library_t lib, const ggml_tensor * op) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT_FINALIZE);
-    GGML_UNUSED(op);
-
-    const char * name = "kernel_flash_attn_ext_finalize";
-
-    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
-    if (!res.pipeline) {
-        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
-    }
-
-    return res;
-}
-
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin(ggml_metal_library_t lib, const ggml_tensor * op, int32_t n_fuse) {
     char base[256];
     char name[256];

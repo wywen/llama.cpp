@@ -47,6 +47,14 @@ size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_idx(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_rows(const struct ggml_tensor * op);
 
+// the bytes past ggml_nbytes(op) the kernels of a flash attention node use: the sum of the extras above
+size_t ggml_metal_op_flash_attn_ext_extra(const struct ggml_tensor * op);
+
+// encode `op`, a FLASH_ATTN_EXT_PARTIAL node, into enc_obj, an id<MTLComputeCommandEncoder> of dev's Metal device,
+// with the kernels and barriers the stock op encodes; false, encoding nothing, when dev does not support the node or
+// the encoder is of another device
+bool ggml_metal_op_flash_attn_ext_partial_encode(ggml_metal_device_t dev, void * enc_obj, const struct ggml_tensor * op);
+
 size_t ggml_metal_op_argmax_extra(const struct ggml_tensor * op);
 
 int ggml_metal_op_concat            (ggml_metal_op_t ctx, int idx);
@@ -78,8 +86,6 @@ int ggml_metal_op_mul_mat           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_mul_mat_id        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_add_id            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_flash_attn_ext    (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_flash_attn_ext_merge   (ggml_metal_op_t ctx, int idx);
-int ggml_metal_op_flash_attn_ext_finalize(ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_bin               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_silu_back         (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_l2_norm           (ggml_metal_op_t ctx, int idx);
