@@ -394,7 +394,7 @@ int main() {
     for (size_t i = 0; i < n_metal; ++i) {
         g_metal_impls[i].dev = ggml_backend_reg_dev_get(reg, i);
 
-        const ggml_backend_custom_op op = { fa_partial_cpu, fa_partial_metal_supports, fa_partial_metal_encode, &g_metal_impls[i] };
+        const ggml_backend_custom_op op = { fa_partial_cpu, fa_partial_metal_supports, fa_partial_metal_encode, &g_metal_impls[i], nullptr };
         if (!ggml_backend_dev_add_custom_op(g_metal_impls[i].dev, &op)) {
             printf("the Metal device %s refuses the custom op\n", ggml_backend_dev_name(g_metal_impls[i].dev));
             return 1;

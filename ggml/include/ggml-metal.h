@@ -205,6 +205,11 @@ GGML_BACKEND_API void ggml_backend_metal_commit_fence(ggml_backend_t backend);
 // caller keeps its pipelines, and any buffers it binds besides the node's tensors, alive until the command buffers
 // that use them have completed. The graph reorder may move a CUSTOM node as it moves a stock op.
 //
+// The device's buffer types, and so the buffers from ggml_backend_dev_buffer_from_host_ptr and
+// ggml_backend_metal_buffer_from_ranges, size a CUSTOM node by the implementation's alloc_size, and the encoder, the
+// graph reorder and fusion take the node's memory to be all of those bytes: a node that lives in the scratch is
+// ordered after the custom node, as it is after a node whose data it overlaps.
+//
 
 //
 // flash attention partial, for the Metal implementation of a GGML_OP_CUSTOM node

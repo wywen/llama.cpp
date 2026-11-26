@@ -9,6 +9,7 @@
 #include "ggml-metal-ops.h"
 #include "ggml-metal-tuning.h"
 
+#include <algorithm>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -312,13 +313,21 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
             {
                 res += ggml_metal_op_argmax_extra(tensor);
             } break;
+        case GGML_OP_CUSTOM:
+            {
+                // the scratch the registered implementation uses past the node's data (see ggml_backend_dev_add_custom_op)
+                ggml_metal_device_t ctx_dev = (ggml_metal_device_t)buft->device->context;
+
+                const ggml_backend_custom_op * impl = ggml_metal_device_get_custom_op(ctx_dev, tensor);
+                if (impl != nullptr && impl->alloc_size != nullptr) {
+                    res = std::max(res, impl->alloc_size(impl->user_data, tensor));
+                }
+            } break;
         default:
             break;
     }
 
     return res;
-
-    GGML_UNUSED(buft);
 }
 
 // default (shared) buffer type
