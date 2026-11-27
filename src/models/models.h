@@ -2840,8 +2840,7 @@ struct llama_model_qwen4exp : public llama_model_base {
 
         // the QSA selection of one layer
         struct qsa_sel {
-            ggml_tensor * mask  = nullptr; // [n_kv, n_tokens] the additive mask
-            ggml_tensor * top_k = nullptr; // [n_top_pool, n_tokens] the picked blocks
+            ggml_tensor * mask = nullptr; // [n_kv, n_tokens] the additive mask
         };
 
         // dense self-attention over the cells the QSA mask keeps

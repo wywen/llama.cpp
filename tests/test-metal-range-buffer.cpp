@@ -9,11 +9,10 @@
 // Each range's Metal buffer is also replaced on its own: while range 1 has none and its pages are mapped anew, kernels
 // over the other ranges compute; after the caller installs a new Metal buffer over the new pages the GPU reads and
 // writes them. A range's Metal buffer may hold only a prefix of it: kernels over tensors inside the prefix compute,
-// and the prefix grows by installing a longer Metal buffer over the same pages, by the caller or by its grow hook when a
-// kernel reaches past the prefix. Encoding a kernel on a tensor in a range with no Metal buffer, on a view across a
-// range boundary, or on a tensor that ends past its range's prefix, aborts, naming the tensor; the binary checks this
-// by running itself in a child process. The backend takes no reference to the caller's Metal buffers. It skips when
-// there is no Metal device.
+// and the prefix grows by the caller installing a longer Metal buffer over the same pages. Encoding a kernel on a
+// tensor in a range with no Metal buffer, on a view across a range boundary, or on a tensor that ends past its range's
+// prefix, aborts, naming the tensor; the binary checks this by running itself in a child process. The backend takes
+// no reference to the caller's Metal buffers. It skips when there is no Metal device.
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -444,69 +443,6 @@ static void test_prefix(fixture & f) {
             "a kernel writing the range's last bytes computes once the range is held whole");
 }
 
-// the grow hook of test_grow: wraps the pages of range 1 that hold its first `bytes` bytes, keeping the Metal buffer it
-// replaces alive until the test has synchronized
-struct grow_state {
-    fixture * f = nullptr;
-    int calls = 0;
-    int range = -1;
-    size_t bytes = 0;
-    std::vector<void *> retired;
-};
-
-static void grow_range(void * user_data, int i, size_t bytes) {
-    grow_state & g = *(grow_state *) user_data;
-    g.calls++;
-    g.range = i;
-    g.bytes = bytes;
-    const size_t pages = (bytes + g.f->page - 1)/g.f->page*g.f->page;
-    void * m = test_metal_nocopy_buffer_new(g.f->dev, g.f->range_base(i), pages);
-    if (m == nullptr || !ggml_backend_metal_buffer_set_range(g.f->buf, i, m)) {
-        return;
-    }
-    if (g.f->metal[i] != nullptr) {
-        g.retired.push_back(g.f->metal[i]);
-    }
-    g.f->metal[i] = m;
-}
-
-// with a grow hook, a kernel on a tensor past range 1's one-page prefix grows it to the pages that hold the tensor,
-// and a kernel inside the prefix calls no hook
-static void test_grow(fixture & f) {
-    const char * sc = "grow";
-
-    grow_state g;
-    g.f = &f;
-    check(f.rewrap(1, f.page), sc, "range 1 gets a Metal buffer over its first page");
-    check(ggml_backend_metal_buffer_set_range_grow(f.buf, grow_range, &g), sc, "a grow hook is installed");
-
-    const std::vector<float> src = ramp(300.0f);
-    ggml_backend_tensor_set(f.in[1], src.data(), 0, kBytes);
-    check(ggml_backend_graph_compute(f.backend, graph_of(f, 1)) == GGML_STATUS_SUCCESS && holds(f.out[1], src, 3.0f) &&
-            g.calls == 0, sc, "a kernel inside the prefix computes without the hook");
-
-    const std::vector<float> src0 = ramp(-300.0f);
-    ggml_backend_tensor_set(f.in[0], src0.data(), 0, kBytes);
-    ggml_backend_tensor_memset(f.out[0], 0xff, 0, kBytes);
-    check(ggml_backend_graph_compute(f.backend, graph_of(f, 0)) == GGML_STATUS_SUCCESS && holds(f.out[0], src0, 2.0f), sc,
-            "a kernel writing past the prefix computes once the hook grew it");
-    check(g.calls == 1 && g.range == 1 && g.bytes == f.sub, sc, "the hook was asked for the bytes the tensor ends at");
-    check(id_of(f.out[0]).metal == f.metal[1], sc, "the tensor resolves to the grown Metal buffer");
-
-    ggml_backend_synchronize(f.backend);
-    for (void * m : g.retired) {
-        test_metal_buffer_release(m);
-    }
-    check(ggml_backend_metal_buffer_set_range_grow(f.buf, nullptr, nullptr), sc, "the hook is removed");
-
-    ggml_backend_buffer_t plain = ggml_backend_dev_buffer_from_host_ptr(f.dev, f.mem, f.sub, f.sub);
-    check(plain != nullptr && !ggml_backend_metal_buffer_set_range_grow(plain, grow_range, &g), sc,
-            "a hook on a host-pointer buffer is refused");
-    if (plain != nullptr) {
-        ggml_backend_buffer_free(plain);
-    }
-}
-
 //
 // child processes that must abort
 //
@@ -667,7 +603,6 @@ int main(int argc, char ** argv) {
     test_validation(f);
     test_caller_buft(f);
     test_prefix(f);
-    test_grow(f);
     test_resolve(f, "resolve-after-prefix");
     test_encode_across();
     test_encode_missing();

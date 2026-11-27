@@ -721,16 +721,6 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_meta
     return res;
 }
 
-size_t ggml_metal_library_n_pipelines(ggml_metal_library_t lib) {
-    [lib->lock lock];
-
-    const size_t res = ggml_metal_pipelines_count(lib->pipelines);
-
-    [lib->lock unlock];
-
-    return res;
-}
-
 struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_metal_library_t lib, const char * base, const char * name, ggml_metal_cv_t cv) {
     struct ggml_metal_pipeline_with_params res = {
         /*.pipeline =*/ nil,
@@ -2179,10 +2169,6 @@ struct ggml_metal_buffer {
     int n_ranges;
     struct ggml_metal_buffer_range * ranges;
 
-    // the caller's hook that grows a range's prefix on demand (see ggml_backend_metal_buffer_set_range_grow), or NULL
-    void (*range_grow)(void * user_data, int i, size_t bytes);
-    void * range_grow_user_data;
-
     bool use_residency_sets;
 
     // optional MTLResidencySet
@@ -2548,18 +2534,6 @@ bool ggml_metal_buffer_set_range(ggml_metal_buffer_t buf, int i, void * metal) {
     }
 
     atomic_store_explicit(&buf->ranges[i].metal, metal, memory_order_release);
-
-    return true;
-}
-
-bool ggml_metal_buffer_set_range_grow(ggml_metal_buffer_t buf, void (*grow)(void * user_data, int i, size_t bytes), void * user_data) {
-    if (buf->ranges == NULL) {
-        GGML_LOG_ERROR("%s: not a buffer from ggml_backend_metal_buffer_from_ranges\n", __func__);
-        return false;
-    }
-
-    buf->range_grow           = grow;
-    buf->range_grow_user_data = user_data;
 
     return true;
 }
@@ -3017,10 +2991,6 @@ static struct ggml_metal_buffer_id ggml_metal_buffer_get_range_id(ggml_metal_buf
 
     void * metal = atomic_load_explicit(&range->metal, memory_order_acquire);
     const size_t need = (size_t) (end - (uintptr_t) range->data);
-    if (buf->range_grow != NULL && (metal == NULL || ggml_metal_buffer_range_held(range, (id<MTLBuffer>) metal) < need)) {
-        buf->range_grow(buf->range_grow_user_data, lo, need);
-        metal = atomic_load_explicit(&range->metal, memory_order_acquire);
-    }
     if (metal == NULL) {
         GGML_ABORT("%s: tensor '%s' is in range %d of a buffer from ggml_backend_metal_buffer_from_ranges, which has "
                 "no Metal buffer; set one with ggml_backend_metal_buffer_set_range before encoding work that uses it",

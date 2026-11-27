@@ -1235,15 +1235,6 @@ void * ggml_backend_metal_device_get_mtl_queue(ggml_backend_dev_t dev) {
     return ggml_metal_device_get_queue((ggml_metal_device_t)dev->context);
 }
 
-size_t ggml_backend_metal_device_n_pipelines(ggml_backend_dev_t dev) {
-    if (!ggml_backend_dev_is_metal(dev)) {
-        GGML_LOG_ERROR("%s: not a Metal device\n", __func__);
-        return 0;
-    }
-
-    return ggml_metal_library_n_pipelines(ggml_metal_device_get_library((ggml_metal_device_t)dev->context));
-}
-
 ggml_backend_buffer_t ggml_backend_metal_buffer_from_ranges(
         ggml_backend_dev_t dev, void * base, size_t size, const struct ggml_backend_metal_range * ranges, int n_ranges) {
     if (!ggml_backend_dev_is_metal(dev)) {
@@ -1303,16 +1294,6 @@ bool ggml_backend_metal_buffer_set_range(ggml_backend_buffer_t buffer, int i, vo
     }
 
     return ggml_metal_buffer_set_range((ggml_metal_buffer_t)buffer->context, i, metal);
-}
-
-bool ggml_backend_metal_buffer_set_range_grow(
-        ggml_backend_buffer_t buffer, ggml_backend_metal_range_grow_t grow, void * user_data) {
-    if (buffer == NULL || !ggml_backend_buffer_is_metal(buffer)) {
-        GGML_LOG_ERROR("%s: not a Metal buffer\n", __func__);
-        return false;
-    }
-
-    return ggml_metal_buffer_set_range_grow((ggml_metal_buffer_t)buffer->context, grow, user_data);
 }
 
 //

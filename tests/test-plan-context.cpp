@@ -13,7 +13,6 @@
 
 #include "llama.h"
 #include "llama-cpp.h"
-#include "speculative.h"
 
 #include "../src/llama-context.h"
 #include "../src/llama-ext.h"
@@ -311,7 +310,8 @@ void fail(outcome & out, const std::string & what) {
     out.failures++;
 }
 
-// the backend sampler chains of one context, one per sequence, freed after the context
+// the backend sampler chains of one context, one per sequence, freed after the context: each a top-k sampler, as a
+// draft context samples on the backend
 struct sampler_chains {
     std::vector<llama_sampler *>          chains;
     std::vector<llama_sampler_seq_config> configs;
@@ -327,7 +327,9 @@ struct sampler_chains {
 
     void make(uint32_t n_seqs) {
         for (uint32_t seq = 0; seq < n_seqs; ++seq) {
-            chains.push_back(common_speculative_draft_backend_chain());
+            llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+            chains.push_back(chain);
             configs.push_back({ (llama_seq_id) seq, chains.back() });
         }
     }
