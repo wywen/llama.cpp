@@ -898,7 +898,7 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
         res->add_fused_node({LLM_FUSED_OP_TOP_K_MASK, sel, il});
         cb(sel, "indexer_sel", il);
 
-        return { sel, top_k };
+        return { sel };
     }
 
     // the top blocks, then the incomplete tail with n_kv for missing cells
@@ -951,7 +951,7 @@ llama_model_qwen4exp::graph::qsa_sel llama_model_qwen4exp::graph::build_qsa_sel(
     sel = ggml_cont(ctx0, sel);
     cb(sel, "indexer_sel", il);
 
-    return { sel, top_k };
+    return { sel };
 }
 
 // Dense GQA self-attention over the cells that the QSA mask keeps.

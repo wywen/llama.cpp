@@ -101,6 +101,14 @@ static std::string common_speculative_get_devices_str(const std::vector<ggml_bac
     return result.empty() ? "default" : result;
 }
 
+// a new chain of the samplers a draft context samples each sequence with on the backend, when the draft parameters
+// ask for backend sampling. The caller frees it.
+static llama_sampler * common_speculative_draft_backend_chain() {
+    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+    return chain;
+}
+
 struct common_speculative_config {
     common_speculative_type type;
     common_params_speculative params;
@@ -3253,12 +3261,6 @@ common_speculative_output_limits common_speculative_get_output_limits(
 
 // initialization of the speculative decoding system
 //
-llama_sampler * common_speculative_draft_backend_chain() {
-    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
-    return chain;
-}
-
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try

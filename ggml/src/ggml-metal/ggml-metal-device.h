@@ -43,7 +43,6 @@ void ggml_metal_pipelines_free(ggml_metal_pipelines_t ppls);
 
 void                  ggml_metal_pipelines_add(ggml_metal_pipelines_t ppls, const char * name, ggml_metal_pipeline_t pipeline);
 ggml_metal_pipeline_t ggml_metal_pipelines_get(ggml_metal_pipelines_t ppls, const char * name);
-size_t                ggml_metal_pipelines_count(ggml_metal_pipelines_t ppls);
 
 struct ggml_metal_pipeline_with_params {
     ggml_metal_pipeline_t pipeline;
@@ -116,9 +115,6 @@ ggml_metal_device_t ggml_metal_library_get_device(ggml_metal_library_t lib);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline    (ggml_metal_library_t lib, const char * name);
 struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_metal_library_t lib, const char * base, const char * name, ggml_metal_cv_t cv);
-
-// the pipelines the library has compiled; it never frees one before it is freed itself
-size_t ggml_metal_library_n_pipelines(ggml_metal_library_t lib);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base              (ggml_metal_library_t lib, enum ggml_op op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy               (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst);
@@ -397,8 +393,6 @@ ggml_metal_buffer_t ggml_metal_buffer_map (ggml_metal_device_t dev, void * ptr, 
 ggml_metal_buffer_t ggml_metal_buffer_map_ranges(ggml_metal_device_t dev, void * base, size_t size, const size_t * sizes, void * const * metals, int n_ranges);
 // see ggml_backend_metal_buffer_set_range
 bool ggml_metal_buffer_set_range(ggml_metal_buffer_t buf, int i, void * metal);
-// see ggml_backend_metal_buffer_set_range_grow
-bool ggml_metal_buffer_set_range_grow(ggml_metal_buffer_t buf, void (*grow)(void * user_data, int i, size_t bytes), void * user_data);
 
 void   ggml_metal_buffer_free     (ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_base (ggml_metal_buffer_t buf);

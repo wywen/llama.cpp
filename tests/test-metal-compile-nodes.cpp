@@ -1,7 +1,8 @@
 // Tests for compiling the pipelines of a range of a graph's nodes without encoding them (ggml_backend_metal_compile_nodes).
 //
-// The pipelines a compile looks up are the ones an encode of the same nodes looks up, read through the device's count
-// of compiled pipelines (ggml_backend_metal_device_n_pipelines), which grows by one for each pipeline compiled:
+// The pipelines a compile looks up are the ones an encode of the same nodes looks up, read through a count of the
+// pipelines compiled: the Metal library logs one debug line for each pipeline it compiles, which a log callback
+// installed with ggml_log_set counts:
 //
 // - a graph compiled first, over tensors that have no memory, compiles every pipeline a compute of the same graph sets:
 //   the compute compiles nothing more; and a compile of it again compiles nothing;
@@ -10,7 +11,7 @@
 //   graph computed fused only may leave the compile the unfused kernels to compile;
 // - a chain of additions, which fuses only addends in one Metal buffer, compiles without memory, and a compute of it
 //   with the addends in one buffer, in two or in three compiles nothing more;
-// - tensors in a buffer over caller ranges with no Metal buffer compile without the range's grow hook being called;
+// - tensors in a buffer over caller ranges with no Metal buffer compile;
 // - fusion statistics do not count a compile;
 // - a range outside the graph and a backend that is not Metal fail.
 //
@@ -25,8 +26,10 @@
 #include "ggml-metal.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #include <sys/mman.h>
@@ -49,6 +52,24 @@ typedef void                  (*fusion_stats_init_t) (ggml_backend_fusion_t);
 typedef void                  (*fusion_stats_reset_t)(ggml_backend_fusion_t);
 typedef int                   (*fusion_stats_get_t)  (ggml_backend_fusion_t, const char **, uint64_t *, int);
 typedef void                  (*fusion_set_enabled_t)(ggml_backend_fusion_t, bool);
+
+// the pipelines compiled since the log callback was installed: the Metal library logs this line for each one
+static std::atomic<size_t> g_n_compiled{0};
+
+struct log_chain {
+    ggml_log_callback prev      = nullptr;
+    void *            prev_data = nullptr;
+};
+
+static void count_compiles(ggml_log_level level, const char * text, void * user_data) {
+    if (level == GGML_LOG_LEVEL_DEBUG && strstr(text, "compiling pipeline:") != nullptr) {
+        g_n_compiled++;
+    }
+    const log_chain & chain = *(const log_chain *) user_data;
+    if (chain.prev != nullptr) {
+        chain.prev(level, text, chain.prev_data);
+    }
+}
 
 constexpr int64_t kRows = 64;
 constexpr int64_t kCols = 32;
@@ -119,8 +140,13 @@ struct fixture {
     fusion_stats_get_t    stats_get   = nullptr;
     fusion_set_enabled_t  set_enabled = nullptr;
 
+    log_chain log;
+
     // false when there is no Metal device
     bool init() {
+        ggml_log_get(&log.prev, &log.prev_data);
+        ggml_log_set(count_compiles, &log);
+
         reg = ggml_backend_metal_reg();
         if (reg == nullptr || ggml_backend_reg_dev_count(reg) == 0) {
             return false;
@@ -150,10 +176,11 @@ struct fixture {
         if (backend != nullptr) {
             ggml_backend_free(backend);
         }
+        ggml_log_set(log.prev, log.prev_data);
     }
 
     size_t n_pipelines() const {
-        return ggml_backend_metal_device_n_pipelines(dev);
+        return g_n_compiled.load();
     }
 
     uint64_t fusions() const {
@@ -329,13 +356,7 @@ static void test_add_chain(fixture & f) {
     printf("     %-20s %zu pipelines compiled by the compile, none by the computes\n", sc, compiled - before);
 }
 
-static int g_grow_calls = 0;
-
-static void count_grow(void * /*user_data*/, int /*i*/, size_t /*bytes*/) {
-    g_grow_calls++;
-}
-
-// tensors in a range with no Metal buffer compile without the range's grow hook
+// tensors in a range with no Metal buffer compile
 static void test_unbacked_range(fixture & f) {
     const char * sc = "unbacked-range";
 
@@ -351,8 +372,6 @@ static void test_unbacked_range(fixture & f) {
     ggml_backend_buffer_t rb = ggml_backend_metal_buffer_from_ranges(f.dev, mem, size, ranges.data(), 1);
     check(rb != nullptr, sc, "a buffer over a range with no Metal buffer is created");
     if (rb != nullptr) {
-        check(ggml_backend_metal_buffer_set_range_grow(rb, count_grow, nullptr), sc, "the grow hook is installed");
-
         ggml_init_params params = {
             /*.mem_size   =*/ ggml_tensor_overhead()*4 + ggml_graph_overhead(),
             /*.mem_buffer =*/ nullptr,
@@ -371,7 +390,6 @@ static void test_unbacked_range(fixture & f) {
         ggml_build_forward_expand(gf, c);
         check(ggml_backend_metal_compile_nodes(f.backend, gf, 0, ggml_graph_n_nodes(gf)) == GGML_STATUS_SUCCESS, sc,
                 "the graph compiles");
-        check(g_grow_calls == 0, sc, "the range's grow hook is not called");
 
         ggml_free(ctx);
         ggml_backend_buffer_free(rb);
@@ -395,7 +413,6 @@ static void test_refused(fixture & f) {
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (cpu != nullptr) {
         check(ggml_backend_metal_compile_nodes(cpu, bare.gf, 0, n) == GGML_STATUS_FAILED, sc, "a backend that is not Metal fails");
-        check(ggml_backend_metal_device_n_pipelines(ggml_backend_get_device(cpu)) == 0, sc, "a non-Metal device counts none");
         ggml_backend_free(cpu);
     }
 }
