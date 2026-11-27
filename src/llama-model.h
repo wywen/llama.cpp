@@ -5,7 +5,6 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
-#include "llama-moe-slots.h"
 #include "llama-vocab.h"
 
 #include <map>
@@ -970,9 +969,6 @@ struct llama_model {
     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
     std::unordered_set<const ggml_tensor *> can_prefetch;
 
-    // the MoE layers that read their expert weights from slots, see llama_model_params::moe_slots
-    llama_moe_slots moe_slots;
-
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 
@@ -997,6 +993,9 @@ struct llama_model {
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
     bool no_alloc() const;
+
+    // whether the model has tensors claimed with no data (LLAMA_TENSOR_CLAIM_NO_DATA), which hold no buffer
+    bool has_no_data_tensors() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
@@ -1094,9 +1093,6 @@ struct llama_model_base : public llama_model {
 
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
-
-    // helper: the slot geometry and file runs of the MoE layers that read their expert weights from slots
-    void load_tensors_moe_slots(llama_model_loader & ml);
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
