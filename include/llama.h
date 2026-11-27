@@ -260,6 +260,24 @@ extern "C" {
     // into `tensor`; `data` is valid only for the duration of the call
     typedef void (*llama_kv_rot_set_callback)(struct ggml_tensor * tensor, const void * data, size_t size, void * user_data);
 
+    // the memory component that a buffer of a context's memory backs
+    enum llama_memory_plan_buffer_kind {
+        LLAMA_MEMORY_PLAN_BUFFER_KV,         // attention KV cache without a sliding window
+        LLAMA_MEMORY_PLAN_BUFFER_KV_SWA,     // attention KV cache that masks attention to a sliding window; the tensor shapes give its cell count
+        LLAMA_MEMORY_PLAN_BUFFER_RECURRENT,  // recurrent state
+        LLAMA_MEMORY_PLAN_BUFFER_DSV4_STATE, // DeepSeek V4 compressor state
+        LLAMA_MEMORY_PLAN_BUFFER_KV_ROT,     // attention rotation matrices of a KV cache
+    };
+
+    // picks the buffer type of one layer's tensors of a KV cache: kind KV or KV_SWA for the layer's K/V, KV_ROT for each
+    // of its rotation matrices; `tag` is the cache's tensor name tag ("" for the attention cache, e.g. "idx_" for an
+    // indexer's); `buft` is the type llama would use, for KV_ROT the layer's own whatever its K/V were given. Return
+    // `buft` (or NULL) to keep it. A type that leaves the layer's K/V without data (a zero-size placeholder) makes the
+    // memory refuse shifts and whole states, see "K/V without data"
+    typedef ggml_backend_buffer_type_t (*llama_memory_buft_callback)(
+            enum llama_memory_plan_buffer_kind kind, int32_t il, const char * tag,
+            ggml_backend_buffer_type_t buft, void * user_data);
+
     // a tensor that the model files do not hold, see llama_model_params.declared_tensors
     struct llama_tensor_decl {
         const char *   name;
@@ -481,8 +499,9 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
-        // buffer type for the KV cache attention rotation matrices, NULL = the buffer type of each layer's cache [EXPERIMENTAL]
-        ggml_backend_buffer_type_t kv_rot_buft;
+        // buffer types of the context's memory, see llama_memory_buft_callback; NULL = llama's own [EXPERIMENTAL]
+        llama_memory_buft_callback cb_memory_buft;
+        void *                     cb_memory_buft_user_data;
 
         // receives the contents of each KV cache attention rotation matrix instead of llama writing them, NULL = llama writes them [EXPERIMENTAL]
         // for a buffer type that cannot take host writes: the callback puts the bytes into `tensor`
@@ -509,8 +528,6 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
-        bool kv_rows_caller; // the caller stores the K/V rows of the sparse attention layers, see "Sparse attention K/V
-                             // rows stored by the caller" [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -755,24 +772,18 @@ extern "C" {
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
 
     //
-    // Sparse attention K/V rows stored by the caller [EXPERIMENTAL]
+    // K/V without data [EXPERIMENTAL]
     //
-    // A sparse attention layer (the QSA layers of qwen4exp) attends to the cells that its indexer selects for each
-    // token, over the K/V cache view of the layer masked to the selection. With llama_context_params.kv_rows_caller the
-    // caller stores the K/V rows of these layers: the context keeps their cell metadata, their rotation matrices and
-    // the indexer cache, and gives each layer metadata-only K/V tensors "cache_k_l<il>" and "cache_v_l<il>", which are
-    // in no buffer and hold no data. The graphs are built as over a cache of the context's own: they store the
-    // ubatch's new rows into these tensors and attend over their views. The caller's graph rewrite
-    // (installed from llama_context_params.cb_sched_new) must replace every op that reads them, e.g. with an attention over the
-    // rows it stores; a graph that still reads one computes over memory that holds nothing.
-    //
-    // Without K/V data the context refuses:
+    // A KV cache layer whose K/V tensors llama_context_params.cb_memory_buft placed on a buffer type that gives them no
+    // data (a zero-size placeholder) keeps its cell metadata and its rotation matrices. Its graphs read and write those
+    // tensors as over a cache of the context's own, so a graph rewrite (installed from llama_context_params.cb_sched_new)
+    // must replace every op that does. Such a memory refuses:
     //   - shifting positions (llama_memory_seq_add, llama_memory_seq_div): logged and nothing changes, and
     //     llama_memory_can_shift is false;
     //   - saving or loading the state (llama_state_*, llama_state_seq_*), except partial-only sequence states,
     //     which hold no attention K/V: they fail with an error.
-    // Removing, copying and keeping sequences change the cell metadata only: a copied cell names the same rows, which
-    // the caller keeps by cell.
+    // Removing, copying and keeping sequences change the cell metadata only, and copying between streams skips such a
+    // layer. A memory built without allocation counts as having data.
     //
 
     // the weight tensor of model named `name`, as the model file names it ("blk.<il>.ffn_gate_inp.weight"), or NULL if

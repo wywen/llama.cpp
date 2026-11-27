@@ -360,7 +360,11 @@ llama_context_params make_cparams(const common_params & params, const ctx_opts &
         cparams.type_v = opts.type_v;
     }
     if (opts.kv_rot_buft != nullptr) {
-        cparams.kv_rot_buft = opts.kv_rot_buft;
+        // the hook answers the rotation matrices with the buffer type it carries as its user data
+        cparams.cb_memory_buft = [](llama_memory_plan_buffer_kind kind, int32_t, const char *, ggml_backend_buffer_type_t buft, void * ud) {
+            return kind == LLAMA_MEMORY_PLAN_BUFFER_KV_ROT ? (ggml_backend_buffer_type_t) ud : buft;
+        };
+        cparams.cb_memory_buft_user_data = opts.kv_rot_buft;
     }
 
     return cparams;

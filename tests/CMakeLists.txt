@@ -254,10 +254,10 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
         ARGS --models "${MOE_MODEL_DIR}")
     set_tests_properties(test-tensor-claims PROPERTIES FIXTURES_REQUIRED moe-models)
 
-    llama_build(test-kv-rows-caller.cpp)
-    llama_test(test-kv-rows-caller LABEL "main behavior backend"
+    llama_build(test-memory-buft.cpp)
+    llama_test(test-memory-buft LABEL "main behavior backend"
         ARGS --models "${MOE_MODEL_DIR}")
-    set_tests_properties(test-kv-rows-caller PROPERTIES FIXTURES_REQUIRED moe-models)
+    set_tests_properties(test-memory-buft PROPERTIES FIXTURES_REQUIRED moe-models)
 
     llama_build(test-kpool-views.cpp)
     llama_test(test-kpool-views LABEL "main behavior backend"

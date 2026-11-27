@@ -86,3 +86,27 @@ ggml_backend_buffer_ptr llama_memory_alloc_buffer(
 
     return buf;
 }
+
+static thread_local llama_memory_buft_params memory_buft_params;
+
+llama_memory_buft_scope::llama_memory_buft_scope(const llama_memory_buft_params & params) : outer(memory_buft_params) {
+    memory_buft_params = params;
+}
+
+llama_memory_buft_scope::~llama_memory_buft_scope() {
+    memory_buft_params = outer;
+}
+
+const llama_memory_buft_params & llama_memory_buft_scope::current() {
+    return memory_buft_params;
+}
+
+ggml_backend_buffer_type_t llama_memory_buft(
+        llama_memory_plan_buffer_kind kind, int32_t il, const char * tag, ggml_backend_buffer_type_t buft) {
+    const llama_memory_buft_params & params = memory_buft_params;
+    if (params.buft == nullptr) {
+        return buft;
+    }
+    ggml_backend_buffer_type_t res = params.buft(kind, il, tag, buft, params.buft_user_data);
+    return res != nullptr ? res : buft;
+}

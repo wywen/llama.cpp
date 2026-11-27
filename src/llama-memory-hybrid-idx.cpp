@@ -219,9 +219,9 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
-    // the caller stores the attention K rows of some layers, which cannot be shifted: shift none of the caches
-    if (shift != 0 && get_mem_attn()->has_caller_rows()) {
-        LLAMA_LOG_ERROR("%s: the caller stores the K rows of some layers (kv_rows_caller), which cannot be shifted: refusing the shift\n", __func__);
+    // the attention K of some layers has no data, which cannot be shifted: shift none of the caches
+    if (shift != 0 && get_mem_attn()->has_layers_without_data()) {
+        LLAMA_LOG_ERROR("%s: the K of some layers has no data, so it cannot be shifted: refusing the shift\n", __func__);
         return;
     }
 
@@ -236,9 +236,9 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
 }
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
-    // the caller stores the attention K rows of some layers, which cannot be shifted: shift none of the caches
-    if (d != 1 && get_mem_attn()->has_caller_rows()) {
-        LLAMA_LOG_ERROR("%s: the caller stores the K rows of some layers (kv_rows_caller), which cannot be shifted: refusing the shift\n", __func__);
+    // the attention K of some layers has no data, which cannot be shifted: shift none of the caches
+    if (d != 1 && get_mem_attn()->has_layers_without_data()) {
+        LLAMA_LOG_ERROR("%s: the K of some layers has no data, so it cannot be shifted: refusing the shift\n", __func__);
         return;
     }
 
