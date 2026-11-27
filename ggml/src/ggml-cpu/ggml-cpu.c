@@ -2117,10 +2117,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_top_k_mask(params, tensor);
             } break;
-        case GGML_OP_FLASH_ATTN_EXT_PARTIAL:
-            {
-                ggml_compute_forward_flash_attn_ext(params, tensor);
-            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2304,7 +2300,6 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
         case GGML_OP_TOP_K_MASK:
-        case GGML_OP_FLASH_ATTN_EXT_PARTIAL:
             {
                 n_tasks = n_threads;
             } break;
@@ -3017,7 +3012,6 @@ struct ggml_cplan ggml_graph_plan(
                         cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
                     } break;
                 case GGML_OP_FLASH_ATTN_EXT:
-                case GGML_OP_FLASH_ATTN_EXT_PARTIAL:
                     {
                         cur += ggml_cpu_flash_attn_ext_node_work_size(node, n_tasks);
                     } break;
@@ -3079,12 +3073,12 @@ struct ggml_cplan ggml_graph_plan(
     return cplan;
 }
 
-// the partial of a node laid out as a FLASH_ATTN_EXT_PARTIAL node, see ggml-cpu.h
+// the flash attention partial of a GGML_OP_CUSTOM node, see ggml-cpu.h
 
 size_t ggml_cpu_flash_attn_ext_partial_work_size(const struct ggml_tensor * dst, int nth) {
     GGML_ASSERT(nth > 0);
 
-    // as ggml_graph_plan sizes a graph of this one node: a partial runs on every thread
+    // as ggml_graph_plan sizes a graph of one flash attention node of dst's sources computed by nth threads
     return ggml_cpu_flash_attn_ext_node_work_size(dst, nth) + CACHE_LINE_SIZE*nth;
 }
 
@@ -3099,17 +3093,16 @@ void ggml_cpu_flash_attn_ext_partial_compute(
     GGML_ASSERT(dst->src[4] == NULL && dst->src[5] == NULL);
     GGML_ASSERT(dst->src[6] == NULL || dst->src[6]->type == GGML_TYPE_I32);
 
-    // the partial node dst stands for: dst's sources and data, the op parameters of `params`
+    // a flash attention node of dst's sources and data, with the op parameters of `params`
     struct ggml_tensor node = *dst;
 
-    node.op = GGML_OP_FLASH_ATTN_EXT_PARTIAL;
+    node.op = GGML_OP_FLASH_ATTN_EXT;
     memset(node.op_params, 0, sizeof(node.op_params));
 
     ggml_set_op_params_f32(&node, 0, params->scale);
     ggml_set_op_params_f32(&node, 1, params->max_bias);
     ggml_set_op_params_f32(&node, 2, params->logit_softcap);
     ggml_set_op_params_i32(&node, 3, (int32_t) params->prec);
-    ggml_set_op_params_i32(&node, 5, dst->src[6] ? params->active_index : 0);
 
     // no threadpool: the partial deals its rows to the threads statically and takes no barrier
     struct ggml_compute_params cparams = {
@@ -3121,7 +3114,7 @@ void ggml_cpu_flash_attn_ext_partial_compute(
         /*.use_ref    =*/ false,
     };
 
-    ggml_compute_forward_flash_attn_ext(&cparams, &node);
+    ggml_compute_forward_flash_attn_ext_partial(&cparams, &node, dst->src[6] ? params->active_index : 0);
 }
 
 

@@ -8775,6 +8775,7 @@ void ggml_compute_forward_top_k(
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
+        bool is_partial,
         int ir0, int ir1,
         int64_t ic_start, int64_t ic_end,
         float * partials, int64_t partial_stride) {
@@ -8801,8 +8802,6 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const int64_t N  = neq1;
 
     // a partial row holds the unnormalized output followed by S and M
-    const bool is_partial = dst->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL;
-
     GGML_ASSERT(ne0 == DV + (is_partial ? 2 : 0));
     GGML_ASSERT(ne2 == N);
 
@@ -9004,6 +9003,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 static void ggml_compute_forward_flash_attn_ext_tiled(
         const ggml_compute_params * params,
         ggml_tensor * dst,
+        bool is_partial,
         int ir0, int ir1) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
@@ -9025,8 +9025,6 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     const int64_t N  = neq1;
 
     // a partial row holds the unnormalized output followed by S and M
-    const bool is_partial = dst->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL;
-
     GGML_ASSERT(ne0 == DV + (is_partial ? 2 : 0));
     GGML_ASSERT(ne2 == N);
 
@@ -9381,14 +9379,17 @@ static void ggml_flash_attn_ext_reduce_partials(
     }
 }
 
+// is_partial: store the partial (ggml_cpu_flash_attn_ext_partial_compute) instead of the normalized output
 static void ggml_compute_forward_flash_attn_ext_f16(
         const ggml_compute_params * params,
-        ggml_tensor * dst) {
+        ggml_tensor * dst,
+        bool is_partial,
+        int32_t active_index) {
 
-    // an inactive partial does no work and leaves dst unwritten (ggml_flash_attn_ext_partial_set_active)
+    // an inactive partial does no work and leaves dst unwritten (see ggml-cpu.h)
     // every thread reads the same count and returns before the first barrier
-    const ggml_tensor * n_active = dst->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL ? dst->src[6] : nullptr;
-    if (n_active && *(const int32_t *) n_active->data <= ggml_get_op_params_i32(dst, 5)) {
+    const ggml_tensor * n_active = is_partial ? dst->src[6] : nullptr;
+    if (n_active && *(const int32_t *) n_active->data <= active_index) {
         return;
     }
 
@@ -9410,8 +9411,6 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t N  = neq1;
 
     // a partial row holds the unnormalized output followed by S and M
-    const bool is_partial = dst->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL;
-
     GGML_ASSERT(ne0 == DV + (is_partial ? 2 : 0));
     GGML_ASSERT(ne2 == N);
 
@@ -9462,7 +9461,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         if (ic_start < nek1) {
             for (int64_t q_head = 0; q_head < neq2; q_head++) {
                 ggml_compute_forward_flash_attn_ext_f16_one_chunk(
-                    params, dst, q_head, q_head + 1, ic_start, ic_end,
+                    params, dst, is_partial, q_head, q_head + 1, ic_start, ic_end,
                     chunk_partials, partial_stride);
             }
         } else {
@@ -9527,9 +9526,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             const int64_t ir1 = MIN(ir0 + dr, nr);
 
             if (use_tiled) {
-                ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
+                ggml_compute_forward_flash_attn_ext_tiled(params, dst, is_partial, ir0, ir1);
             } else {
-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, n_kv_cols, nullptr, 0);
+                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, is_partial, ir0, ir1, 0, n_kv_cols, nullptr, 0);
             }
 
             current_chunk = deal_dynamic ? ggml_threadpool_chunk_add(params->threadpool, 1) : current_chunk + nth;
@@ -9546,7 +9545,28 @@ void ggml_compute_forward_flash_attn_ext(
         case GGML_PREC_BF16:
             {
                 // uses F32 accumulators
-                ggml_compute_forward_flash_attn_ext_f16(params, dst);
+                ggml_compute_forward_flash_attn_ext_f16(params, dst, /*is_partial =*/ false, 0);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+void ggml_compute_forward_flash_attn_ext_partial(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        int32_t active_index) {
+    GGML_ASSERT(dst->src[4] == nullptr && dst->src[5] == nullptr);
+
+    switch (ggml_prec_get_acc(dst)) {
+        case GGML_PREC_UNDEFINED:
+        case GGML_PREC_F32:
+        case GGML_PREC_BF16:
+            {
+                // uses F32 accumulators
+                ggml_compute_forward_flash_attn_ext_f16(params, dst, /*is_partial =*/ true, active_index);
             } break;
         default:
             {

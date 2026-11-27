@@ -413,7 +413,6 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
-        GGML_OP_FLASH_ATTN_EXT_PARTIAL,
 
         GGML_OP_UNARY,
 
@@ -2283,46 +2282,6 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
-
-    // Chunked flash attention: attention over a long KV split into disjoint KV ranges.
-    //
-    // ggml_flash_attn_ext_partial takes the same inputs as ggml_flash_attn_ext, restricted to one KV range
-    // (views of K, V and of the matching mask columns), and returns the unnormalized online-softmax state
-    // of each (head, query) row instead of the normalized output:
-    //
-    //   part: [n_embd_v + 2, n_head, n_batch, ne3] F32 !! permuted like res !!
-    //     part[0 .. n_embd_v-1] = O = sum_i exp(s_i - M)*v_i
-    //     part[n_embd_v + 0]    = S = sum_i exp(s_i - M)
-    //     part[n_embd_v + 1]    = M = max_i s_i
-    //
-    // where s_i = scale*q*k_i (with logit_softcap applied), plus slope*mask_i. A row without a finite
-    // score (all of its mask entries are -inf) has O = 0, S = 0 and M = -inf.
-    //
-    // The caller combines the partials of disjoint ranges (M = max(Ma, Mb), O = Oa*exp(Ma - M) + Ob*exp(Mb - M),
-    // S = Sa*exp(Ma - M) + Sb*exp(Mb - M)) and normalizes the result (O/S); a row with S = 0 adds nothing.
-    //
-    // The mask view may select columns of a larger mask: its rows must be contiguous (nb[0] == sizeof(f16))
-    // but its row stride may be that of the full mask. Sinks and ggml_flash_attn_ext_set_n_kv_max are not
-    // supported on the partial op: the caller applies the sinks when it normalizes.
-    GGML_API struct ggml_tensor * ggml_flash_attn_ext_partial(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * q,
-            struct ggml_tensor  * k,
-            struct ggml_tensor  * v,
-            struct ggml_tensor  * mask,
-            float                 scale,
-            float                 max_bias,
-            float                 logit_softcap);
-
-    // compute the partial only when the first element of n_active (I32, read at compute time) is greater
-    // than index: e.g. the partial of chunk `index` of a number of chunks known at compute time only.
-    // Otherwise the backend may skip the op, prepasses included, and the result is then unspecified (the
-    // CPU and Metal backends leave it unwritten): the caller must not depend on its contents, for example
-    // by discarding it under the same condition. Pass NULL to compute it unconditionally (the default).
-    GGML_API void ggml_flash_attn_ext_partial_set_active(
-            struct ggml_tensor * a,
-            struct ggml_tensor * n_active,
-            int32_t              index);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

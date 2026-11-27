@@ -50,10 +50,15 @@ size_t ggml_metal_op_flash_attn_ext_extra_rows(const struct ggml_tensor * op);
 // the bytes past ggml_nbytes(op) the kernels of a flash attention node use: the sum of the extras above
 size_t ggml_metal_op_flash_attn_ext_extra(const struct ggml_tensor * op);
 
-// encode `op`, a FLASH_ATTN_EXT_PARTIAL node, into enc_obj, an id<MTLComputeCommandEncoder> of dev's Metal device,
-// with the kernels and barriers the stock op encodes; false, encoding nothing, when dev does not support the node or
-// the encoder is of another device
-bool ggml_metal_op_flash_attn_ext_partial_encode(ggml_metal_device_t dev, void * enc_obj, const struct ggml_tensor * op);
+// the flash attention partial of a GGML_OP_CUSTOM node (ggml-metal.h), for `op`, a FLASH_ATTN_EXT node of the custom
+// node's sources, data and op parameters whose rows hold the partial:
+// - _supported: does dev take the partial of op?
+// - _encode: encode it into enc_obj, an id<MTLComputeCommandEncoder> of dev's Metal device, with the kernels and
+//   barriers the stock op encodes, computed only when op->src[6], if set, holds a count greater than active_index;
+//   false, encoding nothing, when dev does not take it or the encoder is of another device
+bool ggml_metal_op_flash_attn_ext_partial_supported(ggml_metal_device_t dev, const struct ggml_tensor * op);
+bool ggml_metal_op_flash_attn_ext_partial_encode(
+        ggml_metal_device_t dev, void * enc_obj, const struct ggml_tensor * op, int32_t active_index);
 
 size_t ggml_metal_op_argmax_extra(const struct ggml_tensor * op);
 
