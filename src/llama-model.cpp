@@ -1381,6 +1381,9 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // contexts of the tensors claimed with no data (LLAMA_TENSOR_CLAIM_NO_DATA), which have no buffer
+    std::vector<ggml_context_ptr> ctxs_no_data;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1707,9 +1710,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const bool use_mmap_buffer = true;
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
-
-    ml.moe_slots    = params.moe_slots;
-    ml.moe_slots_ud = params.moe_slots_user_data;
 
     ml.declare_tensors(params.declared_tensors, params.n_declared_tensors);
     ml.claim_tensors(params.claimed_tensors, params.n_claimed_tensors);
@@ -2046,9 +2046,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             continue;
         }
 
-        // the stock expert weights of slot layers have no buffer
-        if (ctx_key.source == llama_model_loader::ctx_source::SLOT_META) {
-            moe_slots.own_meta(std::move(ctx_ptr));
+        // the tensors claimed with no data have no buffer
+        if (ctx_key.source == llama_model_loader::ctx_source::NO_DATA) {
+            pimpl->ctxs_no_data.emplace_back(std::move(ctx_ptr));
             continue;
         }
 
@@ -2139,8 +2139,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
     }
 
-    load_tensors_moe_slots(ml);
-
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, n_layer_all);
 
@@ -2193,41 +2191,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     load_tensors_hadamard();
 
     return true;
-}
-
-// the layers that read their expert weights from slots, with their stock expert weights
-// the caller lays out and allocates the slots
-void llama_model_base::load_tensors_moe_slots(llama_model_loader & ml) {
-    for (auto & [il, plan] : ml.moe_slot_plans) {
-        if (!plan.slots) {
-            continue;
-        }
-
-        const size_t buft_alignment = ggml_backend_buft_get_alignment(plan.buft);
-        if (plan.stride % buft_alignment != 0) {
-            throw std::runtime_error(format("layer %d: the MoE slot stride %zu is not a multiple of the alignment %zu of %s",
-                il, plan.stride, buft_alignment, ggml_backend_buft_name(plan.buft)));
-        }
-
-        llama_moe_slot_layer & layer = moe_slots.add(il);
-        layer.n_expert = plan.n_expert;
-        layer.stride   = plan.stride;
-        layer.buft     = plan.buft;
-
-        for (const auto & m : plan.members) {
-            if (m.stock == nullptr) {
-                throw std::runtime_error(format("layer %d reads its expert weights from MoE slots, but the model does not use tensor '%s'", il, m.name.c_str()));
-            }
-            llama_moe_slot_layer::member lm;
-            lm.name  = m.name;
-            lm.stock = m.stock;
-            layer.members.push_back(std::move(lm));
-        }
-
-        LLAMA_LOG_INFO("%s: layer %3d: experts read from slots strided by %zu bytes in %s\n", __func__, il, layer.stride, ggml_backend_buft_name(layer.buft));
-    }
-
-    moe_slots.index();
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
@@ -2615,6 +2578,10 @@ llama_split_mode llama_model::split_mode() const {
 
 bool llama_model::no_alloc() const {
     return params.no_alloc;
+}
+
+bool llama_model::has_no_data_tensors() const {
+    return !pimpl->ctxs_no_data.empty();
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
@@ -3622,8 +3589,6 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
-        /*.moe_slots                   =*/ nullptr,
-        /*.moe_slots_user_data         =*/ nullptr,
         /*.declared_tensors            =*/ nullptr,
         /*.n_declared_tensors          =*/ 0,
         /*.claimed_tensors             =*/ nullptr,

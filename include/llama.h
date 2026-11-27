@@ -260,16 +260,23 @@ extern "C" {
     // into `tensor`; `data` is valid only for the duration of the call
     typedef void (*llama_kv_rot_set_callback)(struct ggml_tensor * tensor, const void * data, size_t size, void * user_data);
 
-    // called during loading once for each MoE layer il, with the number of experts of its expert weights
-    // returns 0 if the layer loads its expert weights, otherwise the stride in bytes between consecutive slots of the
-    // layer, a multiple of the alignment of the buffer type of its expert weights; see llama_model_params.moe_slots
-    typedef size_t (*llama_moe_slot_layer_callback)(int32_t il, int32_t n_expert, void * user_data);
-
     // a tensor that the model files do not hold, see llama_model_params.declared_tensors
     struct llama_tensor_decl {
         const char *   name;
         enum ggml_type type;
         int64_t        ne[4];
+    };
+
+    // how the model treats a tensor that the caller claims, see llama_model_params.claimed_tensors
+    enum llama_tensor_claim_flags {
+        LLAMA_TENSOR_CLAIM_NOT_CREATED = 0,      // the model never creates the tensor
+        LLAMA_TENSOR_CLAIM_NO_DATA     = 1 << 0, // the model creates the tensor as metadata only: no buffer, no data
+    };
+
+    // a tensor whose data the caller provides, see llama_model_params.claimed_tensors
+    struct llama_tensor_claim {
+        const char * name;
+        uint32_t     flags; // enum llama_tensor_claim_flags
     };
 
     // Input data for llama_encode/llama_decode
@@ -374,24 +381,22 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
-        // if set, the MoE layers for which it returns a stride read their expert weights from slots that the caller
-        // lays out, allocates and fills, instead of loading them; NULL = every layer loads its expert weights
-        // see "MoE expert slots"
-        llama_moe_slot_layer_callback moe_slots;
-        void * moe_slots_user_data;
-
         // tensors that the model files do not hold: the loader adds each one to the tensors of the model as a tensor
         // with no data, and the model creates it as it creates a weight of that name. A declared tensor is valid only
-        // where llama creates a weight as metadata only, i.e. as an expert weight of a layer that reads its expert
-        // weights from slots (see "MoE expert slots"), or where the model skips the weight (e.g. the layers of a
-        // model part that is not loaded); anywhere else the load fails. A name that the files also hold fails the load
+        // where it is claimed with LLAMA_TENSOR_CLAIM_NO_DATA, or where the model skips the weight (e.g. the layers
+        // of a model part that is not loaded); anywhere else the load fails. A name that the files also hold fails
+        // the load
         const struct llama_tensor_decl * declared_tensors;
         size_t n_declared_tensors;
 
-        // tensors of the model files that the caller loads itself: the model never creates them, they count among the
-        // tensors that the model uses, and llama neither reads nor maps their data. A name that the files do not hold
-        // fails the load
-        const char * const * claimed_tensors;
+        // tensors whose data the caller provides: they count among the tensors that the model uses, and llama neither
+        // reads, prefetches, locks nor keeps mapped their data. The model never creates a NOT_CREATED tensor. It
+        // creates a NO_DATA tensor as metadata at its natural shape and strides, with no buffer and no data, found
+        // with llama_model_get_tensor; a graph that reads it must be rewritten (llama_context_params.cb_sched_new)
+        // before it computes. The load fails for a name that neither the files hold nor declared_tensors declares, a
+        // declared name claimed without NO_DATA, a name claimed twice with different flags, an unknown flag, or a
+        // NO_DATA tensor that the model creates as a duplicate of another tensor
+        const struct llama_tensor_claim * claimed_tensors;
         size_t n_claimed_tensors;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
@@ -748,26 +753,6 @@ extern "C" {
 
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
-
-    //
-    // MoE expert slots
-    //
-    // A MoE layer that reads its experts from slots (see llama_model_params.moe_slots) does not load its expert
-    // weights: its stock expert weights hold no data and no buffer, and the caller allocates and fills the slots. The
-    // caller fixes the layout of the slots: the slot map, which weights a slot holds, their order and padding. It
-    // reads the shape and type of the stock expert weights from their metadata (llama_model_get_tensor).
-    //
-    // The graphs llama builds read the stock expert weights: a caller rewrites each graph
-    // (installed from llama_context_params.cb_sched_new) to remap the router's expert ids through its slot map and read each
-    // expert weight from its slots, with per-expert scales and biases still indexed by the expert ids. A graph that
-    // still reads a stock expert weight after the rewrite must not be computed. A caller whose rewrite reads different
-    // slots for graphs of the same shape tells them apart with llama_set_graph_variant.
-    //
-    // A tensor that reads a member from slots strides its experts by the stride the caller returned for the layer,
-    // which need not be a whole number of blocks: the model places a slot layer's stock expert weights on a buffer
-    // type whose device supports such a tensor, with one slot per expert. The stride is at least the bytes of one
-    // expert of each of the layer's expert weights, and a multiple of the alignment of that buffer type.
-    //
 
     //
     // Sparse attention K/V rows stored by the caller [EXPERIMENTAL]

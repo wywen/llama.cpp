@@ -249,10 +249,10 @@ if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
         ARGS -a "^(qwen3moe|qwen35moe|gemma3n|gemma4|qwen4exp|deepseek2)$" -o "${MOE_MODEL_DIR}")
     set_tests_properties(test-generate-moe-models PROPERTIES FIXTURES_SETUP moe-models)
 
-    llama_build(test-moe-slots.cpp)
-    llama_test(test-moe-slots LABEL "main behavior backend"
+    llama_build(test-tensor-claims.cpp)
+    llama_test(test-tensor-claims LABEL "main behavior backend"
         ARGS --models "${MOE_MODEL_DIR}")
-    set_tests_properties(test-moe-slots PROPERTIES FIXTURES_REQUIRED moe-models)
+    set_tests_properties(test-tensor-claims PROPERTIES FIXTURES_REQUIRED moe-models)
 
     llama_build(test-kv-rows-caller.cpp)
     llama_test(test-kv-rows-caller LABEL "main behavior backend"

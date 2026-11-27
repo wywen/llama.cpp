@@ -812,8 +812,8 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
-            if (!model.moe_slots.empty()) {
-                throw std::runtime_error("the MoE cache cannot be used with a model that reads expert weights from MoE slots");
+            if (model.has_no_data_tensors()) {
+                throw std::runtime_error("the MoE cache cannot be used with a model with tensors claimed with no data");
             }
             moe_cache = std::make_unique<llama_moe_cache>(model, no_alloc, backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
         }
@@ -3482,8 +3482,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         return true;
     }
 
-    // the experts can lie further apart than their size, as in MoE slots, which interleave the members of an expert
-    // (see "MoE expert slots"); a run of experts [a, b) spans from the start of a to the end of b - 1, which for the
+    // the experts can lie further apart than their size, as in slots that interleave the members of an expert;
+    // a run of experts [a, b) spans from the start of a to the end of b - 1, which for the
     // last expert is the end of the tensor
     const int64_t n_expert      = src->ne[2];
     const size_t  expert_stride = src->nb[2];
@@ -3501,7 +3501,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
             for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
                 const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
-                // -1 reads no expert, as for the ids local to a MoE slot range
+                // -1 reads no expert, as for the ids local to a range of slots
                 if (id == -1) {
                     continue;
                 }

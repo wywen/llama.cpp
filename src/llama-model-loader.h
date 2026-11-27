@@ -150,10 +150,10 @@ struct llama_model_loader {
     enum class ctx_source {
         FILE,      // the tensor's own range of the file, mapped or read
         LAZY,      // the tensor's own range of the file, read on demand
-        SLOT_META, // none: an expert weight read from slots, metadata only (see moe_slot_plan)
+        NO_DATA,   // none: a tensor claimed with LLAMA_TENSOR_CLAIM_NO_DATA, metadata only
     };
 
-    // lazy and slot tensors need dedicated contexts: none can be wrapped in place in a mapping
+    // lazy and no-data tensors need dedicated contexts: none can be wrapped in place in a mapping
     struct ctx_key {
         ggml_backend_buffer_type_t buft;
         ctx_source source;
@@ -170,30 +170,6 @@ struct llama_model_loader {
 
     std::map<ctx_key, ggml_context_ptr, ctx_key_comparator> ctx_map;
 
-    // a MoE layer whose expert weights are read from slots, see llama_model_params::moe_slots
-    // the members are the layer's expert weights in the file; each is created as metadata only
-    struct moe_slot_plan {
-        struct member {
-            std::string   name;
-            ggml_tensor * stock = nullptr; // set when the model creates it
-        };
-
-        int32_t n_expert = 0;
-        bool    slots    = false; // false: the layer loads its expert weights
-        size_t  stride   = 0;     // between consecutive slots, as returned by the callback
-
-        std::vector<member> members;
-
-        ggml_backend_buffer_type_t buft = nullptr; // of the members, as selected for their slot tensors
-    };
-
-    llama_moe_slot_layer_callback moe_slots    = nullptr;
-    void *                        moe_slots_ud = nullptr;
-    std::map<int32_t, moe_slot_plan> moe_slot_plans; // by layer, for each MoE layer seen
-
-    // the plan of layer il, made with the callback when the first expert weight 'cur' of the layer is created
-    moe_slot_plan & get_moe_slot_plan(llm_arch arch, int32_t il, const ggml_tensor * cur);
-
     // tensors the files do not hold, see llama_model_params::declared_tensors; metadata only, not in weights_map
     ggml_context_ptr                  declared_ctx;
     std::map<std::string, ggml_tensor *> declared;
@@ -201,11 +177,19 @@ struct llama_model_loader {
     // tensors of the files that the caller loads itself, see llama_model_params::claimed_tensors; in weights_map
     std::set<std::string> claimed;
 
+    // the claimed tensors that the model creates as metadata only (LLAMA_TENSOR_CLAIM_NO_DATA): files or declared
+    std::set<std::string> no_data;
+
     void declare_tensors(const llama_tensor_decl * decls, size_t n);
-    void claim_tensors(const char * const * names, size_t n);
+    void claim_tensors(const llama_tensor_claim * claims, size_t n);
 
     bool is_declared(const std::string & name) const {
         return declared.count(name) > 0;
+    }
+
+    // whether size_data sums the bytes of the weight: neither declared (not in the files) nor claimed (not read)
+    bool is_summed(const std::string & name) const {
+        return !is_declared(name) && claimed.count(name) == 0;
     }
 
     // by file, the ranges of the claimed tensors: llama never reads them, so they are not prefetched, not locked, and unmapped once loading is done
