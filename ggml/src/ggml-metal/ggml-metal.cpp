@@ -296,7 +296,6 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_mul_mat_id_extra_ids(tensor);
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
-        case GGML_OP_FLASH_ATTN_EXT_PARTIAL:
             {
                 res += ggml_metal_op_flash_attn_ext_extra(tensor);
             } break;
@@ -1320,18 +1319,17 @@ bool ggml_backend_metal_buffer_set_range_grow(
 // flash attention partial, for the Metal implementation of a GGML_OP_CUSTOM node
 //
 
-// the partial node dst stands for: dst's sources, data and buffer, with the op parameters of `params`
+// a flash attention node of dst's sources, data and buffer, with the op parameters of `params`
 static ggml_tensor ggml_metal_flash_attn_ext_partial_node(const ggml_tensor * dst, const ggml_metal_fa_partial_params * params) {
     ggml_tensor node = *dst;
 
-    node.op = GGML_OP_FLASH_ATTN_EXT_PARTIAL;
+    node.op = GGML_OP_FLASH_ATTN_EXT;
     memset(node.op_params, 0, sizeof(node.op_params));
 
     if (params) {
         ggml_set_op_params_f32(&node, 0, params->scale);
         ggml_set_op_params_f32(&node, 1, params->max_bias);
         ggml_set_op_params_f32(&node, 2, params->logit_softcap);
-        ggml_set_op_params_i32(&node, 5, dst->src[6] ? params->active_index : 0);
     }
 
     return node;
@@ -1343,14 +1341,9 @@ bool ggml_metal_flash_attn_ext_partial_supported(ggml_backend_dev_t dev, const s
         return false;
     }
 
-    // the layout a partial node has: no sinks and no K/V row lists
-    if (dst->src[4] != nullptr || dst->src[5] != nullptr) {
-        return false;
-    }
-
     const ggml_tensor node = ggml_metal_flash_attn_ext_partial_node(dst, nullptr);
 
-    return ggml_metal_device_supports_op((ggml_metal_device_t) dev->context, &node);
+    return ggml_metal_op_flash_attn_ext_partial_supported((ggml_metal_device_t) dev->context, &node);
 }
 
 size_t ggml_metal_flash_attn_ext_partial_extra_bytes(const struct ggml_tensor * dst) {
@@ -1367,13 +1360,14 @@ bool ggml_metal_flash_attn_ext_partial_encode(
         return false;
     }
 
-    if (dst->src[4] != nullptr || dst->src[5] != nullptr || params == nullptr) {
+    if (params == nullptr) {
         return false;
     }
 
     const ggml_tensor node = ggml_metal_flash_attn_ext_partial_node(dst, params);
 
-    return ggml_metal_op_flash_attn_ext_partial_encode((ggml_metal_device_t) dev->context, native_ctx, &node);
+    return ggml_metal_op_flash_attn_ext_partial_encode((ggml_metal_device_t) dev->context, native_ctx, &node,
+            dst->src[6] ? params->active_index : 0);
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_metal_reg)

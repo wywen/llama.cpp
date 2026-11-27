@@ -438,9 +438,9 @@ else()
 endif()
 
 llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK ggml)
-llama_build_and_test(test-flash-attn-partial-active.cpp LABEL "main behavior backend"  LINK ggml)
 if (NOT GGML_BACKEND_DL)
-    # calls the CPU and Metal backends' flash attention partial entry points from GGML_OP_CUSTOM nodes
+    # calls the CPU and Metal backends' flash attention partial entry points from GGML_OP_CUSTOM nodes, against the
+    # stock flash attention op
     llama_build_and_test(test-flash-attn-partial-custom.cpp LABEL "main behavior backend"  LINK ggml)
 endif()
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model behavior")

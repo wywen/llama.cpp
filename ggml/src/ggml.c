@@ -1097,7 +1097,6 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
-    "FLASH_ATTN_EXT_PARTIAL",
 
     "UNARY",
 
@@ -1115,7 +1114,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1211,7 +1210,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
-    "flash_attn_ext_partial(x)",
 
     "unary(x)",
 
@@ -1229,7 +1227,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3282,7 +3280,6 @@ bool ggml_prec_set_acc(
             }
             break;
         case GGML_OP_FLASH_ATTN_EXT:
-        case GGML_OP_FLASH_ATTN_EXT_PARTIAL:
             {
                 const int32_t prec_i32 = (int32_t) prec;
                 ggml_set_op_params_i32(a, 3, prec_i32);
@@ -3327,7 +3324,6 @@ enum ggml_prec ggml_prec_get_acc(
         case GGML_OP_MUL_MAT_ID:
             return (enum ggml_prec) ggml_get_op_params_i32(a, 0);
         case GGML_OP_FLASH_ATTN_EXT:
-        case GGML_OP_FLASH_ATTN_EXT_PARTIAL:
             return (enum ggml_prec) ggml_get_op_params_i32(a, 3);
         default:
             return GGML_PREC_UNDEFINED;
@@ -5418,10 +5414,8 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
         struct ggml_tensor  * kv_rows,
         float                 scale,
         float                 max_bias,
-        float                 logit_softcap,
-        bool                  partial) {
+        float                 logit_softcap) {
     GGML_ASSERT(ggml_can_mul_mat(k, q));
-    GGML_ASSERT(!partial || !kv_rows);
     // TODO: check if vT can be multiplied by (k*qT)
 
     if (kv_rows) {
@@ -5438,8 +5432,7 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
 
     if (mask) {
         GGML_ASSERT(mask->type == GGML_TYPE_F16);
-        // a partial attends over a KV range, its mask may be a column view of the full mask
-        GGML_ASSERT(partial ? mask->nb[0] == ggml_type_size(GGML_TYPE_F16) : ggml_is_contiguous(mask));
+        GGML_ASSERT(ggml_is_contiguous(mask));
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
 
         GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
@@ -5451,14 +5444,13 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
     }
 
     // permute(0, 2, 1, 3)
-    // a partial row holds the unnormalized output followed by the softmax sum S and max M
-    int64_t ne[4] = { v->ne[0] + (partial ? 2 : 0), q->ne[2], q->ne[1], q->ne[3] };
+    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     float params[] = { scale, max_bias, logit_softcap };
     ggml_set_op_params(result, params, sizeof(params));
 
-    result->op     = partial ? GGML_OP_FLASH_ATTN_EXT_PARTIAL : GGML_OP_FLASH_ATTN_EXT;
+    result->op     = GGML_OP_FLASH_ATTN_EXT;
     result->src[0] = q;
     result->src[1] = k;
     result->src[2] = v;
@@ -5477,7 +5469,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
         float                 scale,
         float                 max_bias,
         float                 logit_softcap) {
-    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, NULL, scale, max_bias, logit_softcap, false);
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, NULL, scale, max_bias, logit_softcap);
 }
 
 struct ggml_tensor * ggml_flash_attn_ext_rows(
@@ -5490,20 +5482,9 @@ struct ggml_tensor * ggml_flash_attn_ext_rows(
         float                 scale,
         float                 max_bias,
         float                 logit_softcap) {
-    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, kv_rows, scale, max_bias, logit_softcap, false);
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, kv_rows, scale, max_bias, logit_softcap);
 }
 
-struct ggml_tensor * ggml_flash_attn_ext_partial(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * q,
-        struct ggml_tensor  * k,
-        struct ggml_tensor  * v,
-        struct ggml_tensor  * mask,
-        float                 scale,
-        float                 max_bias,
-        float                 logit_softcap) {
-    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, NULL, scale, max_bias, logit_softcap, true);
-}
 
 enum ggml_prec ggml_flash_attn_ext_get_prec(
         const struct ggml_tensor * a) {
@@ -5521,21 +5502,6 @@ void ggml_flash_attn_ext_set_n_kv_max(
     GGML_ASSERT(n_kv_max >= 0);
 
     ggml_set_op_params_i32(a, 4, n_kv_max);
-}
-
-void ggml_flash_attn_ext_partial_set_active(
-        struct ggml_tensor * a,
-        struct ggml_tensor * n_active,
-        int32_t              index) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL);
-
-    if (n_active) {
-        GGML_ASSERT(n_active->type == GGML_TYPE_I32);
-        GGML_ASSERT(ggml_nelements(n_active) >= 1);
-    }
-
-    a->src[6] = n_active;
-    ggml_set_op_params_i32(a, 5, n_active ? index : 0);
 }
 
 void ggml_flash_attn_ext_add_sinks(

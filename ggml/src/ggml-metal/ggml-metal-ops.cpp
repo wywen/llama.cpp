@@ -511,7 +511,6 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                 n_fuse = ggml_metal_op_tri(ctx, idx);
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
-        case GGML_OP_FLASH_ATTN_EXT_PARTIAL:
             {
                 n_fuse = ggml_metal_op_flash_attn_ext(ctx, idx);
             } break;
@@ -3271,7 +3270,7 @@ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
 }
 
 bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     const int64_t ne00 = op->src[0]->ne[0]; // head size
     const int64_t ne01 = op->src[0]->ne[1]; // batch size
@@ -3283,7 +3282,7 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
 // ref: https://github.com/ggml-org/llama.cpp/pull/27390
 // dequantize the quantized KV cache to F16 before running the F16 flash attention kernels
 static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     // depending on compute/bandwidth ratio, dequant to f16 kv is not always beneficial
     // ref: https://github.com/ggml-org/llama.cpp/pull/27390#issuecomment-5355152767
@@ -3306,15 +3305,15 @@ static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
     }
 }
 
-static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool has_tensor) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL);
+static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool has_tensor, bool partial) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     if (!has_tensor || ggml_metal_op_flash_attn_ext_use_vec(op)) {
         return false;
     }
 
     // the tensor API kernel stores the normalized output only
-    if (op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL) {
+    if (partial) {
         return false;
     }
 
@@ -3359,15 +3358,10 @@ static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool
 // the mask (src[3]) remains the single source of truth: finite entries are the valid KV positions,
 // n_kv_max is only an upper bound on their number per mask row, used to size the index lists
 static int ggml_metal_op_flash_attn_ext_n_kv_max_sparse(const ggml_tensor * op) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     // K/V row lists are handled by the dense kernels, not by the sparse path
     if (op->src[5] != nullptr) {
-        return 0;
-    }
-
-    // the sparse hint is not set on partials
-    if (op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL) {
         return 0;
     }
 
@@ -3430,7 +3424,7 @@ static int ggml_metal_op_flash_attn_ext_n_kv_max_sparse(const ggml_tensor * op) 
 // the dequantized V is then a view of the dequantized K and does not need its own dequant or scratch
 // - ref: https://github.com/ggml-org/llama.cpp/pull/13435
 static bool ggml_metal_op_flash_attn_ext_v_is_view_of_k(const ggml_tensor * op) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     const ggml_tensor * K = op->src[1];
     const ggml_tensor * V = op->src[2];
@@ -3440,7 +3434,7 @@ static bool ggml_metal_op_flash_attn_ext_v_is_view_of_k(const ggml_tensor * op) 
 
 // size of the F16 dequantized K tensor; the dequantized V tensor follows it in the same scratch buffer
 static size_t ggml_metal_op_flash_attn_ext_kv_f16_k_size(const ggml_tensor * op) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
 
@@ -3448,7 +3442,7 @@ static size_t ggml_metal_op_flash_attn_ext_kv_f16_k_size(const ggml_tensor * op)
 }
 
 size_t ggml_metal_op_flash_attn_ext_extra_pad(const ggml_tensor * op) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
@@ -3506,7 +3500,7 @@ size_t ggml_metal_op_flash_attn_ext_extra_pad(const ggml_tensor * op) {
 }
 
 size_t ggml_metal_op_flash_attn_ext_extra_blk(const ggml_tensor * op) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
   //GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
@@ -3545,7 +3539,7 @@ size_t ggml_metal_op_flash_attn_ext_extra_blk(const ggml_tensor * op) {
 }
 
 size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
@@ -3574,7 +3568,7 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
 }
 
 size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     // note: always reserve the temp buffer to avoid graph reallocations
     //if (!ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
@@ -3599,7 +3593,7 @@ size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
 // size of the sparse index lists: one list of KV indices per mask row,
 // padded with -1 up to a multiple of OP_FLASH_ATTN_EXT_VEC_NCPSG
 size_t ggml_metal_op_flash_attn_ext_extra_idx(const ggml_tensor * op) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     GGML_TENSOR_LOCALS( int32_t, ne3, op->src[3], ne);
 
@@ -3617,7 +3611,7 @@ size_t ggml_metal_op_flash_attn_ext_extra_idx(const ggml_tensor * op) {
 // size of the contiguous F16 buffers holding the K/V rows referenced by the kv_rows lists
 // the attention over these buffers is a standard dense op (no per-tile gather in the main kernel)
 size_t ggml_metal_op_flash_attn_ext_extra_rows(const ggml_tensor * op) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT || op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL);
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     const ggml_tensor * kv_rows = op->src[5];
 
@@ -3650,15 +3644,18 @@ static void ggml_metal_op_kernel_barrier(ggml_metal_op_t ctx, ggml_metal_encoder
     }
 }
 
-// encode the kernels of `op`, a FLASH_ATTN_EXT or FLASH_ATTN_EXT_PARTIAL node, into enc: the stock op through its op
-// context ctx, and a partial for a GGML_OP_CUSTOM node (ggml_metal_flash_attn_ext_partial_encode) with ctx NULL, so
-// both encode the same kernels
+// encode the kernels of `op`, a FLASH_ATTN_EXT node, into enc: the op of a graph through its op context ctx, and the
+// partial of a GGML_OP_CUSTOM node (ggml_metal_flash_attn_ext_partial_encode) with ctx NULL, so both encode the same
+// kernels. partial: store the partial of each row (the unnormalized output, S and M) instead of the normalized output,
+// computed only when op->src[6], if set, holds a count greater than active_index
 static void ggml_metal_flash_attn_ext_encode(
         ggml_metal_op_t ctx,
         ggml_metal_library_t lib,
         ggml_metal_encoder_t enc,
         const ggml_metal_device_props * props_dev,
-        const ggml_tensor * op) {
+        const ggml_tensor * op,
+        bool partial,
+        int32_t active_index) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -3715,8 +3712,6 @@ static void ggml_metal_flash_attn_ext_encode(
     const bool has_sinks = op->src[4] != NULL;
 
     // a partial keeps the softmax state of its KV range, its caller applies the sinks
-    const bool partial = op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL;
-
     GGML_ASSERT(!partial || (!has_sinks && !has_rows));
     GGML_ASSERT(!has_rows || has_mask);
     const bool has_bias  = max_bias != 0.0f;
@@ -3738,15 +3733,16 @@ static void ggml_metal_flash_attn_ext_encode(
 
     ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
 
-    // a partial with an active count (ggml_flash_attn_ext_partial_set_active): every kernel below reads the
-    // count and returns at once when it is not greater than the partial's index, so an inactive partial
-    // costs its launches only
+    // a partial with an active count: every kernel below reads the count and returns at once when it is not greater
+    // than the partial's index, so an inactive partial costs its launches only
     const bool has_active = partial && op->src[6] != nullptr;
     GGML_ASSERT(!has_active || op->src[6]->type == GGML_TYPE_I32);
 
     ggml_metal_buffer_id bid_active = has_active ? ggml_metal_get_buffer_id(op->src[6]) : bid_src0;
 
-    int32_t active_index = has_active ? ggml_get_op_params_i32(op, 5) : 0;
+    if (!has_active) {
+        active_index = 0;
+    }
 
     ggml_metal_buffer_id bid_pad = bid_dst;
     bid_pad.offs += ggml_nbytes(op);
@@ -3763,6 +3759,9 @@ static void ggml_metal_flash_attn_ext_encode(
     // sparse path: gather the finite mask entries into index lists and run the vec kernels over them
     const int n_kv_max_sparse = ggml_metal_op_flash_attn_ext_n_kv_max_sparse(op);
     const bool use_sparse = n_kv_max_sparse > 0;
+
+    // the sparse hint is not set on a partial
+    GGML_ASSERT(!partial || !use_sparse);
     const int n_kv_max_padded = use_sparse ? GGML_PAD(n_kv_max_sparse, OP_FLASH_ATTN_EXT_VEC_NCPSG) : 0;
 
     const bool use_vec = ggml_metal_op_flash_attn_ext_use_vec(op);
@@ -3808,7 +3807,7 @@ static void ggml_metal_flash_attn_ext_encode(
         ggml_metal_buffer_id bid_v_f16 = bid_kv_f16;
         bid_v_f16.offs += ggml_metal_op_flash_attn_ext_kv_f16_k_size(op);
 
-        auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_kv_f16(lib, op);
+        auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_kv_f16(lib, op, has_active);
         const int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline0), 256);
 
         // K
@@ -3952,7 +3951,7 @@ static void ggml_metal_flash_attn_ext_encode(
         }
     }
 
-    if (!use_sparse && ggml_metal_op_flash_attn_ext_use_tensor(op, props_dev->has_tensor)) {
+    if (!use_sparse && ggml_metal_op_flash_attn_ext_use_tensor(op, props_dev->has_tensor, partial)) {
         // tensor API kernel
         const int nqptg = ne00 >= 512 ? OP_FLASH_ATTN_EXT_TENSOR_NQPSG_LARGE : OP_FLASH_ATTN_EXT_TENSOR_NQPSG; // queries per threadgroup
         const int ncpsg = OP_FLASH_ATTN_EXT_TENSOR_NCPSG; // cache values per threadgroup
@@ -3972,7 +3971,7 @@ static void ggml_metal_flash_attn_ext_encode(
                 /*.nb33 =*/ nb33,
             };
 
-            auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_blk(lib, op, nqptg, ncpsg);
+            auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_blk(lib, op, nqptg, ncpsg, has_active);
 
             ggml_metal_encoder_set_pipeline(enc, pipeline0);
             ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
@@ -4082,7 +4081,7 @@ static void ggml_metal_flash_attn_ext_encode(
                 /*.nb33    =*/nb33,
             };
 
-            auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_pad(lib, op, has_mask, ncpsg);
+            auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_pad(lib, op, has_mask, ncpsg, has_active);
 
             ggml_metal_encoder_set_pipeline(enc, pipeline0);
             ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
@@ -4115,7 +4114,7 @@ static void ggml_metal_flash_attn_ext_encode(
                 /*.nb33 =*/ nb33,
             };
 
-            auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_blk(lib, op, nqptg, ncpsg);
+            auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_blk(lib, op, nqptg, ncpsg, has_active);
 
             ggml_metal_encoder_set_pipeline(enc, pipeline0);
             ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
@@ -4191,7 +4190,7 @@ static void ggml_metal_flash_attn_ext_encode(
             /*.logit_softcap =*/ logit_softcap,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, use_kv_f16, ns10, ns20);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, use_kv_f16, ns10, ns20, partial, has_active);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -4288,7 +4287,7 @@ static void ggml_metal_flash_attn_ext_encode(
                 /*.nb33    =*/nb33,
             };
 
-            auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_pad(lib, op, has_mask, ncpsg);
+            auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_pad(lib, op, has_mask, ncpsg, has_active);
 
             ggml_metal_encoder_set_pipeline(enc, pipeline0);
             ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
@@ -4408,7 +4407,7 @@ static void ggml_metal_flash_attn_ext_encode(
             /*.n_kv_max_padded =*/ n_kv_max_padded,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, has_rows, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, use_sparse, has_rows, nqptg, cfg.NE, nsg, nwg, use_kv_f16, ns10, ns20, has_active);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
@@ -4460,7 +4459,7 @@ static void ggml_metal_flash_attn_ext_encode(
                     nrows,
                 };
 
-                auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg);
+                auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg, partial, has_active);
 
                 ggml_metal_encoder_set_pipeline(enc, pipeline0);
                 ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
@@ -4476,7 +4475,8 @@ static void ggml_metal_flash_attn_ext_encode(
 }
 
 int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
-    ggml_metal_flash_attn_ext_encode(ctx, ctx->lib, ctx->enc, ggml_metal_device_get_props(ctx->dev), ctx->node(idx));
+    ggml_metal_flash_attn_ext_encode(ctx, ctx->lib, ctx->enc, ggml_metal_device_get_props(ctx->dev), ctx->node(idx),
+            /*partial =*/ false, /*active_index =*/ 0);
 
     return 1;
 }
@@ -4490,10 +4490,25 @@ size_t ggml_metal_op_flash_attn_ext_extra(const ggml_tensor * op) {
            ggml_metal_op_flash_attn_ext_extra_rows(op);
 }
 
-bool ggml_metal_op_flash_attn_ext_partial_encode(ggml_metal_device_t dev, void * enc_obj, const ggml_tensor * op) {
-    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_EXT_PARTIAL);
+bool ggml_metal_op_flash_attn_ext_partial_supported(ggml_metal_device_t dev, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_EXT);
 
-    if (enc_obj == nullptr || !ggml_metal_device_supports_op(dev, op)) {
+    // no sinks and no K/V row lists
+    if (op->src[4] != nullptr || op->src[5] != nullptr) {
+        return false;
+    }
+
+    // a partial attends over a column view of the mask: the kernels read mask columns in pairs
+    if (op->src[3] && op->src[3]->view_offs % 4 != 0) {
+        return false;
+    }
+
+    return ggml_metal_device_supports_op(dev, op);
+}
+
+bool ggml_metal_op_flash_attn_ext_partial_encode(
+        ggml_metal_device_t dev, void * enc_obj, const ggml_tensor * op, int32_t active_index) {
+    if (enc_obj == nullptr || !ggml_metal_op_flash_attn_ext_partial_supported(dev, op)) {
         return false;
     }
 
@@ -4503,7 +4518,8 @@ bool ggml_metal_op_flash_attn_ext_partial_encode(ggml_metal_device_t dev, void *
     const bool ok = ggml_metal_encoder_get_device(enc) == ggml_metal_device_get_obj(dev);
 
     if (ok) {
-        ggml_metal_flash_attn_ext_encode(nullptr, ggml_metal_device_get_library(dev), enc, ggml_metal_device_get_props(dev), op);
+        ggml_metal_flash_attn_ext_encode(nullptr, ggml_metal_device_get_library(dev), enc, ggml_metal_device_get_props(dev), op,
+                /*partial =*/ true, active_index);
     }
 
     ggml_metal_encoder_free(enc);

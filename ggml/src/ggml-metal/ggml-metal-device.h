@@ -195,21 +195,28 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_opt_step_
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_memset            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_count_equal       (ggml_metal_library_t lib, const struct ggml_tensor * op);
 
+// the flash attention pipelines; for the partial of a custom node (ggml_metal_flash_attn_ext_partial_encode):
+// - partial:    store the unnormalized output of each row with its softmax sum and max instead of the normalized
+//               output
+// - has_active: the kernels read an active count and return at once when it is not greater than the partial's index
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_pad(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
         bool    has_mask,
-        int32_t ncpsg);
+        int32_t ncpsg,
+        bool    has_active);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_kv_f16(
         ggml_metal_library_t lib,
-        const struct ggml_tensor * op);
+        const struct ggml_tensor * op,
+        bool    has_active);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_blk(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
         int32_t nqptg,
-        int32_t ncpsg);
+        int32_t ncpsg,
+        bool    has_active);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_tensor(
         ggml_metal_library_t lib,
@@ -230,7 +237,9 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         int32_t nsg,
         bool    use_kv_f16,
         int32_t ns10,
-        int32_t ns20);
+        int32_t ns20,
+        bool    partial,
+        bool    has_active);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_rows(
         ggml_metal_library_t lib,
@@ -256,13 +265,16 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         int32_t nwg,
         bool    use_kv_f16,
         int32_t ns10,
-        int32_t ns20);
+        int32_t ns20,
+        bool    has_active);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
         int32_t dv,
-        int32_t nwg);
+        int32_t nwg,
+        bool    partial,
+        bool    has_active);
 
 
 // MTLResidencySet wrapper

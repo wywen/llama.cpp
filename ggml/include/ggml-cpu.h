@@ -150,31 +150,47 @@ extern "C" {
     //
     // flash attention partial, for the function of a GGML_OP_CUSTOM node
     //
-    // A caller that computes a flash attention partial (ggml_flash_attn_ext_partial) as a GGML_OP_CUSTOM node of its
-    // own calls these from the node's function. `dst` is laid out as a GGML_OP_FLASH_ATTN_EXT_PARTIAL node, whatever
-    // its op: src[0..3] = q, k, v and the mask (NULL: none), src[4] = src[5] = NULL, src[6] = the active count (I32,
-    // NULL: none; see ggml_flash_attn_ext_partial_set_active), and the shape and type ggml_flash_attn_ext_partial
-    // gives. No op param of dst is read: the op parameters are passed in ggml_cpu_fa_partial_params.
+    // Chunked flash attention splits a long KV into disjoint KV ranges. The partial of one range takes the inputs of
+    // ggml_flash_attn_ext restricted to the range (views of K, V and of the matching mask columns) and stores the
+    // unnormalized online-softmax state of each (head, query) row instead of the normalized output:
+    //
+    //   dst: [n_embd_v + 2, n_head, n_batch, ne3] F32, permuted like the output of ggml_flash_attn_ext
+    //     dst[0 .. n_embd_v-1] = O = sum_i exp(s_i - M)*v_i
+    //     dst[n_embd_v + 0]    = S = sum_i exp(s_i - M)
+    //     dst[n_embd_v + 1]    = M = max_i s_i
+    //
+    // where s_i = scale*q*k_i (with logit_softcap applied), plus slope*mask_i. A row without a finite score (all of
+    // its mask entries are -inf) has O = 0, S = 0 and M = -inf. The caller combines the partials of disjoint ranges
+    // (M = max(Ma, Mb), O = Oa*exp(Ma - M) + Ob*exp(Mb - M), S = Sa*exp(Ma - M) + Sb*exp(Mb - M)) and normalizes the
+    // result (O/S); a row with S = 0 adds nothing. The caller applies sinks when it normalizes.
+    //
+    // A caller computes the partial as a GGML_OP_CUSTOM node of its own and calls these from the node's function.
+    // `dst` has the shape and type above, whatever its op: src[0..3] = q, k, v and the mask (F16, NULL: none),
+    // src[4] = src[5] = NULL, src[6] = the active count (I32, NULL: none). The mask view may select columns of a
+    // larger mask: its rows must be contiguous (nb[0] == sizeof(f16)) but its row stride may be that of the full mask.
+    // With an active count, the partial is computed only when the count's first element (read at compute time) is
+    // greater than active_index, e.g. the partial of chunk active_index of a number of chunks known at compute time
+    // only. No op param of dst is read: the op parameters are passed in ggml_cpu_fa_partial_params.
     //
 
     struct ggml_cpu_fa_partial_params {
-        float          scale;         // op param 0 of a partial node
-        float          max_bias;      // op param 1
-        float          logit_softcap; // op param 2
-        enum ggml_prec prec;          // op param 3 (ggml_prec_set_acc)
-        int32_t        active_index;  // op param 5, read only when dst->src[6] is set
+        float          scale;         // as in ggml_flash_attn_ext
+        float          max_bias;
+        float          logit_softcap;
+        enum ggml_prec prec;          // as ggml_prec_set_acc sets on a flash attention node
+        int32_t        active_index;  // read only when dst->src[6] is set
     };
 
     // the bytes of work data ggml_cpu_flash_attn_ext_partial_compute needs with nth threads: the work size the CPU
-    // backend plans for a graph of one partial node of dst's layout, computed by nth threads
+    // backend plans for a graph of one flash attention node of dst's sources, computed by nth threads
     GGML_BACKEND_API size_t ggml_cpu_flash_attn_ext_partial_work_size(const struct ggml_tensor * dst, int nth);
 
     // compute thread ith's share of the partial into dst's data. Each of the nth threads, ith in [0, nth), calls it
     // once with the same dst, params and wdata (one buffer of at least the work size for nth, shared by the threads);
-    // the calls need no barrier between them, and dst is complete when all nth have returned. The bytes are those
-    // the CPU backend computes for a GGML_OP_FLASH_ATTN_EXT_PARTIAL node of the same sources and op parameters with
-    // nth threads. An inactive partial (the count is not greater than active_index) returns at once in every thread
-    // and leaves dst unwritten.
+    // the calls need no barrier between them, and dst is complete when all nth have returned. Each row is computed
+    // whole by one thread, with the kernels of the CPU flash attention op, so the bytes do not depend on nth or on
+    // the order of the calls. An inactive partial (the count is not greater than active_index) returns at once in
+    // every thread and leaves dst unwritten.
     GGML_BACKEND_API void ggml_cpu_flash_attn_ext_partial_compute(
             struct ggml_tensor * dst, const struct ggml_cpu_fa_partial_params * params,
             int ith, int nth, void * wdata, size_t wsize);
