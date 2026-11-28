@@ -122,7 +122,7 @@ struct ctx_opts {
     ggml_type type_k = GGML_TYPE_COUNT; // COUNT = from params
     ggml_type type_v = GGML_TYPE_COUNT; // COUNT = from params
 
-    ggml_backend_buffer_type_t kv_rot_buft = nullptr; // nullptr = from params
+    ggml_backend_buffer_type_t kv_rot_buft = nullptr; // the rotation matrices' buffer type through cb_memory_buft, nullptr = from params
 
     uint8_t fill = 0; // fill the cache buffers with this byte, 0 = disabled
 

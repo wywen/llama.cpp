@@ -91,6 +91,14 @@ ggml_backend_buffer_type_t cpu_alias_buft() {
     return &buft;
 }
 
+// places the rotation matrices of a context's memory on `buft` through cb_memory_buft, which carries it as its user data
+void set_rot_buft(llama_context_params & params, ggml_backend_buffer_type_t buft) {
+    params.cb_memory_buft = [](llama_memory_plan_buffer_kind kind, int32_t, const char *, ggml_backend_buffer_type_t def, void * ud) {
+        return kind == LLAMA_MEMORY_PLAN_BUFFER_KV_ROT ? (ggml_backend_buffer_type_t) ud : def;
+    };
+    params.cb_memory_buft_user_data = buft;
+}
+
 enum class model_load {
     allocated,
     no_alloc,
@@ -335,11 +343,12 @@ void check_case(outcome & out, const std::string & subject, llama_model * model,
         if (model->hparams.n_embd_per_layer == 0 && !shared_kv && width_kv > 0 && width_kv_swa > 0 && width_kv != width_kv_swa) {
             out.iswa_widths_compared++;
         }
-        if (params.kv_rot_buft != nullptr) {
+        if (params.cb_memory_buft != nullptr) {
+            const auto rot_buft = (ggml_backend_buffer_type_t) params.cb_memory_buft_user_data;
             out.rot_buft_compared += std::count_if(plan->buffers.begin(), plan->buffers.end(),
                     [](const llama_memory_plan_buffer & buf) { return buf.kind == LLAMA_MEMORY_PLAN_BUFFER_KV_ROT; });
-            check_rot_buft(log, "planned", plan->buffers, params.kv_rot_buft);
-            check_rot_buft(log, "built", built, params.kv_rot_buft);
+            check_rot_buft(log, "planned", plan->buffers, rot_buft);
+            check_rot_buft(log, "built", built, rot_buft);
         }
         compare_shape(log, *plan, ctx.get());
         compare_buffers(log, plan->buffers, built);
@@ -525,7 +534,7 @@ bool check_rot_buft_contents(const std::string & path) {
     params.type_v = GGML_TYPE_Q8_0;
     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     const llama_context_ptr ctx_default(llama_init_from_model(model.get(), params));
-    params.kv_rot_buft = cpu_alias_buft();
+    set_rot_buft(params, cpu_alias_buft());
     const llama_context_ptr ctx_chosen(llama_init_from_model(model.get(), params));
 
     const auto * cache_default = ctx_default ? dynamic_cast<const llama_kv_cache *>(llama_get_memory(ctx_default.get())) : nullptr;
@@ -734,7 +743,7 @@ int main(int argc, char ** argv) {
                 const std::string subject = file + (load == model_load::no_alloc ? " no_alloc " : " ") + c.name;
                 check_case(out, subject, model.get(), params);
 
-                params.kv_rot_buft = cpu_alias_buft();
+                set_rot_buft(params, cpu_alias_buft());
                 check_case(out, subject + " rot-buft", model.get(), params);
             }
         }

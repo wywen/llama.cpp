@@ -5,7 +5,6 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
-#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -17,53 +16,6 @@ struct llama_context;
 //
 // llama_kv_cache
 //
-
-// how every llama_kv_cache constructed on this thread while in scope places and fills its attention rotation matrices
-// a context opens one around building its memory; scopes nest, the innermost applies
-struct llama_kv_cache_rot_params {
-    // buffer type of the matrices, nullptr keeps the buffer type of each layer's cache tensor
-    ggml_backend_buffer_type_t buft = nullptr;
-    // receives each matrix's contents in place of the host write into it, nullptr writes them
-    llama_kv_rot_set_callback set = nullptr;
-    void * set_user_data = nullptr;
-};
-
-class llama_kv_cache_rot_scope {
-public:
-    explicit llama_kv_cache_rot_scope(const llama_kv_cache_rot_params & params);
-    ~llama_kv_cache_rot_scope();
-
-    llama_kv_cache_rot_scope(const llama_kv_cache_rot_scope &) = delete;
-    llama_kv_cache_rot_scope & operator=(const llama_kv_cache_rot_scope &) = delete;
-
-    // the params of the innermost scope on this thread, the defaults outside any scope
-    static const llama_kv_cache_rot_params & current();
-
-private:
-    llama_kv_cache_rot_params outer;
-};
-
-// which layers of every untagged llama_kv_cache (the attention cache, not the indexer's) constructed on this thread while in
-// scope have K/V rows that the caller stores (see llama_context_params.kv_rows_caller): such a layer keeps its cell
-// metadata and rotation matrices, and its K/V tensors are metadata-only, in no buffer; scopes nest, the innermost applies
-struct llama_kv_cache_rows_params {
-    std::function<bool(uint32_t il)> caller_rows; // empty: every layer has its tensors
-};
-
-class llama_kv_cache_rows_scope {
-public:
-    explicit llama_kv_cache_rows_scope(const llama_kv_cache_rows_params & params);
-    ~llama_kv_cache_rows_scope();
-
-    llama_kv_cache_rows_scope(const llama_kv_cache_rows_scope &) = delete;
-    llama_kv_cache_rows_scope & operator=(const llama_kv_cache_rows_scope &) = delete;
-
-    // the params of the innermost scope on this thread, the defaults outside any scope
-    static const llama_kv_cache_rows_params & current();
-
-private:
-    llama_kv_cache_rows_params outer;
-};
 
 // saved cell metadata of one or more KV caches: one entry per cache, in snapshot order
 struct llama_kv_cache_cells : llama_memory_cells_i {
@@ -242,8 +194,8 @@ public:
     ggml_tensor * get_k_storage(int32_t il) const;
     ggml_tensor * get_v_storage(int32_t il) const; // nullptr for layers without a V cache
 
-    // the layers whose K/V rows the caller stores have no K/V tensors, see llama_kv_cache_rows_scope
-    bool has_caller_rows() const;
+    // some layers' K/V have no data (see "K/V without data" in llama.h), so shifts and whole states are refused
+    bool has_layers_without_data() const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
@@ -362,17 +314,17 @@ private:
         ggml_tensor * k_rot = nullptr;
         ggml_tensor * v_rot = nullptr;
 
-        // the buffer type of the layer's tensors; for a layer whose K/V rows the caller stores, of its rotations only
+        // the buffer type this cache chose for the layer before llama_memory_buft, also for a layer shared from another
         ggml_backend_buffer_type_t buft = nullptr;
 
-        // the caller stores the layer's K/V rows: k and v hold no data, and the layer has no stream views
-        bool caller_rows = false;
+        // false when k and v (and their stream views) hold no data, in a memory that allocates
+        bool has_data = true;
     };
 
     ggml_type cache_type_k;
     ggml_type cache_type_v;
 
-    bool caller_rows = false; // some layers have metadata-only K/V tensors, see llama_kv_cache_rows_scope
+    bool layers_without_data = false; // some layer has has_data == false
 
     bool v_trans = true;  // the value tensor is transposed
 
@@ -412,9 +364,6 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     llama_memory_bufs ctxs_bufs;
-
-    // the metadata-only K/V tensors of the layers whose rows the caller stores, in no buffer
-    ggml_context_ptr ctx_caller_rows;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method

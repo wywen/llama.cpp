@@ -56,3 +56,32 @@ ggml_backend_buffer_ptr llama_memory_alloc_buffer(
         bool                            no_alloc,
         llama_memory_plan_buffer_kind   kind,
         const char                    * name);
+
+// The memory buffer type choices of the context whose memory is built on this thread while in scope (see
+// llama_context_params.cb_memory_buft and cb_kv_rot_set). Scopes nest: the innermost applies.
+struct llama_memory_buft_params {
+    llama_memory_buft_callback buft = nullptr;
+    void * buft_user_data = nullptr;
+    // receives each rotation matrix's contents in place of the host write into it, nullptr writes them
+    llama_kv_rot_set_callback rot_set = nullptr;
+    void * rot_set_user_data = nullptr;
+};
+
+class llama_memory_buft_scope {
+public:
+    explicit llama_memory_buft_scope(const llama_memory_buft_params & params);
+    ~llama_memory_buft_scope();
+
+    llama_memory_buft_scope(const llama_memory_buft_scope &) = delete;
+    llama_memory_buft_scope & operator=(const llama_memory_buft_scope &) = delete;
+
+    // the params of the innermost scope on this thread, the defaults outside any scope
+    static const llama_memory_buft_params & current();
+
+private:
+    llama_memory_buft_params outer;
+};
+
+// the buffer type of the innermost scope's callback for a layer's tensors, `buft` without a callback or on a NULL answer
+ggml_backend_buffer_type_t llama_memory_buft(
+        llama_memory_plan_buffer_kind kind, int32_t il, const char * tag, ggml_backend_buffer_type_t buft);

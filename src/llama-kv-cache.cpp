@@ -60,42 +60,6 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 }
 
 //
-// llama_kv_cache_rot_scope
-//
-
-static thread_local llama_kv_cache_rot_params kv_cache_rot_params;
-
-llama_kv_cache_rot_scope::llama_kv_cache_rot_scope(const llama_kv_cache_rot_params & params) : outer(kv_cache_rot_params) {
-    kv_cache_rot_params = params;
-}
-
-llama_kv_cache_rot_scope::~llama_kv_cache_rot_scope() {
-    kv_cache_rot_params = outer;
-}
-
-const llama_kv_cache_rot_params & llama_kv_cache_rot_scope::current() {
-    return kv_cache_rot_params;
-}
-
-//
-// llama_kv_cache_rows_scope
-//
-
-static thread_local llama_kv_cache_rows_params kv_cache_rows_params;
-
-llama_kv_cache_rows_scope::llama_kv_cache_rows_scope(const llama_kv_cache_rows_params & params) : outer(kv_cache_rows_params) {
-    kv_cache_rows_params = params;
-}
-
-llama_kv_cache_rows_scope::~llama_kv_cache_rows_scope() {
-    kv_cache_rows_params = outer;
-}
-
-const llama_kv_cache_rows_params & llama_kv_cache_rows_scope::current() {
-    return kv_cache_rows_params;
-}
-
-//
 // llama_kv_cache
 //
 
@@ -203,12 +167,6 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
-    // the attention cache of a context whose caller stores the K/V rows of some layers
-    const auto & rows_params = llama_kv_cache_rows_scope::current();
-    const auto caller_rows_of = [&](uint32_t il) {
-        return name_tag[0] == 0 && !is_indexer && !other && rows_params.caller_rows && rows_params.caller_rows(il);
-    };
-
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -219,6 +177,19 @@ llama_kv_cache::llama_kv_cache(
             LLAMA_LOG_DEBUG("%s: layer %3d: filtered\n", __func__, il);
             continue;
         }
+
+        const char * dev_name = "CPU";
+
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+
+        if (offload) {
+            auto * dev = model.dev_layer(il);
+            buft = ggml_backend_dev_buffer_type(dev);
+
+            dev_name = ggml_backend_dev_name(dev);
+        }
+
+        LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
         if (share && other) {
             const int32_t il_share = share(il);
@@ -232,7 +203,8 @@ llama_kv_cache::llama_kv_cache(
                 map_layer_ids[il] = layers.size();
 
                 layers.push_back(layer_share);
-                layers.back().il = il;
+                layers.back().il   = il;
+                layers.back().buft = buft;
 
                 continue;
             }
@@ -256,46 +228,10 @@ llama_kv_cache::llama_kv_cache(
         const uint32_t n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
         const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
 
-        const char * dev_name = "CPU";
+        const ggml_backend_buffer_type_t buft_kv = llama_memory_buft(
+                swa_type == LLAMA_SWA_TYPE_NONE ? LLAMA_MEMORY_PLAN_BUFFER_KV : LLAMA_MEMORY_PLAN_BUFFER_KV_SWA, il, name_tag, buft);
 
-        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
-
-        if (offload) {
-            auto * dev = model.dev_layer(il);
-            buft = ggml_backend_dev_buffer_type(dev);
-
-            dev_name = ggml_backend_dev_name(dev);
-        }
-
-        LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
-
-        if (caller_rows_of(il)) {
-            LLAMA_LOG_DEBUG("%s: layer %3d: the caller stores the K/V rows\n", __func__, il);
-
-            if (!ctx_caller_rows) {
-                ggml_init_params params = { 2*n_layer*ggml_tensor_overhead(), nullptr, true };
-                ctx_caller_rows.reset(ggml_init(params));
-                if (!ctx_caller_rows) {
-                    throw std::runtime_error("failed to create ggml context for the caller's kv rows");
-                }
-            }
-
-            ggml_tensor * k = ggml_new_tensor_3d(ctx_caller_rows.get(), type_k, n_embd_k_gqa, kv_size, n_stream);
-            ggml_tensor * v = is_mla ? nullptr : ggml_new_tensor_3d(ctx_caller_rows.get(), type_v, n_embd_v_gqa, kv_size, n_stream);
-
-            ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
-            v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
-
-            caller_rows = true;
-            map_layer_ids[il] = layers.size();
-            layers.push_back({ il, k, v, model.layers[il].k_cache_s, model.layers[il].v_cache_s,
-                               std::vector<ggml_tensor *>(n_stream, nullptr), std::vector<ggml_tensor *>(n_stream, nullptr), });
-            layers.back().buft        = buft;
-            layers.back().caller_rows = true;
-            continue;
-        }
-
-        ggml_context * ctx = ctx_for_buft(buft);
+        ggml_context * ctx = ctx_for_buft(buft_kv);
         if (!ctx) {
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
@@ -353,6 +289,12 @@ llama_kv_cache::llama_kv_cache(
                 swa_type == LLAMA_SWA_TYPE_NONE ? LLAMA_MEMORY_PLAN_BUFFER_KV : LLAMA_MEMORY_PLAN_BUFFER_KV_SWA);
 
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+    }
+
+    // a buffer type of llama_memory_buft may leave a layer's K/V without data; without allocation every layer counts as having it
+    for (auto & layer : layers) {
+        layer.has_data = ctxs_bufs.no_alloc || layer.k->data != nullptr;
+        layers_without_data = layers_without_data || !layer.has_data;
     }
 
     {
@@ -462,8 +404,7 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
         return;
     }
 
-    const llama_kv_cache_rot_params rot_params = llama_kv_cache_rot_scope::current();
-    const ggml_backend_buffer_type_t rot_buft = rot_params.buft;
+    const llama_memory_buft_params & rot_params = llama_memory_buft_scope::current();
 
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr> ctx_map;
     for (auto & layer : layers) {
@@ -474,8 +415,7 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
                 continue;
             }
 
-            // a layer whose rows the caller stores still rotates them as its cache would
-            const auto buft = rot_buft ? rot_buft : layer.caller_rows ? layer.buft : ggml_backend_buffer_get_type(cache->buffer);
+            const auto buft = llama_memory_buft(LLAMA_MEMORY_PLAN_BUFFER_KV_ROT, (int32_t) layer.il, name_tag, layer.buft);
             auto & ctx = ctx_map[buft];
             if (!ctx) {
                 ggml_init_params params = { 2*layers.size()*ggml_tensor_overhead(), nullptr, true };
@@ -505,8 +445,8 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
                     continue;
                 }
                 const float * data = attn_rot_hadamard.at(t->ne[0]).data();
-                if (rot_params.set) {
-                    rot_params.set(t, data, ggml_nbytes(t), rot_params.set_user_data);
+                if (rot_params.rot_set) {
+                    rot_params.rot_set(t, data, ggml_nbytes(t), rot_params.rot_set_user_data);
                 } else {
                     ggml_backend_tensor_set(t, data, 0, ggml_nbytes(t));
                 }
@@ -710,8 +650,8 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         return;
     }
 
-    if (caller_rows && shift != 0) {
-        LLAMA_LOG_ERROR("%s: the caller stores the K rows of some layers, which cannot be shifted: refusing the shift\n", __func__);
+    if (layers_without_data && shift != 0) {
+        LLAMA_LOG_ERROR("%s: the K of some layers has no data, so it cannot be shifted: refusing the shift\n", __func__);
         return;
     }
 
@@ -765,8 +705,8 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
         return;
     }
 
-    if (caller_rows && d != 1) {
-        LLAMA_LOG_ERROR("%s: the caller stores the K rows of some layers, which cannot be shifted: refusing the shift\n", __func__);
+    if (layers_without_data && d != 1) {
+        LLAMA_LOG_ERROR("%s: the K of some layers has no data, so it cannot be shifted: refusing the shift\n", __func__);
         return;
     }
 
@@ -1060,6 +1000,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
             for (uint32_t il = 0; il < layers.size(); ++il) {
                 const auto & layer = layers[il];
+
+                if (!layer.has_data) {
+                    continue;
+                }
 
                 if (layer.k_stream[ssrc]) {
                     ggml_backend_tensor_copy(layer.k_stream[ssrc], layer.k_stream[sdst]);
@@ -1466,8 +1410,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
-    // the caller stores some K rows, so they cannot be rotated here
-    if (caller_rows) {
+    // a K without data cannot be rotated here
+    if (layers_without_data) {
         return false;
     }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
@@ -1512,8 +1456,8 @@ ggml_type llama_kv_cache::type_v() const {
     return cache_type_v;
 }
 
-bool llama_kv_cache::has_caller_rows() const {
-    return caller_rows;
+bool llama_kv_cache::has_layers_without_data() const {
+    return layers_without_data;
 }
 
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
@@ -2351,7 +2295,7 @@ size_t llama_kv_cache::size_k_bytes() const {
     size_t size_k_bytes = 0;
 
     for (const auto & layer : layers) {
-        size_k_bytes += layer.k && !layer.caller_rows ? ggml_nbytes(layer.k) : 0;
+        size_k_bytes += layer.k && layer.has_data ? ggml_nbytes(layer.k) : 0;
     }
 
     return size_k_bytes;
@@ -2361,7 +2305,7 @@ size_t llama_kv_cache::size_v_bytes() const {
     size_t size_v_bytes = 0;
 
     for (const auto & layer : layers) {
-        size_v_bytes += layer.v && !layer.caller_rows ? ggml_nbytes(layer.v) : 0;
+        size_v_bytes += layer.v && layer.has_data ? ggml_nbytes(layer.v) : 0;
     }
 
     return size_v_bytes;
@@ -2496,8 +2440,8 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
-    if (caller_rows) {
-        throw std::runtime_error("the caller stores the K/V rows of some layers (kv_rows_caller), so the state cannot hold them");
+    if (layers_without_data) {
+        throw std::runtime_error("the K/V of some layers have no data, so the state cannot hold them");
     }
 
     io.write(&n_stream, sizeof(n_stream));
@@ -2577,8 +2521,8 @@ const slot_info_vec_t *   sinfos_in) {
         return;
     }
 
-    if (caller_rows) {
-        throw std::runtime_error("the caller stores the K/V rows of some layers (kv_rows_caller), so the state cannot hold them");
+    if (layers_without_data) {
+        throw std::runtime_error("the K/V of some layers have no data, so the state cannot hold them");
     }
 
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]

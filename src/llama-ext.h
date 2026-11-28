@@ -159,15 +159,6 @@ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 // memory planning
 //
 
-// the memory component a planned buffer backs
-enum llama_memory_plan_buffer_kind {
-    LLAMA_MEMORY_PLAN_BUFFER_KV,         // attention KV cache without a sliding window
-    LLAMA_MEMORY_PLAN_BUFFER_KV_SWA,     // attention KV cache that masks attention to a sliding window; the tensor shapes give its cell count
-    LLAMA_MEMORY_PLAN_BUFFER_RECURRENT,  // recurrent state
-    LLAMA_MEMORY_PLAN_BUFFER_DSV4_STATE, // DeepSeek V4 compressor state
-    LLAMA_MEMORY_PLAN_BUFFER_KV_ROT,     // attention rotation matrices of a KV cache
-};
-
 struct llama_memory_plan_tensor {
     std::string name;                // e.g. cache_k_l3, cache_idx_k_l3, cache_r_l0, dsv4_csa_state_kv_l2, cache_k_rot_l3
     int32_t     il;                  // layer from the trailing _l<N> of the name; -1 when it has none
